@@ -5,7 +5,7 @@
  * function that implements it.  The header states what this layer is for and
  * why it is not part of JceWaterField.
  */
-#include <jce/middleware/scene/jce_water_ripple.h>
+#include "jce_water_ripple_internal.h"
 
 #include "os/core/jce_memory.h"   /* JCE_CALLOC / JCE_FREE, as jce_water_field.c does */
 
@@ -313,13 +313,13 @@ void JCE_CALL jce_water_ripple_step(JceWaterRipple *r, float dt)
     for (int s = 0; s < steps; ++s) ripple_substep(r, sub);
 }
 
-void JCE_CALL jce_water_ripple_impulse(JceWaterRipple *r, float x, float z,
-                                       float radius_m, float speed_mps)
+static void ripple_velocity_update(JceWaterRipple *r, float x, float z,
+    float radius_m, float speed_mps, float drive_dt)
 {
     if (!r) return;
     if (!ripple_finite(x) || !ripple_finite(z)) return;
     if (!ripple_finite(radius_m) || radius_m <= 0.0f) return;
-    if (!ripple_finite(speed_mps) || speed_mps == 0.0f) return;
+    if (!ripple_finite(speed_mps) || (speed_mps == 0.0f && drive_dt <= 0.0f)) return;
 
     const int   n    = r->n;
     const float half = r->size_m * 0.5f;
@@ -337,10 +337,11 @@ void JCE_CALL jce_water_ripple_impulse(JceWaterRipple *r, float x, float z,
     if (i1 > n - 1) i1 = n - 1;
     if (j1 > n - 1) j1 = n - 1;
 
-    /* The impulse enters as a VELOCITY -- and because the velocity is stored
+    /* The public one-shot impulse enters as a VELOCITY. Because it is stored
      * rather than implied by two height levels, that is literally `v -= speed`
      * with no dt anywhere in it. The same call therefore means the same thing
-     * at 30 fps and at 144.
+     * at 30 fps and at 144. The private continuous driver instead relaxes
+     * toward the target velocity over the executed physics duration.
      *
      * The sign: speed_mps is DOWNWARD (a body falling in), and the surface
      * height axis is up, so a positive speed subtracts from v. */
@@ -359,9 +360,32 @@ void JCE_CALL jce_water_ripple_impulse(JceWaterRipple *r, float x, float z,
             const float w = cosf(d * 1.5707963f);
             const int   idx = j * n + i;
             if (r->c2[idx] <= 0.0f) continue;   /* cannot disturb land */
-            r->v[idx] -= speed_mps * w * w;
+            if (drive_dt > 0.0f) {
+                /* An exact local relaxation is a convex combination. Repeating
+                 * one-shot velocity impulses here instead gives feedback gain
+                 * proportional to tick rate, which can sink a floating body and
+                 * subsequently explode its depth-dependent drag. */
+                const float rate = sqrtf(r->c2[idx]) / fmaxf(radius_m, r->dx);
+                const float blend = -expm1f(-drive_dt * rate * w * w);
+                r->v[idx] += blend * (-speed_mps - r->v[idx]);
+            } else {
+                r->v[idx] -= speed_mps * w * w;
+            }
         }
     }
+}
+
+void JCE_CALL jce_water_ripple_impulse(JceWaterRipple *r, float x, float z,
+    float radius_m, float speed_mps)
+{
+    ripple_velocity_update(r, x, z, radius_m, speed_mps, 0.0f);
+}
+
+void jce_water_ripple_drive_velocity(JceWaterRipple *r, float x, float z,
+    float radius_m, float target_velocity_y, float dt)
+{
+    if (!ripple_finite(dt) || dt <= 0.0f) return;
+    ripple_velocity_update(r, x, z, radius_m, -target_velocity_y, dt);
 }
 
 float JCE_CALL jce_water_ripple_height(const JceWaterRipple *r, float x, float z)

@@ -69,8 +69,8 @@
 /* Hidden editor object-ID picking pass.  Separate FBO/readback target,
  * after regular scene + preview views and before UI. */
 #define JCE_VIEW_EDITOR_PICK 70
-/* One-pixel GPU blit into a readback staging texture. */
-#define JCE_VIEW_EDITOR_PICK_READBACK 71
+/* Stock pick staging blit, after the highest early-remapped physical view. */
+#define JCE_VIEW_EDITOR_PICK_READBACK 248
 
 /* Editor Game View render target.  A SECOND scene-renderer base, and therefore
  * the reason the spacing below is not a matter of taste.
@@ -186,6 +186,20 @@
 #define JCE_VIEW_SR_CAMERA_OVERLAY_OFFSET 64u
 #define JCE_VIEW_SR_CAMERA_OVERLAY_MAX     3u
 
+/* World-space RGB water atlas before the water colour consumer. Offsets 67
+ * and 68 would collide with the Scene View's absolute pick and readback. */
+#define JCE_VIEW_SR_WATER_CAUSTIC_OFFSET 69u
+
+/* Opaque color is read by the water trace, which writes a distinct target.
+ * Transparency then resumes rendering into the original scene target. The
+ * runtime's PostFX range 100..120 is clear. */
+#define JCE_VIEW_SR_WATER_TRACE_OFFSET        94u
+#define JCE_VIEW_SR_TRANSPARENCY_OFFSET       95u
+#define JCE_VIEW_SR_SCREEN_SHAFTS_OFFSET       96u
+#define JCE_VIEW_SR_TOON_HAIR_OFFSET            97u
+#define JCE_VIEW_SR_CLOUD_TEMPORAL_OFFSET       98u
+#define JCE_VIEW_SR_CLOUD_OPAQUE_OFFSET         99u
+
 /* SSGI: one view marches the bounce, the next adds it onto the scene colour.
  *
  * 26/27 and not something in the 60s, because BOTH have to be BELOW the
@@ -274,7 +288,7 @@
  * makes that argument visible outside the compiler.
  *
  * Ranges are [LO, HI] INCLUSIVE. */
-#define JCE_VIEW_SR_FROZEN_RANGE_COUNT 6u
+#define JCE_VIEW_SR_FROZEN_RANGE_COUNT 12u
 
 /* [0]  the contiguous core run: colour, velocity, SSAO's pair, local-shadow
  *      atlas, GPU particle/cull compact, shadow + CSM cascades, volumetric fog,
@@ -315,6 +329,30 @@
 #define JCE_VIEW_SR_FROZEN_5_LO   64u
 #define JCE_VIEW_SR_FROZEN_5_HI   66u
 
+/* [6] RGB caustic atlas producer. */
+#define JCE_VIEW_SR_FROZEN_6_LO   69u
+#define JCE_VIEW_SR_FROZEN_6_HI   69u
+
+/* [7] Trace opaque color and resume transparency. */
+#define JCE_VIEW_SR_FROZEN_7_LO   94u
+#define JCE_VIEW_SR_FROZEN_7_HI   95u
+
+/* [8] Quarter-resolution screen shafts, before the fog composite. */
+#define JCE_VIEW_SR_FROZEN_8_LO   96u
+#define JCE_VIEW_SR_FROZEN_8_HI   96u
+
+/* [9] Camera-space toon hair depth, before opaque colour. */
+#define JCE_VIEW_SR_FROZEN_9_LO   97u
+#define JCE_VIEW_SR_FROZEN_9_HI   97u
+
+/* Half-resolution cloud raymarch and temporal history before sky composition. */
+#define JCE_VIEW_SR_FROZEN_10_LO  98u
+#define JCE_VIEW_SR_FROZEN_10_HI  98u
+
+/* Premultiplied foreground clouds over opaque colour, before transparency. */
+#define JCE_VIEW_SR_FROZEN_11_LO  99u
+#define JCE_VIEW_SR_FROZEN_11_HI  99u
+
 /* True when `off` is a base-relative id a foreign pass must not take. */
 /* EVERY range, and the count above says how many there are.  This tested 0..3
  * and stopped, so range [4] -- SSGI's 26..27 -- was frozen everywhere except in
@@ -335,7 +373,19 @@
      ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_4_LO &&                      \
       (unsigned)(off) <= JCE_VIEW_SR_FROZEN_4_HI) ||                     \
      ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_5_LO &&                      \
-      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_5_HI))
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_5_HI) ||                     \
+     ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_6_LO &&                      \
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_6_HI) ||                     \
+     ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_7_LO &&                      \
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_7_HI) ||                     \
+     ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_8_LO &&                      \
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_8_HI) ||                     \
+     ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_9_LO &&                      \
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_9_HI) ||                     \
+     ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_10_LO &&                     \
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_10_HI) ||                     \
+     ((unsigned)(off) >= JCE_VIEW_SR_FROZEN_11_LO &&                     \
+      (unsigned)(off) <= JCE_VIEW_SR_FROZEN_11_HI))
 
 /* ImGui editor overlay (renders before UI overlay so HUD sits on top). */
 #define JCE_VIEW_IMGUI       250

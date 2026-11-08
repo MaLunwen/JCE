@@ -1,4 +1,6 @@
 """Real executable replay and capture; no engine or editor business hooks."""
+import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -6,12 +8,14 @@ import re
 import struct
 import subprocess
 import sys
+import time
 PROJECT=Path(__file__).resolve().parents[1]
 REPO=PROJECT.parents[2]
 sys.path.insert(0,str(REPO/'tools'))
 from jce_determinism import DETERMINISM, assert_backend
-GAME=REPO/'dist/games/Minesweeper-release-x86_64/Minesweeper.exe'
-OUT=PROJECT/'build/verification'
+GAME=None
+EDITOR=None
+OUT=None
 
 def write_jirc(path,frames):
     with path.open('wb') as f:
@@ -30,10 +34,12 @@ def click(x,y,button=1):return [((),x,y,0)]*3+[((),x,y,1<<(button-1))]*3+[((),x,
 
 def key(code):return [((code,),0,0,0)]*3+idle(5)
 
-def run(name,frames=None,extra=None,max_frames=None,timeout=120):
+def run(name,frames=None,extra=None,max_frames=None,timeout=120,exe=None):
+    exe=Path(exe) if exe is not None else GAME
     OUT.mkdir(parents=True,exist_ok=True)
-    env=dict(os.environ);env.update(DETERMINISM)
-    for k in ('JCE_INPUT_REPLAY','JCE_CAPTURE_PATH','JCE_KPI_GAME_SHOTS','MINES_SELF_TEST'):env.pop(k,None)
+    env={k:v for k,v in os.environ.items() if not k.startswith('JCE_')}
+    env.update(DETERMINISM)
+    env.pop('MINES_SELF_TEST',None)
     count=max_frames or max(120,len(frames or [])+30)
     env.update(JCE_BACKEND='d3d11',JCE_MULTI_INSTANCE='1',JCE_MAX_FRAMES=str(count),MINES_TRACE='1',MINES_SEED='7',MINES_SAVE_DIR=str(OUT/'save'))
     if frames is not None:
@@ -41,8 +47,63 @@ def run(name,frames=None,extra=None,max_frames=None,timeout=120):
         env['JCE_INPUT_REPLAY']=str(path)
     env['JCE_CAPTURE_FRAME']=str(count-10);env['JCE_CAPTURE_PATH']=str(OUT/(name+'.png'))
     if extra:env.update(extra)
-    proc=subprocess.run([str(GAME)],cwd=GAME.parent,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout)
-    log=proc.stdout+proc.stderr;(OUT/(name+'.log')).write_text(log,encoding='utf-8')
+    started=time.perf_counter()
+    before=after=None
+    before_error=after_error=None
+    proc=None
+    failure=None
+    failure_stage=None
+    stdout=stderr=None
+    status='CHILD_RETURNED'
+    try:
+        before=hashlib.sha256(exe.read_bytes()).hexdigest()
+    except OSError as exc:
+        before_error=str(exc);failure=exc;failure_stage='hash_before'
+        status='ARTIFACT_READ_FAILED_BEFORE'
+    if failure is None:
+        try:
+            proc=subprocess.run([str(exe)],cwd=exe.parent,env=env,capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=timeout)
+            stdout,stderr=proc.stdout,proc.stderr
+        except subprocess.TimeoutExpired as exc:
+            stdout,stderr=exc.stdout,exc.stderr
+            failure=exc;failure_stage='child';status='TIMEOUT'
+        except OSError as exc:
+            failure=exc;failure_stage='launch';status='LAUNCH_FAILED'
+    try:
+        after=hashlib.sha256(exe.read_bytes()).hexdigest()
+    except OSError as exc:
+        after_error=str(exc)
+        if failure is None:
+            failure=exc;failure_stage='hash_after';status='ARTIFACT_READ_FAILED_AFTER'
+    # TimeoutExpired may retain bytes even for a text-mode child. Keep all
+    # available output under the same UTF-8 replacement policy as normal runs.
+    def output_text(value):
+        if isinstance(value,bytes):return value.decode('utf-8',errors='replace')
+        return value or ''
+    log=output_text(stdout)+output_text(stderr)
+    if failure is not None:
+        log+='\n[verify-game] status='+status+' stage='+failure_stage+' error='+str(failure)+'\n'
+    log_path=OUT/(name+'.log')
+    log_path.write_text(log,encoding='utf-8',newline='\n')
+    receipt={'executable':str(exe),'sha256_before':before,'sha256_after':after,
+             'hash_before_status':'AVAILABLE' if before is not None else 'UNAVAILABLE',
+             'hash_after_status':'AVAILABLE' if after is not None else 'UNAVAILABLE',
+             'hash_before_error':before_error,'hash_after_error':after_error,
+             'identity_stable':before is not None and after is not None and before==after,
+             'exit':proc.returncode if proc is not None else None,'status':status,
+             'failure_stage':failure_stage,
+             'failure_type':type(failure).__name__ if failure is not None else None,
+             'failure':str(failure) if failure is not None else None,
+             'failure_errno':getattr(failure,'errno',None),
+             'failure_winerror':getattr(failure,'winerror',None),
+             'timeout_s':timeout if status=='TIMEOUT' else None,
+             'elapsed_s':time.perf_counter()-started,'frames':count,
+             'synthetic_replay':frames is not None,
+             'stdout_available':stdout is not None,'stderr_available':stderr is not None,
+             'log_sha256':hashlib.sha256(log_path.read_bytes()).hexdigest()}
+    (OUT/(name+'-artifact.json')).write_text(json.dumps(receipt,indent=2)+'\n',encoding='utf-8')
+    if failure is not None:raise failure
+    assert before==after,'Executable changed during verification'
     print(name,'exit',proc.returncode,flush=True)
     for line in log.splitlines():
         if 'MINES_' in line or 'Lua error' in line:print(line,flush=True)
@@ -71,24 +132,17 @@ def extended():
     print('EXTENDED GAME PASS')
 
 def editor():
-    global GAME
-    session=Path.home()/'.jce/editor-session.json'
-    before=session.read_bytes() if session.exists() else None
-    original_game=GAME
-    try:
-        data=json.loads(before) if before else {}
-        data.update(last_project=str(PROJECT),last_scene_path=str(PROJECT/'resources/scenes/minesweeper.scene.json'))
-        session.parent.mkdir(parents=True,exist_ok=True);session.write_text(json.dumps(data),encoding='utf-8')
-        GAME=REPO/'build/desktop/windows-x64/release/jce_editor.exe'
-        log=run('editor-play',idle(90)+key(30)+idle(100),extra={'JCE_KPI_AUTOPLAY':'1','JCE_DBG_FOCUS_GAME':'1','JCE_KPI_GAME_SHOTS':'2.00|'+str(OUT/'editor-game.png')},max_frames=280)
-        assert 'MINES_BOOT' in log and 'action=start' in log
-    finally:
-        GAME=original_game
-        if before is None:
-            if session.exists():session.unlink()
-        else:session.write_bytes(before)
-        assert (session.read_bytes() if session.exists() else None)==before
-    print('EDITOR PLAY PASS; session restored byte-for-byte')
+    profile=OUT/'editor-profile'
+    profile.mkdir(exist_ok=False)
+    (profile/'editor-session.json').write_text(json.dumps({
+        'last_project':str(PROJECT),
+        'last_scene_path':str(PROJECT/'resources/scenes/minesweeper.scene.json')}),encoding='utf-8')
+    log=run('editor-play',idle(90)+key(30)+idle(100),exe=EDITOR,
+        extra={'JCE_EDITOR_PROFILE_DIR':str(profile),'JCE_KPI_AUTOPLAY':'1',
+               'JCE_DBG_FOCUS_GAME':'1','JCE_KPI_GAME_CAPTURE_SIZE':'1280x720',
+               'JCE_KPI_GAME_SHOTS':'2.00|'+str(OUT/'editor-game.png')},max_frames=280)
+    assert 'MINES_BOOT' in log and 'action=start' in log
+    print('EDITOR PLAY PASS; isolated profile, synthetic replay')
 
 def runtime_ai():
     frames=idle(80)+key(30)+idle(30)+click(100,210)+idle(1600)+key(41)+idle(20)+click(640,480)+idle(20)+click(500,535)+idle(40)
@@ -97,6 +151,29 @@ def runtime_ai():
     print('REAL RUNTIME AI PASS')
 
 def main():
+    global GAME,EDITOR,OUT
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--exe',default=os.environ.get('MINES_VERIFY_GAME'),
+                    help='Explicit current game executable; no build-path guessing')
+    ap.add_argument('--editor-exe',default=os.environ.get('MINES_VERIFY_EDITOR'))
+    ap.add_argument('--out',default=os.environ.get('MINES_VERIFY_OUT'),
+                    help='Fresh verification directory')
+    ap.add_argument('--extended',action='store_true')
+    ap.add_argument('--editor',action='store_true')
+    ap.add_argument('--ai',action='store_true')
+    args=ap.parse_args()
+    if not args.exe or not Path(args.exe).is_file():
+        ap.error('--exe (or MINES_VERIFY_GAME) must name an existing executable')
+    if args.editor and (not args.editor_exe or not Path(args.editor_exe).is_file()):
+        ap.error('--editor-exe (or MINES_VERIFY_EDITOR) is required with --editor')
+    if not args.out:
+        ap.error('--out (or MINES_VERIFY_OUT) must select a fresh directory')
+    GAME=Path(args.exe).resolve()
+    EDITOR=Path(args.editor_exe).resolve() if args.editor_exe else None
+    OUT=Path(args.out).resolve()
+    if OUT.exists() and (not OUT.is_dir() or any(OUT.iterdir())):
+        ap.error('Verification output must be absent or empty; preserve earlier evidence')
+    OUT.mkdir(parents=True,exist_ok=True)
     rules=run('integrated-rules',extra={'MINES_SELF_TEST':'1'})
     assert 'MINES_TEST PASS' in rules
     menu=run('integrated-menu',idle(130))
@@ -104,8 +181,8 @@ def main():
     frames=idle(80)+key(30)+idle(30)+click(456,218)+idle(30)
     log=run('integrated-reveal',frames)
     assert 'action=reveal' in log and 'state=1' in log
-    if '--extended' in sys.argv:extended()
-    if '--editor' in sys.argv:editor()
-    if '--ai' in sys.argv:runtime_ai()
+    if args.extended:extended()
+    if args.editor:editor()
+    if args.ai:runtime_ai()
     return 0
 if __name__=='__main__':raise SystemExit(main())

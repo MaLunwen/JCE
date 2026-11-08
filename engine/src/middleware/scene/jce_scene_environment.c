@@ -33,13 +33,15 @@
  * third clock.  The authored settings stay the SEED; the environment holds the
  * live value; the renderer and the editor both read it.
  *
- * Layer: middleware/scene (L4).  Pure C99, and public API only -- this file
- * cannot see struct JceScene, so it cannot grow a private copy of anything.
+ * Layer: middleware/scene (L4). The scene owns the environment and fog drift.
  */
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/world/jce_environment.h>
 #include <jce/middleware/world/jce_time_of_day.h>
+
+#include "jce_scene_fog_look_internal.h"
+#include "middleware/world/jce_environment_internal.h"
 
 #include <math.h>
 
@@ -190,5 +192,15 @@ void jce_scene_environment_advance(JceScene *scene, float dt)
         }
     }
 
-    jce_environment_advance(env, dt);
+    const JceSceneParticleState *particles = jce_scene_internal_particle_state(scene);
+    const JceScenePrecipitationSettings times = particles ? particles->precipitation
+        : (JceScenePrecipitationSettings){0};
+    jce_environment_advance_with_surface_times(env, dt, times.wetting_seconds,
+                                               times.snowfall_seconds);
+    /* Weather still integrates while the authored day clock is frozen.
+     * The common environment integrator advances day_fraction using the last
+     * running period; pin it again so no frame inherits that stale rate. */
+    if (rs && rs->tod_enabled && !(rs->tod_speed > 0.0f))
+        env->day_fraction = env_wrap_hour(rs->tod_hour) / 24.0f;
+    jce_scene_fog_look_advance(scene, env, dt);
 }

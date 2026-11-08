@@ -562,3 +562,40 @@ void serw_tilemap_collider2d(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddItemToArray(arr, o);
     }
 }
+
+
+void parse_water_spectrum(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceWaterSpectrumComponent value = jce_scene_water_spectrum_default();
+    const double version = j_num(c, "version", 1.0);
+    const double model = j_num(c, "model", JCE_WATER_FFT_SPECTRUM_PM);
+    if (version != JCE_WATER_SPECTRUM_COMPONENT_VERSION ||
+        model < JCE_WATER_FFT_SPECTRUM_JONSWAP ||
+        model > JCE_WATER_FFT_SPECTRUM_TMA || floor(model) != model) return;
+    const double flags = j_num(c, "shadingFlags", JCE_WATER_SPECTRUM_FILTER_NORMALS);
+    if (flags < 0.0 || flags > JCE_WATER_SPECTRUM_FILTER_NORMALS || floor(flags) != flags) return;
+    value.shading_flags = (uint32_t)flags;
+    value.model = (uint32_t)model;
+    value.depth = (float)j_num(c, "depth", 50.0);
+    value.directional_blend = (float)j_num(c, "directionalBlend", 1.0);
+    if (!isfinite(value.depth) || !(value.depth > 0.0f) ||
+        !isfinite(value.directional_blend) || value.directional_blend < 0.0f ||
+        value.directional_blend > 1.0f) return;
+    jce_scene_set_water_spectrum(s, e, &value);
+}
+
+void serw_water_spectrum(JceScene *s, JceEntity e, cJSON *arr)
+{
+    const JceWaterSpectrumComponent *value = jce_scene_get_water_spectrum(s, e);
+    if (!value) return;
+    cJSON *o = cJSON_CreateObject();
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "WaterSpectrum");
+    cJSON_AddNumberToObject(p, "version", value->version);
+    cJSON_AddNumberToObject(p, "model", value->model);
+    cJSON_AddNumberToObject(p, "depth", value->depth);
+    cJSON_AddNumberToObject(p, "directionalBlend", value->directional_blend);
+    cJSON_AddNumberToObject(p, "shadingFlags", value->shading_flags);
+    cJSON_AddItemToObject(o, "properties", p);
+    cJSON_AddItemToArray(arr, o);
+}

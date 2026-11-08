@@ -31,32 +31,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_json.h>
 
 #include "resource/jce_pak_format.h"
 #include "resource/jce_archive_format.h"
 
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_cook.h>
+#include <jce/resource/jce_bundle_loader.h>
+#include <jce/resource/jce_bundle_format.h>
 #include <jce/os/core/jce_alloc.h>
 
 #include <xxhash.h>
 #include <zstd.h>
 
-/* Logging stub: the archive writer/reader/dict/mmap TUs reference
- * jce_log_write(); this host tool has no async log subsystem, so route
- * warnings/errors to stderr and drop the rest. */
+/* Reuse core logging; before async initialization its synchronous fallback
+ * reports packer diagnostics without a background logger or engine boot. */
+#include <jce/os/core/jce_log.h>
 #include <stdarg.h>
-void jce_log_write(int level, const char *tag, const char *file, int line,
-                   const char *fmt, ...) {
-    (void)file; (void)line;
-    if (level < 4) return; /* below WARN: ignore (levels are ascending) */
-    va_list ap;
-    va_start(ap, fmt);
-    fprintf(stderr, "[%s] ", tag ? tag : "?");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-}
 
 /* ================================================================== */
 /* Dynamic byte buffer                                                 */
@@ -289,6 +281,8 @@ static void enumerate_files(const char *dir, StrList *out)
 
 typedef struct {
     char *rel_path;
+    char *source_label;
+    int selected;
     uint64_t path_hash;
     uint64_t original_size;
     uint8_t *compressed;
@@ -299,6 +293,209 @@ typedef struct {
     uint32_t flags;        /* JPAK_FLAG_*                            */
     uint64_t content_hash; /* XXH3_64bits of original bytes          */
 } AssetEntry;
+
+/* Both primary readers consume one immutable snapshot. A present sidecar is
+ * admitted by the public file loader, then bound to that snapshot below. */
+typedef struct {
+    void *blob;
+    size_t size;
+    uint64_t content_id;
+    JceArchive *archive;
+    JceBundleFile *bundle;
+    size_t imported;
+    const char *path;
+    const char *target; /* exact offline target; NULL retains runtime-host policy */
+    char *manifest_json;
+    int sidecar_present, sidecar_verified;
+} SelectedArchive;
+
+static void selected_close(SelectedArchive *selected)
+{
+    jce_archive_close(selected->archive);
+    jce_bundle_file_close(selected->bundle);
+    jce_json_free_string(selected->manifest_json);
+    jce_fs_buffer_free(selected->blob);
+    memset(selected, 0, sizeof(*selected));
+}
+
+static int selected_sidecar(SelectedArchive *selected)
+{
+    char path[1152];
+    int written = snprintf(path, sizeof(path), "%s.json", selected->path);
+    if (written < 0 || (size_t)written >= sizeof(path)) return 0;
+    if (!jce_fs_host_exists_file(path)) return 1; /* public optional policy */
+    selected->sidecar_present = 1;
+    uint64_t before_size = 0, after_size = 0;
+    void *before = jce_fs_host_read_all(path, &before_size);
+    JceBundleFile *checked = before
+        ? (selected->target ? jce_bundle_file_inspect_file(selected->path, selected->target)
+                            : jce_bundle_file_open(NULL, selected->path, NULL)) : NULL;
+    void *after = checked ? jce_fs_host_read_all(path, &after_size) : NULL;
+    int ok = checked && before_size && before_size <= SIZE_MAX && after &&
+        before_size == after_size && memcmp(before, after, (size_t)before_size) == 0;
+    JceJson *doc = ok ? jce_json_parse_strict(before, (size_t)before_size) : NULL;
+    if (!jce_json_is_object(doc)) ok = 0;
+    if (ok && jce_json_get_int(jce_json_get(doc, JCE_BUNDLE_KEY_CONTRACT),
+                              JCE_BUNDLE_KEY_CONTRACT_MINOR, -1) >= 1) {
+        /* The public loader validates the hash syntax/contract. This comparison
+         * binds its file observation to our immutable primary input, not to a
+         * second interpretation of the sidecar's asset graph. */
+        const char *hash = jce_json_get_string(doc, JCE_BUNDLE_KEY_CONTENT_HASH, "");
+        ok = strtoull(hash, NULL, 16) == selected->content_id &&
+            jce_json_get_number(doc, JCE_BUNDLE_KEY_ARCHIVE_SIZE, -1) == (double)selected->size;
+        selected->sidecar_verified = ok;
+    }
+    jce_json_free(doc);
+    jce_fs_buffer_free(before); jce_fs_buffer_free(after);
+    jce_bundle_file_close(checked);
+    if (!ok) fprintf(stderr, "[jce_pak] selected sidecar admission/snapshot failed: %s\n", path);
+    return ok;
+}
+
+static int selected_open(const char *path, SelectedArchive *selected,
+                         const char *expected_target)
+{
+    uint64_t size = 0;
+    selected->path = path;
+    selected->target = expected_target;
+    selected->blob = jce_fs_host_read_all(path, &size);
+    if (!selected->blob || size == 0 || size > SIZE_MAX) goto failed;
+    selected->size = (size_t)size;
+    selected->content_id = jce_archive_content_hash(selected->blob, selected->size);
+    selected->archive = jce_archive_open(selected->blob, selected->size);
+    if (!selected->archive || !jce_archive_verify_header(selected->archive) ||
+        jce_archive_is_secure(selected->archive)) goto failed;
+    selected->bundle = selected->target
+        ? jce_bundle_file_inspect_memory(selected->blob, selected->size, selected->target)
+        : jce_bundle_file_open_memory(NULL, selected->blob, selected->size, "selected_archive");
+    if (!selected->bundle) goto failed;
+    const JceArchiveEntry *manifest = jce_archive_find(selected->archive, JCE_BUNDLE_MANIFEST_VPATH);
+    if (!manifest || manifest->original_size >= SIZE_MAX) goto failed;
+    size_t length = (size_t)manifest->original_size;
+    char *text = (char *)malloc(length + 1);
+    if (!text) goto failed;
+    int valid = jce_archive_read(selected->archive, manifest, text, length) == length &&
+        jce_archive_verify_entry(manifest, text, length);
+    text[length] = 0;
+    JceJson *doc = valid ? jce_json_parse_strict(text, length) : NULL;
+    free(text);
+    if (jce_json_is_object(doc)) selected->manifest_json = jce_json_print(doc, false);
+    jce_json_free(doc);
+    if (!selected->manifest_json || !selected_sidecar(selected)) goto failed;
+    return 1;
+failed:
+    fprintf(stderr, "[jce_pak] selected Bundle read/contract/integrity failed: %s\n", path);
+    selected_close(selected);
+    return 0;
+}
+
+static char *admit_asset_path(const char *path, int require_canonical);
+static int selected_unique_addresses(const SelectedArchive *selected)
+{
+    size_t count = jce_archive_count(selected->archive);
+    if (!count) return 1;
+    if (count > SIZE_MAX / sizeof(const char *)) return 0;
+    const char **paths = (const char **)malloc(count * sizeof(*paths));
+    if (!paths) {
+        fprintf(stderr, "[jce_pak] selected address validation allocation failed: %s\n", selected->path);
+        return 0;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const char *path = jce_archive_debug_path(selected->archive, (uint32_t)i);
+        char *admitted = admit_asset_path(path, 1);
+        if (!admitted) {
+            fprintf(stderr, "[jce_pak] unsafe selected address: %s::%s\n",
+                    selected->path, path ? path : "(no debug path)");
+            free(paths); return 0;
+        }
+        free(admitted); paths[i] = path; /* borrow immutable archive path refs */
+    }
+    qsort(paths, count, sizeof(*paths), sl_cmp);
+    for (size_t i = 1; i < count; ++i) {
+        if (strcmp(paths[i - 1], paths[i]) == 0) {
+            fprintf(stderr, "[jce_pak] duplicate selected address: %s::%s\n", selected->path, paths[i]);
+            free(paths); return 0;
+        }
+    }
+    free(paths); return 1;
+}
+
+/* Normalizing an address is not admission: reject rooted, traversal, separator
+ * aliases and controls before asking the existing archive path owner to fold
+ * case. Selected manifest paths must already be canonical. */
+static char *admit_asset_path(const char *path, int require_canonical)
+{
+    char canonical[1024];
+    if (!path || !path[0] || path[0] == '/') return NULL;
+    const char *segment = path;
+    for (const unsigned char *p = (const unsigned char *)path;; ++p) {
+        if (*p && (*p < 32 || *p == 127 || *p == ':' || *p == '\\')) return NULL;
+        if (*p == '/' || *p == 0) {
+            size_t length = (size_t)((const char *)p - segment);
+            if (length == 0 || (length == 1 && segment[0] == '.') ||
+                (length == 2 && segment[0] == '.' && segment[1] == '.')) return NULL;
+            if (!*p) break;
+            segment = (const char *)p + 1;
+        }
+    }
+    size_t size = jce_archive_normalize_path(path, canonical, sizeof(canonical));
+    if (!size || size >= sizeof(canonical) ||
+        (require_canonical && strcmp(path, canonical) != 0)) return NULL;
+    char *copy = (char *)malloc(size + 1);
+    if (copy) memcpy(copy, canonical, size + 1);
+    return copy;
+}
+
+static void asset_entries_free(AssetEntry *entries, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        free(entries[i].rel_path);
+        free(entries[i].source_label);
+        free(entries[i].compressed);
+    }
+    free(entries);
+}
+
+/* Takes ownership of path and bytes even on failure. Equal addresses may merge
+ * only after byte equality; selected project provenance wins an equal stock row.
+ * Repeated logical addresses within the selected input itself are invalid. */
+static int asset_append(AssetEntry *entries, size_t *count, char *path,
+                         uint8_t *bytes, size_t size, const char *source, int selected)
+{
+    if (!path || !bytes) { free(path); free(bytes); return 0; }
+    for (size_t i = 0; i < *count; ++i) {
+        AssetEntry *prior = &entries[i];
+        if (strcmp(prior->rel_path, path) != 0) continue;
+        int identical = prior->original_size == size &&
+                        (size == 0 || memcmp(prior->compressed, bytes, size) == 0);
+        if (!identical) {
+            fprintf(stderr, "[jce_pak] logical address conflict: %s (first=%s, next=%s, reason=%s)\n",
+                    path, prior->source_label, source,
+                    "different content");
+            free(path); free(bytes); return 0;
+        }
+        if (selected && !prior->selected) {
+            char *label = (char *)malloc(strlen(source) + 1);
+            if (!label) { free(path); free(bytes); return 0; }
+            strcpy(label, source);
+            free(prior->source_label); prior->source_label = label;
+            prior->selected = 1;
+        }
+        free(path); free(bytes); return 1;
+    }
+    char *label = (char *)malloc(strlen(source) + 1);
+    if (!label) { free(path); free(bytes); return 0; }
+    strcpy(label, source);
+    AssetEntry *entry = &entries[(*count)++];
+    entry->rel_path = path;
+    entry->source_label = label;
+    entry->selected = selected;
+    entry->compressed = bytes;
+    entry->original_size = size;
+    entry->compressed_size = size;
+    entry->content_hash = jce_archive_content_hash(bytes, size);
+    return 1;
+}
 
 /* ================================================================== */
 /* COFF .obj generator                                                 */
@@ -678,8 +875,48 @@ static int jpak_dup_cmp(const void *pa, const void *pb) {
  * from --key-file) to also decrypt + verify ENCRYPTED entries (NULL skips
  * them).  Duplicate content is always detected (entries sharing crc +
  * original_size).  Returns 0 on success, 1 on failure. */
+/* Borrow the already admitted archive; publish one verified payload only. */
+static int read_single_entry(JceArchive *ar, const char *logical, const char *out)
+{
+    char *canonical = admit_asset_path(logical, 1);
+    const JceArchiveEntry *entry = canonical ? jce_archive_find(ar, canonical) : NULL;
+    uint64_t id = canonical ? jce_archive_path_id(ar, canonical) : 0;
+    uint32_t matches = 0;
+    for (uint32_t i = 0; entry && i < jce_archive_count(ar); ++i) {
+        const JceArchiveEntry *candidate = jce_archive_get(ar, i);
+        if (candidate && candidate->path_hash == id) ++matches;
+    }
+    free(canonical);
+    if (!entry || matches != 1 || entry->original_size > 16u * 1024u * 1024u) {
+        fprintf(stderr, "[jce_pak] entry missing, unsafe, ambiguous or over 16 MiB\n");
+        return 1;
+    }
+    size_t size = entry->original_size;
+    /* read() returns zero for both empty success and decode failure. Admit
+     * empty output only with the independent public plain-stored mapping. */
+    if (size == 0) {
+        const void *mapped = NULL; size_t mapped_size = 0;
+        if (entry->stored_size || !jce_archive_map_entry(ar, entry, &mapped, &mapped_size) || mapped_size) {
+            fprintf(stderr, "[jce_pak] ambiguous empty codec/encryption layout is unsupported\n");
+            return 1;
+        }
+    }
+    void *bytes = malloc(size ? size : 1);
+    if (!bytes) return 1;
+    int ok = jce_archive_read(ar, entry, bytes, size ? size : 1) == size &&
+             jce_archive_verify_entry(entry, bytes, size);
+    if (ok) ok = jce_fs_host_write_new(out, bytes, size);
+    free(bytes);
+    if (!ok) fprintf(stderr, "[jce_pak] entry read, integrity or exclusive output failed\n");
+    return ok ? 0 : 1;
+}
+
 static int cmd_inspect(const char *path, const char *json_out, int quiet,
-                       int verify, const uint8_t *key) {
+                       int verify, const uint8_t *key,
+                       const AssetEntry *sources, size_t source_count,
+                       const SelectedArchive *selected, size_t selected_count,
+                       const char *bundle_target, const char *platform,
+                       const char *read_entry, const char *read_out) {
     /* Read only the 64-byte header (+ the small dictionary table) up front so
      * we never pull a potentially multi-gigabyte data region into RAM just to
      * list its contents.  Entries and debug paths are then served from an
@@ -747,11 +984,34 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
         return 1;
     }
     if (key) jce_archive_set_decryption_key(ar, key);
+    SelectedArchive typed = {0};
+    if (jce_archive_find(ar, JCE_BUNDLE_MANIFEST_VPATH)) {
+        if (!bundle_target && (strcmp(platform, "mobile") == 0 || strcmp(platform, "console") == 0)) {
+            fprintf(stderr, "[jce_pak] typed Bundle requires an exact --bundle-target for %s\n", platform);
+            jce_archive_close(ar); free(dtbl); return 1;
+        }
+        if (!selected_open(path, &typed, bundle_target) || typed.size < JARC_HEADER_SIZE + dtbl_sz ||
+            memcmp(typed.blob, hdr, JARC_HEADER_SIZE) != 0 ||
+            (dtbl_sz && memcmp((uint8_t *)typed.blob + JARC_HEADER_SIZE, dtbl, dtbl_sz) != 0)) {
+            fprintf(stderr, "[jce_pak] Bundle inspect admission/snapshot failed: %s\n", path);
+            selected_close(&typed); jce_archive_close(ar); free(dtbl); return 1;
+        }
+        jce_archive_close(ar);
+        ar = typed.archive; typed.archive = NULL; /* inspection owns the same snapshot reader */
+        size = typed.size;
+    }
     int      header_ok = jce_archive_verify_header(ar);
     int      secure_index = jce_archive_is_secure(ar);
     int      authenticated = jce_archive_is_authenticated(ar);
     JceArchiveAuthStatus auth_status = jce_archive_auth_status(ar);
     uint32_t n         = jce_archive_count(ar);
+
+    if (read_entry && read_entry[0]) {
+        int status = !header_ok || (authenticated && auth_status != JCE_ARCHIVE_AUTH_VALID)
+            ? 1 : read_single_entry(ar, read_entry, read_out);
+        jce_archive_close(ar); selected_close(&typed); free(dtbl);
+        return status;
+    }
 
     /* ── Duplicate detection (always) + optional deep verify ──────────── */
     uint8_t *dup_flag = NULL;  /* 1 if entry's content is duplicated         */
@@ -807,10 +1067,11 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
 
     if (verify && n) {
         vstate = (int8_t *)malloc(n);
+        if (!vstate) skipped_cnt = n;
         if (vstate) {
             memset(vstate, -1, n);
-            void  *buf = NULL;
-            size_t cap = 0;
+            void *buf = malloc(1); /* empty assets still need a valid verify buffer */
+            size_t cap = buf ? 1 : 0;
             for (uint32_t i = 0; i < n; i++) {
                 const JceArchiveEntry *e = jce_archive_get(ar, i);
                 if (!e)
@@ -828,6 +1089,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
                     buf = nb;
                     cap = e->original_size;
                 }
+                if (!buf) { skipped_cnt++; continue; }
                 size_t got = jce_archive_read(ar, e, buf, cap);
                 int    ok  = (got == e->original_size) &&
                           jce_archive_verify_entry(e, buf, got);
@@ -839,6 +1101,21 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
             }
             free(buf);
         }
+    }
+
+    /* Bind the final archive to each actual input, including secure path IDs. */
+    int sources_ok = sources == NULL || source_count == n;
+    for (size_t i = 0; sources && i < source_count; ++i) {
+        const AssetEntry *source = &sources[i];
+        const JceArchiveEntry *entry = jce_archive_find(ar, source->rel_path);
+        void *bytes = malloc(source->original_size ? (size_t)source->original_size : 1);
+        size_t got = entry && bytes ? jce_archive_read(ar, entry, bytes,
+                                        (size_t)source->original_size) : 0;
+        if (!entry || !bytes || entry->original_size != source->original_size ||
+            got != source->original_size ||
+            !jce_archive_verify_entry(entry, bytes, got) ||
+            (got && memcmp(bytes, source->compressed, got) != 0)) sources_ok = 0;
+        free(bytes);
     }
 
     if (!quiet) {
@@ -955,6 +1232,44 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
         bb_printf(&b, "  \"file\": ");
         json_str(&b, path);
         bb_printf(&b, ",\n  \"file_size\": %llu,\n", (unsigned long long)size);
+        bb_printf(&b, "  \"sources_verified\": %s,\n", sources && sources_ok ? "true" : "false");
+        bb_printf(&b, "  \"bundle_target_request\": ");
+        json_str(&b, bundle_target ? bundle_target : "runtime-host");
+        bb_printf(&b, ",\n");
+        bb_printf(&b, "  \"bundle\": ");
+        if (typed.bundle) {
+            bb_printf(&b, "{\"verified\": true, \"manifest\": %s, \"content_id\": \"%016llx\", "
+                          "\"sidecar\": {\"present\": %s, \"compatible\": %s, \"verified\": %s}}",
+                      typed.manifest_json, (unsigned long long)typed.content_id,
+                      typed.sidecar_present ? "true" : "false",
+                      typed.sidecar_present ? "true" : "false", typed.sidecar_verified ? "true" : "false");
+        } else bb_printf(&b, "null");
+        bb_printf(&b, ",\n");
+        bb_printf(&b, "  \"selected_source\": ");
+        if (selected_count == 1) {
+            bb_printf(&b, "{\"path\": "); json_str(&b, selected->path);
+            bb_printf(&b, ", \"size\": %llu, \"content_id\": \"%016llx\", \"imported_count\": %zu}",
+                      (unsigned long long)selected->size,
+                      (unsigned long long)selected->content_id, selected->imported);
+        } else bb_printf(&b, "null");
+        bb_printf(&b, ",\n  \"selected_sources\": [");
+        for (size_t i = 0; i < selected_count; ++i) {
+            bb_printf(&b, "%s{\"path\": ", i ? "," : ""); json_str(&b, selected[i].path);
+            bb_printf(&b, ", \"size\": %llu, \"content_id\": \"%016llx\", \"imported_count\": %zu}",
+                      (unsigned long long)selected[i].size,
+                      (unsigned long long)selected[i].content_id, selected[i].imported);
+        }
+        bb_printf(&b, "]");
+        bb_printf(&b, ",\n  \"sources\": [");
+        for (size_t i = 0; sources && i < source_count; ++i) {
+            const AssetEntry *source = &sources[i];
+            bb_printf(&b, "%s\n    {\"path\": ", i ? "," : ""); json_str(&b, source->rel_path);
+            bb_printf(&b, ", \"source\": "); json_str(&b, source->source_label);
+            bb_printf(&b, ", \"selected\": %s, \"size\": %llu, \"content_id\": \"%016llx\"}",
+                      source->selected ? "true" : "false", (unsigned long long)source->original_size,
+                      (unsigned long long)source->content_hash);
+        }
+        bb_printf(&b, "%s],\n", sources && source_count ? "\n  " : "");
         bb_printf(&b, "  \"header\": {\n");
         bb_printf(&b, "    \"magic\": \"JPAK\",\n");
         bb_printf(&b, "    \"format_version\": %u,\n", (unsigned)version);
@@ -1033,7 +1348,18 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
             const JceArchiveEntry *e = jce_archive_get(ar, i);
             if (!e)
                 continue;
-            const char *p     = jce_archive_debug_path(ar, i);
+            const char *p = jce_archive_debug_path(ar, i);
+            // Pack reports retain current input addresses only after the actual
+            // source-to-entry bytes were verified. This does not put names back
+            // into the PAK; inspect-only has no source ledger to recover them.
+            if (!p && sources && sources_ok) {
+                for (size_t s = 0; s < source_count; ++s) {
+                    if (jce_archive_find(ar, sources[s].rel_path) == e) {
+                        p = sources[s].rel_path;
+                        break;
+                    }
+                }
+            }
             double      ratio = e->original_size
                                     ? (double)e->stored_size / (double)e->original_size : 0.0;
             bb_printf(&b, "%s\n    {\"index\": %u, \"path\": ", i ? "," : "", (unsigned)i);
@@ -1076,13 +1402,15 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
     }
 
     jce_archive_close(ar);
+    selected_close(&typed);
     free(dtbl);
     free(dup_flag);
     free(vstate);
     if (!header_ok) return 1;
     if (authenticated && key && auth_status != JCE_ARCHIVE_AUTH_VALID)
         return 1;
-    if (verify && (corrupt_cnt != 0 || skipped_cnt != 0)) return 1;
+    if (!sources_ok) return 1;
+    if (verify && (corrupt_cnt != 0 || skipped_cnt != 0 || verified_cnt != n)) return 1;
     return 0;
 }
 
@@ -1091,6 +1419,8 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet,
 /* ================================================================== */
 
 typedef struct {
+    char selected_archives[16][1024];
+    int selected_archive_count;
     char resource_dirs[16][1024];
     int  resource_dir_count;
     char exclude_segments[16][128];
@@ -1105,6 +1435,7 @@ typedef struct {
     char obj_format[32];
     char obj_arch[32];
     char platform[32]; /* desktop, mobile, web, console (default: desktop) */
+    char bundle_target[16]; /* exact manifest target; empty legacy desktop = host */
     char sym_prefix[64]; /* C/COFF symbol base; default "assets_pak_data".
                             Header emits <prefix> and <prefix>_size; the COFF
                             generator uses the same names. */
@@ -1112,6 +1443,7 @@ typedef struct {
     int no_store_opt;  /* 1 to disable STORED auto-detection             */
     int emit_debug_paths; /* 1 to retain virtual paths in the archive    */
     char inspect_file[1024]; /* if set: inspect this archive, skip packing */
+    char read_entry[1024], read_out[1024]; /* explicit single-entry read only */
     char json_file[1024];    /* optional BOM JSON output path             */
     int  quiet;              /* suppress the console bill-of-materials     */
     int  verify;             /* inspect: deep CRC-verify every entry       */
@@ -1122,8 +1454,9 @@ typedef struct {
 static void usage(void) {
     fprintf(stderr,
             "Usage: jce_pak --resource-dir <dir> [--resource-dir <dir2> ...]\n"
+            "              [--selected-archive <graph.jbundle> ...] (max 16 typed closures)\n"
             "              [--exclude-segment <name> ...]\n"
-            "              [--exclude-suffix  <suffix> ...]\n"
+            "              [--exclude-suffix  <suffix> ...] (max 16, 31 bytes each)\n"
             "               --pak-file      <out.pak>\n"
             "               --header-file   <out.h>\n"
             "               --manifest-file <out.cmake>\n"
@@ -1132,6 +1465,7 @@ static void usage(void) {
             "              [--obj-format    coff|c-array|none]   (default: none)\n"
             "              [--obj-arch      x64|arm64|x86|arm]  (default: x64)\n"
             "              [--platform      desktop|mobile|web|console] (default: desktop)\n"
+            "              [--bundle-target windows|linux|macos|android|ios|web|auto]\n"
             "              [--symbol-prefix <ident>]    C/COFF symbol base (default: assets_pak_data)\n"
             "              [--level         <1..22>]    ZSTD level (default: 3)\n"
             "              [--no-store-opt]             disable already-compressed bypass\n"
@@ -1143,10 +1477,14 @@ static void usage(void) {
             "\n"
             "  Inspect mode (read an existing archive, emit a bill-of-materials):\n"
             "    jce_pak --inspect <archive.pak> [--json <out.json>] [--quiet] [--verify]\n"
-            "            [--key-file <key.hex>]\n"
+            "            [--key-file <key.hex>] [--platform <category>] [--bundle-target <exact-target>]\n"
+            "    jce_pak --inspect <archive> --read-entry <canonical-path> --out <new-file>\n"
+            "  Single-entry reads verify integrity, cap output at 16 MiB and refuse overwrite.\n"
             "  --verify decompresses every entry and checks its content CRC (deep audit).\n"
             "  --key-file supplies the decryption key so ENCRYPTED entries verify too\n"
             "  (otherwise they are skipped).\n"
+            "  Bundles expose their validated embedded manifest in JSON; sidecars are optional,\n"
+            "  but a present invalid sidecar fails admission. v1.0 sidecars are not verified.\n"
             "  In pack mode, --json <out.json> also writes and deep-verifies a BOM\n"
             "  of the produced .pak; a failed integrity check fails the pack.\n"
             "\n"
@@ -1154,7 +1492,10 @@ static void usage(void) {
             "  (case-sensitive).  Used to drop platform-irrelevant shader binaries\n"
             "  (e.g. _mtl.bin on Windows, _dx11.bin on Linux).\n"
             "\n"
-            "  --platform selects the target platform (reserved for future use):\n"
+            "  --bundle-target validates an exact Bundle target, not the build host.\n"
+            "  Portable auto Bundles are admitted for any explicit target. web defaults to web;\n"
+            "  legacy desktop defaults to the runtime host. Typed mobile/console needs an exact target.\n"
+            "  --platform selects the content category:\n"
             "    desktop  → Windows / macOS / Linux\n"
             "    mobile   → Android / iOS\n"
             "    web      → Emscripten\n"
@@ -1214,6 +1555,13 @@ static Args parse_args(int argc, char *const argv[]) {
             }
             ++i;
         }
+        else if (strcmp(arg, "--selected-archive") == 0 && val) {
+            if (a.selected_archive_count >= 16 || !val[0] || strlen(val) >= sizeof(a.selected_archives[0])) {
+                fprintf(stderr, "[jce_pak] invalid selected archive or more than 16 inputs\n"); exit(1);
+            }
+            strcpy(a.selected_archives[a.selected_archive_count++], val);
+            ++i;
+        }
         else if (strcmp(arg, "--exclude-segment") == 0 && val) {
             if (a.exclude_segment_count < 16) {
                 snprintf(a.exclude_segments[a.exclude_segment_count],
@@ -1222,6 +1570,15 @@ static Args parse_args(int argc, char *const argv[]) {
             }
             ++i;
         } else if (strcmp(arg, "--exclude-suffix") == 0 && val) {
+            if (a.exclude_suffix_count >= 16) {
+                fprintf(stderr, "[jce_pak] --exclude-suffix accepts at most 16 values\n");
+                exit(1);
+            }
+            if (strlen(val) >= sizeof(a.exclude_suffixes[0])) {
+                fprintf(stderr, "[jce_pak] --exclude-suffix value is %zu bytes; maximum %zu bytes\n",
+                        strlen(val), sizeof(a.exclude_suffixes[0]) - 1);
+                exit(1);
+            }
             if (a.exclude_suffix_count < 16) {
                 snprintf(a.exclude_suffixes[a.exclude_suffix_count], sizeof(a.exclude_suffixes[0]),
                          "%s", val);
@@ -1252,6 +1609,14 @@ static Args parse_args(int argc, char *const argv[]) {
         } else if (strcmp(arg, "--platform") == 0 && val) {
             snprintf(a.platform, sizeof(a.platform), "%s", val);
             ++i;
+        } else if (strcmp(arg, "--bundle-target") == 0 && val) {
+            if (strcmp(val, "windows") && strcmp(val, "linux") && strcmp(val, "macos") &&
+                strcmp(val, "android") && strcmp(val, "ios") && strcmp(val, "web") && strcmp(val, "auto")) {
+                fprintf(stderr, "[jce_pak] invalid exact --bundle-target\n");
+                exit(1);
+            }
+            snprintf(a.bundle_target, sizeof(a.bundle_target), "%s", val);
+            ++i;
         } else if (strcmp(arg, "--symbol-prefix") == 0 && val) {
             snprintf(a.sym_prefix, sizeof(a.sym_prefix), "%s", val);
             ++i;
@@ -1265,6 +1630,12 @@ static Args parse_args(int argc, char *const argv[]) {
         } else if (strcmp(arg, "--inspect") == 0 && val) {
             snprintf(a.inspect_file, sizeof(a.inspect_file), "%s", val);
             ++i;
+        } else if ((!strcmp(arg, "--read-entry") || !strcmp(arg, "--out")) && val) {
+            char *dest = !strcmp(arg, "--read-entry") ? a.read_entry : a.read_out;
+            if (dest[0] || !val[0] || strlen(val) >= sizeof(a.read_entry)) {
+                fprintf(stderr, "[jce_pak] duplicate, empty or overlong single-entry argument\n"); exit(1);
+            }
+            strcpy(dest, val); ++i;
         } else if (strcmp(arg, "--json") == 0 && val) {
             snprintf(a.json_file, sizeof(a.json_file), "%s", val);
             ++i;
@@ -1285,9 +1656,17 @@ static Args parse_args(int argc, char *const argv[]) {
         }
     }
 
+    if ((a.read_entry[0] || a.read_out[0]) &&
+        (!a.inspect_file[0] || !a.read_entry[0] || !a.read_out[0] || a.json_file[0] ||
+         a.verify || a.resource_dir_count || a.selected_archive_count || a.pak_file[0] ||
+         a.header_file[0] || a.manifest_file[0] || a.obj_file[0] || a.c_file[0] || a.encrypt_key_file[0])) {
+        fprintf(stderr, "[jce_pak] --read-entry and --out require inspect-only mode without BOM/verify/pack outputs\n");
+        exit(1);
+    }
+
     /* Inspect mode needs only --inspect; packing inputs are not required. */
     if (!a.inspect_file[0] &&
-        (a.resource_dir_count == 0 || !a.pak_file[0] ||
+        ((a.resource_dir_count == 0 && !a.selected_archive_count) || !a.pak_file[0] ||
          !a.header_file[0]  || !a.manifest_file[0])) {
         usage();
         exit(1);
@@ -1304,6 +1683,19 @@ static Args parse_args(int argc, char *const argv[]) {
     }
 
     /* Validate --level. */
+    if (!a.bundle_target[0] && strcmp(a.platform, "web") == 0)
+        strcpy(a.bundle_target, "web");
+    if (a.bundle_target[0] && strcmp(a.bundle_target, "auto") != 0) {
+        int compatible = strcmp(a.platform, "desktop") == 0
+            ? (!strcmp(a.bundle_target, "windows") || !strcmp(a.bundle_target, "linux") || !strcmp(a.bundle_target, "macos"))
+            : strcmp(a.platform, "mobile") == 0
+                ? (!strcmp(a.bundle_target, "android") || !strcmp(a.bundle_target, "ios"))
+                : strcmp(a.platform, "web") == 0 ? !strcmp(a.bundle_target, "web") : 0;
+        if (!compatible) {
+            fprintf(stderr, "[jce_pak] --platform and exact --bundle-target disagree\n");
+            exit(1);
+        }
+    }
     if (a.zstd_level < 1 || a.zstd_level > 22) {
         fprintf(stderr, "[jce_pak] --level must be in [1, 22] (got %d)\n", a.zstd_level);
         exit(1);
@@ -1330,8 +1722,27 @@ int jce_tool_main(int argc, char *argv[]) {
     /* Inspect mode: read an existing archive and emit a bill-of-materials. */
     if (args.inspect_file[0])
         return cmd_inspect(args.inspect_file, args.json_file, args.quiet,
-                           args.verify, inspect_key_p);
+                           args.verify, inspect_key_p, NULL, 0, NULL, 0,
+                           args.bundle_target[0] ? args.bundle_target : NULL, args.platform,
+                           args.read_entry, args.read_out);
 
+    SelectedArchive selected[16] = {0};
+    size_t selected_entries = 0;
+    if (args.selected_archive_count && !args.bundle_target[0] &&
+        (!strcmp(args.platform, "mobile") || !strcmp(args.platform, "console"))) {
+        fprintf(stderr, "[jce_pak] selected Bundle requires an exact --bundle-target for %s\n", args.platform);
+        return 1;
+    }
+    for (int i = 0; i < args.selected_archive_count; ++i) {
+        if (!selected_open(args.selected_archives[i], &selected[i],
+                           args.bundle_target[0] ? args.bundle_target : NULL) ||
+            !selected_unique_addresses(&selected[i]) ||
+            selected_entries > SIZE_MAX - jce_archive_count(selected[i].archive)) {
+            for (int j = 0; j <= i; ++j) selected_close(&selected[j]);
+            return 1;
+        }
+        selected_entries += jce_archive_count(selected[i].archive);
+    }
     printf("[jce_pak] target platform: %s\n", args.platform);
 
     /* Normalise resource_dir separators and strip trailing slash. */
@@ -1368,35 +1779,60 @@ int jce_tool_main(int argc, char *argv[]) {
      * JPAK v1 archive.  The original bytes are kept alive in e->compressed
      * until the cook copies them. */
     size_t num_entries = 0;
-    size_t entries_cap = files.count ? files.count : 1;
-    AssetEntry   *entries = (AssetEntry *)calloc(entries_cap, sizeof(AssetEntry));
-    JceCookInput *inputs  = (JceCookInput *)calloc(entries_cap, sizeof(JceCookInput));
-    if (!entries || !inputs) { fprintf(stderr, "[jce_pak] out of memory\n"); return 1; }
-
-    size_t skipped_hidden = 0;
-    size_t skipped_excluded = 0;
-
-    for (size_t fi = 0; fi < files.count; fi++) {
+    if (files.count > SIZE_MAX - selected_entries ||
+        files.count + selected_entries > SIZE_MAX / sizeof(AssetEntry)) {
+        sl_free(&files); sl_free(&file_bases);
+        for (int i = 0; i < args.selected_archive_count; ++i) selected_close(&selected[i]);
+        return 1;
+    }
+    size_t entries_cap = files.count + selected_entries;
+    if (!entries_cap) entries_cap = 1;
+    AssetEntry *entries = (AssetEntry *)calloc(entries_cap, sizeof(*entries));
+    JceCookInput *inputs = NULL;
+    void *pak_blob = NULL;
+    int result = 1;
+    size_t skipped_hidden = 0, skipped_excluded = 0;
+    if (!entries) goto failed_inputs;
+    for (size_t fi = 0; fi < files.count; ++fi) {
         char *rel = make_relative(files.items[fi], file_bases.items[fi]);
-        if (is_hidden(rel)) { free(rel); skipped_hidden++; continue; }
-        if (is_excluded_rel_path(rel, &args)) { free(rel); skipped_excluded++; continue; }
-
+        if (is_hidden(rel)) { free(rel); ++skipped_hidden; continue; }
+        if (is_excluded_rel_path(rel, &args)) { free(rel); ++skipped_excluded; continue; }
+        char *canonical = admit_asset_path(rel, 0);
+        free(rel);
         size_t raw_size = 0;
         uint8_t *raw = read_file_bin(files.items[fi], &raw_size);
-
-        AssetEntry *e = &entries[num_entries];
-        e->rel_path        = rel;
-        e->original_size   = raw_size;
-        e->compressed      = raw;       /* original bytes, freed after cook */
-        e->compressed_size = raw_size;  /* updated from the cooked archive  */
-        e->flags           = 0;
-
-        inputs[num_entries].vpath = rel;
-        inputs[num_entries].data  = raw;
-        inputs[num_entries].size  = raw_size;
-        num_entries++;
+        if (!asset_append(entries, &num_entries, canonical, raw, raw_size,
+                          files.items[fi], 0)) goto failed_inputs;
     }
-
+    for (int s = 0; s < args.selected_archive_count; ++s) {
+      for (uint32_t i = 0; i < jce_archive_count(selected[s].archive); ++i) {
+        const char *path = jce_archive_debug_path(selected[s].archive, i);
+        const JceArchiveEntry *entry = jce_archive_get(selected[s].archive, i);
+        if (path && strcmp(path, JCE_BUNDLE_MANIFEST_VPATH) == 0) continue;
+        char *canonical = admit_asset_path(path, 1);
+        if (!canonical || !entry || entry->original_size > SIZE_MAX) {
+            fprintf(stderr, "[jce_pak] unsafe or missing selected address at index %u: %s\n",
+                    i, path ? path : "(no debug path)");
+            free(canonical); goto failed_inputs;
+        }
+        size_t size = (size_t)entry->original_size;
+        uint8_t *bytes = (uint8_t *)malloc(size ? size : 1);
+        if (!bytes || jce_archive_read(selected[s].archive, entry, bytes, size) != size ||
+            !jce_archive_verify_entry(entry, bytes, size)) {
+            fprintf(stderr, "[jce_pak] selected payload read/verify failed: %s::%s\n", selected[s].path, path);
+            free(canonical); free(bytes); goto failed_inputs;
+        }
+        if (!asset_append(entries, &num_entries, canonical, bytes, size, selected[s].path, 1)) goto failed_inputs;
+        ++selected[s].imported;
+      }
+    }
+    inputs = (JceCookInput *)calloc(num_entries ? num_entries : 1, sizeof(*inputs));
+    if (!inputs) goto failed_inputs;
+    for (size_t i = 0; i < num_entries; ++i) {
+        inputs[i].vpath = entries[i].rel_path;
+        inputs[i].data = entries[i].compressed;
+        inputs[i].size = (size_t)entries[i].original_size;
+    }
     sl_free(&files);
     sl_free(&file_bases);
 
@@ -1423,14 +1859,13 @@ int jce_tool_main(int argc, char *argv[]) {
                "HMAC-SHA-256; key ships with the client)\n");
     }
 
-    void    *pak_blob   = NULL;
     size_t   pak_size   = 0;
     uint16_t dict_count = 0;
     if (!jce_archive_cook(inputs, num_entries, &cfg, &pak_blob, &pak_size, &dict_count)) {
         fprintf(stderr, "[jce_pak] archive cook failed\n");
-        return 1;
+        goto failed_inputs;
     }
-    free(inputs);
+    free(inputs); inputs = NULL;
 
     const uint64_t pak_total = (uint64_t)pak_size;
 
@@ -1484,9 +1919,13 @@ int jce_tool_main(int argc, char *argv[]) {
     if (args.json_file[0]) {
         bom_status = cmd_inspect(args.pak_file, args.json_file, 1, 1,
                                  args.encrypt_key_file[0] ? pack_key
-                                                                : inspect_key_p);
-        if (bom_status != 0)
+                                                                : inspect_key_p,
+                                 entries, num_entries, selected, (size_t)args.selected_archive_count,
+                                 args.bundle_target[0] ? args.bundle_target : NULL, args.platform, NULL, NULL);
+        if (bom_status != 0) {
             fprintf(stderr, "[jce_pak] generated archive failed BOM integrity audit\n");
+            goto failed_inputs;
+        }
     }
 
     /* COFF .obj */
@@ -1531,13 +1970,13 @@ int jce_tool_main(int argc, char *argv[]) {
                skipped_hidden, skipped_excluded);
     }
 
-    /* Cleanup. */
+    result = bom_status;
+failed_inputs:
+    sl_free(&files);
+    sl_free(&file_bases);
+    free(inputs);
     jce_free(pak_blob);
-    for (size_t i = 0; i < num_entries; i++) {
-        free(entries[i].rel_path);
-        free(entries[i].compressed);
-    }
-    free(entries);
-
-    return bom_status;
+    asset_entries_free(entries, num_entries);
+    for (int i = 0; i < args.selected_archive_count; ++i) selected_close(&selected[i]);
+    return result;
 }

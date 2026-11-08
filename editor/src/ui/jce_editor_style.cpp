@@ -7,6 +7,7 @@
 #include "jce_editor_style.h"
 
 #include "jce_editor_colors.h"
+#include "jce_editor_font_data.h"
 #include "core/jce_editor_alloc.h"
 #include "core/jce_editor_config.h" /* boot-locale fallback (fonts build pre-i18n) */
 #include "core/jce_editor_i18n.h"   /* active locale → bake only its glyphs */
@@ -26,6 +27,7 @@ extern "C" {
 #include <jce/os/core/jce_process.h>   /* fc-match (Linux fontconfig query) */
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/os/platform/jce_host_font.h>
 }
 
 #define LOG_TAG "editor_style"
@@ -268,14 +270,13 @@ int jce_editor_theme_from_string(const char *s)
  *
  * Editor fonts are resolved in this priority order:
  *   1. User override path (from JceEditorConfig.font_en_path / _zh_path)
- *   2. System font installed on the host OS (Ink Free / KaiTi)
- *   3. ImGui built-in default (proggy) — no fonts are bundled by JCE
+ *   2. Shared host UI role (installed Ink Free first, then system Sans)
+ *   3. Bundled Aileron Latin subset, then ImGui built-in default
  *
- * System font lookup uses runtime platform detection via jce_platform_name()
- * — no compile-time #ifdef branches. We probe a fixed list of well-known
- * filesystem locations per platform string. Loading the file off the
+ * System font lookup is owned by the public OS/platform font resolver.
+ * Loading the file off the
  * user's machine is legal because the user holds a license to use it
- * (e.g. their Windows install ships Ink Free); we never bundle these
+ * (e.g. their Windows install supplies Segoe UI); we never bundle these
  * files in the editor PAK.
  */
 
@@ -284,244 +285,27 @@ static bool file_exists_readable(const char *path)
     return jce_fs_host_exists_file(path);
 }
 
-/* Read a TTF/OTF font file fully into a heap buffer.
-   On success returns a malloc'd buffer (caller transfers ownership to
-   ImGui via FontDataOwnedByAtlas) and writes the size to *out_size. */
+/* Read a TTF/OTF source once using host IO's tracked default heap.
+   Transfer its original buffer to ImGui; dynamic fonts retain it for the
+   full atlas lifetime. Invalid sizes or consumer failure free it once. */
 static void *read_font_file(const char *path, size_t *out_size)
 {
-    if (!path || !*path) return NULL;
-    uint64_t n = 0;
-    void *raw = jce_fs_host_read_all(path, &n);
-    if (!raw || n == 0) {
-        if (raw) jce_free(raw);
-        return NULL;
-    }
-    /* ImGui frees FontDataOwnedByAtlas via IM_FREE, which is wired to
-     * ED_FREE in jce_editor_init() — so allocate via ED_MALLOC here. */
-    void *buf = ED_MALLOC((size_t)n);
-    if (!buf) { jce_free(raw); return NULL; }
-    memcpy(buf, raw, (size_t)n);
-    jce_free(raw);
-    if (out_size) *out_size = (size_t)n;
-    return buf;
+    return ed_font_read_host(path, out_size);
 }
 
-/* Build a candidate path for a system font by joining a directory with
-   a filename. Empty dir or empty file -> empty result. */
-static void join_path(char *out, size_t out_size,
-                      const char *dir, const char *file)
-{
-    if (!dir || !*dir || !file || !*file) { out[0] = '\0'; return; }
-    snprintf(out, out_size, "%s/%s", dir, file);
-}
-
-/* Look up a system-installed font by family. Tries platform-specific
-   well-known locations and returns the first one that exists.
-   `family` is one of: "InkFree", "KaiTi". Returns true if found,
-   writing the absolute path to `out`. */
+/* Installed-font discovery lives in OS/platform, shared with Canvas. */
 static bool find_system_font(const char *family, char *out, size_t out_size)
 {
-    out[0] = '\0';
-    const char *plat = jce_platform_name();   /* "Windows" / "macOS" / "Linux" / ... */
-
-    /* Map family name to per-platform candidate filenames.
-       Filenames are documented OS install names; if the user has the
-       font installed it lives at one of these paths. */
-    const char *win_file = NULL;
-    const char *mac_file = NULL;
-    const char *linux_file = NULL;
-    if (jce_strcasecmp(family, "InkFree") == 0) {
-        win_file   = "inkfree.ttf";
-        mac_file   = "Ink Free.ttf";   /* uncommon on macOS, harmless probe */
-        linux_file = "InkFree.ttf";    /* uncommon on Linux, harmless probe */
-    } else if (jce_strcasecmp(family, "KaiTi") == 0) {
-        win_file   = "simkai.ttf";
-        mac_file   = "Kaiti.ttc";
-        linux_file = "ukai.ttc";       /* AR PL UKai (common Linux Kaiti) */
-    } else {
-        /* Generic family lookup: treat `family` as a filename stem and
-         * probe common font extensions in the per-platform font dirs.
-         * This is how the Korean / Japanese / Latin fallback chains
-         * actually resolve (e.g. "malgun" -> "malgun.ttf" in C:\Windows
-         * \Fonts, "msyh" -> "msyh.ttc", "AppleSDGothicNeo" -> ".ttc"
-         * under /System/Library/Fonts). Without this branch the
-         * fallback walk silently no-ops and Hangul renders as ?. */
-        static const char *exts[] = { ".ttf", ".ttc", ".otf", NULL };
-        char tryname[160];
-        char candidate2[1024];
-
-        if (strcmp(plat, "Windows") == 0) {
-            const char *windir = getenv("WINDIR");
-            if (!windir || !*windir) windir = getenv("SystemRoot");
-            if (windir && *windir) {
-                char fontdir[1024];
-                snprintf(fontdir, sizeof(fontdir), "%s/Fonts", windir);
-                for (int e = 0; exts[e]; ++e) {
-                    snprintf(tryname, sizeof(tryname), "%s%s",
-                             family, exts[e]);
-                    join_path(candidate2, sizeof(candidate2),
-                              fontdir, tryname);
-                    if (file_exists_readable(candidate2)) {
-                        jce_strlcpy(out, candidate2, out_size);
-                        return true;
-                    }
-                }
-            }
-        } else if (strcmp(plat, "macOS") == 0) {
-            const char *dirs[] = {
-                "/System/Library/Fonts/Supplemental",
-                "/System/Library/Fonts",
-                "/Library/Fonts",
-                NULL };
-            for (int i = 0; dirs[i]; ++i) {
-                for (int e = 0; exts[e]; ++e) {
-                    snprintf(tryname, sizeof(tryname), "%s%s",
-                             family, exts[e]);
-                    join_path(candidate2, sizeof(candidate2),
-                              dirs[i], tryname);
-                    if (file_exists_readable(candidate2)) {
-                        jce_strlcpy(out, candidate2, out_size);
-                        return true;
-                    }
-                }
-            }
-        } else if (strcmp(plat, "Linux") == 0) {
-            const char *dirs[] = {
-                /* CJK fonts on Debian/Ubuntu live in family SUBDIRS, not the
-                 * top level — list them so Noto CJK / WenQuanYi / Droid /
-                 * AR PL resolve (e.g. NotoSansCJK-Regular.ttc under noto/). */
-                "/usr/share/fonts/opentype/noto",
-                "/usr/share/fonts/truetype/noto",
-                "/usr/share/fonts/truetype/wqy",
-                "/usr/share/fonts/truetype/droid",
-                "/usr/share/fonts/truetype/arphic",
-                "/usr/share/fonts/truetype",
-                "/usr/share/fonts/opentype",
-                "/usr/share/fonts",
-                "/usr/local/share/fonts",
-                NULL };
-            for (int i = 0; dirs[i]; ++i) {
-                for (int e = 0; exts[e]; ++e) {
-                    snprintf(tryname, sizeof(tryname), "%s%s",
-                             family, exts[e]);
-                    join_path(candidate2, sizeof(candidate2),
-                              dirs[i], tryname);
-                    if (file_exists_readable(candidate2)) {
-                        jce_strlcpy(out, candidate2, out_size);
-                        return true;
-                    }
-                }
-            }
-        }
-        return false;
-    }
-
-    char candidate[1024];
-
-    if (strcmp(plat, "Windows") == 0) {
-        const char *windir = getenv("WINDIR");
-        if (!windir || !*windir) windir = getenv("SystemRoot");
-        if (windir && *windir) {
-            join_path(candidate, sizeof(candidate),
-                      windir, "Fonts");
-            char fontdir[1024];
-            snprintf(fontdir, sizeof(fontdir), "%s", candidate);
-            join_path(candidate, sizeof(candidate), fontdir, win_file);
-            if (file_exists_readable(candidate)) {
-                jce_strlcpy(out, candidate, out_size);
-                return true;
-            }
-        }
-    } else if (strcmp(plat, "macOS") == 0) {
-        const char *dirs[] = {
-            "/System/Library/Fonts/Supplemental",
-            "/System/Library/Fonts",
-            "/Library/Fonts",
-            NULL
-        };
-        for (int i = 0; dirs[i]; ++i) {
-            join_path(candidate, sizeof(candidate), dirs[i], mac_file);
-            if (file_exists_readable(candidate)) {
-                jce_strlcpy(out, candidate, out_size);
-                return true;
-            }
-        }
-    } else if (strcmp(plat, "Linux") == 0) {
-        const char *dirs[] = {
-            "/usr/share/fonts/truetype/arphic",
-            "/usr/share/fonts/truetype",
-            "/usr/share/fonts",
-            "/usr/local/share/fonts",
-            NULL
-        };
-        for (int i = 0; dirs[i]; ++i) {
-            join_path(candidate, sizeof(candidate), dirs[i], linux_file);
-            if (file_exists_readable(candidate)) {
-                jce_strlcpy(out, candidate, out_size);
-                return true;
-            }
-        }
-    }
-    return false;
+    if (family && !strcmp(family, "@ui-latin"))
+        return jce_host_default_font(JCE_HOST_FONT_UI_LATIN, out, out_size);
+    if (family && !strcmp(family, "@ui-cjk"))
+        return jce_host_default_font(JCE_HOST_FONT_UI_CJK, out, out_size);
+    return jce_host_find_font(family, out, out_size);
 }
 
-/* Linux only: ask fontconfig (`fc-match`) for the best installed font for a
-   pattern — ":lang=ja", ":lang=ko", ":lang=zh-cn", or a family name.  This is
-   the native, distro/location/filename-independent way to pull a system font
-   for ANY language (no bundled font, no guessing paths).  Writes the resolved
-   absolute path to `out`.  Quiet no-op on non-Linux or if fc-match is absent. */
 static bool linux_fc_match(const char *pattern, char *out, size_t out_size)
 {
-    out[0] = '\0';
-    if (!pattern || !*pattern) return false;
-    if (jce_strcasecmp(jce_platform_name(), "Linux") != 0) return false;
-
-    /* fc-match -f %{file} "<pattern>"  — jce_process tokenises quote-aware
-       (no shell), so the quotes guard family names containing spaces. */
-    char args[256];
-    snprintf(args, sizeof(args), "-f %%{file} \"%s\"", pattern);
-
-    JceProcessConfig cfg{};
-    cfg.executable_path = "fc-match";      /* resolved via PATH */
-    cfg.arguments       = args;
-    cfg.capture_stdout  = true;
-    cfg.capture_stderr  = false;
-
-    JceProcess *p = jce_process_spawn(&cfg);
-    if (!p) return false;
-
-    char buf[1024];
-    size_t len = 0;
-    int exit_code = -1;
-    uint64_t t0 = jce_time_ticks_ms();
-    for (;;) {
-        if (len < sizeof(buf) - 1)
-            len += jce_process_read_stdout(p, buf + len, sizeof(buf) - 1 - len);
-        if (jce_process_poll_exit(p, &exit_code)) break;
-        if ((int64_t)(jce_time_ticks_ms() - t0) > 3000) {
-            jce_process_force_kill(p);
-            jce_process_destroy(p);
-            return false;
-        }
-        jce_thread_sleep_ms(2);
-    }
-    /* final drain */
-    while (len < sizeof(buf) - 1) {
-        size_t n = jce_process_read_stdout(p, buf + len, sizeof(buf) - 1 - len);
-        if (n == 0) break;
-        len += n;
-    }
-    jce_process_destroy(p);
-    buf[len] = '\0';
-    if (exit_code != 0) return false;
-
-    while (len > 0 && (buf[len-1]=='\n'||buf[len-1]=='\r'||buf[len-1]==' '||buf[len-1]=='\t'))
-        buf[--len] = '\0';
-    char *s = buf;
-    while (*s == ' ' || *s == '\t') s++;
-    if (!*s || !file_exists_readable(s)) return false;
-    jce_strlcpy(out, s, out_size);
-    return true;
+    return jce_host_find_font(pattern, out, out_size);
 }
 
 /* Resolve final font path for a logical role.
@@ -533,10 +317,14 @@ static bool resolve_font_path(const char *override_path,
                               const char **out_source)
 {
     out_path[0] = '\0';
-    if (override_path && *override_path && file_exists_readable(override_path)) {
-        jce_strlcpy(out_path, override_path, out_size);
-        if (out_source) *out_source = "user override";
-        return true;
+    if (override_path && *override_path) {
+        if (file_exists_readable(override_path)) {
+            jce_strlcpy(out_path, override_path, out_size);
+            if (out_source) *out_source = "user override";
+            return true;
+        }
+        LOG_WARN(LOG_TAG, "font phase=override_missing_or_nonfile path=%s fallback=%s",
+                 override_path, system_family ? system_family : "stock/default");
     }
     if (find_system_font(system_family, out_path, out_size)) {
         if (out_source) *out_source = "system font";
@@ -557,39 +345,116 @@ static ImFont *load_font_with_fallback(
     float size_pixels,
     const ImFontConfig *cfg,
     const ImWchar *ranges,
-    bool quiet_on_miss = false)
+    bool quiet_on_miss = false,
+    const char *preferred_family = NULL)
 {
     ImGuiIO &io = ImGui::GetIO();
 
-    char fs_path[1024];
-    const char *source = NULL;
-    bool from_fs = resolve_font_path(override_path, system_family,
-                                     fs_path, sizeof(fs_path), &source);
-
-    if (from_fs) {
+    /* Try the explicit path once, followed by the optional local preference
+     * and the shared role. Never reread a rejected resolved path. */
+    const char *const families[] = { preferred_family, system_family };
+    char rejected_paths[2][1024];
+    unsigned rejected_count = 0;
+    for (unsigned family = preferred_family ? 0u : 1u; family < 2u;) {
+        char fs_path[1024];
+        const char *source = NULL;
+        const bool resolved = resolve_font_path(override_path, families[family],
+                                                fs_path, sizeof(fs_path), &source);
+        const bool is_override = resolved && strcmp(source, "user override") == 0;
+        override_path = NULL;
+        if (!is_override) ++family;
+        if (!resolved) continue;
+        bool already_rejected = false;
+        for (unsigned i = 0; i < rejected_count; ++i)
+            if (strcmp(rejected_paths[i], fs_path) == 0) already_rejected = true;
+        if (already_rejected) continue;
         size_t n = 0;
         void *buf = read_font_file(fs_path, &n);
         if (buf) {
-            ImFont *f = io.Fonts->AddFontFromMemoryTTF(
-                buf, (int)n, size_pixels, cfg, ranges);
+            ImFont *f = ed_font_transfer_recoverable(
+                buf, (int)n, io.ConfigErrorRecoveryEnableAssert,
+                [&](void *data, int bytes) {
+                    return io.Fonts->AddFontFromMemoryTTF(
+                        data, bytes, size_pixels, cfg, ranges);
+                });
             if (f) {
-                LOG_INFO(LOG_TAG, "%s font: %s (%s)",
+                jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                         "font phase=atlas_admitted role=%s path=%s source=%s",
                          role, fs_path, source);
                 return f;
             }
-            LOG_WARN(LOG_TAG, "%s font load failed for %s",
-                     role, fs_path);
-            ED_FREE(buf);
+            LOG_WARN(LOG_TAG, "font phase=atlas_admission_rejected role=%s source=%s path=%s",
+                     role, source, fs_path);
         } else {
-            LOG_WARN(LOG_TAG, "%s font: cannot read %s", role, fs_path);
+            LOG_WARN(LOG_TAG, "font phase=source_read_or_size_rejected role=%s source=%s path=%s",
+                     role, source, fs_path);
+        }
+        if (family < 2u) {
+            jce_strlcpy(rejected_paths[rejected_count], fs_path,
+                        sizeof(rejected_paths[rejected_count]));
+            ++rejected_count;
         }
     }
 
     if (!quiet_on_miss) {
-        LOG_WARN(LOG_TAG, "%s font unavailable (no override, no system match); "
-                          "ImGui default will be used", role);
+        LOG_WARN(LOG_TAG, "font phase=host_sources_exhausted role=%s fallback=stock/default", role);
     }
     return NULL;
+}
+
+static ImFont *load_editor_cjk_font(const char *locale, const char *override_path,
+                                    float pixels, const ImFontConfig *cfg,
+                                    const ImWchar *ranges)
+{
+    const char *preferred = NULL;
+    if (locale && strcmp(locale, "zh_cn") == 0) {
+        /* The existing host alias probes the known installed KaiTi file on
+         * Windows and macOS. Linux's generic alias can return a substitute. */
+        const char *platform = jce_platform_name();
+        if (strcmp(platform, "Windows") == 0 || strcmp(platform, "macOS") == 0)
+            preferred = "KaiTi";
+    }
+    return load_font_with_fallback("CJK", override_path, "@ui-cjk", pixels,
+                                   cfg, ranges, false, preferred);
+}
+
+/* The stock source is read from the existing PAK closure and transferred
+ * through the same atlas-owned buffer path as host fonts. */
+static ImFont *load_stock_font(const JcePakArchive *pak, const char *path,
+                              float pixels, const ImFontConfig *cfg,
+                              const ImWchar *ranges)
+{
+    if (!pak) return NULL;
+    const JcePakAsset *asset = jce_pak_find(pak, path);
+    if (!asset) return NULL;
+    if (asset->original_size <= 100 || asset->original_size > INT_MAX) {
+        LOG_WARN(LOG_TAG, "font phase=stock_source_size_rejected path=%s size=%llu reason=outside_imgui_admission_range",
+                 path, (unsigned long long)asset->original_size);
+        return NULL;
+    }
+    size_t size = (size_t)asset->original_size;
+    void *data = ED_MALLOC(size);
+    if (!data) return NULL;
+    if (jce_pak_decompress_ex(pak, asset, data, size) != size ||
+        !jce_pak_verify(asset, data, size)) {
+        ED_FREE(data);
+        LOG_WARN(LOG_TAG, "font phase=stock_decode_failed path=%s", path);
+        return NULL;
+    }
+    ImGuiIO &io = ImGui::GetIO();
+    ImFont *font = ed_font_transfer_recoverable(
+        data, (int)size, io.ConfigErrorRecoveryEnableAssert,
+        [&](void *bytes, int count) {
+            return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(bytes, count, pixels, cfg, ranges);
+        });
+    if (font) {
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                      "font phase=stock_fallback_ready owner=editor_style path=%s bytes=%zu",
+                      path, size);
+    } else {
+        LOG_WARN(LOG_TAG, "font phase=stock_admission_failed path=%s", path);
+    }
+    return font;
 }
 
 /* Latched by jce_editor_style_ensure_locale_picker_glyphs(): lifts the
@@ -602,9 +467,7 @@ static bool s_ext_locale_glyphs = false;
 bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
                            const char *en_override, const char *zh_override)
 {
-    /* Cache pak across reloads so the deferred-reload path (font size
-       change in Preferences passes pak=NULL) still has access to i18n
-       JSON for the codepoint scan. */
+    /* Deferred font reloads pass no PAK. Keep the stock sources available. */
     static const JcePakArchive *s_pak_cached = NULL;
     if (pak) s_pak_cached = pak;
     const JcePakArchive *use_pak = pak ? pak : s_pak_cached;
@@ -615,7 +478,7 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
        calls (e.g. from Project Settings 'Save') leave the previous Latin
        and CJK fonts in the atlas and append new ones, then re-point
        io.FontDefault. If the second pass fails to resolve CJK (e.g. user
-       cleared the override and KaiTi isn't installed), the new default
+       cleared the override and no CJK UI face is installed), the new default
        font has only Latin glyphs and every CJK character renders as ?.
        Clearing forces a clean rebuild that walks the full fallback chain. */
     io.Fonts->Clear();
@@ -636,16 +499,13 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         0,
     };
 
-    /* Prefer Ink Free on ANY OS if installed (probed via find_system_font for
-       win/mac/linux); otherwise fall through to widely-installed system
-       sans-serifs, then ImGui's proggy bitmap. A user override path wins. */
+    /* A user override wins; otherwise use the shared installed UI Latin policy. */
     ImFont *font = load_font_with_fallback(
-        "Latin", en_override, "InkFree",
+        "Latin", en_override, "@ui-latin",
         size_pixels, &cfg, latin_ranges);
 
-    /* Latin fallback chain: try widely-installed sans-serifs if Ink Free
-       is missing, so the editor renders in something readable instead
-       of falling back to the proggy bitmap. */
+    /* Additional explicit Sans candidates retain compatibility with hosts
+       lacking their usual UI face. */
     if (!font) {
         const char *latin_fallbacks[] = {
             "segoeui", "Arial", "Helvetica", "DejaVuSans", NULL };
@@ -656,8 +516,11 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         }
     }
 
+    if (!font)
+        font = load_stock_font(use_pak, "fonts/Aileron-Regular.ttf",
+                               size_pixels, &cfg, latin_ranges);
     if (!font) {
-        /* No override, no system font. Add ImGui's built-in proggy font so
+        /* No override, system face or stock. Add ImGui's built-in proggy font so
            the atlas isn't empty and we can still merge a CJK font onto it. */
         font = io.Fonts->AddFontDefault();
         LOG_INFO(LOG_TAG, "Latin font: ImGui built-in default (proggy)");
@@ -749,7 +612,6 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
        i18n/*.json.  The static ranges built above/below remain only as
        harmless intent documentation and as a fallback for the legacy path if
        RendererHasTextures were ever disabled. */
-    (void)use_pak;
 
     static ImVector<ImWchar> cjk_ranges_v;
     cjk_ranges_v.clear();
@@ -758,10 +620,9 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
 
     /* CJK fallback chain: try a list of commonly-installed CJK fonts so
        Chinese / Japanese text doesn't show as tofu when the preferred
-       family (KaiTi / simkai.ttf) is absent. */
-    ImFont *cjk = load_font_with_fallback(
-        "CJK", zh_override, "KaiTi",
-        size_pixels, &merge_cfg, cjk_ranges);
+       system UI Sans face is absent. */
+    ImFont *cjk = load_editor_cjk_font(
+        active_loc, zh_override, size_pixels, &merge_cfg, cjk_ranges);
     if (!cjk) {
         /* Linux: ask fontconfig for a CJK-covering system font (Noto CJK
            etc.).  Native, distro/location/filename independent — one font
@@ -810,7 +671,7 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     }
 
     /* --- Korean font (merged) --------------------------------------- */
-    /* KaiTi (default zh_override) and many Chinese-first CJK fonts ship
+    /* Some Chinese-first CJK fonts ship
        *no* Hangul glyphs, so ko.json text renders as ? marks once the
        user switches the editor locale to Korean. Force-merge a
        Korean-capable system font onto the atlas so Hangul resolves
@@ -932,12 +793,17 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         "DejaVuSans",     /* Linux */
         "msyh", "simhei", "simsun",
         NULL };
-    for (int i = 0; icon_fallbacks[i]; i++) {
-        ImFont *ic = load_font_with_fallback(
+    ImFont *icons = NULL;
+    for (int i = 0; icon_fallbacks[i] && !icons; i++) {
+        icons = load_font_with_fallback(
             "Icons", NULL, icon_fallbacks[i],
             size_pixels, &merge_cfg, icon_ranges,
             /*quiet_on_miss=*/true);
-        if (ic) break;
+    }
+    if (!cjk || !icons) {
+        ImFont *stock = load_stock_font(use_pak, "fonts/JCE-CJK-Fallback.ttf",
+                                      size_pixels, &merge_cfg, cjk_ranges);
+        if (!cjk) cjk = stock;
     }
 
     io.FontDefault = font;
@@ -954,7 +820,10 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     /* Rebuild font atlas on bgfx side. */
     jce_imgui_renderer_rebuild_fonts();
 
-    LOG_SUCCESS(LOG_TAG, "loaded fonts (%.0f px, Latin + CJK)", size_pixels);
+    if (!cjk)
+        LOG_WARN(LOG_TAG, "font phase=default_cjk_unavailable owner=editor_style fallback=latin_only");
+    LOG_SUCCESS(LOG_TAG, "loaded fonts (%.0f px, cjk_available=%u)", size_pixels,
+                 cjk ? 1u : 0u);
     return true;
 }
 
@@ -990,6 +859,8 @@ static const char *prettify_font_name(const char *fname)
         { "arial.ttf",          "Arial" },
         { "calibri.ttf",        "Calibri" },
         { "segoeui.ttf",        "Segoe UI" },
+        { "segoepr.ttf",        "Segoe Print" },
+        { "segoeprb.ttf",       "Segoe Print Bold" },
         { "tahoma.ttf",         "Tahoma" },
         { "times.ttf",          "Times New Roman" },
         { "verdana.ttf",        "Verdana" },

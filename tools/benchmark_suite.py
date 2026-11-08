@@ -3,7 +3,8 @@
 
 Usage:
     python tools/benchmark_suite.py --scene PATH --profile standard --kind all
-Results are local artifacts under reports/ (ignored by Git). All five workload
+Results are local artifacts under build/validation/benchmark/ (ignored by Git).
+All five workload
 families use the shared JCE_BENCH_AUTOSPAWN path. Editor and player
 are separate tracks; this tool never labels an editor result as a game Player.
 """
@@ -44,6 +45,26 @@ PROFILES = {
     "soak": (120, None, 1),
 }
 HEADER = ["frame_index", "phase", "ms"]
+CONTEXT_HEADER = HEADER + ["context_json"]
+BACKEND_LATCHED_ROWS = {
+    "frame_backend_latched_cpu_submit": "cpu_submit",
+    "frame_backend_latched_wait_submit": "wait_submit",
+    "frame_backend_latched_wait_render": "wait_render",
+}
+BACKEND_LATCHED_SEMANTICS = (
+    "Latest backend stats from different threads; not frame-aligned or additive CPU phases. "
+    "Missing/invalid source timers are unavailable; finite zero is retained but timer "
+    "availability is not exposed (zero ambiguous). No GPU/presentation completion claim.")
+_CONTEXT_KEYS = {"v", "window_present", "flags_begin", "flags_end", "point_size",
+                 "drawable_size", "native_size_begin", "native_size_end",
+                 "backend_frame_begin", "backend_frame_end"}
+_CONTEXT_V2_KEYS = _CONTEXT_KEYS | {"viewport_reported", "viewports"}
+_CONTEXT_V3_KEYS = _CONTEXT_V2_KEYS | {"clock"}
+_CLOCK_CONTEXT_KEYS = {"domain", "frequency_hz", "begin", "end"}
+_VIEWPORT_CONTEXT_KEYS = {"source_id", "flags", "cpu_outcome", "refusal_reason",
+                          "requested_size", "allocated_size", "display_size",
+                          "texture_index", "image_count", "queued_commands",
+                          "main_submits", "recording_submits"}
 GAME_SIZE = (1280, 720)
 
 
@@ -117,24 +138,109 @@ def player_counters(text):
     return rows
 
 
+def isolated_debug_context(directory, exe, *, backend=None):
+    """Preserve baseline bytes and append bounded C-INI diagnostic overrides."""
+    directory = Path(directory).resolve()
+    sources = (ROOT / ".config" / "jce.ini",
+               Path(exe).resolve().parent / ".config" / "jce.ini")
+    source = next((path for path in sources if path.is_file()), None)
+    original = source.read_bytes() if source is not None else b""
+    if b"\0" in original:
+        raise ValueError("baseline engine configuration contains NUL bytes")
+    requested = None
+    overrides = {"logging.level": "debug"}
+    suffix = b"[logging]\nlevel=debug\n"
+    if backend is not None:
+        requested = {"gl": "opengl", "gles": "opengles"}.get(backend.casefold(), backend.casefold())
+        if requested not in ("d3d11", "d3d12", "vulkan", "opengl", "opengles", "metal"):
+            raise ValueError("isolated diagnostics require a fixed renderer backend")
+        overrides["renderer.backend"] = requested
+        suffix += ("[renderer]\nbackend=" + requested + "\n").encode("ascii")
+    separator = b"\n" if original and not original.endswith((b"\n", b"\r")) else b""
+    payload = original + separator + suffix
+    cwd = directory / "process-cwd"
+    cwd.mkdir(parents=True, exist_ok=False)
+    config = cwd / ".config" / "jce.ini"
+    config.parent.mkdir()
+    with config.open("xb") as output:
+        output.write(payload)
+    return {"cwd": str(cwd), "engine_config_file": str(config),
+            "effective_baseline": str(source.resolve()) if source is not None else "engine_defaults",
+            "effective_baseline_sha256": hashlib.sha256(original).hexdigest() if source is not None else None,
+            "engine_config_sha256": hashlib.sha256(payload).hexdigest(),
+            "selected_logging_level": "debug", "requested_backend": requested,
+            "intended_overrides": overrides,
+            "config_validation_policy": "byte_exact_before_and_after_each_child",
+            "config_checks": [],
+            "observer_mode": "debug_instrumented_diagnostic",
+            "quiet_production_throughput": False}
+
+
+def validate_observer_config(observer, *, boundary="external"):
+    """Reject any actual child configuration change without repairing evidence."""
+    if observer.get("config_validation_policy") != "byte_exact_before_and_after_each_child":
+        raise CorrectnessFailure("observer configuration validation policy is missing")
+    try:
+        actual = sha256_file(observer["engine_config_file"])
+    except (OSError, KeyError, TypeError) as exc:
+        raise CorrectnessFailure("observer configuration changed or is unavailable") from exc
+    expected = observer.get("engine_config_sha256")
+    observer.setdefault("config_checks", []).append(
+        {"boundary": boundary, "expected_sha256": expected,
+         "actual_sha256": actual, "unchanged": actual == expected})
+    if actual != expected:
+        raise CorrectnessFailure("observer configuration changed")
+    return actual
+
+
+def run_observer_child(environment, log_path, observer, *, phase, **options):
+    """Keep all child launches under the same actual byte-preservation guard."""
+    validate_observer_config(observer, boundary=phase + "_before")
+    try:
+        return run(environment, log_path, cwd=observer["cwd"], **options)
+    finally:
+        validate_observer_config(observer, boundary=phase + "_after")
+
+
 def host_render_environment(host, directory, *, witness=False):
+    directory = Path(directory).resolve()
     if host == "player":
         return {"JCE_BENCH_COUNTERS": str(directory / "engine_counters.jsonl"),
                 **({"JCE_BENCH_PLAYER_SHOT": str(directory / "frame.png")} if witness else {})}
-    return (game_capture_environment(30, directory / "frame.png") if witness
-            else fixed_game_render_environment(directory))
+    profile = (directory / "editor-profile").resolve()
+    profile.mkdir(parents=True, exist_ok=True)
+    environment = (game_capture_environment(30, directory / "frame.png") if witness
+                   else fixed_game_render_environment(directory))
+    return {"JCE_EDITOR_PROFILE_DIR": str(profile), **environment}
+
+
+def editor_profile_confirmed(log, expected):
+    if not isinstance(expected, str) or not expected:
+        return False
+    observed = re.findall(r"(?m)\beditor_config: profile directory: ([^\r\n]*)", log)
+    confirmed = []
+    for value in observed:
+        profile, separator, source = value.rpartition(" at ")
+        if separator and re.fullmatch(r"[^\r\n]+\.(?:c|cpp|cc|cxx|h|hpp):\d+", source):
+            value = profile
+        confirmed.append(value)
+    return bool(confirmed) and all(value == expected for value in confirmed)
 
 
 def run_visual_witness(extra, directory, *, exe, timeout, expected_workload=None,
-                       host="editor"):
+                       host="editor", observer=None):
     """A separate process proves pixels without PNG work in the timing run."""
+    directory = Path(directory).resolve()
+    observer = isolated_debug_context(directory, exe, backend=extra.get("JCE_BACKEND")) if observer is None else observer
     visual_extra = dict(extra)
     screenshot = directory / "frame.png"
     visual_extra.update(host_render_environment(host, directory, witness=True))
-    witness = run(visual_extra, directory / "visual.log", frames=180,
-                  timeout=timeout, exe=exe,
-                  expected_workload=expected_workload)
+    witness = run_observer_child(visual_extra, directory / "visual.log", observer,
+                                 phase="visual", frames=180, timeout=timeout, exe=exe,
+                                 expected_workload=expected_workload)
     log = read_execution_log(directory / "visual.log")
+    if host == "editor" and not editor_profile_confirmed(log, visual_extra["JCE_EDITOR_PROFILE_DIR"]):
+        raise CorrectnessFailure("visual witness did not confirm the isolated editor profile")
     if "] ERROR -" in log or not simulation_started(log, host):
         raise CorrectnessFailure("visual witness logged an ERROR or failed to enter Play")
     if png_dimensions(screenshot) != GAME_SIZE:
@@ -231,14 +337,143 @@ def machine_manifest():
     return result
 
 
-def read_frames(path, *, warmup, sample_count):
-    """Stream the full KPI CSV; retain only selected per-frame measurements."""
+def _frame_context_v2(packet):
+    """Validate independent bounded CPU viewport facts without inferring success."""
+    if not isinstance(packet, dict) or set(packet) != _CONTEXT_V2_KEYS:
+        raise ValueError("frame context v2 has missing or unknown keys")
+    if type(packet["v"]) is not int or packet["v"] != 2:
+        raise ValueError("frame context v2 has invalid version")
+    if type(packet["window_present"]) is not bool or type(packet["viewport_reported"]) is not bool:
+        raise ValueError("frame context v2 has invalid window or viewport presence")
+    for key in ("flags_begin", "flags_end", "backend_frame_begin", "backend_frame_end"):
+        value = packet[key]
+        if value is not None and (type(value) is not int or not 0 <= value <= 0xffffffff):
+            raise ValueError("frame context v2 has invalid " + key)
+    for key in ("point_size", "drawable_size", "native_size_begin", "native_size_end"):
+        value = packet[key]
+        if value is not None and (not isinstance(value, list) or len(value) != 2 or
+                any(type(n) is not int or not 0 < n <= 0xffffffff for n in value)):
+            raise ValueError("frame context v2 has invalid " + key)
+    window_keys = ("flags_begin", "flags_end", "point_size", "drawable_size",
+                   "native_size_begin", "native_size_end")
+    if not packet["window_present"] and any(packet[key] is not None for key in window_keys):
+        raise ValueError("frame context v2 reports state for an absent window")
+    viewports = packet["viewports"]
+    if not isinstance(viewports, list) or len(viewports) > 4:
+        raise ValueError("frame context v2 has invalid viewports")
+    if not packet["viewport_reported"] and viewports:
+        raise ValueError("frame context v2 reports viewports without availability")
+    sources = set()
+    for viewport in viewports:
+        if not isinstance(viewport, dict) or set(viewport) != _VIEWPORT_CONTEXT_KEYS:
+            raise ValueError("frame context v2 viewport has missing or unknown keys")
+        for key, minimum, maximum in (("source_id", 1, 0xffffffff), ("flags", 0, 0xff),
+                                      ("cpu_outcome", 0, 3), ("refusal_reason", 0, 0xffffffff)):
+            value = viewport[key]
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError("frame context v2 viewport has invalid " + key)
+        if viewport["source_id"] in sources:
+            raise ValueError("frame context v2 has duplicate viewport source_id")
+        sources.add(viewport["source_id"])
+        flags = viewport["flags"]
+        for key, bit in (("requested_size", 0), ("allocated_size", 1), ("display_size", 3)):
+            value = viewport[key]
+            if flags & (1 << bit):
+                if not isinstance(value, list) or len(value) != 2 or \
+                        any(type(n) is not int or not 0 < n <= 0xffffffff for n in value):
+                    raise ValueError("frame context v2 viewport has invalid " + key)
+            elif value is not None:
+                raise ValueError("frame context v2 viewport has unavailable " + key)
+        for key, bit, maximum in (("texture_index", 4, 65534), ("image_count", 5, 0xffffffff),
+                                  ("queued_commands", 6, 0xffffffff), ("main_submits", 7, 0xffffffff),
+                                  ("recording_submits", 7, 0xffffffff)):
+            value = viewport[key]
+            if flags & (1 << bit):
+                if type(value) is not int or not 0 <= value <= maximum:
+                    raise ValueError("frame context v2 viewport has invalid " + key)
+            elif value is not None:
+                raise ValueError("frame context v2 viewport has unavailable " + key)
+    return packet
+
+
+def _frame_context_v3(packet):
+    """Retain exact Engine counter strings alongside the unchanged v2 facts."""
+    if not isinstance(packet, dict) or set(packet) != _CONTEXT_V3_KEYS:
+        raise ValueError("frame context v3 has missing or unknown keys")
+    if type(packet["v"]) is not int or packet["v"] != 3:
+        raise ValueError("frame context v3 has invalid version")
+    base = {key: value for key, value in packet.items() if key != "clock"}
+    base["v"] = 2
+    _frame_context_v2(base)
+    clock = packet["clock"]
+    if not isinstance(clock, dict) or set(clock) != _CLOCK_CONTEXT_KEYS:
+        raise ValueError("frame context v3 clock has missing or unknown keys")
+    if clock["domain"] != "jce-performance-counter":
+        raise ValueError("frame context v3 clock has invalid domain")
+    values = {}
+    for key in ("frequency_hz", "begin", "end"):
+        value = clock[key]
+        if type(value) is not str or len(value) > 20 or \
+                re.fullmatch(r"0|[1-9][0-9]*", value) is None or int(value) > 0xffffffffffffffff:
+            raise ValueError("frame context v3 clock has invalid " + key)
+        values[key] = int(value)
+    if values["frequency_hz"] == 0 or values["end"] < values["begin"]:
+        raise ValueError("frame context v3 clock has invalid frequency or interval")
+    return packet
+
+
+def _frame_context(text):
+    """Validate private context packets without guessing unknown state."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate frame context key: " + key)
+            result[key] = value
+        return result
+
+    packet = json.loads(text, object_pairs_hook=unique_object)
+    if isinstance(packet, dict) and type(packet.get("v")) is int and packet["v"] == 3:
+        return _frame_context_v3(packet)
+    if isinstance(packet, dict) and type(packet.get("v")) is int and packet["v"] == 2:
+        return _frame_context_v2(packet)
+    if not isinstance(packet, dict) or set(packet) != _CONTEXT_KEYS:
+        raise ValueError("frame context has missing or unknown keys")
+    if type(packet["v"]) is not int or packet["v"] != 1 or \
+            type(packet["window_present"]) is not bool:
+        raise ValueError("frame context has invalid version or window presence")
+    for key in ("flags_begin", "flags_end", "backend_frame_begin", "backend_frame_end"):
+        value = packet[key]
+        if value is not None and (type(value) is not int or not 0 <= value <= 0xffffffff):
+            raise ValueError("frame context has invalid " + key)
+    for key in ("point_size", "drawable_size", "native_size_begin", "native_size_end"):
+        value = packet[key]
+        if value is not None and (not isinstance(value, list) or len(value) != 2 or
+                any(type(n) is not int or not 0 < n <= 0xffffffff for n in value)):
+            raise ValueError("frame context has invalid " + key)
+    window_keys = ("flags_begin", "flags_end", "point_size", "drawable_size",
+                   "native_size_begin", "native_size_end")
+    if not packet["window_present"] and any(packet[key] is not None for key in window_keys):
+        raise ValueError("frame context reports state for an absent window")
+    return packet
+
+
+def read_frames(path, *, warmup, sample_count, allow_zero_wall=False):
+    """Stream KPI CSV; optional raw admission retains finite zero intervals.
+
+    Steady benchmark measurements reject zero wall time by default. Raw capture
+    completeness may retain valid zero timer intervals without dropping rows.
+    """
     if warmup < 0 or (sample_count is not None and sample_count < 1):
         raise ValueError("invalid warm-up or sample count")
     frame_ms, cpu_ms, gpu_ms = array("d"), array("d"), array("d")
-    phase_ms, selected = {}, array("Q")
+    phase_ms, selected, contexts = {}, array("Q"), []
+    backend_latched_ms = {}
     current_id = previous_id = None
     entry = {}
+    context = None
+    context_schema = None
+    clock_identity = previous_clock_end = None
     total_frames = 0
 
     def finish_frame():
@@ -249,13 +484,21 @@ def read_frames(path, *, warmup, sample_count):
             raise ValueError("frame %d has no frame_wall sample" % current_id)
         if total_frames >= warmup and (sample_count is None or
                                        len(selected) < sample_count):
-            if entry["frame_wall"] <= 0:
+            if not allow_zero_wall and entry["frame_wall"] == 0:
                 raise ValueError("steady-state frame time is zero")
             old_length = len(selected)
             selected.append(current_id)
             frame_ms.append(entry["frame_wall"])
             cpu_ms.append(entry.get("frame_cpu", math.nan))
             gpu_ms.append(entry.get("frame_gpu", math.nan))
+            if not backend_latched_ms and any(row in entry for row in BACKEND_LATCHED_ROWS):
+                backend_latched_ms.update({name: array("d", [math.nan]) * old_length
+                                            for name in BACKEND_LATCHED_ROWS.values()})
+            if backend_latched_ms:
+                for row, name in BACKEND_LATCHED_ROWS.items():
+                    backend_latched_ms[name].append(entry.get(row, math.nan))
+            if extended:
+                contexts.append(context)
             for name in phase_ms:
                 phase_ms[name].append(entry.get(name, math.nan))
             for name, value in entry.items():
@@ -264,12 +507,21 @@ def read_frames(path, *, warmup, sample_count):
                     phase_ms[name].append(value)
         total_frames += 1
 
+    # Count the actual validated header, including its newline, for the writer's
+    # payload accounting. Extended captures must not subtract the legacy header.
+    with Path(path).open("rb") as raw:
+        raw_header = raw.readline(256)
     with Path(path).open(newline="", encoding="utf-8") as stream:
         reader = csv.reader(stream)
-        if next(reader, None) != HEADER:
+        header = next(reader, None)
+        if header not in (HEADER, CONTEXT_HEADER):
             raise ValueError("raw KPI header is missing or changed")
+        expected_header = ",".join(header).encode("ascii")
+        if raw_header not in (expected_header + b"\n", expected_header + b"\r\n"):
+            raise ValueError("raw KPI header has noncanonical physical encoding")
+        extended = header == CONTEXT_HEADER
         for line in reader:
-            if len(line) != 3:
+            if len(line) != len(header):
                 raise ValueError("raw KPI row has wrong field count")
             frame, phase, ms = int(line[0]), line[1], float(line[2])
             if frame < 0 or not phase or not math.isfinite(ms) or ms < 0:
@@ -280,19 +532,48 @@ def read_frames(path, *, warmup, sample_count):
                     raise ValueError("raw frame sequence has gaps or reordering")
                 previous_id = current_id = frame
                 entry = {}
+                context = None
             if phase in entry:
                 raise ValueError("duplicate KPI phase %s at frame %d" %
                                  (phase, frame))
             entry[phase] = ms
+            if extended:
+                if phase == "frame_wall":
+                    context = _frame_context(line[3])
+                    schema = {1: "window_v1", 2: "window_viewports_v2",
+                              3: "window_viewports_clock_v3"}[context["v"]]
+                    if context_schema is not None and schema != context_schema:
+                        raise ValueError("mixed frame context schemas in raw KPI CSV")
+                    context_schema = schema
+                    if context["v"] == 3:
+                        clock = context["clock"]
+                        identity = (clock["domain"], clock["frequency_hz"])
+                        begin, end = int(clock["begin"]), int(clock["end"])
+                        if clock_identity is not None and identity != clock_identity:
+                            raise ValueError("frame context v3 clock domain or frequency changed")
+                        if previous_clock_end is not None and begin < previous_clock_end:
+                            raise ValueError("frame context v3 clock intervals overlap or regress")
+                        elapsed_ms = (end - begin) * 1000.0 / int(clock["frequency_hz"])
+                        if not math.isclose(ms, elapsed_ms, rel_tol=1e-12, abs_tol=0.0000501):
+                            raise ValueError("frame context v3 clock duration does not match frame_wall")
+                        clock_identity, previous_clock_end = identity, end
+                elif line[3]:
+                    raise ValueError("frame context is only valid on frame_wall")
     finish_frame()
     needed = warmup + (sample_count if sample_count is not None else 1)
     if total_frames < needed:
         raise ValueError("only %d frame intervals; need %d warm-up + %s steady" %
                          (total_frames, warmup,
                           sample_count if sample_count is not None else "one"))
-    return {"frame_indices": selected, "frame_ms": frame_ms,
+    samples = {"frame_indices": selected, "frame_ms": frame_ms,
             "cpu_frame_ms": cpu_ms, "gpu_frame_ms": gpu_ms,
-            "phase_ms": phase_ms}
+            "phase_ms": phase_ms, "frame_context": contexts if extended else None,
+            "context_schema": context_schema,
+            "csv_header_bytes": len(raw_header)}
+    if backend_latched_ms:
+        samples.update(backend_latched_ms=backend_latched_ms,
+                       backend_latched_semantics=BACKEND_LATCHED_SEMANTICS)
+    return samples
 
 
 def percentile(values, q):
@@ -313,7 +594,7 @@ def frame_summary(samples):
         for name, series in samples["phase_ms"].items()
         if (valid := [x for x in series if x is not None and math.isfinite(x)])
     }
-    return {
+    summary = {
         "phase_median_ms": phase_medians,
         "sample_count": len(values),
         "frame_mean_ms": statistics.fmean(values),
@@ -330,6 +611,15 @@ def frame_summary(samples):
         "cpu_median_ms": statistics.median(cpu) if cpu else None,
         "gpu_median_ms": statistics.median(gpu) if gpu else None,
     }
+    if samples.get("backend_latched_ms"):
+        backend_medians = {}
+        for name in BACKEND_LATCHED_ROWS.values():
+            valid = [x for x in samples["backend_latched_ms"].get(name, ())
+                     if x is not None and math.isfinite(x) and x >= 0]
+            backend_medians[name] = statistics.median(valid) if valid else None
+        summary.update(backend_latched_median_ms=backend_medians,
+                       backend_latched_semantics=BACKEND_LATCHED_SEMANTICS)
+    return summary
 
 
 def soak_windows(samples, seconds=30.0):
@@ -342,10 +632,12 @@ def soak_windows(samples, seconds=30.0):
         elapsed += value / 1000.0
         if elapsed - window_start >= seconds or index == len(values) - 1:
             end = index + 1
-            sliced = {key: series[start:end] for key, series in samples.items()
-                      if key != "phase_ms"}
+            sliced = {key: samples[key][start:end] for key in
+                      ("frame_ms", "cpu_frame_ms", "gpu_frame_ms", "frame_indices")}
             sliced["phase_ms"] = {key: series[start:end]
                                   for key, series in samples["phase_ms"].items()}
+            sliced["backend_latched_ms"] = {key: series[start:end]
+                                            for key, series in samples.get("backend_latched_ms", {}).items()}
             windows.append({"start_s": window_start, "end_s": elapsed,
                             "frame": frame_summary(sliced)})
             start, window_start = end, elapsed
@@ -443,31 +735,36 @@ def _write_json(path, value):
 
 def run_control(*, exe, scene, kind, count, warmup, sample_count,
                 backend, out, timeout, capture, spread, directory=None, host="editor"):
-    control_dir = directory or out / "controls" / ("%s-%d-%s" %
-                                      (kind, count, uuid.uuid4().hex[:8]))
+    control_dir = Path(directory or out / "controls" / ("%s-%d-%s" %
+                                      (kind, count, uuid.uuid4().hex[:8]))).resolve()
     control_dir.mkdir(parents=True, exist_ok=False)
+    observer = isolated_debug_context(control_dir, exe, backend=backend)
     raw = control_dir / "samples.csv"
     screenshot = control_dir / "frame.png"
-    extra = {"JCE_SCENE": str(scene), "JCE_MULTI_INSTANCE": "1",
+    extra = {"JCE_SCENE": str(Path(scene).resolve()), "JCE_MULTI_INSTANCE": "1",
              "JCE_BACKEND": backend, "JCE_DBG_FOCUS_GAME": "1",
              "JCE_BENCH_CAM": viewport_pose(kind, count, spread)}
     extra["JCE_DBG_AUTOPLAY"] = "10"
     if kind == "physics":
         extra["JCE_PHYSICS_MAX_BODIES"] = str(max(4096, count + 64))
+    if host == "editor":
+        extra.update(host_render_environment(host, control_dir))
     intent = {"host": host, "control": True,
-              "kind": kind, "count": count, "environment": extra}
+              "kind": kind, "count": count, "environment": extra, "observer": observer}
     _write_json(control_dir / "intent.json", intent)
     if capture:
-        run_visual_witness(extra, control_dir, exe=exe, timeout=timeout, host=host)
+        run_visual_witness(extra, control_dir, exe=exe, timeout=timeout, host=host, observer=observer)
         visual_log = read_execution_log(control_dir / "visual.log")
         if "benchmark-spawn:" in visual_log:
             raise ValueError("visual negative control accidentally spawned a benchmark")
         extra.update(host_render_environment(host, control_dir))
     _write_json(control_dir / "intent.json", intent)
-    metrics = run(extra, control_dir / "engine.log",
-                  frames=warmup + sample_count + 1, timeout=timeout,
-                  exe=exe, samples_path=raw)
+    metrics = run_observer_child(extra, control_dir / "engine.log", observer,
+                                 phase="timing", frames=warmup + sample_count + 1,
+                                 timeout=timeout, exe=exe, samples_path=raw)
     log = read_execution_log(control_dir / "engine.log", metrics.get("process"))
+    if host == "editor" and not editor_profile_confirmed(log, extra["JCE_EDITOR_PROFILE_DIR"]):
+        raise ValueError("negative control did not confirm the isolated editor profile")
     if "benchmark-spawn:" in log:
         raise ValueError("negative control accidentally spawned a benchmark")
     if "] ERROR -" in log or not simulation_started(log, host):
@@ -476,8 +773,8 @@ def run_control(*, exe, scene, kind, count, warmup, sample_count,
         raise ValueError("negative control has incorrect Game View dimensions")
     samples = read_frames(raw, warmup=warmup, sample_count=sample_count)
     control = {
-        "status": "PASS", "kind": kind, "count": count,
-        "scene": str(scene), "backend_actual": metrics["backend_actual"],
+        "status": "PASS", "kind": kind, "count": count, "observer": observer,
+        "scene": str(Path(scene).resolve()), "backend_actual": metrics["backend_actual"],
         "frame": frame_summary(samples), "draws_representative": metrics["draws"],
         "directory": str(control_dir),
         "capture": capture_info(screenshot) if capture else None,
@@ -493,12 +790,13 @@ def run_one(*, exe, scene, kind, count, profile, warmup, sample_count,
     run_id = "%s-%s-%d-%s" % (
         time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
         kind, index, uuid.uuid4().hex[:8])
-    target = directory or out / run_id
+    target = Path(directory or out / run_id).resolve()
     run_id = target.name
     target.mkdir(parents=True, exist_ok=False)
+    observer = isolated_debug_context(target, exe, backend=backend)
     raw = target / "samples.csv"
     screenshot = target / "frame.png"
-    extra = {"JCE_SCENE": str(scene), "JCE_BENCH_AUTOSPAWN": "%d,%d" %
+    extra = {"JCE_SCENE": str(Path(scene).resolve()), "JCE_BENCH_AUTOSPAWN": "%d,%d" %
              (KINDS[kind], count), "JCE_BENCH_ISOLATE": "1",
              "JCE_MULTI_INSTANCE": "1", "JCE_BACKEND": backend,
              "JCE_DBG_FOCUS_GAME": "1",
@@ -508,27 +806,37 @@ def run_one(*, exe, scene, kind, count, profile, warmup, sample_count,
     extra["JCE_DBG_AUTOPLAY"] = "10"
     if kind == "physics":
         extra["JCE_PHYSICS_MAX_BODIES"] = str(max(4096, count + 64))
+    if host == "editor":
+        extra.update(host_render_environment(host, target))
     intent = {"host": host, "source": identity,
               "profile": profile, "variant": variant, "kind": kind,
               "count": count, "environment": extra,
-              "executable_sha256": executable_sha256}
+              "executable_sha256": executable_sha256, "observer": observer}
     _write_json(target / "intent.json", intent)
     if capture:
         run_visual_witness(extra, target, exe=exe, timeout=timeout,
-                           expected_workload=(KINDS[kind], count), host=host)
+                           expected_workload=(KINDS[kind], count), host=host, observer=observer)
         extra.update(host_render_environment(host, target))
     _write_json(target / "intent.json", intent)
     # One additional engine frame makes the last interval and 120-frame perf
     # report available even though the KPI snapshot rotates at frame start.
     frames = 2000000000 if soak_seconds is not None else \
              warmup + sample_count + 1
-    metrics = run(extra, target / "engine.log", frames=frames, timeout=timeout,
-                  exe=exe, samples_path=raw,
-                  expected_workload=(KINDS[kind], count),
-                  max_seconds=soak_seconds)
+    metrics = run_observer_child(extra, target / "engine.log", observer,
+                                 phase="timing", frames=frames, timeout=timeout,
+                                 exe=exe, samples_path=raw,
+                                 expected_workload=(KINDS[kind], count),
+                                 max_seconds=soak_seconds)
     samples = read_frames(raw, warmup=warmup, sample_count=sample_count)
     summary = frame_summary(samples)
     engine_log = read_execution_log(target / "engine.log", metrics.get("process"))
+    if host == "editor" and not editor_profile_confirmed(engine_log, extra["JCE_EDITOR_PROFILE_DIR"]):
+        raise CorrectnessFailure("measurement did not confirm the isolated editor profile")
+    matched_keys = ("effective_baseline_sha256", "engine_config_sha256",
+                    "selected_logging_level", "observer_mode", "requested_backend",
+                    "intended_overrides", "config_validation_policy")
+    if any(control.get("observer", {}).get(key) != observer[key] for key in matched_keys):
+        raise CorrectnessFailure("measurement configuration differs from negative control")
     if "] ERROR -" in engine_log:
         raise CorrectnessFailure("engine logged an ERROR during the benchmark")
     if soak_seconds is not None and "JCE_MAX_SECONDS reached" not in engine_log:
@@ -576,6 +884,8 @@ def run_one(*, exe, scene, kind, count, profile, warmup, sample_count,
     manifest = {
         "schema_version": 2, "run_id": run_id, "variant": variant,
         "timing_capture_policy": "separate_visual_witness",
+        "observer_mode": "debug_instrumented_diagnostic",
+        "quiet_production_throughput": False,
         "engine": "JCE",
         "host": host, "engine_commit": identity.get("commit"),
         "engine_version": identity.get("version"), "branch": identity.get("branch"),
@@ -595,7 +905,7 @@ def run_one(*, exe, scene, kind, count, profile, warmup, sample_count,
                      "requested_soak_seconds": soak_seconds,
                      "physics_max_bodies": extra.get("JCE_PHYSICS_MAX_BODIES"),
                      "editor_camera_pose": extra["JCE_BENCH_CAM"]},
-        "backend_requested": backend, "backend_actual": actual,
+        "backend_requested": backend, "backend_actual": actual, "observer": observer,
         "negative_control": str(control["directory"]),
         "hardware": hardware, "executable": str(exe),
         "executable_bytes": exe.stat().st_size,
@@ -656,12 +966,13 @@ def run_one(*, exe, scene, kind, count, profile, warmup, sample_count,
             "triangles": None, "visible": None, "culled": None},
         "phase_ms_representative": metrics["phases"],
         "limitations": ["Visual correctness not verified by this run.",
+                        "DEBUG-instrumented diagnostic; not quiet production throughput.",
                         "Editor and Player tracks must not be combined.",
                         "Draws and memory from perf log are representative windows."],
     })
     return {"run_id": run_id, "kind": kind, "variant": variant,
             "run_index": index, "directory": str(target), "status": "PASS",
-            "frame": summary, "backend_actual": actual}
+            "frame": summary, "backend_actual": actual, "observer": observer}
 
 
 def aggregate_runs(results, kinds, repeats, variants=("A",)):
@@ -744,11 +1055,14 @@ def main(argv=None):
                         help="prior run manifest proving B executable hash and source")
     parser.add_argument("--capture", action="store_true",
                         help="compatibility flag; every profile captures the fixed Game View")
-    parser.add_argument("--out", type=Path, default=ROOT / "reports/benchmark")
+    parser.add_argument("--out", type=Path,
+                        default=ROOT / "build" / "validation" / "benchmark")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--soak-seconds", type=int, default=600,
                         help="wall-clock duration for the soak profile")
     args = parser.parse_args(argv)
+    if args.backend.casefold() == "auto" or (args.compare_backend and args.compare_backend.casefold() == "auto"):
+        parser.error("isolated diagnostics require a fixed renderer backend; auto is unsupported")
     if args.host == "player" and args.exe == EXE:
         parser.error("--host player requires an explicit Player executable")
     if args.count < 1 or args.count > 2000000:
@@ -886,6 +1200,8 @@ def main(argv=None):
     aggregate = {
         "schema_version": 2, "suite_id": suite_id,
         "timing_capture_policy": "separate_visual_witness",
+        "observer_mode": "debug_instrumented_diagnostic",
+        "quiet_production_throughput": False,
         "engine": "JCE", "host": args.host,
         "profile": args.profile, "source": identity,
         "variants": [{"label": label, "backend_requested": backend,

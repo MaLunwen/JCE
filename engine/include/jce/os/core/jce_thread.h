@@ -268,8 +268,10 @@ JCE_API void JCE_CALL jce_task_free(JceTask *task);
  * Ordering:
  *   - jce_thread_pool_shared() creates the pool on first call and returns a
  *     BORROWED handle; never pass it to jce_thread_pool_destroy().  It is
- *     safe before and after engine init, and after a shutdown (which simply
- *     causes the next call to build a fresh pool).
+ *     safe before and after engine init. Lookup returns NULL while shared
+ *     shutdown joins the old pool. Standalone shutdown permits later lazy
+ *     recreation; Engine closing prevents recreation until its next admitted
+ *     constructor. Existing borrows are not revoked by that creation gate.
  *   - The first caller becomes the scheduler's own thread and is therefore
  *     the only non-worker thread that may use the work-stealing wait, so
  *     make that first call on the main thread (the frame loop does).

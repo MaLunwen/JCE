@@ -60,6 +60,7 @@
 
 #include "os/core/jce_memory.h"
 #include "renderer/jce_shader_load.h"   /* shared backend suffix */
+#include "renderer/jce_renderer_shader_profile_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 
@@ -499,14 +500,20 @@ JceGpuScene *jce_gpu_scene_create(const JcePakArchive *pak, jce_allocator_t allo
     gs->hiz_src_depth.idx   = UINT16_MAX;
 
     const bgfx_caps_t *caps = bgfx_get_caps();
-    if (!caps || !(caps->supported & BGFX_CAPS_COMPUTE)) {
-        /* Expected on GLES3/WebGL2-class backends; several gpu-scene
-         * instances are created per app, so say it once, not per instance. */
-        static bool warned_no_compute = false;
-        if (!warned_no_compute) {
-            warned_no_compute = true;
-            LOG_WARN(LOG_TAG,
-                     "GPU has no compute support; GPU-driven path disabled");
+    const bool supports_compute = caps && (caps->supported & BGFX_CAPS_COMPUTE);
+    bool compatibility = false;
+    if (supports_compute) {
+        const JceRendererApiInfo api = jce_renderer_get_api_info();
+        compatibility = jce_renderer_shader_profile_compatibility(&api, caps->rendererType);
+    }
+    if (compatibility || !supports_compute) {
+        /* Several GPU scenes are created per app. Report the refusal once. */
+        static bool warned_unavailable = false;
+        if (!warned_unavailable) {
+            warned_unavailable = true;
+            LOG_WARN(LOG_TAG, "%s", compatibility
+                ? "compatibility GL/ES shader profile has no compute programs; GPU-driven path disabled"
+                : "GPU has no compute support; GPU-driven path disabled");
         }
         return gs;  /* no-op mode */
     }

@@ -76,7 +76,7 @@ void handle_scene_selection_box(const SceneViewCtx *ctx)
 static JceTransform *get_transform_for_id(JceScene *scene, uint32_t id)
 {
     if (!scene || id == 0 || !jce_state_entity_exists(id)) return NULL;
-    return jce_scene_get_transform(scene, (JceEntity)id);
+    return jce_scene_get_transform(scene, jce_state_to_ecs_entity(id));
 }
 
 static void set_transform_for_id(JceScene *scene, uint32_t id,
@@ -84,14 +84,14 @@ static void set_transform_for_id(JceScene *scene, uint32_t id,
 {
     if (!scene || id == 0 || !value || !jce_state_entity_exists(id))
         return;
-    jce_scene_set_transform(scene, (JceEntity)id, value);
+    jce_scene_set_transform(scene, jce_state_to_ecs_entity(id), value);
 }
 
 static JcePivotComponent *ensure_pivot_for_id(JceScene *scene, uint32_t id)
 {
     if (!scene || id == 0 || !jce_state_entity_exists(id))
         return NULL;
-    JceEntity e = (JceEntity)id;
+    JceEntity e = jce_state_to_ecs_entity(id);
     JcePivotComponent *p = jce_scene_get_pivot(scene, e);
     if (p)
         return p;
@@ -259,7 +259,7 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     bool axes_composed = false;
     if (!pivot_edit && sel_count <= 1 && !jce_state_get_2d_mode() &&
         jce_state_get_gizmo_mode() != JCE_GIZMO_SCALE) {
-        JcePivotComponent *pv = jce_scene_get_pivot(scene, (JceEntity)focused);
+        JcePivotComponent *pv = jce_scene_get_pivot(scene, jce_state_to_ecs_entity(focused));
         if (pv) {
             jce_quat q = jce_q_normalize(pv->local_rotation);
             if (fabsf(q.w) < 0.999999f) {   /* non-identity orientation */
@@ -276,7 +276,7 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     float gizmo_rot[3];
     if (pivot_edit) {
         jce_vec3 pivot_world =
-            jce_scene_get_pivot_world_position(scene, (JceEntity)focused);
+            jce_scene_get_pivot_world_position(scene, jce_state_to_ecs_entity(focused));
         gizmo_pos[0] = pivot_world.x;
         gizmo_pos[1] = pivot_world.y;
         gizmo_pos[2] = pivot_world.z;
@@ -365,13 +365,17 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     float pre_rot_x   = gizmo_raw_rot[0];
     float pre_rot_y   = gizmo_raw_rot[1];
     float pre_scale_z = gizmo_raw_scale[2];
-    jce_gizmo_update(&gcam,
-                     (int)active_gm,
-                     (int)jce_state_get_gizmo_space(),
-                     scale_factor,
-                     gizmo_raw_pos,
-                     gizmo_raw_rot,
-                     gizmo_raw_scale);
+    /* Navigation chrome owns new presses. Keep an already-started gizmo's
+     * update/release path intact; rendering below still draws the gizmo. */
+    if (jce_scene_view_should_update_gizmo(ctx->navigation_hovered,
+            ctx->navigation_active, gizmo_dragging_before))
+        jce_gizmo_update(&gcam,
+                         (int)active_gm,
+                         (int)jce_state_get_gizmo_space(),
+                         scale_factor,
+                         gizmo_raw_pos,
+                         gizmo_raw_rot,
+                         gizmo_raw_scale);
     if (s_view_2d) {
         apply_2d_constraints(gizmo_raw_pos, gizmo_raw_rot, gizmo_raw_scale,
                              pre_pos_z, pre_rot_x, pre_rot_y, pre_scale_z);
@@ -457,13 +461,13 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
         if (pivot_edit) {
             if (active_gm == JCE_GIZMO_TRANSLATE) {
                 jce_scene_set_pivot_world_position_preserve_model(
-                    scene, (JceEntity)focused,
+                    scene, jce_state_to_ecs_entity(focused),
                     jce_v3(gizmo_pos[0], gizmo_pos[1], gizmo_pos[2]));
             } else if (active_gm == JCE_GIZMO_ROTATE) {
                 JcePivotComponent next = *pivot;
                 normalize_euler_deg(gizmo_rot);
                 next.local_rotation = editor_q_from_euler_deg(gizmo_rot);
-                jce_scene_set_pivot(scene, (JceEntity)focused, &next);
+                jce_scene_set_pivot(scene, jce_state_to_ecs_entity(focused), &next);
             }
         } else if (multi_select) {
             float ax_x[3], ax_y[3], ax_z[3];
@@ -617,7 +621,7 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
         }
         /* Model origin = world matrix applied to the local origin (the
          * world matrix already folds in T(-pivot)). */
-        jce_mat4 wm = jce_scene_get_world_matrix(scene, (JceEntity)focused);
+        jce_mat4 wm = jce_scene_get_world_matrix(scene, jce_state_to_ecs_entity(focused));
         float mo[3] = { wm.raw[3][0], wm.raw[3][1], wm.raw[3][2] };
         float scr2[2];
         if (pivot_on_screen && gm_world_to_screen(&gcam, mo, scr2)) {

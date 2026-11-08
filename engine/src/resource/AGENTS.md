@@ -1,5 +1,12 @@
 # engine/src/resource — Resource / Asset Pipeline (L3-side)
 
+Archive's existing private HMAC-SHA-256 and secure-erasure entry points reuse
+`os/core/jce_sha256_internal.h`. SHA and volatile erasure have one Core owner;
+HMAC construction, key derivation, ChaCha20 and archive formats stay here. Do
+not restore a Resource-local SHA implementation or make Renderer depend on the
+Resource crypto owner. The existing Archive test retains its short-key vector
+and additionally constrains the RFC 4231 long-key hashing path.
+
 > Asset loading, PAK archives, asset cooker, glTF/image decode, bundle streaming.
 
 ## Identity
@@ -38,7 +45,7 @@
 5. **Editor-side caches** belong in `editor/src/scene/` — do NOT duplicate the asset cache here.
 6. **glTF runtime loader** physically lives in `engine/src/renderer/jce_gltf_loader.c` (geometry close to its consumer); this layer just hands raw bytes to it.
 7. **No C++ in headers.** `jce_model_importer.cpp` only — façade exposes `extern "C"`.
-8. **Texture compression**: select per-platform via `jce_gpu_caps` (BC on desktop, ASTC on mobile). Don't ship uncompressed runtime textures.
+8. **Texture compression**: desktop defaults to BC and Android/iOS to ASTC. Portable Web defaults to RGBA8 because WebGL2 does not guarantee ASTC. Explicit compressed-format overrides require actual target capability validation; runtime consumes `jce_gpu_caps` and must report unsupported formats. Keep authored RGBA and mip overrides; offline platform selection cannot substitute for device support.
 9. **Pressure hooks** (`jce_streaming_add_pressure_hook`): up to `JCE_STREAMING_MAX_PRESSURE_HOOKS` (4) chained hooks fire BEFORE the single user callback set via `jce_streaming_set_pressure_callback`. Use for engine-internal layers (mip streaming, audio quality) that must not steal the user slot.
 
 ## Common tasks
@@ -158,3 +165,93 @@ while CPU parts, mesh decode, materials and inspection remain available.
 Host tools must use real PAK readers rather than link-only placeholder APIs.
 
 Availability-aware shader dependency selection lives in jce_bundle_shader_refs_internal.h and the existing scanner. A typed program stem resolves to actual readable backend alternatives; an unresolved program remains a required missing path. The public collector retains its historical ABI/list semantics. Packer callbacks are borrowed per invocation and preserve project/VFS precedence; no global stock registry or renderer dependency belongs in host packing.
+
+Sync asset loading and texture/audio/raw finalization use private core service
+spans even in DIST without Tracy. Actual slot READY/FAILED determines the
+attempt state. Finalization records CPU resource preparation/submission only,
+not GPU completion. No separate event or allocation ownership is introduced.
+
+Font asset load parameters are slot-owned deep copies: codepoint contents and
+effective atlas size participate in lookup identity, and reload retains the same
+parameters. FONT/MESH/MODEL acquire remains synchronous where enforced by the
+manager. SOUND wrappers release the registered audio resource exactly once on
+rollback/reload/release, not just their wrapper allocation. A borrowed model mesh
+cannot be returned after its model owner is destroyed; the standalone mesh-load
+stub is an outstanding capability, not a verified importer.
+
+Offline Bundle inspection uses jce_bundle_file_inspect_memory/file with an exact
+windows/linux/macos/android/ios/web/auto target. Unknown or absent tokens refuse
+before opening. Modern portable auto content is admitted for a known explicit
+target; requested auto admits only portable auto. The same manifest, dependency,
+payload and optional sidecar verification runs through the existing loader.
+Sidecar modern content metadata is checked against that same target before hash
+verification. Inspection takes no filesystem and marks its borrowed Pak as
+irreversibly inspection-only before publishing the handle. The canonical SDK
+provider refuses that same Pak through both named and legacy FS mount APIs;
+no-provider mounting also refuses before later canonical restoration. The Pak
+predicate first detects cycles with a finite Floyd walk. Fallback push only joins
+acyclic chains with distinct tails, refusing shared-tail cycles in linear time;
+Pak fallback attachment refuses inspection bases and layers, including injection
+into an already mounted base. Engine and Bundle use one Pak-owned canonical
+callback tuple via private bridges; the public three-callback provider ABI stays
+unchanged. Restoring that tuple through the old public setter retains its guard.
+Unknown custom opaque providers are not decoded as native Pak objects. Custom
+decoding providers or independently reopened bytes are outside this same-handle
+admission contract: it is not a security sandbox. In particular,
+the existing runtime/catalog entry points always use the compiled platform,
+without ambient target overrides. Legacy 1.0 keeps its prior metadata-limited
+compatibility and does not certify a typed graph or target. Catalog/shared-VFS
+mutation remains owner-thread serial; asynchronous independent pre-reading is
+not concurrent mounting. The actual loader and selected-tool CPU fixtures cover
+Web inspection, wrong runtime target, wrong sidecar target/hash and invalid
+tokens; these controls are separate from installed tools and browser execution.
+
+Actual texture-cook CPU acceptance lives in test_jce_cook_platform_outputs:
+complete CLI dispatch and public Bundle pack output are decoded through the
+actual JCEA reader, checking Web RGBA8, Android/iOS ASTC, base pixels and mip
+payload sizes. CLI --rgba8/--mipmaps and Bundle .import.json target_format/gen_mips
+remain consumed. Portable Web's policy change must invalidate both the CLI option
+salt and Bundle writer revision; unchanged source/options cannot keep old ASTC
+outputs. Complete same-source legacy CLI/cooker/Bundle producers create those
+old artifacts and catalogs before current owners rebuild them, followed by a
+current warm skip/reuse check. Old-Web-default, old-CLI-salt and old-Bundle-salt
+contract variants each restore only its actual wire and must fail unchanged
+ordinary assertions. These tests use CPU decode/cook/archive paths, not GPU
+upload, pixels, browser execution or mobile-device readiness.
+
+Bundle packaging owns the standard boot-policy root. An explicit project_root
+selects Settings/RenderPipeline.rp.json at the canonical runtime address
+settings/render_pipeline.rp.json, including when resource_root is a separate
+staging directory. A resource-root canonical file also works without a project.
+If both exist, require identical bytes; reject conflicts, nonregular/unreadable
+files, empty/over-1-MiB data and non-object JSON before output publication.
+If both are absent, retain runtime tier defaults. Do not sweep Settings or
+consult an unrelated active VFS for this selection. The selected immutable
+buffer survives closure/hash/parallel cook and is freed on both return paths;
+all other assets retain their prior resolver order. The root uses the existing
+dependency graph (origin project_settings) and archive content identity.
+The boot root is force-shared in catalogs and stays in the requested standalone
+Bundle. Ordinary dependencies below shared_threshold are copied into every
+referencing scene; the threshold must never drop them. At or above the threshold
+they share the normal shared Bundle. An allocation failure while growing the
+dependency list fails the pack rather than masquerading as an existing root.
+
+test_jce_bundle_pack exercises the actual producer, canonical decompressed
+bytes, minimal graph, absence, same-byte deduplication, conflicting/nonregular
+source refusal and public PAK fallback lookup. Fallback lookup is the stock
+runtime mechanism, not evidence that a renderer applied the loaded descriptor.
+Stock runtime and isolated Editor Bundle acceptance must separately inspect
+effective pipeline state; never report a BOM entry alone as applied settings.
+The two-scene controls check real per-Bundle bytes at thresholds 3 and 2 plus
+mounted catalog boot-policy lookup. The complete-owner old-partition variant
+restores only the omitted local-copy loop and must fail an ordinary assertion.
+
+## Empty archive data-region integrity
+
+The Archive writer hashes every data region with the same XXH3-64 owner as the
+reader, including a zero-length region containing only empty resources. Zero
+length is not hash value0. The output buffer is already allocated and contains
+the index before this hash; no NULL input contract is needed. Nonempty regions
+retain identical hashing and bytes. The format version, strict reader and
+secure authentication policy are unchanged. The existing public Archive fixture
+covers empty-only strict verify-on-open, empty entry CRC and index/debug modes.

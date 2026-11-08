@@ -49,6 +49,7 @@ extern "C" {
 /* Octave counts are clamped to this; more octaves buy nothing once the octave
  * frequency exceeds the bake resolution, and it bounds the per-sample cost. */
 #define JCE_CLOUD_MAX_OCTAVES 8
+#define JCE_CLOUD_DEFAULT_DETAIL_EROSION 0.45f
 
 /* Upper bound on a single bake, as a voxel count. Purely a sanity rail so a
  * bad dimension triple cannot walk off the end of a plausible buffer. */
@@ -96,6 +97,7 @@ typedef struct JceCloudNoiseParams {
     float   detail_freq;
     int32_t detail_octaves;
     float   detail_strength; /* [0,0.95]; 0 disables erosion entirely */
+    float   curl_metres;     /* [0,256]; 0 leaves the shape domain unwarped */
 
     /* Procedural default weather map (used only when `weather_fn` is NULL). */
     float weather_freq;
@@ -216,6 +218,30 @@ bool jce_cloud_noise_bake_atlas_controlled(
     uint32_t dim_x, uint32_t dim_y, uint32_t dim_z, uint32_t tiles_x,
     JceCloudBakeProgressFn progress, void *user);
 
+#define JCE_CLOUD_DETAIL_PERIOD_METRES 512.0f
+#define JCE_CLOUD_DETAIL_DIM 64u
+/* Canonical authored extinction default; returns inverse kilometres. */
+float jce_cloud_extinction_per_km(float authored);
+
+/* Shared CPU/GPU erosion equation; core density is preserved. */
+float jce_cloud_density_combine(float shape, float detail, float optical_gain, float strength);
+/* Coordinates are metres after the same domain warp used by the base shape. */
+float jce_cloud_detail_sample_prepared(const JceCloudNoiseParams *p, float x, float y, float z);
+/* Shape output is interleaved RG floats (shape, optical gain), twice the
+ * atlas texel count. Scalar detail output is 1-F1, one float per texel,
+ * with all axes periodic. */
+bool jce_cloud_shape_bake_atlas_controlled(const JceCloudNoiseParams *p, float *out_rg,
+    uint32_t nx, uint32_t ny, uint32_t nz, uint32_t tiles,
+    JceCloudBakeProgressFn progress, void *user);
+bool jce_cloud_detail_bake_atlas_controlled(const JceCloudNoiseParams *p, float *out,
+    uint32_t dim, uint32_t tiles, JceCloudBakeProgressFn progress, void *user);
+
+/* Three F1 octave channels in RGBA8 (A=255), same four bytes per texel.
+ * Accepts only the renderer's canonical 48/96/192 frequency, three octaves,
+ * gain .5 and lacunarity 2. Other spectra return false without publication. */
+bool jce_cloud_detail_bake_bands_controlled(const JceCloudNoiseParams *p, uint8_t *out_rgba,
+    uint32_t dim, uint32_t tiles, JceCloudBakeProgressFn progress, void *user);
+
 /* ── Atlas addressing ───────────────────────────────────────────────────
  *
  * A slice atlas is a 3-D volume folded into a 2-D image, so every consumer has
@@ -260,8 +286,9 @@ float jce_cloud_atlas_sample(const float *atlas, uint32_t atlas_w,
  * `tier` is a JceGpuTier; out-of-range values are treated as the lowest, so a
  * caps query that failed degrades to cheap rather than to expensive.
  *
- * The returned value is always <= JCE_CLOUD_MARCH_MAX_STEPS, which is the
- * shader's compile-time loop bound -- a dynamic loop bound would not compile
+ * The returned base budget is <= JCE_CLOUD_MARCH_MAX_STEPS. The modern
+ * split-volume path doubles it within its 48-step shader bound; other paths
+ * retain the base budget. A dynamic loop bound would not compile
  * on the oldest profile the sky shader still targets, so the shader loops to
  * the maximum and breaks on this budget. */
 #define JCE_CLOUD_MARCH_MAX_STEPS 24

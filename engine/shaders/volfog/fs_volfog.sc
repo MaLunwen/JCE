@@ -36,10 +36,16 @@ SAMPLER2D(s_volfog_csm0, 1);
 SAMPLER2D(s_volfog_csm1, 2);
 SAMPLER2D(s_volfog_csm2, 3);
 SAMPLER2D(s_volfog_csm3, 4);
+SAMPLER2D(s_volfog_cloud_shadow, 6);
 
 uniform vec4 u_volfog_p0;
 uniform vec4 u_volfog_p1;
 uniform vec4 u_volfog_color;
+uniform vec4 u_volfog_noise;  // strength, inverse cell metres, XZ wind in cells
+uniform vec4 u_volfog_volume; // world center XYZ, radius in metres (0 = global fog)
+uniform vec4 u_volfog_lobes;  // forward strength, backward strength, override, reserved
+uniform vec4 u_volfog_cloud_map; // extent, center X/Z, cloud base Y in metres
+uniform vec4 u_volfog_cloud_ray; // published bake sun XZ/Y, reserved
 
 /* xyz = direction TOWARD the sun (world, unit), w = Henyey-Greenstein g */
 uniform vec4 u_volfog_sun;
@@ -167,6 +173,14 @@ float volfog_sunlight(vec3 world_pos, float view_z)
 {
 	float count = u_volfog_sun_color.a;
 	if (count < 0.5) return 1.0;
+	float shadow_far = volfog_split(3);
+	float fade_start = shadow_far * 0.85;
+	/* Past the existing fade, valid CSM visibility is already exactly lit.
+	 * Skip only work whose result that fade discards; keep all march samples.
+	 * Invalid counts/reach and a rounded-to-zero fade span keep the old path. */
+	if (count >= 1.0 && count <= 4.0 && shadow_far > 0.0 &&
+	    fade_start < shadow_far && view_z >= shadow_far)
+		return 1.0;
 	int last = int(count) - 1;
 
 	int cascade = last;
@@ -227,9 +241,8 @@ float volfog_sunlight(vec3 world_pos, float view_z)
 	 * cut one cascade further out. Fade over the last 15% of the shadow reach,
 	 * matching csm_shadow.sh's own fade, so the outer edge is a gradient
 	 * instead of an edge. */
-	float shadow_far = volfog_split(3);
 	if (shadow_far > 0.0)
-		vis = mix(vis, 1.0, smoothstep(shadow_far * 0.85, shadow_far, view_z));
+		vis = mix(vis, 1.0, smoothstep(fade_start, shadow_far, view_z));
 
 	return vis;
 }
@@ -250,6 +263,62 @@ float volfog_phase(float cos_theta, float g)
 	return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(denom, 1e-4), 1.5));
 }
 
+/* One period-matched world-space lattice octave, with a fixed vertical
+ * shear so the same horizontal contour does not extend through every height. */
+float volfog_density_hash(vec2 cell)
+{
+	vec2 p = fract(mod(cell, vec2_splat(64.0)) * vec2(0.1031, 0.11369));
+	p += vec2_splat(dot(p, p.yx + vec2_splat(19.19)));
+	return fract(p.x * p.y);
+}
+
+float volfog_density_noise(vec3 world_pos, float strength)
+{
+	vec2 p = (world_pos.xz + vec2(0.17, -0.11) * world_pos.y)
+	       * u_volfog_noise.y - u_volfog_noise.zw;
+	vec2 cell = floor(p);
+	vec2 f = fract(p);
+	vec2 w = f * f * (3.0 - 2.0 * f);
+	float low = mix(volfog_density_hash(cell),
+	                volfog_density_hash(cell + vec2(1.0, 0.0)), w.x);
+	float high = mix(volfog_density_hash(cell + vec2(0.0, 1.0)),
+	                 volfog_density_hash(cell + vec2(1.0, 1.0)), w.x);
+	return 1.0 + strength * (2.0 * mix(low, high, w.y) - 1.0);
+}
+
+float volfog_cloud_transmittance(vec3 world_pos)
+{
+	/* The projected map integrates the complete layer. Only rays below
+	 * the layer use it, with their intercept on the bake's Y=0 plane. */
+	if (world_pos.y >= u_volfog_cloud_map.w)
+		return 1.0;
+	vec2 ground_xz = world_pos.xz - world_pos.y * u_volfog_cloud_ray.xy;
+	vec2 uv = (ground_xz - u_volfog_cloud_map.yz) / u_volfog_cloud_map.x + 0.5;
+	if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+		return 1.0;
+
+#if BGFX_SHADER_LANGUAGE_HLSL
+	float transmittance = texture2DLod(s_volfog_cloud_shadow, uv, 0.0).r;
+#else
+	float transmittance = texture2D(s_volfog_cloud_shadow, uv).r;
+#endif
+	/* Soften the transition to the region where a partial slab is unknown. */
+	float weight = smoothstep(0.0, 24.0, u_volfog_cloud_map.w - world_pos.y);
+	return mix(1.0, clamp(transmittance, 0.0, 1.0), weight);
+}
+
+vec2 volfog_clip_sphere(vec3 ray_start, vec3 ray_dir, float ray_end, vec4 sphere)
+{
+	vec3 to_center = sphere.xyz - ray_start;
+	float along = dot(to_center, ray_dir);
+	vec3 closest = to_center - ray_dir * along;
+	float remaining = sphere.w * sphere.w - dot(closest, closest);
+	if (remaining <= 0.0)
+		return vec2(0.0, 0.0);
+	float half_chord = sqrt(remaining);
+	return vec2(max(along - half_chord, 0.0), min(along + half_chord, ray_end));
+}
+
 void main()
 {
 	float density        = u_volfog_p0.x;
@@ -263,8 +332,10 @@ void main()
 
 	vec2 uv = v_texcoord0;
 	float d = texture2D(s_depth, uv).r;
-	float scene_z = (d >= 1.0) ? max_dist : linearize(d, nearp, farp);
-	scene_z = min(scene_z, max_dist);
+	// The projection W diagonal distinguishes orthographic from perspective.
+	bool orthographic = abs(u_proj[3][3]) > 0.5;
+	float scene_z = (d >= 1.0) ? farp
+	              : (orthographic ? mix(nearp, farp, d) : linearize(d, nearp, farp));
 
 	vec3 cam_ws  = reconstruct_world(uv, 0.0);
 	vec3 far_ws  = reconstruct_world(uv, 1.0);
@@ -275,6 +346,7 @@ void main()
 	float ray_span = max(length(ray_vec), 1e-6);
 	vec3  ray_dir  = ray_vec / ray_span;
 
+	bool cloud_shadow_on = u_volfog_cloud_map.x > 0.0;
 	float sun_on = u_volfog_sun_color.a;
 	/* Cascade splits are view-space Z, but t measures distance ALONG THE RAY.
 	 * At the screen edge those differ by the angle between the ray and the view
@@ -307,8 +379,16 @@ void main()
 	 * Clamped to (0, 1]: cos cannot exceed 1, and the floor keeps a degenerate
 	 * projection (farp == nearp) from dividing by zero. */
 	float view_z_scale = clamp((farp - nearp) / ray_span, 1e-3, 1.0);
-	float phase = volfog_phase(dot(ray_dir, u_volfog_sun.xyz), u_volfog_sun.w);
-
+	float cos_theta = dot(ray_dir, u_volfog_sun.xyz);
+	float phase = volfog_phase(cos_theta, u_volfog_sun.w);
+	BRANCH if (u_volfog_lobes.z > 0.5)
+	{
+		phase *= u_volfog_lobes.x;
+		if (u_volfog_lobes.y > 0.0)
+			phase += u_volfog_lobes.y * volfog_phase(-cos_theta, u_volfog_sun.w);
+		if (u_volfog_lobes.x <= 0.0 && u_volfog_lobes.y <= 0.0)
+			sun_on = 0.0;
+	}
 	/* scene_z is view-space Z -- distance along the VIEW AXIS -- but `t` below
 	 * steps along a NORMALISED ray, so it measures arc length. The two differ
 	 * by 1/cos(angle to the view axis), which is exactly the ratio computed
@@ -325,11 +405,40 @@ void main()
 	 * absence would make this line right for the wrong reason.
 	 *
 	 * view_z_scale is cos(theta), clamped to (0, 1] where it is computed. */
-	float ray_len = max(scene_z - nearp, 0.0) / view_z_scale;
+	float scene_end = min(max(scene_z - nearp, 0.0) / view_z_scale, max_dist);
+	vec2 fog_bounds = vec2(0.0, scene_end);
+	BRANCH if (u_volfog_volume.w > 0.0)
+		fog_bounds = volfog_clip_sphere(cam_ws, ray_dir, scene_end, u_volfog_volume);
+	if (fog_bounds.y <= fog_bounds.x)
+	{
+		gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+		return;
+	}
+	float fog_start = fog_bounds.x;
+	float ray_len = fog_bounds.y - fog_start;
 	float dt = ray_len / step_n;
+	/* Fade lattice contrast as the march stops resolving individual cells.
+	 * A zero weight also skips the noise and enables the uniform shortcut. */
+	float noise_strength = u_volfog_noise.x *
+	                       (1.0 - smoothstep(0.5, 1.5, dt * u_volfog_noise.y));
+	bool noise_on = noise_strength > 0.0;
 
 	float transmittance = 1.0;
 	vec3  inscatter     = vec3(0.0, 0.0, 0.0);
+
+	/* A zero height falloff makes the medium uniform along this ray. Keep
+	 * the same scalar/vector multiplication order, samples and recurrence;
+	 * only their repeated density/segment/bulk work moves out of the loop. */
+	bool uniform_medium = height_falloff == 0.0 && !noise_on;
+	float uniform_seg = 1.0;
+	vec3 uniform_Lin = vec3(0.0, 0.0, 0.0);
+	if (uniform_medium)
+	{
+		float uniform_sigma_t = density;
+		uniform_seg = exp(-uniform_sigma_t * dt);
+		uniform_Lin = u_volfog_color.rgb * (scattering + u_volfog_color.a) *
+		              density * dt;
+	}
 
 	/* Do NOT unroll. fxc unrolls a bounded loop by default, and once the body
 	 * grew a cascade-blend tap and a fallthrough ladder the unrolled march --
@@ -366,19 +475,30 @@ void main()
 	for (int i = 0; i < 64; i++)
 	{
 		if (float(i) >= step_n) break;
-		float t = (float(i) + ign) * dt;
+		float t = fog_start + (float(i) + ign) * dt;
 		vec3 sample_ws = cam_ws + ray_dir * t;
-		float h = sample_ws.y - height_origin;
-		float local_density = density * exp(-max(h, 0.0) * height_falloff);
-		float sigma_t = local_density;
-		float seg = exp(-sigma_t * dt);
+		float local_density = density;
+		float seg = uniform_seg;
+		vec3 Lin = uniform_Lin;
+		/* The condition is draw-uniform. Keep the unused exponentials behind
+		 * it: HLSL flattening otherwise evaluates both paths before selection. */
+#if BGFX_SHADER_LANGUAGE_HLSL
+		[branch]
+#endif
+		if (!uniform_medium)
+		{
+			float h = sample_ws.y - height_origin;
+			local_density = density * exp(-max(h, 0.0) * height_falloff);
+			BRANCH if (noise_on)
+				local_density *= volfog_density_noise(sample_ws, noise_strength);
+			float sigma_t = local_density;
+			seg = exp(-sigma_t * dt);
 
-		/* Bulk ambient term: what the fog scatters from the sky regardless of
-		 * the sun.  Kept separate from the sun term below so that shadowing the
-		 * sun does not black out the fog -- shadowed fog is still lit by the
-		 * sky, and fog that goes to zero inside a shadow looks like a hole. */
-		vec3 Lin = u_volfog_color.rgb * (scattering + u_volfog_color.a) *
-		           local_density * dt;
+			/* Bulk ambient term: what the fog scatters from the sky regardless of
+			 * the sun. Kept separate so a shadow does not black out the fog. */
+			Lin = u_volfog_color.rgb * (scattering + u_volfog_color.a) *
+			      local_density * dt;
+		}
 
 		/* Sun in-scattering, shadowed and phase-weighted.
 		 *
@@ -397,9 +517,11 @@ void main()
 		 * strong", and the density slider is the wrong place to look. */
 		if (sun_on > 0.5)
 		{
-			float vis = volfog_sunlight(sample_ws, t * view_z_scale);
+			float vis = volfog_sunlight(sample_ws, nearp + t * view_z_scale);
 			if (vis > 0.0)
 			{
+				BRANCH if (cloud_shadow_on)
+					vis *= volfog_cloud_transmittance(sample_ws);
 				Lin += u_volfog_sun_color.rgb * u_volfog_color.rgb
 				     * (phase * scattering * local_density * dt * vis
 				        * (1.0 / 3.14159265));

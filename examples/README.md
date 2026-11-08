@@ -1,25 +1,29 @@
-# Consumer examples and completeness projects
+# Single-file Bundle catalogs
 
-examples/ holds SDK consumer projects developed or recreated to test engine
-features and completeness through the public APIs available to project users.
+`examples/` publishes single-file content Bundles with source links, licenses,
+terms and provenance. Authoring source, project policy and dedicated regression
+tools live under `tests/consumers/`; reusable build tools remain under `tools/`.
 
-| Project | Purpose | Source and terms |
-| --- | --- | --- |
-| [caged_kingdom](caged_kingdom/README.md) | Final game and feature laboratories | [terms](caged_kingdom/SOURCE_AND_TERMS.md) |
-| [elemental_serenity](elemental_serenity/README.md) | Diorama recreation and AI scene orchestration | [terms](elemental_serenity/SOURCE_AND_TERMS.md) |
-| [minesweeper](minesweeper/README.md) | Components, values and AI runtime recipes | [terms](minesweeper/SOURCE_AND_TERMS.md) |
-| [snake_seven](snake_seven/AGENTS.md) | Seven scripting languages in one game | [terms](snake_seven/SOURCE_AND_TERMS.md) |
+| Catalog | Published content | Authoring source / terms |
+|---|---|---|
+| [Elemental Serenity](elemental_serenity/README.md) | `elemental_serenity.jbundle`, portable Lua variant | [consumer](../tests/consumers/elemental_serenity/), [terms](elemental_serenity/SOURCE_AND_TERMS.md) |
+| [Minesweeper](minesweeper/README.md) | `minesweeper.jbundle`, portable Lua variant | [consumer](../tests/consumers/minesweeper/), [terms](minesweeper/SOURCE_AND_TERMS.md) |
+| [Snake Seven](snake_seven/README.md) | `snake.jbundle`, portable Lua variant | [consumer](../tests/consumers/snake_seven/), [terms](snake_seven/SOURCE_AND_TERMS.md) |
+| [Tower Defense](td_lab/README.md) | `tower-defense.jbundle`, contextual content; native `TdController`/`td_module` required | [consumer](../tests/consumers/td_lab/), [terms](td_lab/SOURCE_AND_TERMS.md), [Bundle provenance](td_lab/BUNDLE_PROVENANCE.md) |
+| [Caged Kingdom](caged_kingdom/README.md) | Owned game scaffold; implementation currently absent | [project charter](caged_kingdom/AGENTS.md) |
 
-Keep project policy, generators, assets, dedicated probes and design contracts
-inside each project. General tools take explicit project/input/output arguments
-and do not embed game rules. Build through scripts/jce.py app <project> and the
-installed SDK. Consumers use public API umbrellas, never private/dependency
-headers. Author runtime behavior in scenes, components, values and scripts when
-existing APIs support it.
+CK is retained as the owned production project. All its frozen/reference/AI
+materials under `caged_kingdom/way/` are temporarily local and untracked by owner
+instruction. Scaffold metadata is not runnable-game evidence.
 
-Each project records origins, applicable notices, asset provenance limits and
-acceptance evidence. Original external repositories remain external and read
-only. Migration does not authorize vendoring original code or relicensing
-imported assets. Generated output and private assets stay ignored. Report
-missing engine/editor capabilities with a reproducible case; do not hide gaps
-with project special cases. Keep current measurements separate from history.
+Open the published `.jbundle` directly in the editor. A content archive does not
+imply native code or optional external VMs are embedded; each catalog states its
+actual driver and requirements. TD currently needs its native authoring module
+for contextual Editor Play; independent single-EXE/HTML application verification
+is separate from portable content publication.
+
+Consumers develop through public API/SDK entry points and `scripts/jce.py` with
+explicit project inputs. Original external repositories stay outside Git and
+unchanged. Build trees, cooked caches, raw evidence and private materials remain
+ignored. Source licenses and per-asset terms retain their own scope; migration
+alone does not establish redistribution rights or visual/functional acceptance.

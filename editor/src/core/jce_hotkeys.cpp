@@ -3,6 +3,7 @@
  */
 
 #include "jce_hotkeys.h"
+#include "jce_editor_hotkey_diag.h"
 #include "jce_editor_config.h"
 #include "jce_editor_i18n.h"   /* localize hotkey display names (hotkey.<id_string>) */
 #include "jce_editor_alloc.h"
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 
 namespace {
 
@@ -121,6 +123,31 @@ void hotkeys_path(char *out, size_t n)
     jce_editor_dotjce_path("hotkeys.json", out, n);
 }
 
+bool chord_valid(JceHotkeyChord c)
+{
+    constexpr unsigned mods = JCE_HKM_CTRL | JCE_HKM_SHIFT |
+                              JCE_HKM_ALT | JCE_HKM_SUPER;
+    if ((c.mods & ~mods) != 0) return false;
+    if (c.key == ImGuiKey_None) return true;
+    /* Registry safety differs from capture policy: physical named modifier
+     * keys remain legal bindings. Reserved modifier pseudo-keys do not. */
+    return c.key >= ImGuiKey_NamedKey_BEGIN && c.key < ImGuiKey_NamedKey_END &&
+           c.key != ImGuiKey_ReservedForModCtrl &&
+           c.key != ImGuiKey_ReservedForModShift &&
+           c.key != ImGuiKey_ReservedForModAlt &&
+           c.key != ImGuiKey_ReservedForModSuper;
+}
+
+bool json_integer(const JceJson *value, int maximum, int *out)
+{
+    if (!jce_json_is_number(value)) return false;
+    const double number = jce_json_number_value(value, -1.0);
+    if (!std::isfinite(number) || number < 0.0 || number > maximum ||
+        std::floor(number) != number) return false;
+    *out = (int)number;
+    return true;
+}
+
 int chord_imgui(JceHotkeyChord c)
 {
     int chord = 0;
@@ -138,7 +165,12 @@ const char *imgui_key_name(int key)
     return ImGui::GetKeyName((ImGuiKey)key);
 }
 
-bool initialized = false;
+struct HotkeyRuntimeState {
+    bool initialized = false;
+    JceHotkeyId capture_id = JCE_HK_COUNT;
+    int capture_blocked_frame = -1;
+};
+HotkeyRuntimeState s_runtime;
 int consumed_frame = -1;
 ImGuiKeyChord consumed_chords[JCE_HK_COUNT] = {};
 int consumed_chord_count = 0;
@@ -174,17 +206,19 @@ void consume_chord(ImGuiKeyChord chord)
 
 extern "C" void jce_hotkeys_init(void)
 {
-    if (initialized) return;
+    if (s_runtime.initialized) return;
     for (int i = 0; i < JCE_HK_COUNT; ++i) {
         s_table[i].cur = s_table[i].def;
     }
-    initialized = true;
+    s_runtime.initialized = true;
     jce_hotkeys_load();
 }
 
 extern "C" void jce_hotkeys_shutdown(void)
 {
-    initialized = false;
+    s_runtime = HotkeyRuntimeState{};
+    consumed_frame = -1;
+    consumed_chord_count = 0;
 }
 
 extern "C" void jce_hotkeys_reset_all(void)
@@ -252,20 +286,84 @@ extern "C" JceHotkeyChord jce_hotkey_get_default(JceHotkeyId id)
 extern "C" void jce_hotkey_set(JceHotkeyId id, JceHotkeyChord chord)
 {
     if (id < 0 || id >= JCE_HK_COUNT) return;
+    if (!chord_valid(chord)) return;
     s_table[id].cur = chord;
+}
+
+extern "C" bool jce_hotkeys_capture_begin(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return false;
+    s_runtime.capture_id = id;
+    s_runtime.capture_blocked_frame = ImGui::GetFrameCount();
+    return true;
+}
+
+extern "C" JceHotkeyId jce_hotkeys_capture_id(void)
+{
+    return s_runtime.capture_id;
+}
+
+extern "C" void jce_hotkeys_capture_cancel(void)
+{
+    if (s_runtime.capture_id == JCE_HK_COUNT) return;
+    s_runtime.capture_id = JCE_HK_COUNT;
+    s_runtime.capture_blocked_frame = ImGui::GetFrameCount();
+}
+
+extern "C" bool jce_hotkeys_capture_poll(void)
+{
+    if (s_runtime.capture_id == JCE_HK_COUNT) return false;
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        jce_hotkeys_capture_cancel();
+        return false;
+    }
+    const ImGuiKeyChord imgui_mods = ImGui::GetIO().KeyMods;
+    uint8_t mods = 0;
+    if (imgui_mods & ImGuiMod_Ctrl)  mods |= JCE_HKM_CTRL;
+    if (imgui_mods & ImGuiMod_Shift) mods |= JCE_HKM_SHIFT;
+    if (imgui_mods & ImGuiMod_Alt)   mods |= JCE_HKM_ALT;
+    if (imgui_mods & ImGuiMod_Super) mods |= JCE_HKM_SUPER;
+    for (int k = ImGuiKey_NamedKey_BEGIN; k < ImGuiKey_NamedKey_END; ++k) {
+        const ImGuiKey key = (ImGuiKey)k;
+        if (key == ImGuiKey_LeftCtrl || key == ImGuiKey_RightCtrl ||
+            key == ImGuiKey_LeftShift || key == ImGuiKey_RightShift ||
+            key == ImGuiKey_LeftAlt || key == ImGuiKey_RightAlt ||
+            key == ImGuiKey_LeftSuper || key == ImGuiKey_RightSuper ||
+            key == ImGuiKey_ReservedForModCtrl ||
+            key == ImGuiKey_ReservedForModShift ||
+            key == ImGuiKey_ReservedForModAlt ||
+            key == ImGuiKey_ReservedForModSuper ||
+            key == ImGuiKey_Escape) continue;
+        if (!ImGui::IsKeyPressed(key, false)) continue;
+        jce_hotkey_set(s_runtime.capture_id, { k, mods });
+        jce_hotkeys_capture_cancel();
+        return true;
+    }
+    return false;
 }
 
 extern "C" bool jce_hotkey_pressed(JceHotkeyId id)
 {
+    /* Global dispatch runs before the Preferences draw. Ending capture must
+     * also protect later consumers in this frame, regardless of query order. */
+    if (s_runtime.capture_id != JCE_HK_COUNT ||
+        s_runtime.capture_blocked_frame == ImGui::GetFrameCount()) return false;
     if (id < 0 || id >= JCE_HK_COUNT) return false;
     JceHotkeyChord c = s_table[id].cur;
-    if (c.key <= 0) return false;
+    if (!chord_valid(c) || c.key == ImGuiKey_None) return false;
     ImGuiKeyChord chord = (ImGuiKeyChord)chord_imgui(c);
-    if (chord_consumed(chord))
+    if (chord_consumed(chord)) {
+        if (id == JCE_HK_EDIT_PREFERENCES && jce_editor_hotkey_diag_enabled())
+            jce_editor_hotkey_diag_query(ImGui::GetFrameCount(), c,
+                (int)ImGui::GetIO().KeyMods, false, false, true);
         return false;
-    if (!ImGui::IsKeyPressed((ImGuiKey)c.key, false))
-        return false;
-    if (!ImGui::IsKeyChordPressed(chord))
+    }
+    const bool edge = ImGui::IsKeyPressed((ImGuiKey)c.key, false);
+    const bool pressed = edge && ImGui::IsKeyChordPressed(chord);
+    if (id == JCE_HK_EDIT_PREFERENCES && jce_editor_hotkey_diag_enabled())
+        jce_editor_hotkey_diag_query(ImGui::GetFrameCount(), c,
+            (int)ImGui::GetIO().KeyMods, edge, pressed, false);
+    if (!pressed)
         return false;
     consume_chord(chord);
     return true;
@@ -275,6 +373,11 @@ extern "C" char *jce_hotkey_chord_label(JceHotkeyChord c, char *out, size_t n)
 {
     if (!out || n == 0) return out;
     out[0] = '\0';
+    if (!chord_valid(c)) return out;
+    if (c.key == ImGuiKey_None) {
+        std::snprintf(out, n, "(unbound)");
+        return out;
+    }
     char tmp[96] = {0};
     size_t off = 0;
     auto append = [&](const char *s) {
@@ -300,7 +403,7 @@ extern "C" char *jce_hotkey_chord_label(JceHotkeyChord c, char *out, size_t n)
 
 extern "C" bool jce_hotkeys_save(void)
 {
-    if (!initialized) return false;
+    if (!s_runtime.initialized) return false;
     char path[640];
     hotkeys_path(path, sizeof(path));
 
@@ -325,9 +428,7 @@ extern "C" bool jce_hotkeys_save(void)
     jce_json_free(root);
     if (!text) return false;
 
-    /* Atomic: a torn hotkeys.json parses as absent and silently resets
-     * every binding to defaults.  (Hence printing to a buffer instead of
-     * jce_json_write_file, which is a plain write.) */
+    /* Failed publication retains the user's previous bindings on disk. */
     bool ok = jce_fs_host_write_all_atomic(path, text, std::strlen(text));
     jce_json_free_string(text);
     return ok;
@@ -337,34 +438,48 @@ extern "C" bool jce_hotkeys_load(void)
 {
     char path[640];
     hotkeys_path(path, sizeof(path));
-    size_t len = 0;
-    char *buf = (char *)ed_read_file(path, &len);
+    uint64_t len = 0, total = 0;
+    constexpr uint64_t limit = 1 << 20;
+    char *buf = (char *)jce_fs_host_read_capped(path, limit, &len, &total);
     if (!buf) return false;
-    if (len > (1 << 20)) { ED_FREE(buf); return false; }
+    if (total > limit || len != total) { jce_fs_buffer_free(buf); return false; }
 
-    JceJson *root = jce_json_parse(buf, len);
-    ED_FREE(buf);
+    JceJson *root = jce_json_parse_strict(buf, (size_t)len);
+    jce_fs_buffer_free(buf);
     if (!root) return false;   /* malformed: keep the bindings already loaded */
 
     JceJson *arr = jce_json_get(root, "hotkeys");
-    int n = jce_json_array_size(arr);   /* 0 when absent or not an array */
-    for (int e = 0; e < n; ++e) {
+    bool valid = jce_json_is_object(root) && jce_json_is_array(arr);
+    JceHotkeyChord pending[JCE_HK_COUNT];
+    for (int i = 0; i < JCE_HK_COUNT; ++i) pending[i] = s_table[i].cur;
+    const int n = jce_json_array_size(arr);
+    for (int e = 0; valid && e < n; ++e) {
         JceJson *item = jce_json_array_at(arr, e);
+        if (!jce_json_is_object(item)) { valid = false; break; }
         const char *id = jce_json_string_value(jce_json_get(item, "id"), nullptr);
+        if (!id || !id[0]) { valid = false; break; }
         /* A row without "key" says nothing about the binding, so leave it
          * alone; key 0 is a deliberate unbind and must round-trip. */
-        if (!id || !jce_json_has(item, "key")) continue;
+        if (!jce_json_has(item, "key")) continue;
 
         /* Ids no longer in s_table (renamed / retired) find no match and are
          * silently skipped. */
         for (int i = 0; i < JCE_HK_COUNT; ++i) {
             if (std::strcmp(s_table[i].id_string, id) == 0) {
-                s_table[i].cur.key  = jce_json_get_int(item, "key", 0);
-                s_table[i].cur.mods = (uint8_t)(jce_json_get_int(item, "mods", 0) & 0xFF);
+                int key = 0, mods = 0;
+                valid = json_integer(jce_json_get(item, "key"),
+                                     ImGuiKey_NamedKey_END - 1, &key);
+                if (valid && jce_json_has(item, "mods"))
+                    valid = json_integer(jce_json_get(item, "mods"), 15, &mods);
+                const JceHotkeyChord chord{key, (uint8_t)mods};
+                valid = valid && chord_valid(chord);
+                if (valid) pending[i] = chord;
                 break;
             }
         }
     }
     jce_json_free(root);
+    if (!valid) return false;
+    for (int i = 0; i < JCE_HK_COUNT; ++i) s_table[i].cur = pending[i];
     return true;
 }

@@ -315,10 +315,10 @@ static float cloud_worley_fbm01(const JceCloudNoiseParams *sp,
     return cloud_clamp01(sum / norm);
 }
 
-/* Perlin remapped by the inverted Worley: keeps Perlin's connectivity, gains
- * Worley's billows. `billow - 1` lies in [-1,0], so the remap window is at
- * least 1 wide and can never collapse -- the guard in jce_cloud_remap is a
- * belt-and-braces, not the mechanism. */
+/* Remap Perlin with cell-centred billows. Worley is an F1 DISTANCE here:
+ * near a seed F1 is small, so remapping from F1-1 increases the potential.
+ * Using (1-F1)-1 instead favours cell walls and hollows the billow centres.
+ * The remap denominator remains in [1,2], including exact seed positions. */
 static float cloud_perlin_worley_uvw(const JceCloudNoiseParams *sp,
                                      float u, float v, float w)
 {
@@ -326,8 +326,7 @@ static float cloud_perlin_worley_uvw(const JceCloudNoiseParams *sp,
                                             sp->base_octaves, CLOUD_SALT_PERLIN);
     const float worley = cloud_worley_fbm01(sp, u, v, w, sp->base_freq,
                                             sp->base_octaves, CLOUD_SALT_WORLEY);
-    const float billow = 1.0f - worley;
-    return cloud_clamp01(jce_cloud_remap(perlin, billow - 1.0f, 1.0f, 0.0f, 1.0f));
+    return cloud_clamp01(jce_cloud_remap(perlin, worley - 1.0f, 1.0f, 0.0f, 1.0f));
 }
 
 /* ── parameter sanitising ───────────────────────────────────────────────── */
@@ -346,14 +345,15 @@ void jce_cloud_noise_params_default(JceCloudNoiseParams *p)
     p->period_y = 1000.0f;
     p->period_z = 4096.0f;
 
-    p->base_freq     = 4.0f; /* cells per period, not per world unit */
-    p->base_octaves  = 4;
+    p->base_freq     = 12.0f; /* cells per period, not per world unit */
+    p->base_octaves  = 3;
     p->lacunarity    = 2.0f;
     p->gain          = 0.5f;
 
-    p->detail_freq     = 24.0f;
+    p->detail_freq     = 48.0f;
     p->detail_octaves  = 3;
-    p->detail_strength = 0.45f;
+    p->detail_strength = JCE_CLOUD_DEFAULT_DETAIL_EROSION;
+    p->curl_metres = 0.0f;
 
     p->weather_freq          = 3.0f;
     p->weather_coverage_bias = 0.0f;
@@ -411,6 +411,7 @@ static void cloud_sanitize(const JceCloudNoiseParams *in, JceCloudNoiseParams *o
     out->detail_octaves  = cloud_sani(in->detail_octaves, 1, JCE_CLOUD_MAX_OCTAVES);
     /* Capped below 1 so the erosion remap window (1 - strength) stays open. */
     out->detail_strength = cloud_sanf(in->detail_strength, 0.0f, 0.95f, 0.0f);
+    out->curl_metres = cloud_sanf(in->curl_metres, 0.0f, 256.0f, 0.0f);
 
     out->weather_freq          = cloud_sanf(in->weather_freq, 1.0f, 64.0f, d.weather_freq);
     out->weather_coverage_bias = cloud_sanf(in->weather_coverage_bias, -1.0f, 1.0f, 0.0f);
@@ -436,7 +437,7 @@ float jce_cloud_height_gradient(float height01, float cloud_type, float anvil_bi
     /* Bands are expressed as fractions of the cloud layer, per the classic
      * stratus / cumulus / cumulonimbus split. */
     const float stratus = cloud_band(h, 0.00f, 0.05f, 0.13f, 0.20f);
-    const float cumulus = cloud_band(h, 0.10f, 0.24f, 0.44f, 0.60f);
+    const float cumulus = cloud_band(h, 0.08f, 0.18f, 0.65f, 0.88f);
     float cumulonimbus  = cloud_band(h, 0.05f, 0.14f, 0.82f, 1.00f);
 
     /* The anvil spreads the top out instead of adding to it: scaling by
@@ -520,16 +521,35 @@ void jce_cloud_weather_sample(const JceCloudNoiseParams *p, float x, float z,
 /* `precipitation` is the weather map's rain channel, 0 where it is not
  * raining.  Zero is the identity: a field with no rain bakes bit-for-bit as it
  * did before this parameter existed. */
-static float cloud_density_s(const JceCloudNoiseParams *sp,
-                             float x, float y, float z,
-                             float height01, float coverage, float cloud_type,
-                             float precipitation)
+/* A cheap periodic, divergence-free XZ field from a stream function.
+ * The shortest domain period bounds displacement on either axis. Weather
+ * coverage and type stay attached to the unwarped world position. */
+static void cloud_shape_xz(const JceCloudNoiseParams *sp, float x, float z,
+                           float *u, float *w)
 {
-    float u, v, w, pw, grad, shape;
+    *u = cloud_tile_coord(x, sp->period_x);
+    *w = cloud_tile_coord(z, sp->period_z);
+    if (sp->curl_metres <= 0.0f) return;
 
-    if (!isfinite(x) || !isfinite(y) || !isfinite(z) || !isfinite(height01)) {
-        return 0.0f;
-    }
+    const float wave = 25.132741228718345f; /* four cycles per tile */
+    const float a = wave * *u + 0.43f;
+    const float b = wave * *w + 1.17f;
+    const float offset = fminf(sp->curl_metres, 0.0625f * fminf(sp->period_x, sp->period_z));
+    const float dx = sinf(a) * cosf(b);
+    const float dz = -cosf(a) * sinf(b);
+    /* Sample in the same periodic tile even when warp crosses its edge. */
+    const float tile_offset = offset / fmaxf(sp->period_x, sp->period_z);
+    *u = cloud_tile_coord(*u + tile_offset * dx, 1.0f);
+    *w = cloud_tile_coord(*w + tile_offset * dz, 1.0f);
+}
+
+static float cloud_shape_uvw(const JceCloudNoiseParams *sp,
+    float u, float v, float w, float height01, float coverage,
+    float cloud_type, float precipitation, float *optical_gain)
+{
+    float pw, grad, shape;
+    *optical_gain = 1.0f;
+
     coverage = cloud_clamp01(coverage);
     if (coverage <= 0.0f) {
         /* Explicit early out so "no clouds" is exactly zero, not epsilon. */
@@ -551,51 +571,101 @@ static float cloud_density_s(const JceCloudNoiseParams *sp,
      * already dense -- which is precisely the cells that rain. */
     cloud_type = cloud_clamp01(cloud_type + precipitation * 0.5f);
 
-    u = cloud_tile_coord(x, sp->period_x);
-    v = cloud_tile_coord(y, sp->period_y);
-    w = cloud_tile_coord(z, sp->period_z);
-
-    pw = cloud_perlin_worley_uvw(sp, u, v, w);
+    /* The height envelope is independent of the noise metric. Using one
+     * frequency in three normalised periods compresses every billow by
+     * period_y / period_x. Follow metres along Y instead, so changing the
+     * layer thickness reveals more volume rather than stretching thin sheets.
+     * Only the density field uses this metric; standalone periodic noise
+     * functions retain their original three-axis tile convention. */
+    const float shortest_period = fminf(sp->period_x, sp->period_z);
+    float shape_v = v * sp->period_y / shortest_period;
+    if (sp->curl_metres > 0.0f) {
+        /* Break the aligned Y lattice planes of the base field, too. This
+         * periodic offset changes only the noise domain: the authored height
+         * envelope and the independent erosion field keep their own meaning.
+         * X/Z seams agree exactly; zero curl preserves the original path. */
+        const float wave = 25.132741228718345f;
+        const float offset = fminf(sp->curl_metres, 0.0625f * shortest_period);
+        shape_v += (offset / shortest_period) *
+            sinf(wave * u + 0.43f) * sinf(wave * w + 1.17f);
+    }
+    pw = cloud_perlin_worley_uvw(sp, u, shape_v, w);
     grad = jce_cloud_height_gradient(height01, cloud_type, sp->anvil_bias);
     shape = pw * grad;
 
-    /* Coverage carve: only the top `coverage` slice of the shape survives, and
-     * the survivors are scaled by coverage so thin weather stays thin instead
-     * of turning the few remaining voxels opaque. */
+    /* Coverage selects the occupied shape. Optical thickness is independent;
+     * multiplying coverage here also turned sparse cloud cores into erosion. */
     shape = cloud_clamp01(jce_cloud_remap(shape, 1.0f - coverage, 1.0f, 0.0f, 1.0f));
-    shape *= coverage;
     if (shape <= 0.0f) {
         return 0.0f;
     }
 
-    if (sp->detail_strength > 0.0f) {
-        /* Erosion is subtractive and edge-weighted: `edge` reaches 0 once the
-         * shape passes CLOUD_CORE_ONSET, which makes the remap the identity and
-         * leaves the core bit-for-bit untouched. Uniform erosion would eat the
-         * interior and dissolve the cloud. */
-        const float detail = cloud_worley_fbm01(sp, u, v, w, sp->detail_freq,
-                                                sp->detail_octaves, CLOUD_SALT_DETAIL);
-        const float wisp = 1.0f - detail;
-        const float edge = 1.0f - cloud_clamp01(shape * (1.0f / CLOUD_CORE_ONSET));
-        const float erosion = sp->detail_strength * edge * wisp;
-        shape = cloud_clamp01(jce_cloud_remap(shape, erosion, 1.0f, 0.0f, 1.0f));
-    }
+    *optical_gain = sp->density_scale * (1.0f + precipitation * 2.0f);
+    return shape;
+}
 
-    {
-        /* And it absorbs more: the reference darkens rain cells by raising
-         * light absorption where they exist. This atlas carries one channel,
-         * and the march derives BOTH extinction and self-shadowing from it, so
-         * raising density here is how "more absorption" is spelled. The clamp
-         * is what bounds it: a cell already at 0.5 saturates, a thin one does
-         * not, and the contrast between a raining cell and its neighbours is
-         * the thing being bought. */
-        const float dens = shape * sp->density_scale
-                         * (1.0f + precipitation * 2.0f);
-        if (!isfinite(dens)) {
-            return 0.0f;
-        }
-        return cloud_clamp01(dens);
-    }
+float jce_cloud_extinction_per_km(float authored)
+{
+    /* Scene value zero selects the documented 1/km default. Do not alter the
+     * authored scene: this is the canonical renderer/shadow interpretation. */
+    return isfinite(authored) && authored > 0.0f ? authored : 1.0f;
+}
+
+float jce_cloud_density_combine(float shape, float detail, float optical_gain,
+                                 float strength)
+{
+    const float edge = 1.0f - cloud_clamp01(shape / CLOUD_CORE_ONSET);
+    /* The scalar CPU sampler returns 1-F1; the modern RGB bake stores F1
+     * directly. Both erode walls and preserve the same billow centres. */
+    /* Restore the contrast lost when three F1 octaves are averaged. This
+     * remap retains cell centres, walls and the neutral far-LOD mean. */
+    const float wall = cloud_clamp01(0.5f + 2.5f * (0.5f - cloud_clamp01(detail)));
+    const float erosion = cloud_sanf(strength, 0.0f, 0.95f, 0.0f) * edge * wall;
+    const float density = cloud_clamp01(jce_cloud_remap(shape, erosion, 1.0f, 0.0f, 1.0f));
+    return cloud_clamp01(density * optical_gain);
+}
+
+float jce_cloud_detail_sample_prepared(const JceCloudNoiseParams *sp,
+                                       float x, float y, float z)
+{
+    if (!sp || !isfinite(x) || !isfinite(y) || !isfinite(z)) return 0.0f;
+    const float period = JCE_CLOUD_DETAIL_PERIOD_METRES;
+    const float u = cloud_tile_coord(x, period);
+    const float v = cloud_tile_coord(y, period);
+    const float w = cloud_tile_coord(z, period);
+    /* The compact unshaped volume resolves the same 85/43/21 m frequencies
+     * independently of the kilometre-scale shape atlas and its height band. */
+    const float frequency = sp->detail_freq * period / 4096.0f;
+    return 1.0f - cloud_worley_fbm01(sp, u, v, w, frequency,
+                                     sp->detail_octaves, CLOUD_SALT_DETAIL);
+}
+
+static float cloud_density_uvw(const JceCloudNoiseParams *sp,
+    float u, float v, float w, float height01, float coverage,
+    float cloud_type, float precipitation)
+{
+    float gain;
+    const float shape = cloud_shape_uvw(sp, u, v, w, height01, coverage,
+                                       cloud_type, precipitation, &gain);
+    if (shape <= 0.0f) return 0.0f;
+    if (shape >= CLOUD_CORE_ONSET || sp->detail_strength <= 0.0f)
+        return cloud_clamp01(shape * gain);
+    const float detail = sp->detail_strength > 0.0f
+        ? jce_cloud_detail_sample_prepared(sp, u * sp->period_x,
+                                            v * sp->period_y, w * sp->period_z) : 0.0f;
+    return jce_cloud_density_combine(shape, detail, gain, sp->detail_strength);
+}
+
+static float cloud_density_s(const JceCloudNoiseParams *sp,
+    float x, float y, float z, float height01, float coverage,
+    float cloud_type, float precipitation)
+{
+    if (!isfinite(x) || !isfinite(y) || !isfinite(z) || !isfinite(height01) ||
+        !(coverage > 0.0f)) return 0.0f;
+    float u, w;
+    cloud_shape_xz(sp, x, z, &u, &w);
+    return cloud_density_uvw(sp, u, cloud_tile_coord(y, sp->period_y), w,
+                             height01, coverage, cloud_type, precipitation);
 }
 
 void jce_cloud_noise_params_sanitize(const JceCloudNoiseParams *in,
@@ -698,11 +768,14 @@ static void cloud_bake_slice(const JceCloudNoiseParams *sp, uint32_t k,
         /* The weather field is XZ-only, so it is hoisted out of the column;
          * the resulting strided writes are cheaper than dim_y extra fBm. */
         cloud_weather_sample_s(sp, xx, zz, &wx);
+        float u, w;
+        cloud_shape_xz(sp, xx, zz, &u, &w);
         for (j = 0; j < dim_y; ++j) {
             const float h01 = ((float)j + 0.5f) / (float)dim_y;
+            const float v = cloud_tile_coord(h01 * sp->period_y, sp->period_y);
             dst[(size_t)j * row_stride + (size_t)i] =
-                cloud_density_s(sp, xx, h01 * sp->period_y, zz, h01,
-                                wx.coverage, wx.cloud_type, wx.precipitation);
+                cloud_density_uvw(sp, u, v, w, h01,
+                                  wx.coverage, wx.cloud_type, wx.precipitation);
         }
     }
 }
@@ -797,6 +870,97 @@ bool jce_cloud_noise_bake_atlas_controlled(
         cloud_bake_slice(&sp, k, dim_x, dim_y, dim_z, slice, (size_t)w);
         if (progress && !progress(user, k + 1u, dim_z))
             return false;
+    }
+    return true;
+}
+
+/* RG low-frequency shape and optical gain. The high-frequency erosion
+ * field is deliberately absent, so changing coverage never rebakes it. */
+bool jce_cloud_shape_bake_atlas_controlled(const JceCloudNoiseParams *p, float *out,
+    uint32_t nx, uint32_t ny, uint32_t nz, uint32_t tiles,
+    JceCloudBakeProgressFn progress, void *user)
+{
+    uint32_t width, height;
+    if (!out || !jce_cloud_noise_atlas_size(nx, ny, nz, tiles, &width, &height)) return false;
+    JceCloudNoiseParams sp;
+    cloud_sanitize(p, &sp);
+    memset(out, 0, (size_t)width * height * 2u * sizeof(float));
+    if (progress && !progress(user, 0u, nz)) return false;
+    for (uint32_t z = 0; z < nz; ++z) {
+        const float zz = ((float)z + 0.5f) / (float)nz * sp.period_z;
+        for (uint32_t x = 0; x < nx; ++x) {
+            const float xx = ((float)x + 0.5f) / (float)nx * sp.period_x;
+            JceCloudWeather weather;
+            cloud_weather_sample_s(&sp, xx, zz, &weather);
+            float u, w;
+            cloud_shape_xz(&sp, xx, zz, &u, &w);
+            for (uint32_t y = 0; y < ny; ++y) {
+                const float h = ((float)y + 0.5f) / (float)ny;
+                const size_t index = ((size_t)(z / tiles * ny + y) * width + z % tiles * nx + x) * 2u;
+                out[index] = cloud_shape_uvw(&sp, u, h, w, h,
+                    weather.coverage, weather.cloud_type, weather.precipitation, &out[index + 1u]);
+            }
+        }
+        if (progress && !progress(user, z + 1u, nz)) return false;
+    }
+    return true;
+}
+
+bool jce_cloud_detail_bake_atlas_controlled(const JceCloudNoiseParams *p, float *out,
+    uint32_t dim, uint32_t tiles, JceCloudBakeProgressFn progress, void *user)
+{
+    uint32_t width, height;
+    if (!out || !jce_cloud_noise_atlas_size(dim, dim, dim, tiles, &width, &height)) return false;
+    JceCloudNoiseParams sp;
+    cloud_sanitize(p, &sp);
+    memset(out, 0, (size_t)width * height * sizeof(float));
+    if (progress && !progress(user, 0u, dim)) return false;
+    for (uint32_t z = 0; z < dim; ++z) {
+        for (uint32_t y = 0; y < dim; ++y) {
+            for (uint32_t x = 0; x < dim; ++x) {
+                const float step = JCE_CLOUD_DETAIL_PERIOD_METRES / (float)dim;
+                const size_t index = (size_t)(z / tiles * dim + y) * width + z % tiles * dim + x;
+                out[index] = jce_cloud_detail_sample_prepared(&sp,
+                    ((float)x + 0.5f) * step, ((float)y + 0.5f) * step, ((float)z + 0.5f) * step);
+            }
+        }
+        if (progress && !progress(user, z + 1u, dim)) return false;
+    }
+    return true;
+}
+
+/* The split renderer uses a fixed three-octave spectrum. Separate UNORM8
+ * channels preserve coarse variation when a ray cannot resolve fine erosion,
+ * within the same four bytes per voxel as the old combined R32F field. */
+bool jce_cloud_detail_bake_bands_controlled(const JceCloudNoiseParams *p, uint8_t *out,
+    uint32_t dim, uint32_t tiles, JceCloudBakeProgressFn progress, void *user)
+{
+    uint32_t width, height;
+    if (!out || !jce_cloud_noise_atlas_size(dim, dim, dim, tiles, &width, &height)) return false;
+    JceCloudNoiseParams sp;
+    cloud_sanitize(p, &sp);
+    /* The shader's band wavelengths and weights must match exactly. Other
+     * spectra retain the complete scalar density fallback. */
+    if (sp.detail_freq != 48.0f || sp.detail_octaves != 3 ||
+        sp.lacunarity != 2.0f || sp.gain != 0.5f) return false;
+    memset(out, 0, (size_t)width * height * 4u);
+    if (progress && !progress(user, 0u, dim)) return false;
+    for (uint32_t z = 0; z < dim; ++z) {
+        for (uint32_t y = 0; y < dim; ++y) {
+            for (uint32_t x = 0; x < dim; ++x) {
+                const size_t index = ((size_t)(z / tiles * dim + y) * width + z % tiles * dim + x) * 4u;
+                for (uint32_t o = 0u; o < 3u; ++o) {
+                    const uint32_t cells = 6u << o;
+                    const float step = (float)cells / (float)dim;
+                    const float distance = cloud_worley3(((float)x + 0.5f) * step,
+                        ((float)y + 0.5f) * step, ((float)z + 0.5f) * step,
+                        cells, sp.seed ^ CLOUD_SALT_DETAIL ^ (o * 0x9e3779b1u));
+                    out[index + o] = (uint8_t)(cloud_clamp01(distance) * 255.0f + 0.5f);
+                }
+                out[index + 3u] = 255u;
+            }
+        }
+        if (progress && !progress(user, z + 1u, dim)) return false;
     }
     return true;
 }

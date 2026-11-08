@@ -1,5 +1,5 @@
 /*
- * jce_scene_pick.h  GPU object-ID scene picking.
+ * jce_scene_pick.h  GPU object-ID and CPU model ray picking.
  *
  * Renders selectable scene geometry into an offscreen ID buffer and reads
  * back the clicked pixel asynchronously.  The GPU depth test decides the
@@ -47,6 +47,21 @@ typedef struct JceScenePickResult {
 } JceScenePickResult;
 
 JCE_API bool jce_scene_pick_supported(void);
+
+typedef enum JceSceneRayPickResult {
+    JCE_SCENE_RAY_PICK_UNAVAILABLE = 0,
+    JCE_SCENE_RAY_PICK_MISS,
+    JCE_SCENE_RAY_PICK_HIT
+} JceSceneRayPickResult;
+
+/* Test the loaded model for one entity against origin + direction * t over
+ * [0, max_t). The scene renderer supplies its current pose and asset cache.
+ * HIT alone writes out_t. MISS is authoritative for this query and must not
+ * be replaced by an AABB hit. UNAVAILABLE means the entity uses another
+ * geometry provider or lacks retained CPU data. No GPU readback is needed. */
+JCE_API JceSceneRayPickResult jce_scene_pick_model_ray(
+    JceSceneRenderer *sr, JceScene *scene, uint64_t entity,
+    jce_vec3 origin, jce_vec3 direction, float max_t, float *out_t);
 
 JCE_API JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc);
 JCE_API void              jce_scene_pick_destroy(JceScenePickPass *pass);

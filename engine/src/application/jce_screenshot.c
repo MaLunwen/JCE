@@ -40,10 +40,12 @@ static bool screenshot_schedule_fail(JceScreenshotSchedule *out,
 
 bool jce_screenshot_save(const char *path, JceScreenshotFormat format)
 {
-    /* Output format is selected by the file extension (.png default, .bmp);
-     * the enum is advisory for now. */
-    (void)format;
-    if (!path || !path[0])
+    /* This utility currently supports PNG only. The lower renderer also has
+     * an extension-selected BMP path; never accept it as requested PNG. */
+    if (!path || !path[0] || format != JCE_SCREENSHOT_PNG)
+        return false;
+    const char *extension = strrchr(path, '.');
+    if (extension && jce_strcasecmp(extension, ".bmp") == 0)
         return false;
     return jce_renderer_request_screenshot(path);
 }
@@ -59,6 +61,11 @@ void jce_screenshot_capture(JceScreenshotCallback cb, void *userdata)
 bool jce_screenshot_pending(void)
 {
     return jce_renderer_screenshot_pending();
+}
+
+int jce_screenshot_poll(void)
+{
+    return jce_renderer_screenshot_poll();
 }
 
 bool JCE_CALL jce_screenshot_schedule_parse(

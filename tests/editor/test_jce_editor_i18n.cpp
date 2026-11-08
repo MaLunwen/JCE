@@ -1,8 +1,7 @@
 // test_jce_editor_i18n.cpp — pure paths of the editor i18n facade.
 //
-// We do NOT initialize the i18n system here (that requires loading a
-// real PAK archive).  Instead we verify the uninitialized-state contract
-// every translated call must honour:
+// Verify the uninitialized-state contract and use a small in-memory PAK
+// for the compact catalog and cross-locale query paths:
 //
 //   * jce_editor_i18n(key)          -> returns key unchanged
 //   * jce_editor_i18n_or(key, fb)   -> returns fb (never key)
@@ -19,6 +18,8 @@
 #include <doctest.h>
 
 #include "core/jce_editor_i18n.h"
+#include <jce/os/core/jce_alloc.h>
+#include <jce/resource/jce_archive_writer.h>
 
 #include <cstring>
 
@@ -117,4 +118,77 @@ TEST_CASE("shutdown is safe to call without init")
     /* And idempotent. */
     jce_editor_i18n_shutdown();
     CHECK(true);
+}
+
+TEST_CASE("installed labels and qualified keys are searchable across locales")
+{
+    struct Fixture {
+        JceArchiveWriter *writer = nullptr;
+        void *blob = nullptr;
+        JcePakArchive *pak = nullptr;
+        ~Fixture()
+        {
+            jce_editor_i18n_shutdown();
+            if (pak) jce_pak_close(pak);
+            if (blob) jce_free(blob);
+            if (writer) jce_archive_writer_destroy(writer);
+        }
+    } fixture;
+
+    const char en[] = R"({"panel.project_settings.tab.project":"Project","menu.file":"File","menu.file":"Duplicate","command.publish":"Publish"})";
+    const char fr[] = R"({"_meta.nativeName":"French","panel.project_settings.tab.project":"Projet","command.publish":"Publier {menu.file}","menu.file":"Fichier"})";
+    const char zh[] = R"({"panel.project_settings.tab.project":"\u9879\u76ee","panel.project_settings.tab.build":"\u6784\u5efa","command.publish":"\u53d1\u5e03"})";
+    JceArchiveWriterConfig config = {};
+    config.emit_debug_paths = true;
+    fixture.writer = jce_archive_writer_create(&config);
+    REQUIRE(fixture.writer);
+    REQUIRE(jce_archive_writer_add(fixture.writer, "i18n/en.json", en, sizeof en - 1));
+    REQUIRE(jce_archive_writer_add(fixture.writer, "i18n/fr.json", fr, sizeof fr - 1));
+    REQUIRE(jce_archive_writer_add(fixture.writer, "i18n/zh_cn.json", zh, sizeof zh - 1));
+    size_t bytes = 0;
+    REQUIRE(jce_archive_writer_finish(fixture.writer, &fixture.blob, &bytes));
+    fixture.pak = jce_pak_open(fixture.blob, bytes);
+    REQUIRE(fixture.pak);
+    REQUIRE(jce_editor_i18n_init(fixture.pak));
+
+    const char *key = "panel.project_settings.tab.project";
+    const JceLocale fr_locale = jce_editor_i18n_locale_from_code("fr");
+    const JceLocale zh_locale = jce_editor_i18n_locale_from_code("zh_cn");
+    CHECK(jce_editor_i18n_locale_count() == 3);
+    CHECK(jce_editor_i18n_get_locale() == JCE_LOCALE_EN);
+    CHECK(std::strcmp(jce_editor_i18n_locale_native_name(fr_locale), "French") == 0);
+
+    JceLocale matched = JCE_LOCALE_INVALID;
+    CHECK(jce_editor_i18n_search_match(key, "Project", "Pro", &matched));
+    CHECK(matched == JCE_LOCALE_INVALID);
+    CHECK(jce_editor_i18n_search_match(key, nullptr, "panel.project_settings.tab.PRO", &matched));
+    CHECK(matched == JCE_LOCALE_INVALID);
+    CHECK_FALSE(jce_editor_i18n_search_match(key, nullptr, "panel.project_settings.tab.", &matched));
+    CHECK_FALSE(jce_editor_i18n_search_match(key, nullptr, "panel.project_settings", &matched));
+    CHECK_FALSE(jce_editor_i18n_search_match(key, nullptr, "panel.pro", &matched));
+    CHECK(jce_editor_i18n_search_match(key, nullptr, "projet", &matched));
+    CHECK(matched == fr_locale);
+    CHECK(jce_editor_i18n_search_match(key, nullptr, "\xe9\xa1\xb9\xe7\x9b\xae", &matched));
+    CHECK(matched == zh_locale);
+    CHECK(jce_editor_i18n_search_match("command.publish", nullptr, "Publier Fichier", &matched));
+    CHECK(matched == fr_locale);
+    CHECK(jce_editor_i18n_search_match("command.publish", nullptr, "\xe5\x8f\x91\xe5\xb8\x83", &matched));
+    CHECK(matched == zh_locale);
+    CHECK(jce_editor_i18n_get_locale() == JCE_LOCALE_EN);
+    CHECK(jce_editor_i18n_search_match("missing.key", "Custom Label", "CUSTOM", &matched));
+    CHECK(matched == JCE_LOCALE_INVALID);
+    CHECK_FALSE(jce_editor_i18n_search_match("missing.key", nullptr, "custom", &matched));
+    CHECK(jce_editor_i18n_search_match(nullptr, nullptr, "", &matched));
+    CHECK(matched == JCE_LOCALE_INVALID);
+
+    const char *file_en = jce_editor_i18n_lookup_locale(JCE_LOCALE_EN, "menu.file");
+    REQUIRE(file_en);
+    CHECK(std::strcmp(file_en, "File") == 0);
+    CHECK(jce_editor_i18n_lookup_locale(JCE_LOCALE_INVALID, key) == nullptr);
+    CHECK(jce_editor_i18n_lookup_locale(zh_locale, "menu.file") == nullptr);
+    jce_editor_i18n_set_locale(zh_locale);
+    CHECK(std::strcmp(jce_editor_i18n("menu.file"), file_en) == 0);
+    CHECK(jce_editor_i18n_search_match(key, nullptr, "projet", &matched));
+    CHECK(matched == fr_locale);
+    CHECK(jce_editor_i18n_get_locale() == zh_locale);
 }

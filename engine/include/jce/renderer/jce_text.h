@@ -23,9 +23,10 @@ typedef struct JcePakArchive  JcePakArchive;
 
 /* Lifetime / ownership notes
  * ---------------------------
- *  - JceFont owns its glyph atlas texture and an internal copy of the
- *    decompressed TTF byte buffer; callers must not free the PAK entry
- *    on the font's behalf.
+ *  - JceFont owns its glyph atlas/face and a reference to internal immutable
+ *    source bytes. Equal live byte contents may share storage; each face,
+ *    size, SDF and shaping state remains independent. The last font closes
+ *    that byte storage; callers must not free it on the font's behalf.
  *  - Font instances are not thread-safe; create/draw/close on one
  *    thread (typically the render thread).
  *  - FreeType / HarfBuzz are private implementation details: no

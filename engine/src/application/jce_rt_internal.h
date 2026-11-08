@@ -155,6 +155,9 @@ typedef struct {
 	JceEntity entity;
 	JceSound  sound;
 	JceVoice  voice;
+	/* Full-generation handle paused by the runtime host in this episode.
+	 * INVALID means the voice was already paused, ended, or not owned here. */
+	JceVoice  paused_by_runtime;
 	bool      spatial;
 	float     base_volume;   /* authored volume; occlusion scales it each frame */
 	char      bus[32];       /* mixer bus name this voice is routed to */
@@ -697,6 +700,8 @@ struct JceRuntime {
 
 	JceRuntimeInput  input;
 	float pointer_xywh[4];  /* viewport-local frame sample; zero size is invalid */
+	float viewport_wh[2]; /* host presentation; independent of frame input */
+	bool viewport_invalid_reported;
 	const JceInputActions *actions;  /* borrowed: live action map for script name queries */
 
 	/* Fixed-timestep accumulator driving physics on a stable cadence,
@@ -1279,6 +1284,10 @@ void        rt_audio_poll(JceRuntime *rt);
  * Both are no-ops when the host supplied no asset_fs (the editor drives its
  * own streamer, which additionally mirrors into the hierarchy). */
 void rt_input_expire_frame_sample(JceRuntime *rt);
+bool rt_viewport_initialize(JceRuntime *rt, struct JcePlatformServices *services,
+    const JceRuntimeCreateOptions *options, size_t options_size);
+void rt_script_viewport_size(void *user, float out_wh[2]);
+void rt_script_viewport_changed(JceRuntime *rt);
 void rt_drive_character(JceRuntime *rt, float dt);
 bool rt_character_try_spawn(JceRuntime *rt, JceScene *scene, JceEntity e,
                             const JceTransform *tf);

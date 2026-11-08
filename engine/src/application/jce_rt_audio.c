@@ -10,6 +10,8 @@
  */
 
 #include "jce_rt_internal.h"
+#include "os/core/jce_trace_scope_internal.h"
+#include <jce/os/core/jce_hash.h>
 #include <math.h>
 
 JceSound rt_load_sound(JceRuntime *rt, const char *path)
@@ -86,57 +88,108 @@ static void rt_mixer_seed_default(JceAudioMixer *m)
 	jce_audio_mixer_add_bus(m, JCE_AUDIO_BUS_MASTER, "UI",    1.0f);
 }
 
-/* Read audio_mixer.json into a heap buffer (caller frees with
- * jce_fs_buffer_free).  Returns NULL on miss / over-size; *out_size set to the
- * byte length.  Shared by the device-free bus/sends/sidechain/snapshot apply
- * and the device-gated effect-attach pass so the file is read once. */
+typedef enum {
+    RT_MIXER_SOURCE_DEFAULTS, RT_MIXER_SOURCE_READ_SERVICE, RT_MIXER_SOURCE_PAK
+} RtMixerSource;
+typedef enum {
+    RT_MIXER_MISSING, RT_MIXER_LOADED, RT_MIXER_READ_FAILED,
+    RT_MIXER_SIZE_INVALID, RT_MIXER_ALLOC_FAILED, RT_MIXER_DECODE_FAILED,
+    RT_MIXER_PARSE_INVALID, RT_MIXER_LOADED_AFTER_READ_FAILURE
+} RtMixerOutcome;
+typedef struct {
+    RtMixerSource source;
+    RtMixerOutcome outcome;
+    JceFsPresence presence;
+    bool explicit_path, read_attempted, read_failed;
+} RtMixerConfigObservation;
+
+/* A missing optional DEFAULT is metadata, not a fabricated failed file read.
+ * UNKNOWN must still ask the real source service, including custom readers.
+ * Explicit requests retain their old read/fallback behavior regardless of probe. */
 static char *rt_mixer_read_config(const JceRuntime *rt, const char *path,
-                                  uint64_t *out_size)
+                                  uint64_t *out_size, RtMixerConfigObservation *observation)
 {
-	if (out_size) *out_size = 0;
+    if (out_size) *out_size = 0;
+    observation->explicit_path = path && path[0];
+    if (!observation->explicit_path) path = "Settings/audio_mixer.json";
+    observation->presence = observation->explicit_path ? JCE_FS_PRESENCE_UNKNOWN
+                                                      : jce_fs_probe_read(path);
+    if (observation->explicit_path || observation->presence != JCE_FS_PRESENCE_ABSENT) {
+        observation->source = RT_MIXER_SOURCE_READ_SERVICE;
+        observation->read_attempted = true;
+        uint64_t size = 0;
+        char *raw = (char *)jce_fs_host_read_all(path, &size);
+        if (raw) {
+            if (!size || size > (1u << 20)) {
+                jce_fs_buffer_free(raw);
+                observation->outcome = RT_MIXER_SIZE_INVALID;
+                return NULL;
+            }
+            if (out_size) *out_size = size;
+            observation->outcome = RT_MIXER_LOADED;
+            return raw;
+        }
+        observation->read_failed = true;
+        observation->outcome = RT_MIXER_READ_FAILED;
+    }
 
-	/* A NULL path is the SHIPPED case, not "no config".  jce_default_main
-	 * only sets JceRuntimeDesc.mixer_config_path when the file exists ON THE
-	 * HOST -- so in a single-file exe, where the config is inside the PAK and
-	 * not on disk, the path arrives NULL and an early return here would make
-	 * the PAK branch below unreachable in exactly the configuration it exists
-	 * for.  Falling back to the cooked location lets the archive be asked.
-	 * Fixed HERE rather than at the caller because the runtime owns where its
-	 * own config lives, and the caller only knows what it could stat. */
-	if (!path || !path[0]) path = "Settings/audio_mixer.json";
+    /* Direct runtime PAK fallback is separate from the active read service.
+     * Probe its actual asset, without opening a knowingly missing host file. */
+    if (!rt || !rt->pak) return NULL;
+    const JcePakAsset *asset = jce_pak_find(rt->pak, path);
+    if (!asset) return NULL;
+    observation->source = RT_MIXER_SOURCE_PAK;
+    if (!asset->original_size || asset->original_size > (1u << 20)) {
+        observation->outcome = RT_MIXER_SIZE_INVALID;
+        return NULL;
+    }
+    char *buffer = jce_malloc((size_t)asset->original_size);
+    if (!buffer) { observation->outcome = RT_MIXER_ALLOC_FAILED; return NULL; }
+    const size_t bytes = jce_pak_decompress(asset, buffer, (size_t)asset->original_size);
+    if (bytes != (size_t)asset->original_size) {
+        jce_free(buffer);
+        observation->outcome = RT_MIXER_DECODE_FAILED;
+        return NULL;
+    }
+    if (out_size) *out_size = (uint64_t)bytes;
+    observation->outcome = observation->read_failed ? RT_MIXER_LOADED_AFTER_READ_FAILURE : RT_MIXER_LOADED;
+    return buffer;
+}
 
-	/* Editor / dev: the live file on the host filesystem. */
-	uint64_t size = 0;
-	char *raw = (char *)jce_fs_host_read_all(path, &size);
-	if (raw) {
-		if (size > (1u << 20)) { jce_fs_buffer_free(raw); return NULL; }
-		if (out_size) *out_size = size;
-		return raw;
-	}
-
-	/* SHIPPED: the cooked copy inside the mounted PAK.  Without this a
-	 * single-file exe read nothing here and fell back to the default bus
-	 * tree -- no insert effects, and no aux sends either, both authored and
-	 * both silently absent in the only build a player ever runs.  Host first
-	 * so an editor edit stays live; PAK second so a packaged game finds it.
-	 * Same order and same reason as rt_script_read_file. */
-	if (!rt || !rt->pak) return NULL;
-	const JcePakAsset *a = jce_pak_find(rt->pak, path);
-	if (!a || a->original_size == 0 || a->original_size > (1u << 20))
-		return NULL;
-	/* The caller frees this with jce_fs_buffer_free, which is JCE_FREE, and
-	 * the host branch above allocates with JCE_MALLOC inside
-	 * jce_fs_host_read_all -- so both branches must hand back a pointer that
-	 * same free accepts.  jce_malloc/jce_free are those macros verbatim
-	 * (jce_alloc.c:9-22 is `return JCE_MALLOC(size);` and `JCE_FREE(ptr)`),
-	 * so the public pair is exact AND keeps the internal
-	 * engine/src/os/core/jce_memory.h out of the application layer. */
-	char *pbuf = (char *)jce_malloc((size_t)a->original_size);
-	if (!pbuf) return NULL;
-	size_t n = jce_pak_decompress(a, pbuf, (size_t)a->original_size);
-	if (n == 0) { jce_free(pbuf); return NULL; }
-	if (out_size) *out_size = (uint64_t)n;
-	return pbuf;
+static void rt_mixer_observe(JceTraceScope scope, const RtMixerConfigObservation *observation,
+                              const char *path, bool applied, bool default_seeded)
+{
+    const RtMixerSource selected = applied ? observation->source : RT_MIXER_SOURCE_DEFAULTS;
+    const bool succeeded = (applied || (default_seeded && observation->outcome == RT_MIXER_MISSING)) &&
+                           !observation->read_failed;
+    if (scope.id) {
+        const uint64_t hash = jce_fnv1a64_str(path && path[0] ? path : "Settings/audio_mixer.json");
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.path_hash_hi",
+            (int64_t)(uint32_t)(hash >> 32), scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.path_hash_lo",
+            (int64_t)(uint32_t)hash, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.source", selected, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.attempted_source", observation->source, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.outcome", observation->outcome, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.presence", observation->presence, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.explicit", observation->explicit_path, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.read_attempted", observation->read_attempted, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.read_failed", observation->read_failed, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.applied", applied, scope.id, scope.parent);
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_CORE, "runtime.mixer.default_seeded", default_seeded, scope.id, scope.parent);
+    }
+    static const char *const sources[] = {"defaults", "read-service", "pak"};
+    static const char *const outcomes[] = {"optional-absent", "loaded", "read-failed", "invalid-size",
+        "allocation-failed", "decode-failed", "invalid-config", "loaded-after-read-failure"};
+    if (succeeded)
+        LOG_INFO(LOG_TAG, "audio mixer source=%s attempted=%s outcome=%s probe=%d explicit=%d read_failed=%d",
+            sources[selected], sources[observation->source], outcomes[observation->outcome],
+            observation->presence, observation->explicit_path, observation->read_failed);
+    else
+        LOG_WARN(LOG_TAG, "audio mixer source=%s attempted=%s outcome=%s probe=%d explicit=%d read_failed=%d",
+            sources[selected], sources[observation->source], outcomes[observation->outcome],
+            observation->presence, observation->explicit_path, observation->read_failed);
+    jce_trace_scope_end(scope, succeeded ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
 }
 
 /* Device-gated effect-attach callback: each authored insert effect for a bus is
@@ -171,15 +224,22 @@ static void rt_mixer_attach_effect_cb(const char *bus_name,
 void rt_init_mixer(JceRuntime *rt, const char *config_path)
 {
 	if (!rt->audio) return;
+	JceTraceScope scope = jce_trace_scope_begin("runtime.mixer.configure");
+	RtMixerConfigObservation observation = {0};
 	rt->mixer = jce_audio_mixer_create();
-	if (!rt->mixer) return;
+	if (!rt->mixer) {
+		observation.outcome = RT_MIXER_ALLOC_FAILED;
+		rt_mixer_observe(scope, &observation, config_path, false, false);
+		return;
+	}
 
 	uint64_t cfg_size = 0;
-	char *cfg = rt_mixer_read_config(rt, config_path, &cfg_size);
+	char *cfg = rt_mixer_read_config(rt, config_path, &cfg_size, &observation);
 
 	/* 1. Device-free: bus tree + sends + sidechain + snapshots. */
 	bool applied = cfg && jce_audio_mixer_apply_config(rt->mixer, cfg,
 	                                                   (size_t)cfg_size);
+	if (cfg && !applied) observation.outcome = RT_MIXER_PARSE_INVALID;
 	if (!applied)
 		rt_mixer_seed_default(rt->mixer);
 
@@ -223,6 +283,7 @@ void rt_init_mixer(JceRuntime *rt, const char *config_path)
 		                                   rt_mixer_attach_effect_cb, rt);
 
 	if (cfg) jce_fs_buffer_free(cfg);
+	rt_mixer_observe(scope, &observation, config_path, applied, !applied);
 }
 
 /* Pick the mixer bus for an AudioSource.  No bus field exists on the
@@ -942,6 +1003,7 @@ void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
     rt->voices[rt->voice_count].entity      = e;
     rt->voices[rt->voice_count].sound       = snd;
     rt->voices[rt->voice_count].voice       = v;
+    rt->voices[rt->voice_count].paused_by_runtime = JCE_VOICE_INVALID;
     rt->voices[rt->voice_count].spatial     = spatial;
     rt->voices[rt->voice_count].base_volume = vol;
     rt->voices[rt->voice_count].bus[0]      = '\0';
@@ -1116,11 +1178,12 @@ void rt_audio_poll(JceRuntime *rt)
             continue;
         }
 
-        /* Re-fetch the component at play time (the entity may have moved /
-         * been disabled in the 1-2 frames since spawn). */
+        /* Re-fetch the full entity binding at play time. Stop disarms its
+         * intent, and an edited clip must not consume the previous decode. */
         JceAudioSourceComponent *as =
-            jce_scene_get_audio_source(rt->scene, p->entity);
-        if (as &&
+            p->entity != JCE_ENTITY_INVALID
+                ? jce_scene_get_audio_source(rt->scene, p->entity) : NULL;
+        if (as && strcmp(as->clip_path, p->args->path) == 0 &&
             jce_scene_component_enabled(rt->scene, p->entity,
                                         JCE_COMP_FLAG_AUDIO_SOURCE) &&
             jce_async_task_state(p->task) == JCE_ASYNC_STATE_SUCCEEDED &&
@@ -1205,14 +1268,14 @@ bool rt_audio_source_start(JceRuntime *rt, JceScene *scene, JceEntity e)
     return true;
 }
 
-/* Stop and forget every voice this entity's AudioSource started.
+/* Stop every voice and pending play intent this AudioSource started.
  *
  * The sound is unloaded with the voice: rt->voices owns the decoded clip (the
  * spawn path uploads one per start), so leaving it would leak a buffer per
  * retrigger -- and a retriggerable source is exactly what this API is for. */
 static int rt_audio_stop_entity(JceRuntime *rt, JceEntity e)
 {
-    if (!rt || !rt->audio) return 0;
+    if (!rt || !rt->audio || e == JCE_ENTITY_INVALID) return 0;
     int w = 0, stopped = 0;
     for (int i = 0; i < rt->voice_count; ++i) {
         if (rt->voices[i].entity == e) {
@@ -1225,6 +1288,28 @@ static int rt_audio_stop_entity(JceRuntime *rt, JceEntity e)
         w++;
     }
     rt->voice_count = w;
+
+    w = 0;
+    for (int i = 0; i < rt->pending_audio_count; ++i) {
+        RtPendingAudio *p = &rt->pending_audio[i];
+        if (p->entity == e) {
+            ++stopped;
+            if (!p->task) {
+                /* No executor borrowed these args: remove the queued intent. */
+                if (p->args) jce_audio_cpu_free(p->args->cpu);
+                jce_free(p->args);
+                continue;
+            }
+            /* Cancellation is a request, not a borrow-retirement barrier.
+             * Disarm even an already successful task before the next poll,
+             * retaining its args/result until terminal poll or scene teardown. */
+            p->entity = JCE_ENTITY_INVALID;
+            (void)jce_async_task_cancel(p->task);
+        }
+        if (w != i) rt->pending_audio[w] = *p;
+        ++w;
+    }
+    rt->pending_audio_count = w;
     return stopped;
 }
 

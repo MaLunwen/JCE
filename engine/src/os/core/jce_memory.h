@@ -55,6 +55,9 @@ void  jce__free_tracked(void *ptr);
  * `requested` is the size asked for; the live-byte tracker uses the
  * allocator's usable size instead. NULL is a no-op in both hooks. Call
  * the free hook BEFORE releasing the block, while the pointer is valid.
+ * Shared counters use allocation-free native-word atomics; observations are
+ * individually safe, not a globally consistent snapshot, and wrap at size_t.
+ * jce_alloc_frame_delta has one consumer thread owning its last-read baseline.
  */
 void jce__alloc_account_alloc(void *ptr, size_t requested);
 void jce__alloc_account_free(void *ptr);

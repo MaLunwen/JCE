@@ -12,6 +12,9 @@
 #include <jce/os/core/jce_trace.h>
 
 #include "jce_memory.h"
+#include "jce_enki_trace_internal.h"
+#include "jce_thread_session_internal.h"
+#include "os/core/jce_worker_budget_internal.h"
 
 #include <enkiTS/TaskScheduler_c.h>
 #include <SDL3/SDL.h>
@@ -197,9 +200,8 @@ void jce_tls_set(JceTLS *tls, void *value)
 /* sequentially consistent.                                            */
 /* ================================================================== */
 
-struct JceAtomicI32 {
-    SDL_AtomicInt v;
-};
+/* Shared private storage keeps embedded service flags on this same owner. */
+#include "jce_atomic_storage.h"
 
 JceAtomicI32 *jce_atomic_i32_create(int32_t initial)
 {
@@ -508,10 +510,10 @@ JceThreadPool *jce_thread_pool_create_named(int num_threads,
     num_threads = 1;
 #endif
 
-    if (num_threads <= 0)
-        enkiInitTaskScheduler(pool->scheduler);          /* auto-detect */
-    else
-        enkiInitTaskSchedulerNumThreads(pool->scheduler, (uint32_t)num_threads);
+    struct enkiTaskSchedulerConfig config = enkiGetTaskSchedulerConfig(pool->scheduler);
+    if (num_threads > 0) config.numTaskThreadsToCreate = (uint32_t)num_threads - 1;
+    config.profilerCallbacks.threadStop = jce_enki_trace_worker_stop;
+    enkiInitTaskSchedulerWithConfig(pool->scheduler, config);
 
     pool->pending_head  = NULL;
     pool->pending_mutex = SDL_CreateMutex();
@@ -828,6 +830,8 @@ void jce_task_free(JceTask *task)
 static JceThreadPool *g_shared_pool;
 static int            g_shared_workers = -1;  /* <=0 = apply the auto formula */
 static SDL_AtomicInt  g_shared_lock;          /* zero-init = unlocked        */
+static bool           g_shared_closing;
+static bool           g_shared_session_closed;
 
 /* A spin lock rather than a JceMutex: this guards the *creation* of the one
    shared pool, so it must work before any engine object exists and cannot
@@ -844,6 +848,20 @@ static void shared_unlock(void)
     SDL_SetAtomicInt(&g_shared_lock, 0);
 }
 
+void jce_thread_pool_session_open_internal(void)
+{
+    shared_lock();
+    g_shared_session_closed = false;
+    shared_unlock();
+}
+
+void jce_thread_pool_session_close_internal(void)
+{
+    shared_lock();
+    g_shared_session_closed = true;
+    shared_unlock();
+}
+
 void jce_thread_pool_shared_set_workers(int workers)
 {
     shared_lock();
@@ -856,16 +874,25 @@ void jce_thread_pool_shared_set_workers(int workers)
    SDL-only on purpose: this layer must not reach into jce_config. */
 int jce_thread_pool_default_workers(void)
 {
-    int workers = SDL_GetNumLogicalCPUCores() - 1;
-    if (workers < 1) workers = 1;
-    if (workers > 8) workers = 8;
+    return jce_worker_budget_default(false, SDL_GetNumLogicalCPUCores());
+}
+
+/* The same pinned/default authority bounds private structured executors.
+ * A live pool retains its owned count; this read never creates one. */
+int jce_thread_pool_shared_worker_budget(void)
+{
+    shared_lock();
+    int workers = g_shared_pool ? g_shared_pool->worker_count : g_shared_workers;
+    if (workers < 0 || (!g_shared_pool && workers == 0))
+        workers = jce_thread_pool_default_workers();
+    shared_unlock();
     return workers;
 }
 
 JceThreadPool *jce_thread_pool_shared(void)
 {
     shared_lock();
-    if (!g_shared_pool) {
+    if (!g_shared_pool && !g_shared_closing && !g_shared_session_closed) {
         /* A pin from jce_thread_pool_shared_set_workers() (jce.ini
            [performance] job_workers, pushed by jce_config_publish_perf) wins
            over the house policy. */
@@ -876,7 +903,7 @@ JceThreadPool *jce_thread_pool_shared(void)
         g_shared_pool = jce_thread_pool_create_named(
             workers + 1, "jce-frame");
     }
-    JceThreadPool *p = g_shared_pool;
+    JceThreadPool *p = g_shared_closing ? NULL : g_shared_pool;
     shared_unlock();
     return p;
 }
@@ -884,12 +911,17 @@ JceThreadPool *jce_thread_pool_shared(void)
 void jce_thread_pool_shared_shutdown(void)
 {
     shared_lock();
+    if (g_shared_closing) { shared_unlock(); return; }
     JceThreadPool *p = g_shared_pool;
+    g_shared_closing = true;
     g_shared_pool    = NULL;
     g_shared_workers = -1;
     shared_unlock();
 
-    /* Outside the lock: destroy waits for every outstanding task and joins the
-       workers, and one of those tasks may call jce_thread_pool_shared(). */
+    /* Outside the lock: in-flight task lookup and recursive shutdown must see
+       closing instead of creating a replacement pool or joining themselves. */
     if (p) jce_thread_pool_destroy(p);
+    shared_lock();
+    g_shared_closing = false;
+    shared_unlock();
 }

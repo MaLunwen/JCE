@@ -642,6 +642,7 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
      * asset when the next frame reloaded it. jce_scene_clear() is the engine's
      * transactional-reload primitive: it removes user entities while retaining
      * the scene handle, component registry, and resource caches. */
+    jce_editor_scene_render_cancel_probe_capture();
     if (mutated) *mutated = true;
     g_entity_order.clear();
     ++g_entity_order_gen;

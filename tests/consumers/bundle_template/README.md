@@ -12,3 +12,8 @@ The project directory must be new. Build that emitted project with
 `scripts/jce.py app <project> --delivery-profile embedded --sdk <sdk>`.
 This console emitter creates no rendering window. Runtime graphics validation
 is separate and uses hidden windows and isolated output directories.
+
+The emitter declares a minimal empty startup scene so current DIST builds use
+the ordinary authenticated selected-content admission. This scene is fixture
+bootstrap content; it does not replace the explicit input Bundle or certify
+its rendering. Build against the matching installed SDK variant.

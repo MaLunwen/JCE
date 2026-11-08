@@ -19,6 +19,7 @@ extern "C" {
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_env.h>
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_read_source.h>

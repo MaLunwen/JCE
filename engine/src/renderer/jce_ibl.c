@@ -687,8 +687,9 @@ void jce_ibl_convolve_cube_specular_rgba16f(const uint16_t *src_faces,
                                             uint16_t *out_mipchain)
 {
     if (!src_faces || !out_mipchain || face_size == 0) return;
-    const uint32_t max_mip = ibl_prefilter_mip_count(face_size);
-    const size_t   words   = ibl_prefilter_words(face_size, max_mip);
+    const uint32_t max_mip = jce_ibl_cube_mip_count(face_size);
+    const size_t   words   = jce_ibl_cube_mipchain_bytes(face_size);
+    if (!max_mip || !words) return;
 
     /* mip 0 is roughness 0: the mirror reflection, copied verbatim so an HDR
      * probe's sharpest level is exactly what the capture read back. */
@@ -714,16 +715,34 @@ void jce_ibl_convolve_cube_specular_rgba16f(const uint16_t *src_faces,
     JCE_FREE(f32);
 }
 
+/* Probe containers require the complete chain through 1x1. The sky's
+ * independent eight-level prefilter budget above is not a wire format. */
+static uint32_t ibl_cube_chain_words(uint32_t face_size, uint32_t *out_mips)
+{
+    if (!face_size || face_size > UINT16_MAX) return 0u;
+    uint64_t words = 0u;
+    uint32_t mips = 0u;
+    for (uint32_t side = face_size; side; side >>= 1u) {
+        words += (uint64_t)side * side * 6u * 4u;
+        ++mips;
+    }
+    /* Shared convolution storage also allocates one float per element.
+     * Refuse before narrowing or copying when any owner cannot address it. */
+    if (words > UINT32_MAX || words > SIZE_MAX / sizeof(float)) return 0u;
+    if (out_mips) *out_mips = mips;
+    return (uint32_t)words;
+}
+
 uint32_t jce_ibl_cube_mip_count(uint32_t face_size)
 {
-    return face_size ? ibl_prefilter_mip_count(face_size) : 0u;
+    uint32_t mips = 0u;
+    (void)ibl_cube_chain_words(face_size, &mips);
+    return mips;
 }
 
 size_t jce_ibl_cube_mipchain_bytes(uint32_t face_size)
 {
-    if (!face_size) return 0u;
-    return (size_t)ibl_prefilter_words(face_size,
-                                       ibl_prefilter_mip_count(face_size));
+    return (size_t)ibl_cube_chain_words(face_size, NULL);
 }
 
 void jce_ibl_convolve_cube_specular_rgba8(const uint8_t *src_faces,
@@ -732,8 +751,9 @@ void jce_ibl_convolve_cube_specular_rgba8(const uint8_t *src_faces,
 {
     if (!src_faces || !out_mipchain || face_size == 0) return;
 
-    const uint32_t max_mip = ibl_prefilter_mip_count(face_size);
-    const uint32_t words   = ibl_prefilter_words(face_size, max_mip);
+    const uint32_t max_mip = jce_ibl_cube_mip_count(face_size);
+    const uint32_t words   = (uint32_t)jce_ibl_cube_mipchain_bytes(face_size);
+    if (!max_mip || !words) return;
 
     /* MIP 0 IS THE SOURCE, copied.  Roughness 0 is a mirror: the GGX lobe
      * collapses to the reflection direction, so integrating it can only

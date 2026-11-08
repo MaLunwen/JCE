@@ -35,6 +35,61 @@ def admits(expression, forwardplus, **options):
     return bool(eval(expression, {"__builtins__": {}}, values))
 
 
+def function(source, signature):
+    start = source.index(signature)
+    opening = source.index("{", start)
+    depth, end = 1, opening + 1
+    while depth:
+        depth += (source[end] == "{") - (source[end] == "}")
+        end += 1
+    return source[start:end]
+
+
+def assert_foliage_bind_chain(test, environment, draw, special, model):
+    """Check the actual source owners through each per-band submit."""
+    colour = function(draw, "void sr_draw_entities(")
+    arm = colour.index("jce_model_set_pre_submit_cb(sr_model_presubmit_cb, sr);")
+    submit = colour.index("sr_colour_special_submit_opaque(")
+    retire = colour.index("jce_model_set_pre_submit_cb(NULL, NULL);", submit)
+    test.assertLess(arm, submit)
+    test.assertLess(submit, retire)
+    dispatcher = function(special, "static void sr_colour_special_submit_opaque(")
+    test.assertIn("sr_draw_foliage(sr, scene, list, e, view_id, camera);", dispatcher)
+    foliage = function(environment, "void sr_draw_foliage(")
+    test.assertIn("sr_foliage_gpu_lod_cull_draw(sr, slot, mc->model", foliage)
+    adapter = function(environment, "static bool sr_foliage_gpu_lod_cull_draw(")
+    test.assertIn("jce_model_draw_foliage_lod_indirect(model, sr->renderer, view_id,", adapter)
+
+    setter = function(model, "void jce_model_set_pre_submit_cb(")
+    test.assertIn("s_pre_submit_cb   = cb;", setter)
+    test.assertIn("s_pre_submit_user = user;", setter)
+    owner = function(model, "void jce_model_draw_foliage_lod_indirect(")
+    band = function(owner, "for (uint32_t b = 0; b < band_count; ++b)")
+    material = band.index("jce_pbr_material_bind(mat, r, view_id);")
+    callback = band.index("s_pre_submit_cb(s_pre_submit_user, view_id);")
+    indirect = band.index("bgfx_submit_indirect(view_id, prog, indir, (uint16_t)b")
+    test.assertLess(material, callback)
+    test.assertLess(callback, indirect)
+    test.assertIn("BGFX_DISCARD_ALL", band[indirect:])
+
+    callback = function(draw, "static void sr_model_presubmit_cb(")
+    test.assertIn("sr_inline_bind_pbr_global(sr, NULL, view_id, NULL, NULL,", callback)
+    test.assertRegex(callback, r"if \(sr->fp_active_frame\)\s+"
+                     r"jce_forwardplus_bind\(sr->fp_storage.module\);")
+    test.assertLess(callback.index("sr_inline_bind_pbr_global("),
+                    callback.index("jce_forwardplus_bind("))
+
+
+def foliage_bind_sources():
+    scene = ROOT / "engine/src/middleware/scene"
+    return (
+        (scene / "jce_sr_environment.c").read_text(),
+        DRAW.read_text(),
+        (scene / "jce_sr_colour_special_internal.h").read_text(),
+        (ROOT / "engine/src/renderer/jce_model.c").read_text(),
+    )
+
+
 class ForwardPlusAdmissionTests(unittest.TestCase):
     def test_unsupported_tint_and_array_families_keep_ordinary_pbr_fallback(self):
         source = DRAW.read_text()
@@ -70,8 +125,20 @@ class ForwardPlusAdmissionTests(unittest.TestCase):
         self.assertIn("jce_renderer_get_program_pbr_inst(sr->renderer)", function)
         self.assertIn("const float fade_w = fade_prog ? s_fade : 0.0f", function)
         self.assertIn("s_step, bands, capb_real, fade_w", function)
-        self.assertIn("jce_forwardplus_bind(sr->forwardplus)", function)
         self.assertIn("jce_model_draw_foliage_lod_indirect", function)
+        assert_foliage_bind_chain(self, *foliage_bind_sources())
+
+    def test_missing_shared_foliage_callback_bind_fails_same_chain_checker(self):
+        environment, draw, special, model = foliage_bind_sources()
+        callback = function(draw, "static void sr_model_presubmit_cb(")
+        wire = "jce_forwardplus_bind(sr->fp_storage.module);"
+        self.assertEqual(callback.count(wire), 1)
+        mutant = callback.replace(wire, "(void)0;", 1)
+        self.assertEqual(draw.count(callback), 1)
+        assert_foliage_bind_chain(self, environment, draw, special, model)
+        with self.assertRaisesRegex(AssertionError, "jce_forwardplus_bind"):
+            assert_foliage_bind_chain(self, environment,
+                draw.replace(callback, mutant, 1), special, model)
 
     def test_tinted_model_batch_rejects_before_mutating_counts_or_allocating(self):
         source = DRAW.read_text()

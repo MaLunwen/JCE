@@ -295,6 +295,14 @@ void ensure_assets_init(void)
     }
 }
 
+void request_asset_resource_refresh(void)
+{
+    s_assets.needs_refresh = true;
+    if (!s_assets.project_root.empty() &&
+        !is_filesystem_root(s_assets.project_root.c_str()))
+        jce_asset_path_index_rebuild_async(s_assets.project_root.c_str());
+}
+
 void refresh_entries(void)
 {
     s_assets.entries.clear();
@@ -975,7 +983,7 @@ void jce_editor_panel_assets_content(void)
     if (now >= s_assets.next_auto_refresh_time) {
         s_assets.next_auto_refresh_time = now + 0.35;
         if (!s_assets.needs_refresh && directory_entries_changed())
-            s_assets.needs_refresh = true;
+            request_asset_resource_refresh();
     }
 
     if (s_assets.needs_refresh)

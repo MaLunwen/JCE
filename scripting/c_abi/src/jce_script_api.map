@@ -51,6 +51,7 @@
         jce_script_api_get_touch;
         jce_script_api_get_touch_count;
         jce_script_api_get_velocity;
+        jce_script_api_get_viewport_size;
         jce_script_api_get_world_position;
         jce_script_api_has_component;
         jce_script_api_is_action_down;

@@ -1,0 +1,12 @@
+{
+  "schema": 2,
+  "name": "render_liveness_lab",
+  "version": "0.1.0",
+  "target": "JceRenderLivenessLab",
+  "exe": "jce_render_liveness_lab.exe",
+  "assets": ["resources"],
+  "source_assets": "resources",
+  "cooked_assets": "resources/_cooked",
+  "variants": ["release"],
+  "required_languages": []
+}

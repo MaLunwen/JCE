@@ -16,6 +16,7 @@
 #include <jce/renderer/jce_decals.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_renderer_shader_profile_internal.h"
 #include "renderer/jce_shader_load.h"   /* backend suffix + engine-pak fallback */
 
 #include <bgfx/c99/bgfx.h>
@@ -57,6 +58,11 @@ struct JceDecalPool {
 JceDecalPool *jce_decals_create(const JceDecalPoolDesc *desc)
 {
     if (!desc || !desc->pak || desc->max_decals == 0) return NULL;
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    if (jce_renderer_shader_profile_compatibility(&api, bgfx_get_renderer_type())) {
+        LOG_WARN(LOG_TAG, "decal pool unsupported by compatibility GL/ES shader profile; authored data retained");
+        return NULL;
+    }
 
     const char *sfx = jce_shader_backend_suffix();
     if (!sfx) {
@@ -65,11 +71,15 @@ JceDecalPool *jce_decals_create(const JceDecalPoolDesc *desc)
     }
 
     JceDecalPool *pool = (JceDecalPool *)JCE_CALLOC(1, sizeof(JceDecalPool));
-    if (!pool) return NULL;
+    if (!pool) { LOG_ERROR(LOG_TAG, "decal pool allocation failed"); return NULL; }
+    pool->program.idx = pool->s_decal.idx = UINT16_MAX;
 
     pool->capacity = desc->max_decals < 16u ? 16u : desc->max_decals;
     pool->slots = (DecalSlot *)JCE_CALLOC(pool->capacity, sizeof(DecalSlot));
-    if (!pool->slots) { JCE_FREE(pool); return NULL; }
+    if (!pool->slots) {
+        LOG_ERROR(LOG_TAG, "decal slot allocation failed (capacity=%u)", pool->capacity);
+        JCE_FREE(pool); return NULL;
+    }
 
     /* Layout: vec3 pos + vec2 uv + vec4 colour. */
     bgfx_vertex_layout_begin(&pool->layout, BGFX_RENDERER_TYPE_NOOP);
@@ -87,7 +97,16 @@ JceDecalPool *jce_decals_create(const JceDecalPoolDesc *desc)
         return NULL;
     }
     pool->program = bgfx_create_program(vsh, fsh, true);
+    if (pool->program.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "decal program creation failed");
+        JCE_FREE(pool->slots); JCE_FREE(pool); return NULL;
+    }
     pool->s_decal = bgfx_create_uniform("s_decal", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    if (pool->s_decal.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "decal sampler creation failed");
+        bgfx_destroy_program(pool->program);
+        JCE_FREE(pool->slots); JCE_FREE(pool); return NULL;
+    }
 
     return pool;
 }

@@ -9,7 +9,8 @@
       "path": "render_settings.json",
       "bundle": "force-shared"
     },
-    "fonts/LXGWWenKai-Regular.ttf"
+    "scene_ai/elemental_catalog.json",
+    "scene_ai/bootstrap_recipes.json"
   ],
   "optional_assets": [
     "audio/musics/forest_dreams.mp3",

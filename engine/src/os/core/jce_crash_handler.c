@@ -77,6 +77,7 @@
   #include <windows.h>
   #include <shellapi.h>   /* ShellExecuteA: open the crash folder */
   #include <dbghelp.h>
+  #include "os/platform/jce_thread_description_native_internal.h"
   #pragma comment(lib, "dbghelp.lib")
   #pragma comment(lib, "shell32.lib")
 #endif
@@ -664,7 +665,8 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
     {
         DWORD tid = GetCurrentThreadId();
         PWSTR desc_w = NULL;
-        HRESULT hr = GetThreadDescription(GetCurrentThread(), &desc_w);
+        HRESULT hr = jce_native_get_thread_description_internal(
+            GetCurrentThread(), &desc_w);
         if (SUCCEEDED(hr) && desc_w && desc_w[0]) {
             char desc_a[64] = {0};
             WideCharToMultiByte(CP_UTF8, 0, desc_w, -1,

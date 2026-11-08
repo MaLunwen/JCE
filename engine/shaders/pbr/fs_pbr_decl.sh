@@ -45,6 +45,8 @@
  */
 
 #include <bgfx_shader.sh>
+
+// Internal matched native diagnostics only; generated stock entries keep mode zero.
 #include "pbr_common.sh"
 #include "fog_apply.sh"
 #include "shadow_debug.sh"
@@ -66,6 +68,8 @@ uniform vec4 u_ambientColor;    // xyz=ambient color, w=ambient intensity
 #ifdef JCE_TOON
 uniform vec4 u_toonParams;    // x=bands(2..4), y=ramp threshold/softness, z=rim power, w=rim intensity
 uniform vec4 u_toonRimColor;  // xyz=rim color (linear), w=pad
+uniform vec4 u_toonAtlas[2]; // [0] right.xyz/mode (0 legacy, 1 surface, 2 face), [1] forward.xyz/hair enabled
+uniform mat4 u_toonHairViewProj;
 #endif
 
 // ── Look Profile uniforms (stylized slice plan 02; consumed by plan 03/04) ──
@@ -115,6 +119,74 @@ SAMPLER2D(s_metalRough, 1);
 SAMPLER2D(s_normalMap,  2);
 SAMPLER2D(s_aoMap,      3);
 SAMPLER2D(s_emissive,   4);
+
+#ifdef JCE_TOON
+#include "screen_reconstruct.sh"
+
+float toon_hair_visibility(vec3 position, vec3 light_dir, float eye_depth)
+{
+    // Sample the camera projection that wrote the separate nearest-hair depth.
+    vec4 clip = mul(u_toonHairViewProj, vec4(position + light_dir * 0.075, 1.0));
+    if (clip.w <= 1e-4) return 1.0;
+    vec2 uv = jce_clip_to_uv(clip);
+    if (any(lessThan(uv, vec2_splat(0.0))) ||
+        any(greaterThan(uv, vec2_splat(1.0)))) return 1.0;
+    float caster = texture2DLod(s_metalRough, uv, 0.0).r;
+    if (caster <= 0.0) return 1.0;
+    float gap = eye_depth - caster;
+    return 1.0 - smoothstep(0.008, 0.027, gap) *
+        (1.0 - smoothstep(0.20, 0.34, gap));
+}
+
+// Four 64px regions with a one-texel replicated border in a linear 128px atlas.
+vec2 toon_atlas_uv(vec2 quadrant, vec2 uv)
+{
+    return quadrant * 0.5 + (clamp(uv, vec2_splat(0.0), vec2_splat(1.0)) * 61.0 + 1.5) / 128.0;
+}
+
+vec4 toon_atlas_sample(vec2 quadrant, vec2 uv)
+{
+    vec2 tile = toon_atlas_uv(quadrant, uv);
+#if BGFX_SHADER_LANGUAGE_HLSL
+    return texture2DLod(s_emissive, tile, 0.0);
+#else
+    return texture2D(s_emissive, tile);
+#endif
+}
+
+vec3 toon_ramp_color(float light_key, float ramp_mask)
+{
+    // RGB atlases read as A=255 and retain the original center row.
+    bool legacy_row = ramp_mask >= 254.5 / 255.0;
+    float row_y = legacy_row ? 0.5 : (floor(ramp_mask * 4.0) + 0.5) * 0.25;
+    vec2 uv = vec2(light_key, row_y);
+#if !BGFX_SHADER_LANGUAGE_HLSL
+    if (legacy_row) return toon_atlas_sample(vec2_splat(0.0), uv).rgb;
+#endif
+    // A discontinuous row index must not select mips that blend adjacent palettes.
+    return texture2DLod(s_emissive, toon_atlas_uv(vec2_splat(0.0), uv), 0.0).rgb;
+}
+
+float toon_body_glint(vec3 normal, vec3 view_dir, vec3 light_dir, float ndl)
+{
+    vec3 half_sum = view_dir + light_dir;
+    float ndh = dot(normal, half_sum) * inversesqrt(max(dot(half_sum, half_sum), 1e-6));
+    return 0.24 * smoothstep(0.86, 0.94, ndh) * smoothstep(0.0, 0.18, ndl);
+}
+
+float toon_face_direction(vec3 light_dir, vec2 uv, float ndl)
+{
+    vec2 planar = vec2(dot(light_dir, u_toonAtlas[0].xyz), dot(light_dir, u_toonAtlas[1].xyz));
+    float len2 = dot(planar, planar);
+    if (len2 <= 1e-6) return ndl;
+    float forward = planar.y * inversesqrt(len2);
+    uv.x = mix(1.0 - uv.x, uv.x, step(0.0, planar.x));
+    float sdf = toon_atlas_sample(vec2(1.0, 0.0), uv).r;
+    float angle = 0.5 + 0.5 * forward;
+    float directional = smoothstep(sdf - 0.035, sdf + 0.035, angle);
+    return mix(ndl, directional, smoothstep(1e-6, 0.0025, len2));
+}
+#endif
 SAMPLER2D(s_shadowMap,  5);
 
 // Shadow uniforms
@@ -241,23 +313,14 @@ SAMPLER2D(s_csmShadow1, 10);
 SAMPLER2D(s_csmShadow2, 11);
 SAMPLER2D(s_csmShadow3, 12);
 
-// P3-E.5  — Light cookies + IES profiles (stages 13-14)
-// P3-E.5b — Directional light cookie projection (shares sampler 13).
-// Atlas slot index per-light is uploaded in u_dirLights[i*2+1].w and
-// u_spotLights[i*4+3].y; the CPU side currently single-binds the
-// first eligible cookie texture, but once s_cookie is promoted to
-// SAMPLER2DARRAY the per-light slot can drive texture2DArray sampling
-// with no further engine changes.  See engine/src/renderer/AGENTS.md.
-/* ALWAYS the array now.  Each light's atlas slot rides in
- * u_dirLights[i*2+1].w / u_spotLights[i*4+3].y, so every light samples its
- * OWN cookie instead of borrowing the one image a single 2D bind could carry.
- *
- * No permutation guards this, and that is checked rather than assumed: bgfx
- * rewrites the shader's #version to 140 on this engine's GL floor (3.1, the
- * lowest of the three graphics tiers in conan/hooks/hook_bgfx_wasm_fix.py)
- * and then emits `#define texture2DArray texture` -- so profile-120 source
- * compiles to valid GLSL 1.40.  See renderer_gl.cpp's OPENGL >= 31 branch. */
+// Compatibility GL/ES has no array cookie sampler. The runtime uses the
+// same shader-profile policy and leaves stage 13 unbound on that path.
+#ifndef JCE_SHADER_COMPATIBILITY
+#define JCE_SHADER_COMPATIBILITY 0
+#endif
+#if !JCE_SHADER_COMPATIBILITY
 SAMPLER2DARRAY(s_cookie, 13);
+#endif
 
 // ── Sampler stage 14: IES LUT (default) vs Forward+ cluster table ───────
 // The cookie (stage 13) stays in both programs.  Stage 14 is multiplexed:
@@ -390,7 +453,7 @@ float sampleAtlasTile(int slotIndex, mat4 vp, vec3 worldPos, vec3 N,
     // tier (ALU-only, it is the acne fix); only the 9-tap PCF is skipped.
     if (u_shadowQuality.x < 0.5) {
         vec2 t0 = clamp(inTile, vec2_splat(lo), vec2_splat(hi));
-        float d0 = texture2D(s_localShadowMap, tileOrigin + t0).r;
+        float d0 = texture2DLod(s_localShadowMap, tileOrigin + t0, 0.0).r;
         return ((curDepth - b) <= d0) ? 1.0 : 0.0;
     }
 
@@ -399,7 +462,7 @@ float sampleAtlasTile(int slotIndex, mat4 vp, vec3 worldPos, vec3 N,
         for (int ox = -1; ox <= 1; ox++) {
             vec2 t = clamp(inTile + vec2(float(ox), float(oy)) * texel,
                            vec2_splat(lo), vec2_splat(hi));
-            float d = texture2D(s_localShadowMap, tileOrigin + t).r;
+            float d = texture2DLod(s_localShadowMap, tileOrigin + t, 0.0).r;
             sum += ((curDepth - b) <= d) ? 1.0 : 0.0;
         }
     }
@@ -493,7 +556,7 @@ float csm_sample_depth(int cascade, vec2 uv)
     return texture2D(s_csmShadow3, uv).r;
 }
 
-// Needs csm_sample_depth (above) and u_shadowQuality / u_csmPenumbra.
+// Bias also consumes the shared cascade scale when blocker search is disabled.
 #include "pcss.sh"
 #include "shadow_bias.sh"
 
@@ -520,6 +583,53 @@ float shadow_hash(vec3 p)
     p += dot(p, p.yzx + 19.19);
     return fract((p.x + p.y) * p.z);
 }
+
+// Selected sampler; preserve the original PCF tier and tap arithmetic.
+float csm_pcf_filter(sampler2D shadow_map, vec2 csm_uv, float csm_z,
+                     float depth_bias, vec2 texel, float filter_radius,
+                     vec3 world_pos)
+{
+    float s;
+    if (u_shadowQuality.x < 1.5)
+    {
+        // Tier 1: unrotated 3x3 PCF (9 taps).
+        float sum9 = 0.0;
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int x = -1; x <= 1; x++)
+            {
+                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
+                float depth = texture2D(shadow_map, csm_uv + offset).r;
+                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
+            }
+        }
+        s = sum9 / 9.0;
+    }
+    else
+    {
+        // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
+        // to eliminate visible grid patterns while keeping temporally stable shadows.
+        float angle = shadow_hash(world_pos) * 6.283185;
+        float rot_c = cos(angle);
+        float rot_s = sin(angle);
+
+        float sum = 0.0;
+        for (int y = -2; y <= 2; y++)
+        {
+            for (int x = -2; x <= 2; x++)
+            {
+                vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
+                vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
+                                   raw.x * rot_s + raw.y * rot_c);
+                float depth = texture2D(shadow_map, csm_uv + offset).r;
+                sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
+            }
+        }
+        s = sum / 25.0;
+    }
+    return s;
+}
+
 
 float sample_csm_shadow(int cascade,
                         vec3 world_pos,
@@ -598,42 +708,21 @@ float sample_csm_shadow(int cascade,
         float depth0 = csm_sample_depth(cascade, csm_uv);
         s = (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
     }
-    else if (u_shadowQuality.x < 1.5)
-    {
-        // Tier 1: unrotated 3x3 PCF (9 taps).
-        float sum9 = 0.0;
-        for (int y = -1; y <= 1; y++)
-        {
-            for (int x = -1; x <= 1; x++)
-            {
-                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
-                float depth = csm_sample_depth(cascade, csm_uv + offset);
-                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        s = sum9 / 9.0;
-    }
     else
     {
-        // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
-        // to eliminate visible grid patterns while keeping temporally stable shadows.
-        float angle = shadow_hash(world_pos) * 6.283185;
-        float rot_c = cos(angle);
-        float rot_s = sin(angle);
-
-        float sum = 0.0;
-        for (int y = -2; y <= 2; y++)
-        {
-            for (int x = -2; x <= 2; x++)
-            {
-                vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
-                vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
-                                   raw.x * rot_s + raw.y * rot_c);
-                float depth = csm_sample_depth(cascade, csm_uv + offset);
-                sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        s = sum / 25.0;
+        // Select once, outside the unchanged PCF loops.
+        BRANCH if (cascade == 0)
+            s = csm_pcf_filter(s_csmShadow0, csm_uv, csm_z,
+                depth_bias, texel, filter_radius, world_pos);
+        else BRANCH if (cascade == 1)
+            s = csm_pcf_filter(s_csmShadow1, csm_uv, csm_z,
+                depth_bias, texel, filter_radius, world_pos);
+        else BRANCH if (cascade == 2)
+            s = csm_pcf_filter(s_csmShadow2, csm_uv, csm_z,
+                depth_bias, texel, filter_radius, world_pos);
+        else
+            s = csm_pcf_filter(s_csmShadow3, csm_uv, csm_z,
+                depth_bias, texel, filter_radius, world_pos);
     }
 
     // Dual shadow maps: min() with the DYNAMIC-caster atlas tile for this cascade

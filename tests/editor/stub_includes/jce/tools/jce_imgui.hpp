@@ -19,9 +19,27 @@
 using ImGuiKey      = int;
 using ImGuiKeyChord = int;
 
+struct ImGuiIO { int KeyMods = 0; };
+
 /* Subset of ImGuiKey_ enum needed by editor/src/core/jce_hotkeys.cpp. */
 enum : ImGuiKey {
     ImGuiKey_None   = 0,
+    /* Capture declarations only; real-context tests exercise key polling. */
+    ImGuiKey_NamedKey_BEGIN = 512,
+    ImGuiKey_NamedKey_END = 667,
+    ImGuiKey_Escape = 526,
+    ImGuiKey_LeftCtrl = 527,
+    ImGuiKey_LeftShift = 528,
+    ImGuiKey_LeftAlt = 529,
+    ImGuiKey_LeftSuper = 530,
+    ImGuiKey_RightCtrl = 531,
+    ImGuiKey_RightShift = 532,
+    ImGuiKey_RightAlt = 533,
+    ImGuiKey_RightSuper = 534,
+    ImGuiKey_ReservedForModCtrl = 663,
+    ImGuiKey_ReservedForModShift = 664,
+    ImGuiKey_ReservedForModAlt = 665,
+    ImGuiKey_ReservedForModSuper = 666,
     ImGuiKey_Space  = 533,
     ImGuiKey_0      = 536,
     ImGuiKey_1      = 537,
@@ -101,6 +119,7 @@ const char *GetKeyName(ImGuiKey key);
 bool        IsKeyChordPressed(ImGuiKeyChord chord);
 bool        IsKeyPressed(ImGuiKey key, bool repeat = true);
 int         GetFrameCount();
+ImGuiIO    &GetIO();
 
 }  /* namespace ImGui */
 

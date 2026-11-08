@@ -9,56 +9,57 @@ $output v_texcoord0, v_pcolor
  * the compute pool.  Dead slots (size == 0) collapse to a degenerate
  * point so the rasteriser discards them with no fragment work.
  *
- * i_data1.xyz optionally carries velocity*stretch (world) for motion-aligned
- * streaks (rain / sparks).  It is honoured ONLY when u_particle_misc.y > 0.5
- * (the CPU scene path) AND the vector is non-zero, so every round emitter and
- * the GPU pool (which reuses i_data1 for vel/life) are unaffected.
+ * CPU instances carry velocity*stretch in i_data1.xyz. GPU instances carry
+ * raw velocity there and set u_particle_misc.w to the stretch multiplier.
+ * u_particle_misc.y enables motion-aligned streaks for the draw.
  */
 
 #include <bgfx_shader.sh>
 
-uniform vec4 u_particle_misc;   // .y = 1 -> allow motion-stretch
+uniform vec4 u_particle_misc; // .y enables stretch, .w scales raw GPU velocity
+#include "particle_roof.sh"
+#if BGFX_SHADER_LANGUAGE_HLSL
+#include "particle_rain_surface.sh"
+#endif
 
 void main()
 {
     vec3  center = i_data0.xyz;
     float size   = i_data3.x;
 
-    if (size <= 0.0) {
+    // CPU instances have zero in the GPU lifetime slot and cull before upload.
+    bool gpu = i_data1.w > 0.0;
+    bool hidden = size <= 0.0 || (gpu && particle_roof_blocks(center, i_data1.xyz));
+#if BGFX_SHADER_LANGUAGE_HLSL
+    bool impact = gpu && i_data3.z > 0.5;
+    hidden = hidden || (impact && !particle_rain_enabled());
+#endif
+    if (hidden) {
         gl_Position = vec4(0.0, 0.0, 0.0, 0.0);
         v_pcolor    = vec4(0.0, 0.0, 0.0, 0.0);
         v_texcoord0 = vec2(0.0, 0.0);
-    } else {
-        /* mul() — NOT raw m[i][j] indexing: the latter reads the matrix
-         * transposed on GLSL vs HLSL, giving a wrong (skewed) billboard basis
-         * on OpenGL that smears sprites into streaks at diagonal view angles.
-         * mul(M, axis) extracts the world-space camera axis on every backend. */
-        vec3 cam_right = mul(u_invView, vec4(1.0, 0.0, 0.0, 0.0)).xyz;
-        vec3 cam_up    = mul(u_invView, vec4(0.0, 1.0, 0.0, 0.0)).xyz;
-
-        vec3  stretch_vec = i_data1.xyz;
-        float slen = length(stretch_vec);
-        vec3  world;
-        if (u_particle_misc.y > 0.5 && slen > 0.0001) {
-            /* Motion-aligned streak: the billboard's long axis follows the
-             * world velocity, its short axis stays perpendicular and faces the
-             * camera.  Length = size + streak (a slow drop stays ~round, a fast
-             * one elongates); width stays `size`.  The procedural soft circle in
-             * fs_particle then reads as a soft vertical rain streak. */
-            vec3  cam_pos  = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-            vec3  view_dir = normalize(cam_pos - center);
-            vec3  up_axis  = stretch_vec / slen;
-            vec3  rt_axis  = cross(up_axis, view_dir);
-            float rl = length(rt_axis);
-            rt_axis  = (rl > 0.0001) ? (rt_axis / rl) : cam_right;
-            world = center + rt_axis * (a_position.x * size)
-                           + up_axis * (a_position.y * (size + slen));
-        } else {
-            vec2 corner = a_position.xy * size;
-            world = center + cam_right * corner.x + cam_up * corner.y;
-        }
-
+#if BGFX_SHADER_LANGUAGE_HLSL
+    } else if (impact) {
+        float progress = clamp(i_data0.w / i_data1.w, 0.0, 1.0);
+        // A bounded quarter-metre surface response, not a metre-wide halo.
+        float diameter = mix(0.07, 0.34, progress);
+        vec2 xz = center.xz + vec2(a_position.x, -a_position.y) * diameter;
+        float surface_y;
+        bool wet = particle_rain_surface(xz, surface_y);
+        vec3 world = vec3(xz.x, (wet ? surface_y : center.y) + 0.035, xz.y);
         gl_Position = mul(u_viewProj, vec4(world, 1.0));
+        float fade = (1.0 - progress) * (1.0 - progress);
+        // Rain-ring branch passes world XZ for the same wet test in FS.
+        v_pcolor = vec4(xz, i_data2.b, i_data2.a * fade);
+        v_texcoord0 = a_texcoord0 + vec2(2.0, 0.0);
+#endif
+    } else {
+        float stretch_scale = u_particle_misc.w > 0.0 ? u_particle_misc.w : 1.0;
+#define JCE_PARTICLE_STRETCH_VECTOR (i_data1.xyz * stretch_scale)
+#define JCE_PARTICLE_CORNER a_position
+#include "particle_billboard.sh"
+#undef JCE_PARTICLE_CORNER
+#undef JCE_PARTICLE_STRETCH_VECTOR
         v_pcolor    = i_data2;
         v_texcoord0 = a_texcoord0;
     }

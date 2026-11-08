@@ -2,7 +2,8 @@
  * jce_trace.h - Low-overhead runtime observability.
  *
  * Producers write fixed-size events into a bounded overwrite ring. Event
- * publication performs no heap allocation and never waits for a consumer.
+ * publication uses a short per-slot critical section with no heap allocation,
+ * IO or callbacks. A producer may wait for another slot copy to finish.
  * Tracy, the editor profiler, structured logs, and Chrome Trace exports can
  * therefore consume one common task/thread timeline.
  */
@@ -101,8 +102,8 @@ typedef struct JceTraceStats {
 JCE_API void JCE_CALL jce_trace_set_enabled(bool enabled);
 JCE_API bool JCE_CALL jce_trace_enabled(void);
 
-/* Reset is intended for tests or an explicit capture start. Producers must be
- * quiescent while it runs. The enabled state is preserved. */
+/* Reset is intended for tests or an explicit capture start. Producers and
+ * consumers must be quiescent while it runs. The enabled state is preserved. */
 JCE_API void JCE_CALL jce_trace_reset(void);
 
 /* Process-unique for the current capture. Zero is never returned. */

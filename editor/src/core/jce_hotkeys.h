@@ -162,9 +162,21 @@ bool                jce_hotkey_chord_equal(JceHotkeyChord a, JceHotkeyChord b);
 JceHotkeyId         jce_hotkey_find_conflict(JceHotkeyId for_id,
                                               JceHotkeyChord chord);
 
+/* Rebinding belongs to this registry. Begin/poll/cancel require the editor's
+ * active ImGui context and UI thread. COUNT means no capture. Poll commits
+ * the next non-modifier edge (Esc cancels) and returns true only on commit.
+ * Capture blocks every action query, including the frame it ends/cancels.
+ * The UI cancels when its capture tab closes or loses focus. Conflicting
+ * chords retain the existing warning-only policy; no other binding changes. */
+bool                jce_hotkeys_capture_begin(JceHotkeyId id);
+JceHotkeyId         jce_hotkeys_capture_id(void);
+bool                jce_hotkeys_capture_poll(void);
+void                jce_hotkeys_capture_cancel(void);
+
 /* Per-frame query (ImGui-context required). True only on the first frame
  * the chord is satisfied (rising edge), regardless of whether ImGui has
- * keyboard focus on a text input — call sites can opt-in/opt-out. */
+ * keyboard focus on a text input — call sites can opt-in/opt-out.
+ * Rebinding capture and its completion frame always suppress actions. */
 bool                jce_hotkey_pressed(JceHotkeyId id);
 
 /* Renders a human-readable chord, e.g. "Ctrl+Shift+Z". `out` must be

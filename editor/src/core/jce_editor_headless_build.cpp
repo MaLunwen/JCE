@@ -69,7 +69,10 @@ bool start_build(void *,
                  const JceEditorHeadlessBuildRequest *request,
                  std::string *error)
 {
-    jce_editor_current_project_root_set(request->project.c_str());
+    if (!jce_editor_current_project_root_set(request->project.c_str())) {
+        if (error) *error = "project switch refused: outgoing editor state could not be saved";
+        return false;
+    }
     const char *root = jce_editor_current_project_root();
     jce_project_settings_set_root(root);
     jce_editor_project_set_root(root);
@@ -133,10 +136,16 @@ void get_status(void *, JceBuildStatus *out)
     jce_build_manager_get_status(out);
 }
 
+void get_log(void *, JceBuildLogView *out)
+{
+    jce_build_manager_get_log(out);
+}
+
 void request_quit(void *)
 {
     g_headless.quit_requested = true;
-    jce_engine_request_quit();
+    jce_engine_request_quit_with_result(
+        jce_editor_headless_build_driver_app_result(&g_headless.driver));
 }
 
 JceEditorHeadlessBuildDriverOps driver_ops(
@@ -146,6 +155,7 @@ JceEditorHeadlessBuildDriverOps driver_ops(
     JceEditorHeadlessBuildDriverOps ops{};
     ops.start = start;
     ops.get_status = get_status;
+    ops.get_log = get_log;
     ops.request_quit = request_quit;
     return ops;
 }
@@ -182,10 +192,9 @@ bool jce_editor_headless_build_initialize()
             : g_headless.request.error;
         LOG_ERROR("editor_headless_build", "%s",
                   g_headless.forced_error.c_str());
-        (void)jce_editor_headless_build_driver_start(
+        return jce_editor_headless_build_driver_start(
             &g_headless.driver, &g_headless.request,
             driver_ops(start_failure), nullptr);
-        return true;
     }
 
     LOG_INFO("editor_headless_build",
@@ -193,10 +202,9 @@ bool jce_editor_headless_build_initialize()
              g_headless.request.project.c_str(),
              g_headless.request.variant.c_str(),
              g_headless.request.arch.c_str());
-    (void)jce_editor_headless_build_driver_start(
+    return jce_editor_headless_build_driver_start(
         &g_headless.driver, &g_headless.request,
         driver_ops(start_build), nullptr);
-    return true;
 }
 
 void jce_editor_headless_build_poll()
@@ -212,7 +220,9 @@ void jce_editor_headless_build_shutdown()
         jce_build_manager_request_stop();
     jce_editor_project_set_root(nullptr);
     jce_project_settings_set_root(nullptr);
-    jce_editor_current_project_root_set(nullptr);
+    /* Shutdown must not block process exit; the state owner logs refusal and
+       retains unpublished values rather than clearing them as if saved. */
+    (void)jce_editor_current_project_root_set(nullptr);
     g_headless = HeadlessBuildState{};
 }
 

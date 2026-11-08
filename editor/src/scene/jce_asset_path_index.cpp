@@ -16,6 +16,7 @@
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/middleware/scene/jce_ui_canvas.h>
 
 #include <algorithm>
 #include <cctype>
@@ -318,6 +319,7 @@ void aidx_finalize(void)
         /* Swap the freshly-built index in (replaces the previous one). */
         g_live = std::move(j->maps);
         g_aidx_generation++;   /* invalidates negative resolve caches */
+        jce_ui_canvas_invalidate_resources();
         LOG_INFO(LOG_TAG, "async asset index ready: %d files under %s",
                  (int)g_live.total, j->root.c_str());
     }
@@ -347,6 +349,7 @@ void jce_asset_path_index_clear(void)
     g_aidx_pending_root.clear();
     g_live = IndexMaps{};
     g_aidx_generation++;
+    jce_ui_canvas_invalidate_resources();
 }
 
 int jce_asset_path_index_rebuild(const char *root)
@@ -355,6 +358,7 @@ int jce_asset_path_index_rebuild(const char *root)
      * populated before they return. */
     int n = index_walk_into(&g_live, root);
     g_aidx_generation++;
+    jce_ui_canvas_invalidate_resources();
     return n;
 }
 

@@ -2,18 +2,21 @@
 #define JCE_RENDERER_CAPS_INTERNAL_H
 
 #include <jce/renderer/jce_renderer_caps.h>
+#if JCE_PLATFORM_WINDOWS && defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+#include <bgfx/c99/bgfx.h>
+bool jce_renderer_caps_xp_backend_available(bgfx_renderer_type_t type);
+#endif
 
 /* Renderer lifecycle bridge.
  *
  * THERE ARE TWO WAYS THE NEGOTIATED VERSION CAN ARRIVE, and the difference
  * matters because the first one is not always there:
  *
- *   1. capture_trace() — bgfx does not expose the version through any API, so
- *      conan/hooks/hook_bgfx_wasm_fix.py PATCHES renderer_gl.cpp and
- *      renderer_vk.cpp to BX_TRACE it, and jce_renderer.c forwards the tagged
- *      lines here.  This works only when the bgfx package in use was built
- *      with that patch: a package built before the hook existed emits nothing,
- *      the version is never observed, and nothing says so.
+ *   1. capture_trace() accepts legacy explicitly tagged observations when
+ *      available. Pristine pinned bgfx does not emit those JCE tags; no package
+ *      or upstream source is patched to obtain them. Web reads its actual
+ *      Emscripten context through the shared private platform snapshot instead,
+ *      then admits the reported API/GLSL after bgfx initialization.
  *   2. publish_probe() — jce_renderer.c asks the driver directly, through a
  *      throwaway SDL context, before bgfx is initialised at all.  Independent
  *      of which bgfx binary is installed, and it runs BEFORE the attempt, so
@@ -50,6 +53,11 @@ bool jce_renderer_caps_api_publish_probe(JceRendererBackend backend,
 bool jce_renderer_caps_api_accept_active_backend(void);
 void jce_renderer_caps_api_reset(void);
 
+/* Web only: actual post-init context admission and observation invalidation.
+ * Native policies remain unchanged. Lost/restored epochs require recreation. */
+bool jce_renderer_caps_api_admit_web_context(void);
+bool jce_renderer_caps_api_web_context_current(void);
+
 /* ================================================================== */
 /* Vertex-stage texture fetch                                          */
 /* ================================================================== */
@@ -81,6 +89,7 @@ typedef enum {
 typedef enum {
     JCE_GPU_VFETCH_FMT_RGBA32F = 0,  /* FFT displacement, bone palette    */
     JCE_GPU_VFETCH_FMT_R32F,         /* water ripple height               */
+    JCE_GPU_VFETCH_FMT_RGBA16F,      /* nearshore disturbance atlas       */
     JCE_GPU_VFETCH_FMT_COUNT
 } JceGpuVertexFetchFormat;
 
@@ -90,8 +99,10 @@ JceGpuVertexFetch jce_gpu_vertex_fetch_state(JceGpuVertexFetchFormat fmt);
 
 /* The policy every call site wants: can the vertex stage sample `fmt`?
  * UNANSWERED resolves against the build floor -- desktop GL 3.1+ and
- * GLES 3.0+ both MANDATE vertex texture fetch and the JCE floor is exactly
- * those, so it proceeds.  Web is the exception and keeps its fallback:
+ * GLES 3.0+ both MANDATE vertex texture fetch, so those native build policies
+ * proceed. The explicit GL 2.1 / GLES 2.0 compatibility policy has no such
+ * guarantee and conservatively returns false. Explicit backend YES/NO still
+ * wins for every policy. Web also keeps its conservative fallback:
  * float FILTERING in the vertex stage there needs OES_texture_float_linear,
  * and that is the platform the original guards were written for. */
 bool jce_gpu_vertex_fetch_usable(JceGpuVertexFetchFormat fmt);

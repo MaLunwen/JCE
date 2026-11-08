@@ -4,6 +4,10 @@
 
 #include "renderer/jce_vertex_layout.h"
 #include "jce_upload_metrics.h"
+#include "jce_mesh_create_internal.h"
+#include "jce_model_deform_internal.h"
+#include "jce_view_wireframe_internal.h"
+#include "os/core/jce_trace_scope_internal.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_mesh.h>
@@ -23,6 +27,7 @@ struct JceMesh {
     bgfx_index_buffer_handle_t  ibh;
     bgfx_index_buffer_handle_t  wf_ibh;     /* wireframe line indices */
     bgfx_vertex_layout_t        layout;
+    JceMeshCreateProvider       creation;
     uint32_t                    num_verts;
     uint32_t                    num_indices;
     uint32_t                    num_wf_indices;
@@ -128,9 +133,9 @@ static bool build_unique_wireframe_indices(const uint32_t *indices,
  *
  * The tangent was missing and the shader read it anyway -- see JceMeshVertex.
  * The skinned layout in jce_skinned_mesh.c has always declared it. */
-static void init_mesh_layout(bgfx_vertex_layout_t *layout)
+static void init_mesh_layout(bgfx_vertex_layout_t *layout, bgfx_renderer_type_t type)
 {
-    bgfx_vertex_layout_begin(layout, bgfx_get_renderer_type());
+    bgfx_vertex_layout_begin(layout, type);
     jce_vertex_layout_add_pbr_base(layout);
     bgfx_vertex_layout_end(layout);
 }
@@ -222,15 +227,40 @@ static bool generate_tangents(JceMeshVertex *v, uint32_t nv,
     return true;
 }
 
+static const bgfx_memory_t *mesh_copy(const void *data, uint32_t bytes, void *user)
+{ (void)user; return bgfx_copy(data, bytes); }
+static bgfx_vertex_buffer_handle_t mesh_vertex_create(const bgfx_memory_t *mem,
+    const bgfx_vertex_layout_t *layout, void *user)
+{ (void)user; return bgfx_create_vertex_buffer(mem, layout, BGFX_BUFFER_NONE); }
+static bgfx_index_buffer_handle_t mesh_index_create(const bgfx_memory_t *mem, void *user)
+{ (void)user; return bgfx_create_index_buffer(mem, BGFX_BUFFER_INDEX32); }
+static void mesh_vertex_destroy(bgfx_vertex_buffer_handle_t handle, void *user)
+{ (void)user; bgfx_destroy_vertex_buffer(handle); }
+static void mesh_index_destroy(bgfx_index_buffer_handle_t handle, void *user)
+{ (void)user; bgfx_destroy_index_buffer(handle); }
 JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
-                          const uint32_t *indices, uint32_t num_indices)
+    const uint32_t *indices, uint32_t num_indices)
 {
     if (!vertices || num_verts == 0) return NULL;
-
+    const JceMeshCreateProvider provider = { bgfx_get_renderer_type(), mesh_copy,
+        mesh_vertex_create, mesh_index_create, mesh_vertex_destroy, mesh_index_destroy, NULL };
+    return jce_mesh_create_with_provider(vertices, num_verts, indices, num_indices, &provider);
+}
+JceMesh *jce_mesh_create_with_provider(const JceMeshVertex *vertices, uint32_t num_verts,
+    const uint32_t *indices, uint32_t num_indices, const JceMeshCreateProvider *provider)
+{
+    if (!vertices || num_verts == 0 || !provider || !provider->copy ||
+        !provider->create_vertex || !provider->create_index ||
+        !provider->destroy_vertex || !provider->destroy_index ||
+        num_verts > UINT32_MAX / sizeof(JceMeshVertex) ||
+        num_indices > UINT32_MAX / sizeof(uint32_t)) return NULL;
+    JceTraceScope scope = jce_trace_scope_begin("renderer.mesh.create");
     JceMesh *m = (JceMesh *)JCE_CALLOC(1, sizeof(*m));
-    if (!m) return NULL;
-
-    init_mesh_layout(&m->layout);
+    if (!m) { jce_trace_scope_end(scope, JCE_TRACE_TASK_FAILED); return NULL; }
+    m->creation = *provider;
+    m->vbh.idx = m->ibh.idx = m->wf_ibh.idx = UINT16_MAX;
+    const char *failure = NULL;
+    init_mesh_layout(&m->layout, provider->renderer_type);
     m->num_verts   = num_verts;
     m->num_indices = num_indices;
 
@@ -273,31 +303,30 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
     }
 
     /* Create vertex buffer. */
-    const bgfx_memory_t *vmem = bgfx_copy(vertices,
-                                           num_verts * (uint32_t)sizeof(JceMeshVertex));
+    const bgfx_memory_t *vmem = provider->copy(vertices,
+        num_verts * (uint32_t)sizeof(JceMeshVertex), provider->user);
     JCE_FREE(owned);
-    const uint64_t payload_bytes_2 = vmem ? vmem->size : 0u;
-    m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
+    if (!vmem) { failure = "vertex_staging_allocation"; goto failed; }
+    const uint64_t payload_bytes_2 = vmem->size;
+    m->vbh = provider->create_vertex(vmem, &m->layout, provider->user);
     jce_upload_metrics_record(JCE_UPLOAD_STATIC_VERTEX, payload_bytes_2,
         m->vbh.idx != UINT16_MAX);
     if (m->vbh.idx == UINT16_MAX) {
-        /* bgfx static vertex-buffer pool exhausted (or upload failed): fail the
-         * whole mesh instead of returning a zombie with an invalid vbh that
-         * would forever submit nothing. Degrades gracefully under handle
-         * pressure rather than feeding a broken handle into the draw list. */
-        LOG_WARN(LOG_TAG, "mesh: vertex buffer allocation failed");
-        JCE_FREE(m);
-        return NULL;
+        failure = "vertex_buffer_allocation"; goto failed;
     }
 
     /* Create index buffer (optional). */
     if (indices && num_indices > 0) {
-        const bgfx_memory_t *imem = bgfx_copy(indices,
-                                               num_indices * (uint32_t)sizeof(uint32_t));
-        const uint64_t payload_bytes_1 = imem ? imem->size : 0u;
-        m->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+        const bgfx_memory_t *imem = provider->copy(indices,
+            num_indices * (uint32_t)sizeof(uint32_t), provider->user);
+        if (!imem) { failure = "index_staging_allocation"; goto failed; }
+        const uint64_t payload_bytes_1 = imem->size;
+        m->ibh = provider->create_index(imem, provider->user);
         jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_1,
             m->ibh.idx != UINT16_MAX);
+        if (m->ibh.idx == UINT16_MAX) {
+            failure = "index_buffer_allocation"; goto failed;
+        }
 
         /* Build wireframe index buffer using UNIQUE undirected edges.
          * This preserves full wireframe topology while avoiding duplicate
@@ -307,14 +336,18 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
         if (build_unique_wireframe_indices(indices, num_indices,
                                            &wf, &wf_count)
             && wf && wf_count > 0) {
-            const bgfx_memory_t *wmem = bgfx_copy(wf,
-                                                    wf_count * (uint32_t)sizeof(uint32_t));
-            const uint64_t payload_bytes_0 = wmem ? wmem->size : 0u;
-            m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
+            const bgfx_memory_t *wmem = provider->copy(wf,
+                wf_count * (uint32_t)sizeof(uint32_t), provider->user);
+            JCE_FREE(wf); wf = NULL;
+            if (!wmem) { failure = "wireframe_staging_allocation"; goto failed; }
+            const uint64_t payload_bytes_0 = wmem->size;
+            m->wf_ibh = provider->create_index(wmem, provider->user);
             jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_0,
                 m->wf_ibh.idx != UINT16_MAX);
+            if (m->wf_ibh.idx == UINT16_MAX) {
+                failure = "wireframe_index_buffer_allocation"; goto failed;
+            }
             m->num_wf_indices = wf_count;
-            JCE_FREE(wf);
         } else {
             m->wf_ibh.idx = UINT16_MAX;
         }
@@ -323,7 +356,16 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
         m->wf_ibh.idx = UINT16_MAX;
     }
 
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
     return m;
+failed:
+    LOG_WARN(LOG_TAG, "mesh creation rejected owner=%p vertices=%u indices=%u reason=%s",
+        (void *)m, num_verts, num_indices, failure);
+    if (scope.id) jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+        "mesh.create_rejected", 1, scope.id, scope.id);
+    jce_mesh_destroy(m);
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_FAILED);
+    return NULL;
 }
 
 JceMesh *jce_mesh_load(const JcePakArchive *pak, const char *asset_path)
@@ -339,11 +381,11 @@ void jce_mesh_destroy(JceMesh *mesh)
 {
     if (!mesh) return;
     if (mesh->vbh.idx != UINT16_MAX)
-        bgfx_destroy_vertex_buffer(mesh->vbh);
+        mesh->creation.destroy_vertex(mesh->vbh, mesh->creation.user);
     if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_destroy_index_buffer(mesh->ibh);
+        mesh->creation.destroy_index(mesh->ibh, mesh->creation.user);
     if (mesh->wf_ibh.idx != UINT16_MAX)
-        bgfx_destroy_index_buffer(mesh->wf_ibh);
+        mesh->creation.destroy_index(mesh->wf_ibh, mesh->creation.user);
     JCE_FREE(mesh);
 }
 
@@ -370,34 +412,26 @@ void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id
     jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
+void jce_mesh_submit_view_wireframe(const JceMesh *mesh, const JceRenderer *r,
+                                    uint16_t view_id, bool overlay)
+{
+    const JceShaderHandle program = jce_renderer_get_program_mesh(r);
+    if (!mesh || mesh->wf_ibh.idx == UINT16_MAX || program.idx == UINT16_MAX) {
+        if (jce_tls_encoder) bgfx_encoder_discard(jce_tls_encoder, BGFX_DISCARD_ALL);
+        else bgfx_discard(BGFX_DISCARD_ALL);
+        return;
+    }
+
+    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    jce_enc_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+    jce_enc_set_state(jce_view_wireframe_state(overlay, mesh->num_wf_indices), 0);
+    jce_enc_submit(view_id, (bgfx_program_handle_t){program.idx}, 0, BGFX_DISCARD_ALL);
+}
+
 void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r,
                                        uint16_t view_id)
 {
-    if (!mesh || !r) return;
-
-    jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
-
-    if (mesh->wf_ibh.idx != UINT16_MAX) {
-        jce_enc_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-    } else if (mesh->ibh.idx != UINT16_MAX) {
-        jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-    }
-
-    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                   | BGFX_STATE_DEPTH_TEST_LEQUAL
-                   | BGFX_STATE_MSAA | BGFX_STATE_PT_LINES;
-
-    /* LINEAA is visually nice but very expensive on dense meshes. */
-    if (mesh->num_wf_indices < 1500000u)
-        state |= BGFX_STATE_LINEAA;
-
-    /* LEQUAL depth test so wireframe overlay renders on top of solid geometry
-     * at the same depth.  LINEAA for smooth anti-aliased lines. */
-    jce_enc_set_state(state, 0);
-
-    JceShaderHandle sh = jce_renderer_get_program_mesh(r);
-    bgfx_program_handle_t prog = { sh.idx };
-    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_mesh_submit_view_wireframe(mesh, r, view_id, true);
 }
 
 void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
@@ -570,12 +604,13 @@ void jce_mesh_get_aabb(const JceMesh *mesh, float out_min[3], float out_max[3])
 
 /* -- Built-in procedural meshes ------------------------------------ */
 
-JceMesh *jce_mesh_create_cube(float size)
+void jce_mesh_cube_geometry(float size, JceMeshVertex vertices[24],
+                            uint32_t indices[36])
 {
     float hs = size * 0.5f;
 
     /* 24 vertices (4 per face, unique normals). */
-    JceMeshVertex verts[24] = {
+    const JceMeshVertex verts[24] = {
         /* Front face (+Z) */
         {{ -hs, -hs,  hs }, {  0,  0,  1 }, { 0, 1 }},
         {{  hs, -hs,  hs }, {  0,  0,  1 }, { 1, 1 }},
@@ -608,7 +643,7 @@ JceMesh *jce_mesh_create_cube(float size)
         {{ -hs,  hs, -hs }, { -1,  0,  0 }, { 0, 0 }},
     };
 
-    uint32_t indices[36];
+    memcpy(vertices, verts, sizeof verts);
     for (int face = 0; face < 6; face++) {
         int b = face * 4;
         int i = face * 6;
@@ -620,6 +655,13 @@ JceMesh *jce_mesh_create_cube(float size)
         indices[i + 5] = (uint32_t)(b + 3);
     }
 
+}
+
+JceMesh *jce_mesh_create_cube(float size)
+{
+    JceMeshVertex verts[24];
+    uint32_t indices[36];
+    jce_mesh_cube_geometry(size, verts, indices);
     return jce_mesh_create(verts, 24, indices, 36);
 }
 

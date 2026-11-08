@@ -1,3 +1,5 @@
+jce_register_test_directory()
+
 cmake_minimum_required(VERSION 3.20)
 
 # ----------------------------------------------------------------------- #
@@ -51,7 +53,7 @@ target_include_directories(jce_script_vm_java_lifecycle PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/engine/include")
 target_link_libraries(jce_script_vm_java_lifecycle PRIVATE
 	jce_core jce_script jce_script_vm_java)
-add_dependencies(jce_tests jce_script_vm_java_lifecycle)
+jce_test_build_dependencies(jce_script_vm_java_lifecycle)
 
 add_test(NAME test_jce_script_vm_java_lifecycle
 	COMMAND "${Python3_EXECUTABLE}"
@@ -68,7 +70,7 @@ add_test(NAME test_jce_script_vm_java_lifecycle
 # is satisfied by the add_dependencies above, which names the real build input.
 set_tests_properties(test_jce_script_vm_java_lifecycle PROPERTIES
 	TIMEOUT     600
-	LABELS      "unit"
+	LABELS      "unit" JCE_TEST_KIND integration
 	ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
 set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
 	test_jce_script_vm_java_lifecycle)
@@ -93,7 +95,7 @@ add_custom_command(
 	VERBATIM)
 add_custom_target(jce_script_vm_java_classes
 	DEPENDS "${_jce_java_vm_classes}/.stamp")
-add_dependencies(jce_tests jce_script_vm_java_classes)
+jce_test_build_dependencies(jce_script_vm_java_classes)
 
 # ── The pre-compiled fixture: the shape a shipped Java game actually uses ──
 #
@@ -129,7 +131,7 @@ add_custom_command(
 	VERBATIM)
 add_custom_target(jce_script_vm_java_precompiled
 	DEPENDS "${_jce_java_precompiled}/shipped_asset.class")
-add_dependencies(jce_tests jce_script_vm_java_precompiled)
+jce_test_build_dependencies(jce_script_vm_java_precompiled)
 
 # ── The unit suite: everything the differential structurally cannot see ──
 jce_add_unit_test(test_jce_script_vm_java
@@ -164,7 +166,7 @@ add_test(NAME test_jce_script_vm_java_local_frames
 	        "${CMAKE_CURRENT_SOURCE_DIR}/test_local_frames.py")
 set_tests_properties(test_jce_script_vm_java_local_frames PROPERTIES
 	TIMEOUT     120
-	LABELS      "unit"
+	LABELS      "unit" JCE_TEST_KIND integration
 	ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
 set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
 	test_jce_script_vm_java_local_frames)

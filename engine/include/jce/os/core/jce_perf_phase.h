@@ -2,8 +2,8 @@
  * jce_perf_phase.h  Lightweight per-frame CPU-phase accumulator.
  *
  * Named phase buckets accumulate ms over a reporting window (e.g. 120 frames).
- * Call jce_perf_phase_report() to get a sorted string and reset all buckets.
- * All calls are no-ops when disabled (jce_perf_phase_set_enabled(0)).
+ * Call jce_perf_phase_report() to format and reset only the reporting window.
+ * Phase additions are no-ops when disabled (jce_perf_phase_set_enabled(0)).
  *
  * Main-thread only — not thread-safe.
  */
@@ -28,7 +28,8 @@ JCE_EXTERN_C_BEGIN
 JCE_API void jce_perf_phase_add(const char *name, double ms);
 
 /* Format all slots as "name=ms name=ms ..." sorted descending by ms,
- * then RESET all accumulators to 0.  Name registrations persist. */
+ * then RESET the reporting-window accumulators to 0. Pending frame samples
+ * and the completed snapshot are retained. Name registrations persist. */
 JCE_API void jce_perf_phase_report(char *out, int out_sz);
 /* Same reset/report operation, but emits average milliseconds per frame over
  * `frame_count`. This is the preferred periodic-log form. */
@@ -40,11 +41,13 @@ JCE_API void jce_perf_phase_set_enabled(int on);
 JCE_API int  jce_perf_phase_enabled(void);
 
 /* Non-destructive access (editor profiler UI, engine hitch attribution).
- * frame_tick() rotates the window accumulators into a per-frame snapshot
- * (delta since the previous tick); peek_frame() reads that snapshot without
- * touching the window that jce_perf_phase_report() owns.  Called once per
- * frame by the engine's player loop; idempotent, so a host that also calls it
- * (the editor does) costs nothing and clobbers nothing.
+ * frame_tick() snapshots independent samples since the previous tick;
+ * peek_frame() reads that snapshot without touching the reporting window.
+ * Reports cannot erase samples pending that tick. Called once per frame by
+ * the engine's player loop; duplicate ticks without new samples preserve the
+ * snapshot. An explicit zero-duration sample still denotes a new frame and
+ * makes the completed snapshot available, even when every duration is zero.
+ * Ticks before any accepted sample leave the snapshot unavailable.
  *
  * frame_has_data() distinguishes "the snapshot says every phase was cheap"
  * from "nothing ever populated the snapshot".  Those are not the same claim,

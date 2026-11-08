@@ -6,6 +6,7 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "core/jce_editor_i18n.h"
 #include "jce_panel_common.h"
 #include "ui/jce_editor_dnd.h"
 
@@ -115,13 +116,25 @@ bool entity_matches_search_fields(uint32_t entity_id, const char *filter)
         return true;
 
     JceTagColor tc = jce_state_entity_tag_color(entity_id);
-    if ((int)tc >= 0 && (int)tc < JCE_TAG_COLOR_COUNT) {
-        const char *tag_color_name = s_tag_names[tc];
-        if (text_matches_filter_ci(tag_color_name, filter))
-            return true;
-    }
+    if ((int)tc < 0 || (int)tc >= JCE_TAG_COLOR_COUNT) return false;
 
-    return false;
+    static char cached_filter[sizeof s_hier.search_buf] = {0};
+    static JceLocale cached_locale = JCE_LOCALE_INVALID;
+    static int cached_locale_count = -1;
+    static bool matches[JCE_TAG_COLOR_COUNT] = {false};
+    const JceLocale locale = jce_editor_i18n_get_locale();
+    const int locale_count = jce_editor_i18n_locale_count();
+    if (locale != cached_locale || locale_count != cached_locale_count ||
+        strcmp(cached_filter, filter) != 0) {
+        snprintf(cached_filter, sizeof cached_filter, "%s", filter);
+        cached_locale = locale;
+        cached_locale_count = locale_count;
+        for (int i = 0; i < JCE_TAG_COLOR_COUNT; ++i) {
+            const char *key = i == 0 ? "tagColor.none" : s_tag_filter_keys[i];
+            matches[i] = jce_editor_i18n_search_match(key, s_tag_names[i], filter, nullptr);
+        }
+    }
+    return matches[tc];
 }
 
 void build_default_prefab_path(const char *entity_name,

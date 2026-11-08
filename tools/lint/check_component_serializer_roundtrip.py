@@ -224,7 +224,31 @@ def _function_bodies(text: str) -> list:
     return out
 
 
-def scoped_serializer_text(comps: dict) -> dict:
+def _serializer_functions(path: Path) -> tuple:
+    """Root definitions and its actually included same-directory private helpers.
+
+    An unrelated file or accessor never becomes persistence just by mentioning
+    a component. Quoted sibling headers are the serializer's local include
+    closure; missing files fail rather than silently dropping a helper.
+    """
+    pending, seen, texts = [path], set(), []
+    directory = path.parent.resolve()
+    while pending:
+        current = pending.pop()
+        canonical = current.resolve()
+        if canonical in seen:
+            continue
+        if canonical.parent != directory:
+            raise SystemExit("serializer helper escapes its source directory: " + str(current))
+        seen.add(canonical)
+        text = strip_comments(current.read_text(encoding="utf-8", errors="replace"))
+        texts.append(text)
+        for name in re.findall(r'^\s*#\s*include\s+"([^"/\\]+\.h)"', text, re.M):
+            pending.append(current.parent / name)
+    return _function_bodies(texts[0]), [function for text in texts for function in _function_bodies(text)]
+
+
+def scoped_serializer_text(comps: dict, *, directions: bool = False) -> dict:
     """Per-component serialiser text, instead of one blob for all of them.
 
     THE BUG THIS REPLACES.  serializer_text() concatenated all nine
@@ -243,14 +267,15 @@ def scoped_serializer_text(comps: dict) -> dict:
     depending on the function NAMES matching the struct name, which they do
     not always do.
     """
-    files = []
+    units = []
     for rel in sorted(glob.glob(str(REPO_ROOT / SER_GLOB))):
-        files.append(strip_comments(
-            Path(rel).read_text(encoding="utf-8", errors="replace")))
-
-    funcs = []
-    for text in files:
-        funcs.extend(_function_bodies(text))
+        roots, functions = _serializer_functions(Path(rel))
+        named = {}
+        for header, body in functions:
+            match = re.search(r"\b([A-Za-z_]\w*)\s*\(", header)
+            if match:
+                named[match.group(1)] = (header, body)
+        units.append((roots, named))
 
     out = {}
     for comp in comps:
@@ -266,10 +291,26 @@ def scoped_serializer_text(comps: dict) -> dict:
         # components, NetworkObject and Tilemap -- and reported 28 of their
         # fields as one-way on a clean tree.  A gate that reports 28 false
         # positives is switched off as fast as one that reports none.
-        pieces = [h + b for (h, b) in funcs
-                  if (comp in h or comp in b)
-                  and re.search(r"\b(?:parse|serw?)_\w+\s*\(", h)]
-        out[comp] = " ".join(pieces)
+        parts = {}
+        for direction, prefix in (("parse", "parse"), ("serialize", "serw?")):
+            pieces = []
+            for roots, named in units:
+                pending = [(h, b) for h, b in roots
+                           if (comp in h or comp in b)
+                           and re.search(r"\b(?:" + prefix + r")_\w+\s*\(", h)]
+                visited = set()
+                while pending:
+                    header, body = pending.pop()
+                    if header in visited:
+                        continue
+                    visited.add(header)
+                    pieces.append(header + body)
+                    for call in re.findall(r"\b([A-Za-z_]\w*)\s*\(", body):
+                        helper = named.get(call)
+                        if helper and re.search(r"\b" + re.escape(comp) + r"\b", helper[0]):
+                            pending.append(helper)
+            parts[direction] = " ".join(pieces)
+        out[comp] = parts if directions else parts["parse"] + " " + parts["serialize"]
     return out
 
 
@@ -351,8 +392,8 @@ def one_way_fields() -> list:
             "component type(s) over %d bytes of serialiser; the shape changed "
             "and this extractor no longer sees it" % (len(comps), len(ser_all)))
 
-    scoped = scoped_serializer_text(comps)
-    covered = sum(1 for c in comps if scoped.get(c))
+    scoped = scoped_serializer_text(comps, directions=True)
+    covered = sum(1 for c in comps if any(scoped.get(c, {}).values()))
     if covered < len(comps) // 2:
         raise SystemExit(
             "check_component_serializer_roundtrip: FAIL - only %d of %d "
@@ -362,24 +403,29 @@ def one_way_fields() -> list:
 
     out = []
     for comp in sorted(comps):
-        ser = scoped.get(comp) or ""
-        if not ser:
+        parts = scoped.get(comp) or {}
+        if not any(parts.values()):
             # No serialiser function mentions this type at all: it is not
             # persisted, so there is no round-trip to check.
             continue
         for field in comps[comp]:
             e = re.escape(field)
+            # A partial parser may READ a prior live value as its default.
+            # That is not a serializer WRITE. Keep both directions rooted in
+            # their real entry functions and the helpers each actually calls.
+            parser = parts.get("parse", "")
+            serializer = parts.get("serialize", "")
             # A READ, in the four shapes this serialiser uses: a direct or
             # element-wise assignment, a `count++` inside a parse loop, a
             # copy_str for a char array, or the array passed by name.
             read = (
-                re.search(r"(?:\.|->)" + e + IDX + r"\s*=(?!=)", ser)
-                or re.search(r"(?:\.|->)" + e + IDX + r"\s*\+\+", ser)
-                or re.search(r"copy_str\(\s*[A-Za-z_]\w*\.\s*" + e, ser)
-                or re.search(r"[A-Za-z_]\w*\." + e + r"\s*,", ser))
+                re.search(r"(?:\.|->)" + e + IDX + r"\s*=(?!=)", parser)
+                or re.search(r"(?:\.|->)" + e + IDX + r"\s*\+\+", parser)
+                or re.search(r"copy_str\(\s*[A-Za-z_]\w*\.\s*" + e, parser)
+                or re.search(r"[A-Za-z_]\w*\." + e + r"\s*,", parser))
             # WRITE: any mention that is not an assignment target.
             write = re.search(r"->\s*" + e + IDX + r"\b(?!\s*(?:=(?!=)|\+\+))",
-                              ser)
+                              serializer)
             key = "%s.%s" % (comp, field)
             if bool(read) != bool(write) and key not in EXEMPT:
                 out.append((comp, field,

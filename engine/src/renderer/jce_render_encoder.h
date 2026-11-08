@@ -25,6 +25,7 @@ extern __thread bgfx_encoder_t *jce_tls_encoder;
 
 static inline void jce_render_encoder_set(bgfx_encoder_t *enc) { jce_tls_encoder = enc; }
 
+
 /* Per-frame transform-matrix pressure counter (always-on, mirrors the rank-9
  * alloc counter).  bgfx caches every set_transform matrix in a fixed
  * BGFX_CONFIG_MAX_MATRIX_CACHE pool (65536 as built) that SATURATES SILENTLY
@@ -100,15 +101,52 @@ static inline void jce_enc_set_instance_data_from_dynamic_vertex_buffer(
     if (e) bgfx_encoder_set_instance_data_from_dynamic_vertex_buffer(e, handle, startVertex, num);
     else   bgfx_set_instance_data_from_dynamic_vertex_buffer(handle, startVertex, num);
 }
+/* Prepare after all per-draw callbacks. NULL keeps implicit-only producers'
+ * sampler rebinds on the same implicit path as their existing state bindings. */
+static inline bgfx_program_handle_t jce_enc_prepare_submit(bgfx_view_id_t id,
+    bgfx_program_handle_t program, bgfx_encoder_t *explicit_encoder)
+{
+    program.idx = jce_shader_deferred_resolve(program.idx);
+    if (program.idx == UINT16_MAX) {
+        /* No submit will retire these already prepared commands and state.
+         * Use the same recording owner, including implicit-only producers. */
+        if (explicit_encoder) bgfx_encoder_discard(explicit_encoder, BGFX_DISCARD_ALL);
+        else bgfx_discard(BGFX_DISCARD_ALL);
+        return program;
+    }
+
+    (void)id;
+    (void)explicit_encoder;
+
+    return program;
+}
+
 static inline void jce_enc_submit(bgfx_view_id_t id, bgfx_program_handle_t program,
                                   uint32_t depth, uint8_t flags)
 {
-    program.idx = jce_shader_deferred_resolve(program.idx);
-    if (program.idx == UINT16_MAX) return;
-
     bgfx_encoder_t *e = jce_tls_encoder;
+    program = jce_enc_prepare_submit(id, program, e);
+    if (program.idx == UINT16_MAX) return;
     if (e) bgfx_encoder_submit(e, id, program, depth, flags);
     else   bgfx_submit(id, program, depth, flags);
+}
+
+/* Render-thread producers with raw implicit state must not borrow a TLS encoder. */
+static inline void jce_enc_submit_implicit(bgfx_view_id_t id, bgfx_program_handle_t program,
+    uint32_t depth, uint8_t flags)
+{
+    program = jce_enc_prepare_submit(id, program, NULL);
+    if (program.idx == UINT16_MAX) return;
+    bgfx_submit(id, program, depth, flags);
+}
+
+static inline void jce_enc_submit_indirect_implicit(bgfx_view_id_t id,
+    bgfx_program_handle_t program, bgfx_indirect_buffer_handle_t indirect,
+    uint32_t start, uint32_t num, uint32_t depth, uint8_t flags)
+{
+    program = jce_enc_prepare_submit(id, program, NULL);
+    if (program.idx == UINT16_MAX) return;
+    bgfx_submit_indirect(id, program, indirect, start, num, depth, flags);
 }
 
 #ifdef __cplusplus

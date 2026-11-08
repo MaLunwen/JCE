@@ -46,14 +46,11 @@ Do not cite the baseline as a list of bugs.  That mistake has already been
 made on this branch, when three of five written-out exemption reasons turned
 out to rest on searches that came back empty for the wrong reason.
 
-IT READS THE GIT INDEX, so a NEW FILE that is not staged yet is invisible to
-it.  Splitting a file and moving readers into an untracked TU makes those
-fields look newly unread -- seven of them, on 2026-09-01, when the dropdown
-and input field moved out of jce_ui_canvas.c.  `git add` the new file and the
-gate goes green.  That is the right behaviour for a gate whose baseline is a
-tracked contract, but it reads as a regression, so it is written down here.
-(check_shader_uniform_bound.py made the opposite choice, scanning the
-filesystem, because it has no baseline to keep honest.)
+IT READS THE WORKING TREE through lint_git_files.working_tree(): tracked
+and untracked production sources, excluding ignored build and frozen copies.
+Moving readers into a newly authored TU must not make fields look unread
+until somebody stages the file.  The baseline remains the recorded field
+contract; it is compared against the actual authored source, not the index.
 
 Two deliberate exclusions: `reserved`, which is forward-compat padding and is
 SUPPOSED to have no reader, and jce_scene_components_*.c, because reading a
@@ -85,13 +82,18 @@ Exit 0 clean, 1 on any newly unread field.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 LINT_DIR = Path(__file__).resolve().parent
+_spec = importlib.util.spec_from_file_location(
+    "lint_git_files", LINT_DIR / "lint_git_files.py")
+_lgf = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lgf)
+
 REPO_ROOT = LINT_DIR.parents[1]
 HEADER = REPO_ROOT / "engine/include/jce/middleware/scene/jce_scene.h"
 IMPL = REPO_ROOT / "engine/src/middleware/scene/jce_scene.c"
@@ -281,16 +283,17 @@ def component_fields() -> dict:
 
 
 def engine_texts() -> dict:
-    listing = subprocess.run(["git", "ls-files", "engine/src"],
-                             cwd=REPO_ROOT, capture_output=True, text=True)
     out = {}
-    for rel in listing.stdout.split():
-        if not rel.endswith((".c", ".cpp")):
+    for rel in sorted(_lgf.working_tree()):
+        if not rel.startswith("engine/src/") or not rel.endswith((".c", ".cpp")):
             continue
         if any(k in rel for k in SERIALIZERS):
             continue
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue  # A tracked source can be deleted in the working tree.
         out[rel] = strip_comments(
-            (REPO_ROOT / rel).read_text(encoding="utf-8", errors="replace"))
+            path.read_text(encoding="utf-8", errors="replace"))
     return out
 
 

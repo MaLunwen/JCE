@@ -4,6 +4,7 @@
 
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_toast.h"
+#include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -25,6 +26,13 @@ namespace {
 
 constexpr size_t kMaxCompletedSpans = 2048;
 constexpr size_t kMaxTaskDefinitions = 8192;
+constexpr size_t kMaxObservedThreads = 1024;
+constexpr size_t kMaxCounterNames = 2048;
+constexpr size_t kMaxActiveSpans = 8192;
+
+enum class ThreadRegistration : uint8_t {
+    Unknown, Registered, UnregistrationObserved
+};
 
 struct ThreadRow {
     std::string name;
@@ -33,7 +41,7 @@ struct ThreadRow {
     uint64_t busy_ns = 0;
     uint64_t completed_work = 0;
     uint32_t active_work = 0;
-    bool active = false;
+    ThreadRegistration registration = ThreadRegistration::Unknown;
 };
 
 struct TaskDefinition {
@@ -73,7 +81,10 @@ struct TracePanelState {
     std::deque<uint64_t> task_order;
     std::unordered_map<uint64_t, ActiveSpan> active_spans;
     std::deque<CompletedSpan> completed_spans;
-    std::map<std::string, int64_t> counters;
+    std::map<std::string, int64_t, std::less<>> counters;
+    uint64_t refused_thread_rows = 0;
+    uint64_t refused_counter_names = 0;
+    uint64_t refused_span_begins = 0;
 };
 
 TracePanelState s_trace;
@@ -88,13 +99,98 @@ double ns_to_ms(uint64_t ns)
     return static_cast<double>(ns) / 1000000.0;
 }
 
-ThreadRow &thread_for(uint64_t id)
+const char *thread_registration_name(ThreadRegistration registration)
 {
+    switch (registration) {
+    case ThreadRegistration::Registered:
+        return tr("profiler.trace.registered", "Registered");
+    case ThreadRegistration::UnregistrationObserved:
+        return tr("profiler.trace.unregistrationObserved", "Unregistered");
+    default:
+        return tr("profiler.trace.registrationUnknown", "Unknown");
+    }
+}
+
+/* Only these signed backend memory observations use negative sentinels.
+ * Preserve legitimate zero and unrelated negative counters verbatim. */
+bool counter_unavailable(const std::string &name, int64_t value)
+{
+    return value < 0 &&
+        (name == "gpu.adapter_reported_used_bytes" ||
+         name == "renderer.texture_estimate_bytes" ||
+         name == "renderer.rt_estimate_bytes");
+}
+
+/* Counts refused admission events, not distinct IDs: no refusal registry. */
+void count_refusal(uint64_t &count)
+{
+    if (count != UINT64_MAX) ++count;
+}
+
+ThreadRow *thread_for(uint64_t id)
+{
+    auto found = s_trace.threads.find(id);
+    if (found != s_trace.threads.end()) {
+        if (found->second.name.empty())
+            found->second.name = tr("profiler.trace.nameUnavailable", "Name unavailable");
+        return &found->second;
+    }
+    if (s_trace.threads.size() >= kMaxObservedThreads) {
+        count_refusal(s_trace.refused_thread_rows);
+        return nullptr;
+    }
     ThreadRow &thread = s_trace.threads[id];
     thread.id = id;
-    if (thread.name.empty())
-        thread.name = tr("profiler.trace.unregistered", "Unregistered");
-    return thread;
+    thread.name = tr("profiler.trace.nameUnavailable", "Name unavailable");
+    return &thread;
+}
+
+/* Only cached work begins contribute to the table's tracked open count. */
+void release_tracked_work(const ActiveSpan &active)
+{
+    if (active.wait) return;
+    auto thread = s_trace.threads.find(active.thread_id);
+    if (thread != s_trace.threads.end() && thread->second.active_work > 0)
+        --thread->second.active_work;
+}
+
+void remember_span(const JceTraceEvent &event, bool wait, ThreadRow *thread)
+{
+    auto found = s_trace.active_spans.find(event.id);
+    if (found == s_trace.active_spans.end()) {
+        if (s_trace.active_spans.size() >= kMaxActiveSpans) {
+            count_refusal(s_trace.refused_span_begins);
+            return;
+        }
+    } else {
+        release_tracked_work(found->second);
+    }
+    ActiveSpan active;
+    active.task_id = event.parent_id;
+    active.thread_id = event.thread_id;
+    active.started_ns = event.timestamp_ns;
+    active.queue_ns = wait ? 0 : event.value_u64;
+    active.name = event.name;
+    active.wait = wait;
+    if (found == s_trace.active_spans.end())
+        s_trace.active_spans.emplace(event.id, std::move(active));
+    else
+        found->second = std::move(active);
+    if (!wait && thread) ++thread->active_work;
+}
+
+void remember_counter(const JceTraceEvent &event)
+{
+    auto found = s_trace.counters.find(event.name);
+    if (found != s_trace.counters.end()) {
+        found->second = static_cast<int64_t>(event.value_u64);
+        return;
+    }
+    if (s_trace.counters.size() >= kMaxCounterNames) {
+        count_refusal(s_trace.refused_counter_names);
+        return;
+    }
+    s_trace.counters.emplace(event.name, static_cast<int64_t>(event.value_u64));
 }
 
 void remember_task(const JceTraceEvent &event)
@@ -120,13 +216,14 @@ void complete_span(const JceTraceEvent &event, bool wait)
     CompletedSpan completed;
     auto active_it = s_trace.active_spans.find(event.id);
 
-    if (active_it != s_trace.active_spans.end()) {
+    if (active_it != s_trace.active_spans.end() && active_it->second.wait == wait) {
         const ActiveSpan &active = active_it->second;
         completed.name = active.name;
         completed.task_id = active.task_id;
         completed.thread_id = active.thread_id;
         completed.queue_ns = active.queue_ns;
         completed.wait = active.wait;
+        release_tracked_work(active);
         s_trace.active_spans.erase(active_it);
     } else {
         completed.name = event.name;
@@ -147,57 +244,57 @@ void complete_span(const JceTraceEvent &event, bool wait)
 
 void consume_event(const JceTraceEvent &event)
 {
-    ThreadRow &thread = thread_for(event.thread_id);
-    thread.last_event_ns = event.timestamp_ns;
+    ThreadRow *thread = thread_for(event.thread_id);
+    if (thread) thread->last_event_ns = event.timestamp_ns;
 
     switch (event.type) {
     case JCE_TRACE_EVENT_THREAD_REGISTER:
-        thread.name = event.name;
-        thread.active = true;
+        if (thread) {
+            thread->name = event.name;
+            thread->registration = ThreadRegistration::Registered;
+        }
         break;
     case JCE_TRACE_EVENT_THREAD_UNREGISTER:
-        thread.active = false;
+        if (thread) thread->registration = ThreadRegistration::UnregistrationObserved;
         break;
     case JCE_TRACE_EVENT_TASK_SUBMIT:
         remember_task(event);
         break;
-    case JCE_TRACE_EVENT_TASK_BEGIN: {
-        ActiveSpan active;
-        active.task_id = event.parent_id;
-        active.thread_id = event.thread_id;
-        active.started_ns = event.timestamp_ns;
-        active.queue_ns = event.value_u64;
-        active.name = event.name;
-        s_trace.active_spans[event.id] = std::move(active);
-        thread.active_work++;
+    case JCE_TRACE_EVENT_TASK_BEGIN:
+        remember_span(event, false, thread);
         break;
-    }
     case JCE_TRACE_EVENT_TASK_END:
-        if (thread.active_work > 0)
-            thread.active_work--;
-        thread.completed_work++;
-        thread.busy_ns += event.value_u64;
+        if (thread) {
+            thread->completed_work++;
+            thread->busy_ns += event.value_u64;
+        }
         complete_span(event, false);
         break;
-    case JCE_TRACE_EVENT_WAIT_BEGIN: {
-        ActiveSpan active;
-        active.task_id = event.parent_id;
-        active.thread_id = event.thread_id;
-        active.started_ns = event.timestamp_ns;
-        active.name = event.name;
-        active.wait = true;
-        s_trace.active_spans[event.id] = std::move(active);
+    case JCE_TRACE_EVENT_WAIT_BEGIN:
+        remember_span(event, true, thread);
         break;
-    }
     case JCE_TRACE_EVENT_WAIT_END:
         complete_span(event, true);
         break;
     case JCE_TRACE_EVENT_COUNTER:
-        s_trace.counters[event.name] = static_cast<int64_t>(event.value_u64);
+        remember_counter(event);
         break;
     default:
         break;
     }
+}
+
+/* A missing prefix may contain registrations, unregisters or span ends.
+ * Retained history is not a current OS roster. Resume open-work accounting
+ * only from newly observed begins after this gap; keep raw counter history. */
+void invalidate_registration_prefix(void)
+{
+    for (auto &entry : s_trace.threads) {
+        entry.second.registration = ThreadRegistration::Unknown;
+        entry.second.name = tr("profiler.trace.nameUnavailable", "Name unavailable");
+        entry.second.active_work = 0;
+    }
+    s_trace.active_spans.clear();
 }
 
 void poll_trace(void)
@@ -212,9 +309,12 @@ void poll_trace(void)
         return;
 
     for (int pass = 0; pass < 8; ++pass) {
+        const uint64_t previous_loss = s_trace.cursor.lost_events;
         uint32_t count = jce_trace_read(
             &s_trace.cursor, events,
             static_cast<uint32_t>(sizeof(events) / sizeof(events[0])));
+        if (s_trace.cursor.lost_events != previous_loss)
+            invalidate_registration_prefix();
         for (uint32_t i = 0; i < count; ++i)
             consume_event(events[i]);
         if (count < static_cast<uint32_t>(sizeof(events) / sizeof(events[0])))
@@ -228,7 +328,8 @@ void clear_view(void)
 
     jce_trace_get_stats(&stats);
     s_trace.cursor.next_sequence =
-        static_cast<uint32_t>(stats.recorded_events) + 1u;
+        stats.recorded_events >= UINT32_MAX ? UINT32_MAX
+            : static_cast<uint32_t>(stats.recorded_events) + 1u;
     s_trace.cursor.lost_events = 0;
     s_trace.threads.clear();
     s_trace.tasks.clear();
@@ -236,6 +337,9 @@ void clear_view(void)
     s_trace.active_spans.clear();
     s_trace.completed_spans.clear();
     s_trace.counters.clear();
+    s_trace.refused_thread_rows = 0;
+    s_trace.refused_counter_names = 0;
+    s_trace.refused_span_begins = 0;
 }
 
 void export_trace(void)
@@ -254,7 +358,7 @@ void export_trace(void)
 
 void draw_toolbar(const JceTraceStats &stats)
 {
-    ImGui::Checkbox(jce_editor_i18n_or("profiler.trace.live", "Live"),
+    ImGui::Checkbox(jce_editor_i18n_or("profiler.trace.live", "Auto refresh"),
                     &s_trace.live);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_or("profiler.trace.clear",
@@ -268,10 +372,22 @@ void draw_toolbar(const JceTraceStats &stats)
     s_trace.filter.Draw(tr("profiler.trace.filter", "Filter tasks..."),
                         260.0f);
 
-    if (stats.enabled) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", tr("profiler.trace.recording", "recording"));
-    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(stats.enabled
+        ? jce_editor_i18n_or("profiler.trace.recording", "Recording: on")
+        : jce_editor_i18n_or("profiler.trace.recordingOff", "Recording: off"));
+    if (!stats.enabled)
+        ImGui::TextWrapped("%s", jce_editor_i18n_or("profiler.trace.retainedHint",
+            "Showing retained history; auto refresh does not enable recording."));
+    if (s_trace.refused_thread_rows || s_trace.refused_counter_names ||
+        s_trace.refused_span_begins)
+        ImGui::TextWrapped(jce_editor_i18n_or("profiler.trace.localViewPartial",
+            "Local view partial: thread-row events refused %llu (limit %zu); "
+            "counter-name events refused %llu (limit %zu); span-begin events refused %llu "
+            "(limit %zu). Producer loss is reported separately."),
+            static_cast<unsigned long long>(s_trace.refused_thread_rows), kMaxObservedThreads,
+            static_cast<unsigned long long>(s_trace.refused_counter_names), kMaxCounterNames,
+            static_cast<unsigned long long>(s_trace.refused_span_begins), kMaxActiveSpans);
 }
 
 void draw_summary(const JceTraceStats &stats)
@@ -283,7 +399,7 @@ void draw_summary(const JceTraceStats &stats)
     ImGui::TableNextColumn();
     ImGui::Text("%u", stats.active_threads);
     ImGui::TextDisabled(
-        "%s", jce_editor_i18n_or("profiler.trace.threads", "Active threads"));
+        "%s", jce_editor_i18n_or("profiler.trace.registeredThreads", "Trace-registered threads"));
     ImGui::TableNextColumn();
     ImGui::Text("%u", stats.active_work_items);
     ImGui::TextDisabled(
@@ -380,7 +496,7 @@ void draw_gpu_scene(void)
 
 void draw_counters(void)
 {
-    ImGui::SeparatorText(tr("profiler.trace.counters", "Live counters"));
+    ImGui::SeparatorText(tr("profiler.trace.recentCounters", "Most recent counters"));
     if (!ImGui::BeginTable("##trace_counters", 2,
                            ImGuiTableFlags_BordersInnerV |
                            ImGuiTableFlags_RowBg |
@@ -401,14 +517,18 @@ void draw_counters(void)
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(entry.first.c_str());
         ImGui::TableNextColumn();
-        ImGui::Text("%lld", static_cast<long long>(entry.second));
+        if (counter_unavailable(entry.first, entry.second))
+            ImGui::TextUnformatted(tr("profiler.trace.counterUnavailable", "N/A"));
+        else
+            ImGui::Text("%lld", static_cast<long long>(entry.second));
     }
     ImGui::EndTable();
 }
 
 void draw_threads(void)
 {
-    ImGui::SeparatorText(tr("profiler.trace.threadTable", "Threads"));
+    ImGui::TextWrapped("%s", jce_editor_i18n("profiler.trace.scopeNote"));
+    ImGui::SeparatorText(tr("profiler.trace.observedThreadTable", "Observed thread history"));
     if (!ImGui::BeginTable("##trace_threads", 6,
                            ImGuiTableFlags_BordersInnerV |
                            ImGuiTableFlags_RowBg |
@@ -419,10 +539,10 @@ void draw_threads(void)
 
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn(tr("profiler.trace.state", "State"),
-                            ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                            ImGuiTableColumnFlags_WidthFixed, 110.0f);
     ImGui::TableSetupColumn(tr("profiler.trace.name", "Name"));
     ImGui::TableSetupColumn(tr("profiler.trace.threadId", "Thread ID"));
-    ImGui::TableSetupColumn(tr("profiler.trace.activeWork", "Active"),
+    ImGui::TableSetupColumn(tr("profiler.trace.trackedOpenWork", "Locally tracked open work"),
                             ImGuiTableColumnFlags_WidthFixed, 60.0f);
     ImGui::TableSetupColumn(tr("profiler.trace.completed", "Completed"));
     ImGui::TableSetupColumn(tr("profiler.trace.busy", "Observed busy"));
@@ -434,10 +554,7 @@ void draw_threads(void)
             continue;
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
-        ImGui::TextUnformatted(
-            thread.active
-                ? jce_editor_i18n_or("profiler.trace.live", "Live")
-                : jce_editor_i18n_or("profiler.trace.exited", "Exited"));
+        ImGui::TextUnformatted(thread_registration_name(thread.registration));
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(thread.name.c_str());
         ImGui::TableNextColumn();
@@ -544,9 +661,13 @@ void draw_work_items(void)
 
 extern "C" void jce_editor_panel_profiler_trace_content(void)
 {
-    JceTraceStats stats = {};
-
     poll_trace();
+    /* Keep this passive cursor current while the same-host Game overlay covers
+     * presentation. Detached profiler windows keep their visible tables. */
+    if (jce_editor_game_view_maximized() &&
+        ImGui::GetWindowViewport() == ImGui::GetMainViewport()) return;
+
+    JceTraceStats stats = {};
     jce_trace_get_stats(&stats);
     draw_toolbar(stats);
     draw_summary(stats);

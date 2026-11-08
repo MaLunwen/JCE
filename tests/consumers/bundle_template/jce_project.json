@@ -1,5 +1,6 @@
 {
   "name": "JceBundleTemplateEmitter",
   "target": "JceBundleTemplateEmitter",
-  "required_languages": []
+  "required_languages": [],
+  "startup_scene": "scenes/emitter.scene.json"
 }

@@ -243,7 +243,7 @@ bool load_scene_from_parsed_root(const JceJson *root,
 
     /* Loading a scene during Play would swap the JceScene out from under a
      * running runtime — stop it first. */
-    stop_play_before_scene_swap();
+    if (!stop_play_before_scene_swap()) return false;
 
     /* Clear editor state and the ECS scene. */
     clear_scene_entities();

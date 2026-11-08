@@ -21,7 +21,9 @@ uniform vec4 u_sky_colors[3];
  * both existed, which is part of how mode 4 stayed unreachable unnoticed. */
 uniform vec4 u_sky_params;
 
+#if !defined(JCE_SKY_GL21_STOCK)
 #include "sky_stylise.sh"
+#endif
 
 /* ── Preetham analytic sky (mode 2) — GPU twin of jce_sky.c ──────────
  * Mirror of jce_sky_radiance(): keep this byte-aligned with the C math.
@@ -35,12 +37,6 @@ uniform vec4 u_sky_params;
 uniform vec4 u_sky_perez[4];
 uniform vec4 u_sky_zenith;
 uniform vec4 u_sky_sun_dir;
-
-/* Absolute scale of the PHYSICAL sky, see the derivation at its use site.
- * A single named constant rather than a number buried in an expression,
- * because it is the one figure in this shader that is calibrated against a
- * measurement instead of derived from the atmosphere. */
-#define JCE_SKY_SCALE 0.21
 
 /* ── Stylized sky dome (mode 3, u_sky_params.x > 2.5) ─────────────────
  * Reuses u_sky_colors[0]=zenith, [1]=horizon, [2]=ground and
@@ -61,6 +57,7 @@ uniform vec4 u_fogParams;    // x=mode (0 = off), y=density, z=start, w=end
 uniform vec4 u_fogColor;     // xyz=fog color
 
 SAMPLER2D(s_equirect, 0);
+#if !defined(JCE_SKY_GL21_STOCK)
 /* Baked atmospheric transmittance, 256x64 RGBA: u = (cos(sun zenith)+1)/2,
  * v = altitude / atmosphere height.  Sampled at TEXEL CENTRES -- see
  * jce_atmosphere_lut_uv; the half-texel matters most at the horizon, which is
@@ -83,16 +80,11 @@ SAMPLER2D(s_sky_clouds, 2);
 SAMPLER2D(s_sky_multiscatter, 3);
 uniform vec4 u_cloud_params;   // x=coverage y=density z=bottom_km w=top_km
 uniform vec4 u_cloud_atlas;    // x=dim_x y=dim_y z=dim_z w=tiles_x
-uniform vec4 u_cloud_quality;  // x=step budget (<= the loop bound) yz=wind offset (tile units)
+uniform vec4 u_cloud_quality;  // x=step budget, yz=wind offset (tile units), w=cumulus material
 uniform vec4 u_cloud_period;   // xy = 1/period_x, 1/period_z, per KILOMETRE
+#endif
 
-/* Perez F(theta,gamma): abcde = (A,B,C,D,E). Identical to sky_perez(). */
-float sky_perez(vec4 abcd, float E, float cos_theta, float gamma)
-{
-    float cg = cos(gamma);
-    return (1.0 + abcd.x * exp(abcd.y / cos_theta))
-         * (1.0 + abcd.z * exp(abcd.w * gamma) + E * cg * cg);
-}
+#include "sky_preetham_math.sh"
 
 /* ── Night-sky helpers (mode 3, dark-zenith scenes only) ──────────────
  * Stars + moon craters engage when the authored dome zenith is dark
@@ -130,146 +122,61 @@ float sky_vnoise3(vec3 p)
     return mix(nxy0, nxy1, u.z);
 }
 
-/* Density of the cloud field at a world point, in the atlas's own terms.
- *
- * Lifted out of the view march so the LIGHT march can ask the same question.
- * Two copies of this addressing is exactly how the axis swap survived as long
- * as it did -- it was wrong in the march and right in the CPU bake, and there
- * was nothing to compare. */
-/* One trilinear-in-XY, nearest-in-Z fetch of the folded atlas.
- *
- * Split out of cloud_density_at so the same addressing can be reused at a
- * second, higher frequency for the detail term below.  Two copies of this
- * arithmetic is exactly how the axis swap documented above survived. */
-float cloud_atlas_fetch(float u01, float v01, float w01)
+#if !defined(JCE_SKY_GL21_STOCK)
+#include "sky_cloud_atlas.sh"
+#include "sky_celestial.sh"
+
+#include "sky_cloud_march.sh"
+
+SAMPLER2D(s_sky_cloud_resolved, 7);
+uniform vec4 u_cloud_temporal;  // x=main sky has a resolved cloud texture
+uniform vec4 u_cloud_rt_params; // x=originBottomLeft
+uniform mat4 u_cloud_sample_view_proj; // clean projection used by the half-res march
+
+// Segment Beer transmittance from the actual atmosphere LUT. The CPU bake
+// uses Earth radius6360km, top60km, Rayleigh8km/Mie1.2km scale heights,
+// and per-km extinction (including Mie absorption and ozone). No normalized
+// display coefficient is used as a physical extinction coefficient here.
+vec3 sky_ground_segment_transmittance(vec3 eye_km, vec3 ray, out float distance_km)
 {
-	float dimx = u_cloud_atlas.x, dimy = u_cloud_atlas.y;
-	float dimz = u_cloud_atlas.z, tilesx = u_cloud_atlas.w;
-	float slice = floor(clamp(w01, 0.0, 0.999) * dimz);
-	float tcol  = mod(slice, tilesx);
-	float trow  = floor(slice / tilesx);
-	float aw    = dimx * tilesx;
-	float ah    = dimy * ceil(dimz / tilesx);
-	float px    = tcol * dimx + clamp(u01, 0.0, 1.0) * (dimx - 1.0) + 0.5;
-	float py    = trow * dimy + clamp(v01, 0.0, 1.0) * (dimy - 1.0) + 0.5;
-	return texture2D(s_sky_clouds, vec2(px / aw, py / ah)).r;
+    distance_km = -1.0;
+    float b = dot(eye_km, ray) + JCE_CLOUD_PLANET_KM * ray.y;
+    float c = dot(eye_km, eye_km) + 2.0 * JCE_CLOUD_PLANET_KM * eye_km.y;
+    vec2 roots = cloud_sphere_roots(b, c);
+    if (roots.x < 0.0 || roots.y < roots.x) return vec3_splat(1.0);
+    distance_km = roots.x;
+    if (distance_km < 0.0001) return vec3_splat(1.0);
+    vec3 radial = eye_km + vec3(0.0, JCE_CLOUD_PLANET_KM, 0.0);
+    float radius = length(radial);
+    float altitude_km = max(c / (radius + JCE_CLOUD_PLANET_KM), 0.0);
+    vec3 ground_up = (radial + ray * distance_km) / JCE_CLOUD_PLANET_KM;
+    // The reverse ray passes from ground through the eye and then to space.
+    // T(G,space) = T(G,eye) * T(eye,space), including varying air density.
+    float ground_mu = clamp(dot(ground_up, -ray), -1.0, 1.0);
+    float eye_mu = clamp(dot(radial / radius, -ray), -1.0, 1.0);
+    vec2 ground_uv = vec2(((ground_mu * 0.5 + 0.5) * 255.0 + 0.5) / 256.0,
+                          0.5 / 64.0);
+    vec2 eye_uv = vec2(((eye_mu * 0.5 + 0.5) * 255.0 + 0.5) / 256.0,
+        (clamp(altitude_km / 60.0, 0.0, 1.0) * 63.0 + 0.5) / 64.0);
+#if BGFX_SHADER_LANGUAGE_HLSL || BGFX_SHADER_LANGUAGE_SPIRV || BGFX_SHADER_LANGUAGE_METAL
+    vec3 ground_to_space = texture2DLod(s_sky_transmittance, ground_uv, 0.0).rgb;
+    vec3 eye_to_space = texture2DLod(s_sky_transmittance, eye_uv, 0.0).rgb;
+#else
+    vec3 ground_to_space = texture2D(s_sky_transmittance, ground_uv).rgb;
+    vec3 eye_to_space = texture2D(s_sky_transmittance, eye_uv).rgb;
+#endif
+    return clamp(ground_to_space / max(eye_to_space, vec3_splat(1e-8)),
+                 vec3_splat(0.0), vec3_splat(1.0));
 }
+#endif
 
-/* `detail` selects whether the high-frequency erosion runs.
- *
- * The light march passes 0.  It takes six samples for every view sample, so
- * giving it the second fetch would nearly double the cost of the whole layer
- * to sharpen a self-shadow that is then blurred by the phase function anyway.
- * The reference makes the same split: full detail on the view ray, cheap
- * sampling on the light ray. */
-float cloud_density_at(vec3 wp, float bot, float top, float detail)
-{
-	float h01 = clamp((wp.y - bot) / (top - bot), 0.0, 1.0);
-	/* Wrap XZ into the baked period; the bake tiles seamlessly.
-	 *
-	 * The factor was 0.05 per kilometre -- a declared period of
-	 * 20 km. The atlas covers exactly ONE period of the field,
-	 * which is 4096 m by default, so the sky was drawing the same
-	 * clouds 4.88x too large while the ground sampled the CPU
-	 * field at its true size. u_cloud_period carries 1/period.
-	 *
-	 * u_cloud_quality.yz is how far the wind has carried the
-	 * field, already in tile units and already wrapped. Subtracting
-	 * it moves the CLOUDS downwind rather than moving the world
-	 * upwind -- the same picture with the opposite sign, and the
-	 * sign is checkable, because the shadow bake subtracts the same
-	 * displacement from the same world position. */
-	float u01 = fract(wp.x * u_cloud_period.x - u_cloud_quality.y);
-	float w01 = fract(wp.z * u_cloud_period.y - u_cloud_quality.z);
-
-	/* Fold into the slice atlas.
-	 *
-	 * The bake writes slice = world Z, column = world X, row =
-	 * NORMALISED ALTITUDE (jce_cloud_noise.c:655-667: zz from k,
-	 * xx from i, h01 from j). This read had altitude selecting the
-	 * slice and world Z selecting the row -- the two exchanged. A
-	 * cloud's vertical structure was therefore laid out along Z and
-	 * its Z extent along the height gradient, which is why the
-	 * height profile and anvil shape were correct in the shadow
-	 * bake, which samples the field directly, and wrong in the sky. */
-	float v01 = clamp(h01, 0.0, 1.0);
-	float d   = cloud_atlas_fetch(u01, v01, w01);
-
-	/* Coverage carves the field: below the threshold there is no
-	 * cloud at all, so raising coverage grows existing clouds
-	 * rather than fading a uniform haze in. */
-	/* Trim the noise floor ONLY.  Coverage is not applied here:
-	 * it is baked into the atlas via the field's own coverage
-	 * bias, which is the control that decides how much cloud
-	 * exists at all.  This line used to threshold by coverage as
-	 * well, so the slider was applied twice -- once to a field
-	 * that had never heard of it (bias fixed at its default,
-	 * leaving 13.8% of the volume non-zero and a peak density of
-	 * 0.46) and again here, carving most of what remained.  The
-	 * result was a slider that did nothing until it neared 1 and
-	 * then produced wisps. */
-	d = clamp((d - 0.02) / 0.98, 0.0, 1.0);
-
-	/* HIGH-FREQUENCY EROSION.
-	 *
-	 * The comment on the atlas bake says the layer is deliberately small
-	 * because "the DETAIL that makes a cloud edge look eroded comes from the
-	 * shader's own high-frequency term, not from a larger bake".  There was no
-	 * such term.  This function was one atlas fetch and a noise-floor trim, and
-	 * the field's finest feature is 171 m (detail_freq 24 over a 4096 m
-	 * period) -- so every cloud in this sky was a smooth blob at a scale where
-	 * the reference has cauliflower.
-	 *
-	 * A second fetch of the SAME atlas at eight times the frequency supplies
-	 * it without a second bake or a second texture.  The atlas is a coherent
-	 * tiling 3D field, so read at 8x it is valid noise at 8x the frequency;
-	 * what it is not is INDEPENDENT noise, so the offsets and the axis
-	 * permutation below matter -- reading it at the same phase would carve
-	 * every cloud with a scaled copy of its own silhouette.  The altitude axis
-	 * is tiled only 3x because it spans 1 km against 4 km of XZ, and matching
-	 * the horizontal rate there would alias against the height gradient.
-	 *
-	 * REMAP, not multiply -- this is the one detail the reference is explicit
-	 * about: "Remapping prevents a loss of too much density at the core."
-	 * (low - high*k) / (1 - high*k) subtracts the detail from the base and
-	 * then renormalises, so a dense core stays dense while a thin edge is
-	 * carved away.  A plain multiply would thin the whole cloud uniformly,
-	 * which reads as lower coverage rather than as erosion. */
-	if (detail > 0.5 && d > 0.0)
-	{
-		float du = fract(u01 * 8.0 + 0.37);
-		float dv = fract(v01 * 3.0 + 0.11);
-		float dw = fract(w01 * 8.0 + 0.61);
-		/* Axis permutation: feed the horizontal coordinate into the atlas's
-		 * altitude row and vice versa, so the detail carries none of the base
-		 * field's vertical structure. */
-		float hi = cloud_atlas_fetch(dw, du, dv);
-
-		const float k = 0.42;
-		/* No trailing underscore in a local name: glsl-optimizer renames
-		 * locals to <name>_<id>, which turns one into a reserved __ name. */
-		float sub = hi * k;
-		d = clamp((d - sub) / max(1.0 - sub, 1e-3), 0.0, 1.0);
-	}
-	return d;
-}
+#if !defined(JCE_SKY_GL21_STOCK)
+#include "sky_stylized_clouds.sh"
+#endif
 
 void main()
 {
-    /* Reconstruct world-space view ray direction.  The NDC near-plane z is
-     * backend-dependent: OpenGL clip space is [-1,1] (near = -1) while
-     * D3D/Vulkan/Metal are [0,1] (near = 0).  Unprojecting z = -1 on a [0,1]
-     * backend yields a point OUTSIDE the frustum (negative w after the
-     * homogeneous divide) → a garbage ray → the dome gradient samples the
-     * wrong band → dark sky on D3D/VK (OpenGL stayed correct). */
-#if BGFX_SHADER_LANGUAGE_GLSL
-    float ndcNearZ = -1.0;
-#else
-    float ndcNearZ =  0.0;
-#endif
-    vec4 nearH = mul(u_invViewProj, vec4(v_texcoord0, ndcNearZ, 1.0));
-    vec4 farH  = mul(u_invViewProj, vec4(v_texcoord0,      1.0, 1.0));
-    vec3 dir   = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
+#include "sky_view_ray.sh"
 
     /* Sky mode dispatch, in DESCENDING threshold order.
      *
@@ -284,10 +191,12 @@ void main()
      * Any new mode MUST be inserted in descending order.  A greater-than
      * ladder that is not sorted is not a dispatch, it is a shadowing bug that
      * looks like working code. */
+#if !defined(JCE_SKY_GL21_STOCK)
     if (u_sky_params.x > 3.5) {
         /* Cloud silhouette term for the stylisation layer.  0 in open sky and
          * deep inside a cloud, 1 at the edge -- see where it is set below. */
         float cloud_rim = 0.0;
+        float cloud_transmittance = 1.0;
         /* ── PHYSICAL: sample the baked transmittance table ─────────────
          *
          * The same table the CPU lighting authority reads, so the sky and the
@@ -431,257 +340,61 @@ void main()
          * in sRGB -- the figure the exposure ablation above produced from an
          * otherwise identical frame. */
         vec3 col = (single + ms) * airmass * u_sky_params.y * JCE_SKY_SCALE;
-        /* Below the horizon fade to the ground colour rather than cutting. */
-        col = mix(u_sky_colors[2].rgb * 0.15, col, smoothstep(-0.1, 0.05, dir.y));
+        if (u_cloud_quality.w > 0.5 && u_cloud_params.x > 0.001) {
+            // Daytime cumulus look: deepen the clear air away from the sun.
+            // The cloud source and atmospheric light LUT keep their own colors.
+            float blue_sky = smoothstep(0.12, 0.45, mu) * smoothstep(0.08, 0.38, dir.y);
+            blue_sky *= 1.0 - 0.65 * smoothstep(0.86, 0.99, cosT);
+            col *= mix(vec3_splat(1.0), vec3(0.40, 0.51, 0.94), blue_sky);
+        }
+        // Sky is the fallback only where no scene geometry was drawn. A
+        // real planetary intersection supplies the background ground distance,
+        // rather than attaching a dark directional band to the camera.
+        vec3 ground_eye_km = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz * 0.001;
+        float ground_distance_km;
+        vec3 air_transmittance = sky_ground_segment_transmittance(
+            ground_eye_km, dir, ground_distance_km);
+        if (ground_distance_km >= 0.0) {
+            // Integrate the existing per-kilometre scattering source over
+            // the finite segment. Multiplying an already blue path integral
+            // by (1-T) again would count wavelength selection twice.
+            vec3 middle = ground_eye_km + dir * (0.5 * ground_distance_km);
+            float middle_altitude = max(cloud_world_altitude(middle), 0.0);
+            float rayleigh_density = exp(-middle_altitude / H_R);
+            float mie_density = exp(-middle_altitude / 1.2);
+            vec3 source_per_km = (beta_R * (phase * rayleigh_density)
+                + beta_M * (phaseM * mie_density)) * T + ms * (rayleigh_density / H_R);
+            vec3 optical_depth = -log(max(air_transmittance, vec3_splat(1e-8)));
+            vec3 optical_integral = (vec3_splat(1.0) - air_transmittance)
+                / max(optical_depth, vec3_splat(0.0001));
+            vec3 effective_length = ground_distance_km * mix(vec3_splat(1.0),
+                optical_integral, step(vec3_splat(0.0001), optical_depth));
+            col = u_sky_colors[2].rgb * 0.15 * air_transmittance
+                + source_per_km * effective_length * (u_sky_params.y * JCE_SKY_SCALE);
+        }
 
-        /* ── Volumetric clouds ──────────────────────────────────────────
-         *
-         * coverage 0 skips the march entirely, which is what keeps a scene
-         * without clouds bit-identical rather than paying for a transparent
-         * layer.  Only rays that actually rise into the slab march at all. */
-        if (u_cloud_params.x > 0.001 && dir.y > 0.02)
-        {
-            float botKm = (u_cloud_params.z > 0.0) ? u_cloud_params.z : 1.5;
-            float topKm = (u_cloud_params.w > botKm) ? u_cloud_params.w : 4.0;
-            float dens  = (u_cloud_params.y > 0.0) ? u_cloud_params.y : 1.0;
+        vec4 cloud;
+        BRANCH if (u_cloud_temporal.x > 0.5) {
+            float y_sign = u_cloud_rt_params.x > 0.5 ? 0.5 : -0.5;
+            vec4 clean_clip = mul(u_cloud_sample_view_proj, vec4(dir, 0.0));
+            vec2 cloud_ndc = clean_clip.w > 0.0001 ? clean_clip.xy / clean_clip.w : v_texcoord0;
+            vec2 cloud_uv = cloud_ndc * vec2(0.5, y_sign) + vec2_splat(0.5);
+            cloud = texture2D(s_sky_cloud_resolved, cloud_uv);
+            cloud_rim = clamp(4.0 * cloud.a * (1.0 - cloud.a), 0.0, 1.0);
+        } else {
+            vec3 camera_km = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz * 0.001;
+            float distance_km;
+            cloud = jce_cloud_march_with_rim(camera_km, dir, mu, T, ms,
+                gl_FragCoord.xy, distance_km, cloud_rim);
+        }
+        col += sky_authored_night_gradient(dir);
+        cloud_transmittance = cloud.a;
+        col = col * cloud_transmittance + cloud.rgb * u_sky_params.y * JCE_SKY_SCALE;
 
-            /* Flat-slab intersection: the camera is treated as being at
-             * ground level, which is exact enough for a layer a few km up and
-             * avoids a sphere intersection per pixel. */
-            /* The camera's world position, in kilometres, so the layer can
-             * be addressed in world space (see the march below). */
-            vec3 camWKm = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz * 0.001;
-
-            float t0 = botKm / dir.y;
-            float t1 = topKm / dir.y;
-
-            /* The loop BOUND is a compile-time constant -- a dynamic bound
-             * does not compile on the oldest profile this shader targets -- so
-             * the march always loops to the maximum and breaks on the budget.
-             * dt is derived from the BUDGET, not the bound, so a cheaper tier
-             * still traverses the whole slab with fewer, longer steps rather
-             * than stopping part-way through the cloud. */
-            const int STEPS_MAX = 24;
-            float budget = max(u_cloud_quality.x, 1.0);
-            float dt = (t1 - t0) / budget;
-
-            /* Wrenninge's contrast approximation (SIGGRAPH 2015): each octave
-             * i weakens the source (b^i), weakens extinction (a^i) and pushes
-             * the phase toward ISOTROPIC (c^i * g).
-             *
-             * That last term is the whole point.  A single anisotropic term
-             * makes a cloud dark everywhere it is not facing the sun.  Real
-             * clouds are dark only at the THIN edges, where light scatters
-             * once; deep inside, light has bounced so many times that the
-             * field is isotropic and the interior is bright.  Summing octaves
-             * with c^i -> 0 reproduces exactly that: rim anisotropic and dark,
-             * core isotropic and bright. */
-            float g = 0.6;
-            vec3  scatter = vec3_splat(0.0);
-            float trans   = 1.0;
-
-            /* Break the march's own step boundary with a per-pixel offset.
-             *
-             * Every pixel sampled at exactly t0 + (si + 0.5) * dt, so every
-             * pixel crossed the same density contour at the same place and
-             * the layer came out in visible steps -- a low sample count shows
-             * up as banding, and banding at a FIXED phase is the one kind a
-             * viewer reads as a defect rather than as texture.
-             *
-             * Interleaved gradient noise (Jimenez): one dot product and a
-             * fract, no texture, no state. It is a function of gl_FragCoord
-             * alone, so the dither pattern is IDENTICAL every frame -- the
-             * image stays deterministic, which matters because a temporal
-             * jitter without TAA to resolve it trades banding for crawling,
-             * and TAA is not on in every tier this has to run on.
-             *
-             * The offset is bounded to one step: sampling outside [t0, t0+dt)
-             * would push the first sample past geometry the slab test already
-             * decided was in front. */
-            float ign = fract(52.9829189 * fract(dot(gl_FragCoord.xy,
-                                                    vec2(0.06711056, 0.00583715))));
-
-            for (int si = 0; si < STEPS_MAX; ++si)
-            {
-                if (float(si) >= budget) break;
-                float t = t0 + (float(si) + ign) * dt;
-                /* WORLD space, not camera space.
-                 *
-                 * This was `dir * t` -- the ray from the camera, with the
-                 * camera's own world position never added.  The clouds
-                 * therefore travelled with the viewer: you could not walk
-                 * under one, and the layer was pinned to the eye like a
-                 * skybox.  Worse, the cloud SHADOW on the ground is baked at
-                 * true world XZ (jce_cloud_shadow.c), so the sky and its own
-                 * shadow disagreed by exactly the camera's world position --
-                 * a disagreement that CHANGED as the camera moved, which is
-                 * the shape of error that reads as "the shadows are wrong"
-                 * from every position except the origin.
-                 *
-                 * camWKm is metres/1000 because the slab, the periods and t
-                 * are all in kilometres. The mul() form is the one the mode-3
-                 * branch below already uses; raw element indexing of u_invView
-                 * reads the transpose on one backend (see vs_foliage.sc). */
-                /* XZ only. The slab intersection above keeps the existing
-                 * "camera is at ground level" convention (t0 = botKm/dir.y),
-                 * so adding the camera's world Y here would raise every sample
-                 * altitude by the eye height while t0 still assumed zero --
-                 * a second, quieter version of the same class of mismatch this
-                 * change exists to remove. The reported defect is horizontal:
-                 * the layer slid with the viewer in XZ while its ground shadow
-                 * did not. */
-                vec3  wp = vec3(camWKm.x, 0.0, camWKm.z) + dir * t;  /* km */
-
-                float d = cloud_density_at(wp, botKm, topKm, 1.0);
-                float sigma = d * dens;
-                if (sigma <= 0.0) continue;
-
-                /* Where this sample sits in the slab: 0 at the base, 1 at the
-                 * top. Used by the ambient term below. */
-                float h01s = clamp((wp.y - botKm) / max(topKm - botKm, 1e-4),
-                                   0.0, 1.0);
-
-                float sun_cos = clamp(dot(normalize(dir), normalize(u_sky_sun_dir.xyz)), -1.0, 1.0);
-
-                /* Short march toward the sun: the self-shadow (capability B15).
-                 *
-                 * Six samples over one slab thickness, with the step growing
-                 * geometrically. Uniform steps spend their whole budget in the
-                 * first few hundred metres, which is where the density is most
-                 * like the sample we already have; the far samples are what
-                 * tell a thick cloud from a thin one, and a growing step is
-                 * how they get reached without paying for the gap.
-                 *
-                 * Toward the sun, not along the light: u_sky_sun_dir is what
-                 * the Henyey-Greenstein above already uses as the direction
-                 * light arrives FROM, and a forward phase with g = 0.6 peaks
-                 * where the two agree -- so the two terms cannot disagree
-                 * about which way the sun is.
-                 *
-                 * The cost is real: six atlas fetches per view sample, on a
-                 * march that already takes up to 24. It is gated on the same
-                 * quality budget the view march uses, so the low tiers that
-                 * take fewer view steps also take fewer light steps. */
-                float sun_tau = 0.0;
-                {
-                    vec3  ldir  = normalize(u_sky_sun_dir.xyz);
-                    float lstep = (topKm - botKm) * 0.25;
-                    vec3  lp    = wp;
-                    for (int li = 0; li < 6; ++li)
-                    {
-                        if (float(li) * 4.0 >= budget) break;
-                        lp += ldir * lstep;
-                        /* Above the slab there is nothing left to shadow. */
-                        if (lp.y > topKm) break;
-                        sun_tau += cloud_density_at(lp, botKm, topKm, 0.0)
-                                 * dens * lstep;
-                        lstep *= 1.5;
-                    }
-                }
-
-                vec3 octave_sum = vec3_splat(0.0);
-                float a = 1.0, b = 1.0, c = 1.0;
-                for (int oi = 0; oi < 3; ++oi)
-                {
-                    /* Henyey-Greenstein with a per-octave eccentricity. */
-                    float gi = g * c;
-                    float den = 1.0 + gi * gi - 2.0 * gi * sun_cos;
-                    float ph  = (1.0 - gi * gi) / (4.0 * 3.14159265 * pow(max(den, 1e-4), 1.5));
-
-                    /* SILVER LINING -- a second, much tighter FORWARD lobe.
-                     *
-                     * Both lobes point forward and they are combined with
-                     * max(), which is the reference's own formulation:
-                     *   max(HG(cos, 0.6), silver * HG(cos, 0.99 - spread))
-                     * It is not the forward+backward weighted sum that the
-                     * generic literature uses; that shape cannot produce a
-                     * bright rim on a cloud that is between you and the sun.
-                     *
-                     * A single g = 0.6 lobe is broad enough to look right at
-                     * midday and visibly wrong at a low sun, which is exactly
-                     * the picture this is aimed at: the reference's brightest
-                     * feature is the blown-out edge where the sun is directly
-                     * behind a cloud, and a broad lobe spreads that energy
-                     * into general haze instead of concentrating it at the
-                     * silhouette.
-                     *
-                     * Applied at the FIRST octave only. The deeper Wrenninge
-                     * octaves exist to push the phase toward isotropic for the
-                     * multiply-scattered interior; a tight forward spike there
-                     * would undo the thing they are for. */
-                    if (oi == 0)
-                    {
-                        const float sil_g = 0.91;   /* 0.99 - spread(0.08) */
-                        const float sil_i = 0.70;
-                        float dens_s = 1.0 + sil_g * sil_g - 2.0 * sil_g * sun_cos;
-                        float ph_s = (1.0 - sil_g * sil_g)
-                                   / (4.0 * 3.14159265 * pow(max(dens_s, 1e-4), 1.5));
-                        ph = max(ph, sil_i * ph_s);
-                    }
-                    /* Light that survived to this point, per octave.
-                     *
-                     * This used to be exp(-sigma * a * dt * 4.0): the LOCAL
-                     * sample's own density, times a 4 that stood for the
-                     * distance to the top of the cloud without measuring it.
-                     * A cloud therefore never shadowed itself -- the underside
-                     * of a thick cumulus was exactly as bright as its sunlit
-                     * crown, and the whole layer read flat.
-                     *
-                     * sun_tau is the real optical depth from this sample to
-                     * the sun, marched below. Multiplying by `a` keeps the
-                     * per-octave falloff the multiple-scattering approximation
-                     * is built on: deeper octaves see a thinner medium, which
-                     * is what makes the core bright instead of black. */
-                    float li  = exp(-sun_tau * a);
-                    octave_sum += T * b * ph * li;
-                    a *= 0.5; b *= 0.5; c *= 0.5;
-                }
-
-                /* AMBIENT: the sky's own light falling on the cloud.
-                 *
-                 * The only source in this march was `T` -- sun transmittance,
-                 * and sampled at GROUND altitude at that (v_lu = 0.5/64) for a
-                 * layer 1.4 to 4.2 km up. A cloud lit by nothing but a
-                 * collimated sun is black wherever the sun does not reach,
-                 * which is what made this layer read as flat grey: the octave
-                 * approximation was carrying the entire burden of not being
-                 * black.
-                 *
-                 * `ms` is the multiple-scattered sky radiance already computed
-                 * for this pixel, so the light the cloud receives from the sky
-                 * is the same quantity the sky itself is drawn with -- one
-                 * source, not a second invented constant.
-                 *
-                 * Ramped with height because the top of a cloud sees most of
-                 * the hemisphere and the base sees mostly more cloud. That is
-                 * the cheap stand-in for the reference's density-profile AO,
-                 * and it is the dominant part of it. */
-                vec3 ambient = ms * mix(0.15, 0.70, h01s);
-
-                float step_t = exp(-sigma * dt);
-                scatter += trans * (octave_sum + ambient) * sigma * dt;
-                trans   *= step_t;
-                if (trans < 0.01) break;
-            }
-
-            /* The silhouette is where the layer is PARTIALLY transparent:
-             * fully clear sky and the opaque interior of a cloud are both
-             * "not an edge".  4*t*(1-t) peaks at t=0.5 and vanishes at both
-             * ends, which is the edge without a screen-space derivative --
-             * and a derivative-based edge would also outline the horizon and
-             * every other depth discontinuity, which is not a cloud. */
-            cloud_rim = clamp(4.0 * trans * (1.0 - trans), 0.0, 1.0);
-
-            /* Composite over the sky.  Fade the layer out toward the horizon
-             * where the slab intersection degenerates. */
-            float edge = smoothstep(0.02, 0.15, dir.y);
-            /* JCE_SKY_SCALE applies here too.  The cloud's radiance is built
-             * from T and ms -- the same two quantities the sky behind it is
-             * built from -- so scaling one and not the other would leave the
-             * clouds roughly five times brighter than the sky they sit in,
-             * which is not a look, it is a unit mismatch wearing one. */
-            col = col * mix(1.0, trans, edge)
-                + scatter * u_sky_params.y * JCE_SKY_SCALE * edge;
+        /* Celestial radiance originates behind the cloud layer. */
+        if (sky_celestial_enabled()) {
+            col += sky_celestial_radiance(dir, T)
+                 * (u_sky_params.y * cloud_transmittance);
         }
 
         /* The stylisation layer grades the PHYSICAL core's radiance -- it does
@@ -696,12 +409,19 @@ void main()
          * a screen-space edge detect that would also outline the horizon. */
         gl_FragColor = vec4(sky_stylise(max(col, vec3_splat(0.0)),
                                         cloud_rim), 1.0);
-    } else if (u_sky_params.x > 2.5) {
+    } else
+#endif
+    if (u_sky_params.x > 2.5) {
         /* ── Stylized dome (mode 3) ──────────────────────────────────
          * (1) multi-stop vertical ramp zenith→mid→horizon→ground
          * (2) additive horizon glow band
          * (3) sun disk + halo aligned to u_sky_sun_dir.
          * All linear; tonemap downstream applies gamma. */
+
+#if !defined(JCE_SKY_GL21_STOCK)
+        /* JCE_LOOKDEV_R3: real view ray, not authored anchor direction. */
+        vec3 cloudViewRay = dir;
+#endif
 
         /* ORIGIN-ANCHORED dome (u_sky_dome_sun_col.w = sphere radius; 0 =
          * infinite view-direction dome).  The anchored mode intersects the
@@ -763,9 +483,10 @@ void main()
                                 u_sky_dome_sun.x + u_sky_dome_sun.y, cg);
         float halo = pow(max(cg, 0.0), u_sky_dome_sun.z);
 
-        /* Moon craters (night only): value-noise mottling inside the disk. */
+        /* Moon craters contribute only inside the disk. Avoid two 3D noise
+         * evaluations for night pixels whose disk contribution is zero. */
         float craterMul = 1.0;
-        if (nightness > 0.001) {
+        if (nightness > 0.001 && disk > 0.0) {
             float cr  = sky_vnoise3(dir * 48.0) * 0.65
                       + sky_vnoise3(dir * 96.0) * 0.35;
             craterMul = mix(1.0, 0.58 + 0.42 * cr, nightness);
@@ -834,51 +555,17 @@ void main()
         /* Sun/moon on TOP of the fog blend so the near-horizon disc survives. */
         col += sunAdd;
 
+#if !defined(JCE_SKY_GL21_STOCK)
+        /* JCE_LOOKDEV_R3: same renderer cloud atlas in stylized sky. */
+        vec3 cloudEyeKm = mul(u_invView, vec4(0.0, 0.0, 0.0, 1.0)).xyz * 0.001;
+        col = sky_stylized_clouds(col, cloudViewRay, cloudEyeKm);
+#endif
+
         col *= u_sky_params.y;                /* exposure */
         col  = max(col, vec3_splat(0.0));
         gl_FragColor = vec4(col, 1.0);
     } else if (u_sky_params.x > 1.5) {
-        /* ── Preetham analytic daylight (mode 2) ──────────────────── */
-        /* theta = view-zenith angle; clamp cos just above 0 (sky hemi). */
-        float cos_theta = clamp(dir.y, 0.01, 1.0);
-
-        float cos_gamma = clamp(dot(dir, u_sky_sun_dir.xyz), -1.0, 1.0);
-        float gamma     = acos(cos_gamma);
-
-        float cos_ts  = clamp(u_sky_sun_dir.y, 0.01, 1.0);
-        float theta_s = acos(cos_ts);
-
-        /* F(0, theta_s): cos(0)=1, gamma=theta_s. */
-        float fY0 = sky_perez(u_sky_perez[0], u_sky_perez[3].x, 1.0, theta_s);
-        float fx0 = sky_perez(u_sky_perez[1], u_sky_perez[3].y, 1.0, theta_s);
-        float fy0 = sky_perez(u_sky_perez[2], u_sky_perez[3].z, 1.0, theta_s);
-        fY0 = (abs(fY0) < 1e-6) ? 1e-6 : fY0;
-        fx0 = (abs(fx0) < 1e-6) ? 1e-6 : fx0;
-        fy0 = (abs(fy0) < 1e-6) ? 1e-6 : fy0;
-
-        float Y = u_sky_zenith.x * sky_perez(u_sky_perez[0], u_sky_perez[3].x, cos_theta, gamma) / fY0;
-        float x = u_sky_zenith.y * sky_perez(u_sky_perez[1], u_sky_perez[3].y, cos_theta, gamma) / fx0;
-        float y = u_sky_zenith.z * sky_perez(u_sky_perez[2], u_sky_perez[3].z, cos_theta, gamma) / fy0;
-
-        Y = max(Y, 0.0);
-        if (u_sky_zenith.w > 0.5) {
-            float Yz = max(u_sky_zenith.x, 1e-6);
-            Y /= Yz;
-        }
-
-        /* xyY -> XYZ (guard y). */
-        y = max(y, 1e-4);
-        float X = (x / y) * Y;
-        float Z = ((1.0 - x - y) / y) * Y;
-
-        /* XYZ -> linear sRGB (D65) — mirrors jce_sky_radiance(). */
-        vec3 col;
-        col.r =  3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z;
-        col.g = -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z;
-        col.b =  0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z;
-
-        col *= u_sky_params.y;          /* exposure */
-        col  = max(col, vec3_splat(0.0));
+#include "sky_preetham_body.sh"
         gl_FragColor = vec4(col, 1.0);
     } else if (u_sky_params.x > 0.5) {
         /* Equirectangular HDR sky. */

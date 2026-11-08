@@ -10,6 +10,7 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_i18n.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
@@ -75,7 +76,7 @@ static void rp_kick_next(JceScene *scene)
      * is the fallback, not the plan.  Both write the same artefact path, so
      * the component records it either way. */
     char out[256] = {0};
-    if (jce_scene_reflection_probe_capture(scene, e, out, (int)sizeof out)) {
+    if (jce_editor_scene_render_begin_probe_capture(scene, e, out, (int)sizeof out)) {
         snprintf(p->baked_cubemap_path, sizeof p->baked_cubemap_path, "%s", out);
         h = 0u;   /* the capture submits the bake itself when its faces land */
     } else {

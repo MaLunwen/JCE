@@ -221,12 +221,21 @@
             "posX": 18.25,
             "posY": 10.69,
             "posZ": 27.32,
-            "rotX": 0,
-            "rotY": 0,
+            "rotX": -18.02333207636913,
+            "rotY": 33.7432714254813,
             "rotZ": 0,
             "scaleX": 1,
             "scaleY": 1,
             "scaleZ": 1
+          },
+          {
+            "type": "Camera",
+            "primary": true,
+            "orthographic": false,
+            "fov": 25,
+            "nearClip": 0.1,
+            "farClip": 1000,
+            "clearMode": 0
           },
           {
             "type": "VirtualCamera",
@@ -9164,7 +9173,7 @@
           },
           {
             "type": "UIText",
-            "text": "\u266a Forest Dreams",
+            "text": "♪ Forest Dreams",
             "fontPath": "",
             "fontSize": 15,
             "alignment": 0,
@@ -9241,7 +9250,7 @@
           },
           {
             "type": "UIText",
-            "text": "Skip \u23ed",
+            "text": "Skip ⏭",
             "fontPath": "",
             "fontSize": 13,
             "alignment": 1,
@@ -9309,6 +9318,839 @@
             "name": "IntroTitle"
           }
         ]
+      },
+      {
+        "id": 219,
+        "name": "MoodRequest",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "Script",
+            "scriptPath": "scripts/es_mood_portable.lua"
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodRequest"
+          }
+        ]
+      },
+      {
+        "id": 220,
+        "name": "MoodPlan",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodPlan"
+          }
+        ]
+      },
+      {
+        "id": 221,
+        "name": "MoodAck",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodAck"
+          }
+        ]
+      },
+      {
+        "id": 222,
+        "name": "MoodProvider",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodProvider"
+          }
+        ]
+      },
+      {
+        "id": 223,
+        "name": "MoodStatus",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIText",
+            "text": "READY | authored preset provider",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -14,
+            "anchoredY": 18,
+            "sizeW": 490,
+            "sizeH": 42
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodStatus"
+          }
+        ]
+      },
+      {
+        "id": 224,
+        "name": "MoodNext",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -14,
+            "anchoredY": 66,
+            "sizeW": 118,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_next",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "Next preset",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -18,
+            "anchoredY": 69,
+            "sizeW": 110,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodNext"
+          }
+        ]
+      },
+      {
+        "id": 225,
+        "name": "MoodState0",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -374,
+            "anchoredY": 102,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_spring_day",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "spring / day",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -378,
+            "anchoredY": 105,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState0"
+          }
+        ]
+      },
+      {
+        "id": 226,
+        "name": "MoodState1",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -254,
+            "anchoredY": 102,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_spring_night",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "spring / night",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -258,
+            "anchoredY": 105,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState1"
+          }
+        ]
+      },
+      {
+        "id": 227,
+        "name": "MoodState2",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -134,
+            "anchoredY": 102,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_winter_day",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "winter / day",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -138,
+            "anchoredY": 105,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState2"
+          }
+        ]
+      },
+      {
+        "id": 228,
+        "name": "MoodState3",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -14,
+            "anchoredY": 102,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_winter_night",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "winter / night",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -18,
+            "anchoredY": 105,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState3"
+          }
+        ]
+      },
+      {
+        "id": 229,
+        "name": "MoodState4",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -374,
+            "anchoredY": 132,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_autumn_day",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "autumn / day",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -378,
+            "anchoredY": 135,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState4"
+          }
+        ]
+      },
+      {
+        "id": 230,
+        "name": "MoodState5",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -254,
+            "anchoredY": 132,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_autumn_night",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "autumn / night",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -258,
+            "anchoredY": 135,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState5"
+          }
+        ]
+      },
+      {
+        "id": 231,
+        "name": "MoodState6",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -134,
+            "anchoredY": 132,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_rainy_day",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "rainy / day",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -138,
+            "anchoredY": 135,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState6"
+          }
+        ]
+      },
+      {
+        "id": 232,
+        "name": "MoodState7",
+        "parentId": 208,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1
+          },
+          {
+            "type": "UIImage",
+            "colorR": 0.07,
+            "colorG": 0.09,
+            "colorB": 0.11,
+            "colorA": 0.86,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -14,
+            "anchoredY": 132,
+            "sizeW": 114,
+            "sizeH": 27
+          },
+          {
+            "type": "UIButton",
+            "onClickHandler": "es_mood_rainy_night",
+            "normalR": 0.07,
+            "normalG": 0.09,
+            "normalB": 0.11,
+            "normalA": 0.86,
+            "highlightR": 0.19,
+            "highlightG": 0.24,
+            "highlightB": 0.29,
+            "highlightA": 0.95,
+            "pressedR": 0.04,
+            "pressedG": 0.06,
+            "pressedB": 0.08,
+            "pressedA": 1
+          },
+          {
+            "type": "UIText",
+            "text": "rainy / night",
+            "fontPath": "",
+            "fontSize": 13,
+            "alignment": 0,
+            "colorR": 0.96,
+            "colorG": 0.96,
+            "colorB": 0.94,
+            "colorA": 1,
+            "anchorMinX": 1,
+            "anchorMinY": 0,
+            "anchorMaxX": 1,
+            "anchorMaxY": 0,
+            "pivotX": 1,
+            "pivotY": 0,
+            "anchoredX": -18,
+            "anchoredY": 135,
+            "sizeW": 106,
+            "sizeH": 22
+          },
+          {
+            "type": "EditorMeta",
+            "name": "MoodState7"
+          }
+        ]
       }
     ],
     "rendering": {
@@ -9346,7 +10188,7 @@
       "postfx": {
         "tonemap": true,
         "bloom": true,
-        "fxaa": false,
+        "fxaa": true,
         "vignette": false,
         "exposure": 0.92,
         "gamma": 2.2,

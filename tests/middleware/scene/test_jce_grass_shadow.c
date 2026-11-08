@@ -1,25 +1,5 @@
-/*
- * test_jce_grass_shadow.c — GrassField.cast_shadow decides whether a field's
- * blades reach the depth pass, and which of them.
- *
- * The field was authored, serialized, and drawn in the Inspector inside
- * BeginDisabled(true) with an unwired badge and a "(v1: reserved)" label.  So
- * the editor was honest -- and grass never darkened anything, which reads as
- * flat paint rather than as blades.
- *
- * The prior hypothesis was that the instanced shadow program did not exist.
- * It does: vs_shadow_inst.sc is built as `shadow_inst` and the sibling
- * vegetation scatter has been driving it from a persistent instance buffer for
- * some time.  Grass carries the identical machinery and simply never joined.
- *
- * COUNTS AND RANGES, no GPU and no pixels.  The run set IS the submit
- * decision, so "this field contributes N blades to this cascade" is exactly
- * the question the gate is really asking, and it is arithmetic.
- *
- * IN THE TREE: tests/ is tracked on this branch (gitignored on `main`).
- * Settle it with `git check-ignore -v <path>`, never from memory --
- * tools/lint/check_provenance_claims.py has what that cost.
- */
+/* Pure production grass resident-admission/cell-range controls.
+ * Counts and ranges are CPU decisions, not proof of shader/GPU execution. */
 #include "unity.h"
 
 #include <jce/middleware/scene/jce_scene.h>
@@ -62,9 +42,7 @@ static void test_every_gate_must_agree_before_a_blade_is_submitted(void)
     TEST_ASSERT_FALSE_MESSAGE(casts(true, false, true, 4096),
         "a disabled component casts nothing");
     TEST_ASSERT_FALSE_MESSAGE(casts(true, true, true, 0),
-        "no persistent instance buffer -- LOW/MED tiers and "
-        "JCE_PERSIST_GRASS=0 -- must degrade to no grass shadows, not to a "
-        "submit of a buffer that was never built");
+        "nonempty roots cannot submit a missing persistent owner");
     TEST_ASSERT_TRUE_MESSAGE(casts(true, true, true, 4096),
         "and with all four true it casts: this is the feature");
 }
@@ -190,6 +168,22 @@ static void test_a_run_cap_truncates_rather_than_overruns(void)
     TEST_ASSERT_TRUE_MESSAGE(n <= 1, "must never write past max_runs");
 }
 
+static void test_full_cell_scratch_keeps_more_than_sixty_four_disjoint_runs(void)
+{
+    enum { SIDE = 16, CELLS = SIDE * SIDE };
+    uint32_t starts[CELLS + 1];
+    starts[0] = 0u;
+    for (uint32_t i = 0u; i < CELLS; ++i)
+        starts[i + 1u] = starts[i] + ((i & 1u) == 0u ? 1u : 0u);
+    jce_vec4 planes[6]; box_planes(-1000.0f, 1000.0f, -1000.0f, 1000.0f, planes);
+    GrassRun runs[CELLS];
+    const uint32_t count = jce_grass_shadow_runs(starts, SIDE, SIDE, 0.0f, 0.0f,
+        1.0f, 0.0f, 1.0f, planes, jce_v3(0.0f, 0.0f, 0.0f), 0.0f, runs, CELLS);
+    TEST_ASSERT_EQUAL_UINT32(CELLS / 2u, count);
+    TEST_ASSERT_EQUAL_UINT32(CELLS / 2u, total(runs, count));
+    TEST_ASSERT_EQUAL_UINT32(starts[CELLS], runs[count - 1u].start + runs[count - 1u].count);
+}
+
 static void test_degenerate_input_is_refused(void)
 {
     jce_vec4 p[6];
@@ -216,5 +210,6 @@ int main(void)
     RUN_TEST(test_the_fade_distance_is_the_same_one_the_colour_pass_uses);
     RUN_TEST(test_a_run_cap_truncates_rather_than_overruns);
     RUN_TEST(test_degenerate_input_is_refused);
+    RUN_TEST(test_full_cell_scratch_keeps_more_than_sixty_four_disjoint_runs);
     return UNITY_END();
 }

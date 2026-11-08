@@ -1,0 +1,9 @@
+build/
+native/build/
+resources/_cooked/
+.jce/editor-state.json
+.jce/pak_key.hex
+__pycache__/
+!.jce/
+.jce/*
+!.jce/project-settings.json

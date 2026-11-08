@@ -9,30 +9,14 @@
  */
 
 #include "jce_panel_inspector_common.h"
-#include "jce_panel_common.h"
 
 namespace {
 
 bool component_matches_filter(const JceEditorComponentDescriptor *desc,
                               const char *filter)
 {
-    if (!desc || !filter || !*filter)
-        return true;
-
-    if (jce_panel_contains_ci(desc->display_name, filter))
-        return true;
-
-    if (!desc->i18n_key)
-        return false;
-
-    int n_loc = jce_editor_i18n_locale_count();
-    for (int li = 0; li < n_loc; ++li) {
-        const char *loc_name = jce_editor_i18n_lookup_locale(
-            (JceLocale)li, desc->i18n_key);
-        if (jce_panel_contains_ci(loc_name, filter))
-            return true;
-    }
-    return false;
+    return !desc || jce_editor_i18n_search_match(
+        desc->i18n_key, desc->display_name, filter, nullptr);
 }
 
 bool component_already_present(const JceEditorComponentDescriptor *desc,

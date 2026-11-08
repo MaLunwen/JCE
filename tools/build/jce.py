@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import argparse
+from contextlib import nullcontext
 import datetime as _dt
 import json
 import os
@@ -52,6 +53,8 @@ import inspect
 
 # Repo root = parent of this scripts/ directory.
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 # ── Host detection ────────────────────────────────────────────────────────
 _SYS = platform.system().lower()
@@ -121,6 +124,11 @@ def build_jobs(env: dict | None = None) -> str:
     if raw.isdigit() and int(raw) > 0:
         return raw
     return "8"
+
+
+def conan_jobs_args(env: dict) -> list[str]:
+    """Apply the shared job budget to both Conan graph contexts."""
+    return ["-c:a", "tools.build:jobs=" + build_jobs(env)]
 
 
 def ctest_jobs(explicit=None) -> str:
@@ -271,7 +279,8 @@ def _vs_install_paths() -> list:
         try:
             out = subprocess.check_output(
                 [str(vswhere), "-all", "-prerelease", "-products", "*",
-                 "-property", "installationPath"], text=True)
+                 "-property", "installationPath"], text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             paths = [Path(p) for p in out.splitlines() if p.strip()]
         except Exception:
             paths = []
@@ -367,7 +376,9 @@ def msvc_env(t: dict) -> dict:
             "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA",
             "COMSPEC", "PATHEXT", "NUMBER_OF_PROCESSORS",
             "PROCESSOR_ARCHITECTURE", "COMPUTERNAME", "OS", "CONAN_HOME",
-            "JAVA_HOME"}
+            "JAVA_HOME", "CMAKE_BUILD_PARALLEL_LEVEL",
+            "JCE_GRAPHICS_API_TIER", "JCE_BGFX_CPU_PROFILER",
+            "JCE_BGFX_DEBUG_ANNOTATION", "JCE_SHADERC_EXECUTABLE", "BGFX_SHADERC"}
     base = {k: v for k, v in os.environ.items() if k.upper() in keep}
     tool_dirs = []
     for _tool in ("cmake", "ninja", "conan", "python", "git"):
@@ -394,20 +405,28 @@ def msvc_env(t: dict) -> dict:
 
 
 # ── Conan ─────────────────────────────────────────────────────────────────
-GRAPHICS_API_TIERS = ("stable", "modern", "current")
+GRAPHICS_API_TIERS = ("stable", "modern", "current", "compatibility")
 
 
 def graphics_api_tier(env: dict | None = None) -> str:
     source = env if env is not None else os.environ
     tier = source.get("JCE_GRAPHICS_API_TIER", "stable").strip().lower()
     if tier not in GRAPHICS_API_TIERS:
-        die("JCE_GRAPHICS_API_TIER must be stable, modern, or current "
+        die("JCE_GRAPHICS_API_TIER must be stable, modern, current, or compatibility "
             f"(got {tier!r})")
     return tier
 
 
 def bgfx_graphics_conan_args(env: dict) -> list[str]:
-    return ["-c", "user.jce:bgfx_graphics_tier=" + graphics_api_tier(env)]
+    profiler = env.get("JCE_BGFX_CPU_PROFILER", "off").strip().lower()
+    if profiler not in ("off", "on"):
+        die("JCE_BGFX_CPU_PROFILER must be off or on " + f"(got {profiler!r})")
+    annotation = env.get("JCE_BGFX_DEBUG_ANNOTATION", "auto").strip().lower()
+    if annotation not in ("auto", "off", "on"):
+        die("JCE_BGFX_DEBUG_ANNOTATION must be auto, off or on " + f"(got {annotation!r})")
+    return ["-c", "user.jce:bgfx_graphics_tier=" + graphics_api_tier(env),
+            "-c", "user.jce:bgfx_cpu_profiler=" + profiler,
+            "-c", "user.jce:bgfx_debug_annotation=" + annotation]
 
 
 def system_package_conan_args(env: dict) -> list[str]:
@@ -444,40 +463,12 @@ def stamp_graphics_tier(toolchain: Path, tier: str) -> None:
 
 def sync_conan_hooks(env: dict | None = None) -> None:
     """Synchronize owned configuration hooks; preserve all upstream files."""
-    src = ROOT / "conan/hooks"
-    env = os.environ if env is None else env
-    dst = Path(env.get("CONAN_HOME", str(Path.home() / ".conan2"))) / "extensions/hooks"
-    hooks = sorted(src.glob("hook_*.py"))
-    policy = json.loads((ROOT / "contracts/conan-source-policy.json").read_text(encoding="utf-8"))
-    log(f"syncing {len(hooks)} configuration-only Conan hooks -> {dst}")
-    if DRY_RUN:
-        return
-    dst.mkdir(parents=True, exist_ok=True)
-    for name, expected in policy["retired_hooks"].items():
-        installed = dst / name
-        current = src / name
-        if not installed.is_file():
-            continue
-        data = installed.read_bytes()
-        if current.is_file() and data == current.read_bytes():
-            continue
-        if hashlib.sha256(data).hexdigest() != expected:
-            die(f"unknown installed hook {installed}; use a separate CONAN_HOME")
-        archived = ROOT / "docs/delivery/retired-installed-conan-hooks" / name
-        archived.parent.mkdir(parents=True, exist_ok=True)
-        if archived.exists() and archived.read_bytes() != data:
-            die(f"hook archive differs: {archived}")
-        if not archived.exists():
-            # CONAN_HOME and the repository may be on different volumes.
-            shutil.copy2(installed, archived)
-        if archived.read_bytes() != data:
-            die(f"hook archive verification failed: {archived}")
-        installed.unlink()
-    for hook in hooks:
-        installed = dst / hook.name
-        if installed.exists() and installed.read_bytes() != hook.read_bytes():
-            die(f"unknown installed hook {installed}; use a separate CONAN_HOME")
-        shutil.copy2(hook, installed)
+    from tools.build.conan_config import sync_hooks
+    try:
+        sync_hooks(ROOT, dict(os.environ) if env is None else env,
+                   dry_run=DRY_RUN, log=log)
+    except ValueError as error:
+        die(str(error))
 
 
 def export_conan_recipes(env: dict) -> None:
@@ -521,6 +512,15 @@ def export_conan_recipes(env: dict) -> None:
 
 def conan_generation_fingerprint(command: list[str], env: dict) -> str:
     """Hash owned graph inputs and the exact install configuration, not packages."""
+    spec = importlib.util.spec_from_file_location(
+        "jce_conan_configuration_digest", Path(__file__).with_name("conan_config.py"))
+    configuration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(configuration)
+    try:
+        configuration_sha256 = configuration.configuration_digest(
+            env.get("CONAN_HOME") or str(Path.home() / ".conan2"))
+    except (OSError, ValueError) as error:
+        die(f"cannot fingerprint selected Conan configuration: {error}")
     inputs = [ROOT / "conanfile.py", ROOT / "conan.lock",
               ROOT / "contracts/conan-source-policy.json"]
     inputs += sorted(p for p in (ROOT / "conan").rglob("*")
@@ -532,6 +532,7 @@ def conan_generation_fingerprint(command: list[str], env: dict) -> str:
                     or key in ("CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS",
                                "JCE_WEB_CONAN_CONFIG_SHA256")}
     payload = {"schema": 1, "command": command, "files": files,
+               "configuration_sha256": configuration_sha256,
                "environment": relevant_env}
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -582,24 +583,42 @@ def _sdk_cache_paths(values):
     return [tree, conan_dir(target), prefix, *host_tools]
 
 
+def _authoring_editor_paths(target, variant):
+    root = ROOT / "build/desktop" / target["key"] / "authoring"
+    return root / "obj" / ("release" if variant == "dist" else variant), root / variant
+
+
 def _editor_cache_paths(values):
     args = values["args"]
     target = resolve_target(args.arch)
     if _delivery_module().profile(args) == "embedded":
-        stem = target["key"] + "-standalone"
-        return [ROOT / "build/desktop" / stem,
-                ROOT / "build/desktop" / (stem + "-conan")]
-    kind = {"debug": "debug", "dist": "dist"}.get(args.variant, "release")
-    tree = (ROOT / "build/desktop" / (target["key"] + "-asan")
-            if args.variant == "asan" else preset_binary_dir(target, kind))
-    artifacts = getattr(args, "artifact_dir", None)
+        owner = _standalone_module()
+        driver = argparse.Namespace(**globals())
+        plan = owner.native_cache_plan(driver, args, target)
+        args._native_cache_plan = plan
+        return [plan["build"], plan["conan"], owner.editor_artifact_dir(driver, args, target)]
+    tree, output = _authoring_editor_paths(target, args.variant)
+    override = getattr(args, "artifact_dir", None)
     host_tools = _host_cache_paths() if target.get("cross") or target.get("emscripten") else []
-    return [tree, conan_dir(target), *host_tools,
-            *([Path(artifacts).resolve()] if artifacts else [])]
+    return [tree, conan_dir(target), Path(override).resolve() if override else output, *host_tools]
+
+
+def _test_ai_dispatch_flags(args) -> list[str]:
+    """Only an explicit configure request may change this optional module."""
+    selected = getattr(args, "ai_dispatch", None)
+    if selected is None:
+        return []
+    if selected not in ("on", "off"):
+        die("test: invalid --ai-dispatch (expected on or off)")
+    if not getattr(args, "configure", False):
+        die("test: --ai-dispatch requires --configure")
+    return ["-DJCE_ENABLE_AI_DISPATCH=" + selected.upper()]
 
 
 def _test_cache_paths(values):
     args = values["args"]
+    # Refuse invalid scope changes before even acquiring build/cache ownership.
+    _test_ai_dispatch_flags(args)
     target = resolve_target(getattr(args, "arch", None))
     return [preset_binary_dir(target, getattr(args, "variant", "release")),
             conan_dir(target)]
@@ -638,22 +657,41 @@ def _confirmed_app_sdk_tools(args, sdk: Path, target: dict) -> dict[str, Path]:
     return current
 
 
+def _app_build_dir(project: Path, target: dict, variant: str) -> Path:
+    if target.get("emscripten"):
+        return project / "build" / f"{target['host']}-{target['arch']}-{variant}"
+    return project / "build/desktop" / target["key"] / variant
+
+
 def _app_cache_paths(values):
     args = values["args"]
     target = resolve_target(args.arch)
     sdk = resolve_sdk(args, target)
     args._sdk_host_tools = _sdk_host_tools(sdk, target)
     host_paths = [] if len(args._sdk_host_tools) == 3 else _host_cache_paths()
-    return [Path(args.project).resolve() / "build" /
-            f"{target['host']}-{target['arch']}-{args.variant}", sdk, *host_paths]
+    project = Path(args.project).resolve()
+    return [_app_build_dir(project, target, args.variant),
+            project / "build/delivery-admission", sdk, *host_paths]
+
+
+def _smoke_build_dir(t, sdk, variant, build_dir=None, scripting=False):
+    family = "web" if t.get("emscripten") else "desktop"
+    stem = "sdk-smoke-script" if scripting else "sdk-smoke"
+    directory = (Path(build_dir).resolve() if build_dir else
+                 ROOT / "build" / family / f"{stem}-{t['key']}-{variant}")
+    sdk = Path(sdk).resolve()
+    if (directory == ROOT or directory in ROOT.parents or
+            (directory.is_relative_to(ROOT) and
+             not directory.is_relative_to(ROOT / "build")) or
+            directory == sdk or directory.is_relative_to(sdk) or
+            sdk.is_relative_to(directory)):
+        die(f"smoke: unsafe consumer build directory {directory}")
+    return directory
 
 
 def _smoke_cache_paths(values, scripting=False):
-    target = values["t"]
-    family = "web" if target.get("emscripten") else "desktop"
-    stem = "sdk-smoke-script" if scripting else "sdk-smoke"
-    return [ROOT / "build" / family / f"{stem}-{target['key']}-{values['variant']}",
-            values["sdk"]]
+    return [_smoke_build_dir(values["t"], values["sdk"], values["variant"],
+                             values.get("build_dir"), scripting), values["sdk"]]
 
 
 def web_toolchain_conan_args(em: dict, env: dict) -> list[str]:
@@ -705,7 +743,7 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
                    "-c", ("tools.build:compiler_executables="
                           f"{{'c': '{em['cc']}', 'cpp': '{em['cxx']}'}}"),
                    *bgfx_graphics_conan_args(env), *system_package_conan_args(env),
-                   "-c:a", "tools.build:jobs=" + build_jobs(env),
+                   *conan_jobs_args(env),
                    "--output-folder", str(conan_dir(t)), "--build=missing"]
     else:
         extra = ["-s", "build_type=Debug"] if config == "Debug" else []
@@ -721,7 +759,7 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
                    "-pr:b", f"conan/profiles/{host_build_profile()}",
                    "--output-folder", str(conan_dir(t)), "--build=missing",
                    *bgfx_graphics_conan_args(env),
-                   "-c:a", "tools.build:jobs=" + build_jobs(env),
+                   *conan_jobs_args(env),
                    *system_package_conan_args(env), *vs_conf, *extra]
     sync_conan_hooks(env)
     fingerprint = conan_generation_fingerprint(command, env)
@@ -909,15 +947,17 @@ def ensure_host_tools(env: dict, tools=("jce_pak",)) -> dict[str, Path]:
         host_conan = ROOT / "build" / "host-conan"
         tc = host_conan / "build" / "Release" / "generators" / "conan_toolchain.cmake"
         if not tc.exists():
-            sync_conan_hooks()
-            export_conan_recipes(env)
+            sync_conan_hooks(host_env)
+            export_conan_recipes(host_env)
             run(["conan", "install", ".",
                  "-pr:h", f"conan/profiles/{host_build_profile()}",
                  "-pr:b", f"conan/profiles/{host_build_profile()}",
+                 *conan_jobs_args(host_env),
                  "--output-folder", str(host_conan), "--build=missing"],
                 env=host_env, cwd=ROOT)
         run(["cmake", "-S", ".", "-B", "build/host", "-G", "Ninja",
              f"-DCMAKE_TOOLCHAIN_FILE={tc}", "-DCMAKE_BUILD_TYPE=Release",
+             "-DJCE_BUILD_EDITOR=OFF", "-DJCE_BUILD_TESTS=OFF",
              "-DJCE_ENABLE_CPPCHECK=OFF", "-DJCE_ENABLE_SDK_INSTALL=ON",
              "-DJCE_DELIVERY_PROFILE=authoring", "-DJCE_EDITOR_STANDALONE=OFF"],
             env=host_env, cwd=ROOT)
@@ -1082,6 +1122,7 @@ def cmd_shader_inspect(args) -> None:
                    # headers, the one thing the tree does not carry.
                    "-i", str(src.parent.resolve()),
                    "-i", str(ROOT / "engine" / "shaders"),
+                   "-i", str(ROOT / "engine" / "shaders" / "ssr"),
                    "-i", str(include),
                    "-O", str(args.optimise)]
             if can_disasm:
@@ -1204,9 +1245,7 @@ def cmd_agent_bridge(args) -> None:
     run(["cmake", "-S", str(ROOT / "tools" / "jce_agent_bridge"),
          "-B", str(bdir), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
          f"-DJCE_DIR={jce_cmake}",
-           *_delivery_module().cmake_flags(_delivery_module().profile(args)),
-           "-DJCE_REQUIRED_SCRIPT_LANGUAGES="+";".join(required_languages),
-           "-DJCE_REQUIRED_SCRIPT_TARGET="+(args.target or manifest.get("target") or project.name)]
+           *_delivery_module().cmake_flags(_delivery_module().profile(args))]
         + (["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"]
            if HOST == "windows" else []),
         env=env, cwd=ROOT)
@@ -1258,7 +1297,8 @@ def _read_roster(path: Path) -> dict:
     return {m.group(1): m.group(2).strip() for m in _ROSTER_SET_RE.finditer(text)}
 
 
-def sdk_shipped_script_backends(install: Path, target: dict | None = None) -> list:
+def sdk_shipped_script_backends(install: Path, target: dict | None = None,
+                                config: str | None = None) -> list:
     """Which language backends the INSTALLED SDK actually contains.
 
     Derived from the files on disk and not from the options this run passed: an
@@ -1283,6 +1323,7 @@ def sdk_shipped_script_backends(install: Path, target: dict | None = None) -> li
     machine at their configure time.
     """
     libdir = install / "lib"
+    library_pattern = (config + "/") if config else "*/"
     backends = install / "lib" / "cmake" / "JCE" / "backends"
     shipped = []
     config = install / 'lib/cmake/JCE/JCEScripting.cmake'
@@ -1291,14 +1332,14 @@ def sdk_shipped_script_backends(install: Path, target: dict | None = None) -> li
                   ('1', 'ON', 'TRUE', 'YES'))
 
     def has_link_library(stem: str) -> bool:
-        return (any(libdir.glob("*/" + stem + ".lib")) or
-                any(libdir.glob("*/lib" + stem + ".a")) or
-                any(libdir.glob("*/" + stem + ".a")))
+        return (any(libdir.glob(library_pattern + stem + ".lib")) or
+                any(libdir.glob(library_pattern + "lib" + stem + ".a")) or
+                any(libdir.glob(library_pattern + stem + ".a")))
 
     def has_shared_library(stem: str) -> bool:
-        return (any(libdir.glob("*/" + stem + ".dll")) or
-                any(libdir.glob("*/lib" + stem + ".so")) or
-                any(libdir.glob("*/lib" + stem + ".dylib")))
+        return (any(libdir.glob(library_pattern + stem + ".dll")) or
+                any(libdir.glob(library_pattern + "lib" + stem + ".so")) or
+                any(libdir.glob(library_pattern + "lib" + stem + ".dylib")))
 
     for roster in sorted(backends.glob("*/jce_backend.cmake")):
         r = _read_roster(roster)
@@ -1446,6 +1487,7 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
     env = dict(os.environ) if is_wasm else msvc_env(t)
 
     if do_clean:
+        _standalone_module().guard_cache_clean((bdir, conan_dir(t)), ROOT / "build")
         for d in (bdir, conan_dir(t)):
             if d.exists():
                 log(f"clean: {d}")
@@ -1634,19 +1676,16 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
         (install / "delivery-profile.json").write_text(json.dumps({"schema": 1,
             "profile": delivery_profile, "languages": ["lua", *sdk_shipped_script_backends(install, t)],
             "external_vm_allowed": delivery_profile == "authoring"}, indent=2)+"\n", encoding="utf-8")
+    if not DRY_RUN:
+        _publish_sdk_product(install, t, config, variant, delivery_profile, bdir,
+                             require_tools=tools_status == "ok")
     log(f"SDK ({variant}/{config}) -> {install}")
 
 
 def _standalone_sdk_cache_paths(values):
-    args=values["args"]
-    target=resolve_target(args.arch)
-    sdk=sdk_install_dir(target,args.variant)
-    sdk=sdk.with_name(sdk.name+"-single")
-    resources=[*_editor_cache_paths(values),sdk]
-    if getattr(args,"smoke",False):
-        nested={"t":target,"sdk":sdk,"variant":args.variant}
-        resources += _smoke_cache_paths(nested)+_smoke_cache_paths(nested,True)
-    return resources
+    args = values["args"]
+    return _standalone_module().sdk_outputs().cache_paths(
+        globals(), args, resolve_target(args.arch))
 
 
 @_cache_owned(_standalone_sdk_cache_paths)
@@ -1658,6 +1697,7 @@ def _sdk_standalone(args):
 def cmd_sdk(args) -> None:
     t = resolve_target(args.arch)
     delivery_profile = _delivery_module().profile(args)
+    _standalone_module().sdk_outputs().admit(die, args, t, delivery_profile)
     if delivery_profile == "embedded" and not t.get("emscripten"):
         _sdk_standalone(args)
         return
@@ -1694,9 +1734,12 @@ def cmd_sdk(args) -> None:
                  codec_flags, script_java, delivery_profile)
     # Gate: build + run the plain-C99 smoke consumer against each fresh SDK.
     if getattr(args, "smoke", False):
+        native_run = not (DRY_RUN or t["cross"] or t.get("emscripten"))
         for v in variants:
-            _smoke_one(t, sdk_install_dir(t, v), v)
-            _smoke_scripting_one(t, sdk_install_dir(t, v), v)
+            _smoke_one(t, sdk_install_dir(t, v), v,
+                       require_run=native_run, delivery_profile=delivery_profile)
+            _smoke_scripting_one(t, sdk_install_dir(t, v), v,
+                                require_run=native_run, delivery_profile=delivery_profile)
     if getattr(args, "smoke", False) and (t["cross"] or t.get("emscripten")):
         log("sdk: build/install complete; requested smoke EXECUTION PENDING")
     else:
@@ -1744,12 +1787,44 @@ def _extract_introspection(stdout: str, subject: str):
     return None
 
 
+def _smoke_runtime_ok(stdout, marker):
+    """One complete success token line, with no failure line, is the run proof."""
+    lines = [line.strip() for line in stdout.splitlines()]
+    success = sum(line == marker or line.startswith(marker + " ") for line in lines)
+    failure = marker.removesuffix("OK") + "FAIL"
+    return success == 1 and not any(
+        line == failure or line.startswith(failure + " ") for line in lines)
+
+
+def _smoke_run_admission(t, sdk, variant, require_run, delivery_profile):
+    # Runs inside the existing scratch/SDK lease, before any consumer mutation.
+    if not require_run:
+        return True
+    if DRY_RUN:
+        die("smoke: --require-run cannot certify --dry-run")
+    resolve_sdk(argparse.Namespace(sdk=str(sdk), variant=variant,
+                                  delivery_profile=delivery_profile), t)
+    if t["cross"] or t.get("emscripten"):
+        log("smoke: SKIPPED — EXECUTION_PENDING, selected target cannot run "
+            "natively on this host")
+        return False
+    return True
+
+
 @_cache_owned(lambda values: _smoke_cache_paths(values))
 def _smoke_one(t: dict, sdk: Path, variant: str,
-               introspect: str = "", introspect_out: str = "") -> None:
+               introspect: str = "", introspect_out: str = "",
+               build_dir: Path | None = None, require_run: bool = False,
+               delivery_profile: str = "authoring") -> str:
     """Build tests/sdk_smoke OUT-OF-TREE against the SDK at `sdk`, verify the
     cook→pack→embed artifacts offline, then (native arch only) run the
-    consumer headless and require its `JCE_SMOKE: OK` marker."""
+    consumer headless and require its `JCE_SMOKE: OK` marker.
+
+    Returns passed, skipped, execution_pending or dry_run; only passed proves
+    the actual native run. The historical CLI may still request cross audits.
+    """
+    if not _smoke_run_admission(t, sdk, variant, require_run, delivery_profile):
+        return "execution_pending"
     jce_cmake = sdk / "lib" / "cmake" / "JCE"
     if not DRY_RUN and not (jce_cmake / "JCEConfig.cmake").exists():
         die(f"smoke: no JCEConfig.cmake under {jce_cmake} — build the SDK first.")
@@ -1791,8 +1866,7 @@ def _smoke_one(t: dict, sdk: Path, variant: str,
                 "nothing to gate.")
 
     env = dict(os.environ) if t.get("emscripten") else msvc_env(t)
-    smoke_family = "web" if t.get("emscripten") else "desktop"
-    bdir = ROOT / "build" / smoke_family / f"sdk-smoke-{t['key']}-{variant}"
+    bdir = _smoke_build_dir(t, sdk, variant, build_dir)
     cfg = ["cmake", "-S", str(ROOT / "tests" / "sdk_smoke"), "-B", str(bdir),
            "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
            "-U", "JCE_PAK_EXECUTABLE",
@@ -1803,22 +1877,44 @@ def _smoke_one(t: dict, sdk: Path, variant: str,
         cfg += ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"]
     if t.get("emscripten"):
         cfg += [f"-DCMAKE_TOOLCHAIN_FILE={emscripten_paths()['toolchain']}"]
+    cfg += ["-U", "JCE_PROJECT_PREBUILT_ASSETS_*",
+            "-U", "JCE_PROJECT_PREBUILT_PAK_KEY_C",
+            "-U", "JCE_PROJECT_STAGE_LOOSE_ASSETS"]
+    dist_assets = require_run and variant == "dist"
+    if require_run:
+        cfg += [f"-DJCE_BUILD_VARIANT={variant}",
+                f"-DJCE_DELIVERY_PROFILE={delivery_profile}"]
+        if dist_assets:
+            try:
+                cfg += _sdk_smoke_assets_module().prepare(
+                    sys.modules[__name__], t, sdk, bdir, env)
+            except (OSError, ValueError) as error:
+                die("smoke: authenticated DIST asset admission failed: " + str(error))
+    else:
+        cfg += ["-U", "JCE_BUILD_VARIANT", "-U", "JCE_DELIVERY_PROFILE"]
     run(cfg, env=env, cwd=ROOT)
-    run(["cmake", "--build", str(bdir)], env=env, cwd=ROOT)
+    run(["cmake", "--build", str(bdir), "--parallel", build_jobs(env)], env=env, cwd=ROOT)
     if DRY_RUN:
-        return
+        return "dry_run"
 
     # Offline artifact gates — these run even for SDKs whose target arch
     # cannot execute on this host (cross/wasm).
-    cooked = bdir / "JceSdkSmoke_cooked" / "smoke.png"
-    if not cooked.exists():
-        die(f"smoke: cooked asset missing: {cooked}")
-    with open(cooked, "rb") as f:
-        magic = f.read(4)
-    if magic != b"JCEA":
-        die(f"smoke: {cooked} is not a cooked .jceasset (magic={magic!r}) — "
-            "the cook path produced raw bytes.")
-    pak = bdir / "JceSdkSmoke_assets.pak"
+    if dist_assets:
+        try:
+            _sdk_smoke_assets_module().verify(bdir)
+        except (OSError, ValueError) as error:
+            die("smoke: authenticated DIST asset proof failed: " + str(error))
+        pak = bdir / "jce_generated" / "project_assets.pak"
+    else:
+        cooked = bdir / "JceSdkSmoke_cooked" / "smoke.png"
+        if not cooked.exists():
+            die(f"smoke: cooked asset missing: {cooked}")
+        with open(cooked, "rb") as f:
+            magic = f.read(4)
+        if magic != b"JCEA":
+            die(f"smoke: {cooked} is not a cooked .jceasset (magic={magic!r}) — "
+                "the cook path produced raw bytes.")
+        pak = bdir / "JceSdkSmoke_assets.pak"
     exe, payload = _smoke_target_artifacts(t, bdir, "jce_sdk_smoke")
     if not pak.exists():
         die(f"smoke: pak missing: {pak}")
@@ -1834,7 +1930,7 @@ def _smoke_one(t: dict, sdk: Path, variant: str,
     if t["cross"] or t.get("emscripten"):
         log("smoke: BUILD/AUDIT PASS; EXECUTION PENDING (target requires "
             "actual browser/device validation)")
-        return
+        return "execution_pending"
 
     # Run gate: headless boot (noop renderer), one frame, clean exit. The
     # stdout marker is the primary signal — the engine's own error path
@@ -1852,7 +1948,7 @@ def _smoke_one(t: dict, sdk: Path, variant: str,
                               capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         die("smoke: consumer hung (>120 s) — should_quit never fired?")
-    marker_ok = "JCE_SMOKE: OK" in (proc.stdout or "")
+    marker_ok = _smoke_runtime_ok(proc.stdout or "", "JCE_SMOKE: OK")
     if not marker_ok or proc.returncode != 0:
         sys.stderr.write(proc.stdout or "")
         sys.stderr.write(proc.stderr or "")
@@ -1888,11 +1984,14 @@ def _smoke_one(t: dict, sdk: Path, variant: str,
             # part of what they asked for.
             print(body)
     log(f"smoke: PASS ({variant} SDK at {sdk})")
+    return "passed"
 
 
 # ── The MULTI-LANGUAGE half of the smoke gate ─────────────────────────────
 @_cache_owned(lambda values: _smoke_cache_paths(values, True))
-def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
+def _smoke_scripting_one(t: dict, sdk: Path, variant: str,
+                         build_dir: Path | None = None, require_run: bool = False,
+                         delivery_profile: str = "authoring") -> str:
     """Build tests/sdk_smoke_scripting OUT-OF-TREE against the SDK at `sdk` and
     require its `JCE_SMOKE_SCRIPTING: OK` marker.
 
@@ -1907,6 +2006,8 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
     REASON, because "the scripting gate did not run" and "the scripting gate
     passed" produced the same empty output for as long as the SDK shipped
     nothing from scripting/ at all."""
+    if not _smoke_run_admission(t, sdk, variant, require_run, delivery_profile):
+        return "execution_pending"
     jce_cmake = sdk / "lib" / "cmake" / "JCE"
     fragment = jce_cmake / "JCEScripting.cmake"
     if not DRY_RUN and not fragment.exists():
@@ -1915,9 +2016,58 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
             f"or came from a tree without scripting/. Rebuild the SDK to gate "
             f"it; add an embeddable CPython and -DJCE_BUILD_SCRIPT_JAVA=ON "
             f"for the Python and Java halves.")
-        return
+        return "skipped"
 
-    shipped = sdk_shipped_script_backends(sdk, t) if not DRY_RUN else ["c"]
+    shipped = sdk_shipped_script_backends(sdk, t, config="Release") if not DRY_RUN else ["c"]
+    if not DRY_RUN:
+        # The existing generated config declares producer intent; catalog
+        # rosters alone also describe intentionally uncompiled languages.
+        text = fragment.read_text(encoding="utf-8")
+        names = ("JCE_SCRIPT_AVAILABILITY_SCHEMA", "JCE_SCRIPT_CATALOG_LANGUAGES",
+                 "JCE_SCRIPT_COMPILED_LANGUAGES")
+        fields = {}
+        for name in names:
+            entries = re.findall(r'^\s*set\(\s*' + name + r'\s+("[^"\r\n]*"|[^()\s]+)\s*\)\s*$', text, re.M)
+            if len(entries) != 1:
+                die(f"smoke-scripting: missing/malformed/duplicate {name}; refresh the SDK")
+            fields[name] = entries[0].strip('"')
+        if fields[names[0]] != "1":
+            die("smoke-scripting: unsupported availability schema; refresh the SDK")
+        sets = []
+        for name in names[1:]:
+            languages = fields[name].split(";") if fields[name] else []
+            if (len(set(languages)) != len(languages) or
+                    any(not re.fullmatch(r"[a-z][a-z0-9_]*", lang) for lang in languages)):
+                die(f"smoke-scripting: malformed/duplicate {name}; refresh the SDK")
+            sets.append(set(languages))
+        catalog, compiled = sets
+        if not compiled <= catalog:
+            die("smoke-scripting: compiled languages outside the catalog; refresh the SDK")
+        declared = set()
+        for roster in sorted((jce_cmake / "backends").glob("*/jce_backend.cmake")):
+            entry = _read_roster(roster)
+            language = entry.get("JCE_BACKEND_LANGUAGE", "")
+            stem = entry.get("JCE_BACKEND_VM_TARGET", "")
+            raw = roster.read_text(encoding="utf-8")
+            keys = [match.group(1) for match in _ROSTER_SET_RE.finditer(raw)]
+            if (not re.fullmatch(r"[a-z][a-z0-9_]*", language) or
+                    not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", stem) or
+                    keys.count("JCE_BACKEND_LANGUAGE") != 1 or
+                    keys.count("JCE_BACKEND_VM_TARGET") != 1):
+                die(f"smoke-scripting: malformed installed roster {roster}")
+            if language in declared:
+                die(f"smoke-scripting: duplicate installed language {language}: {roster}")
+            declared.add(language)
+        if declared != catalog:
+            die("smoke-scripting: installed roster catalog mismatch; refresh the SDK")
+        missing = sorted(compiled - set(shipped))
+        unexpected = sorted(set(shipped) - compiled)
+        if missing or unexpected:
+            die("smoke-scripting: compiled-language payload mismatch: "
+                f"missing={','.join(missing) or 'none'} unexpected={','.join(unexpected) or 'none'}; refresh the SDK")
+        unavailable = sorted(catalog - compiled)
+        if unavailable:
+            log("smoke-scripting: UNAVAILABLE (not compiled in this SDK): " + ", ".join(unavailable))
     if not shipped:
         die(f"smoke-scripting: {sdk} contains JCEScripting.cmake but no "
             "complete scripting backend. A scripting layer that can run no "
@@ -1938,9 +2088,7 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
     log("smoke-scripting: installed roster = lua (built-in positive control), " + ", ".join(shipped))
 
     env = dict(os.environ) if t.get("emscripten") else msvc_env(t)
-    smoke_family = "web" if t.get("emscripten") else "desktop"
-    bdir = (ROOT / "build" / smoke_family /
-            f"sdk-smoke-script-{t['key']}-{variant}")
+    bdir = _smoke_build_dir(t, sdk, variant, build_dir, scripting=True)
     cfg = ["cmake", "-S", str(ROOT / "tests" / "sdk_smoke_scripting"),
            "-B", str(bdir), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
            "-U", "JCE_PAK_EXECUTABLE",
@@ -1954,11 +2102,31 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
         cfg += ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"]
     if t.get("emscripten"):
         cfg += [f"-DCMAKE_TOOLCHAIN_FILE={emscripten_paths()['toolchain']}"]
+    cfg += ["-U", "JCE_PROJECT_PREBUILT_ASSETS_*",
+            "-U", "JCE_PROJECT_PREBUILT_PAK_KEY_C",
+            "-U", "JCE_PROJECT_STAGE_LOOSE_ASSETS"]
+    dist_assets = require_run and variant == "dist"
+    if require_run:
+        cfg += [f"-DJCE_BUILD_VARIANT={variant}",
+                f"-DJCE_DELIVERY_PROFILE={delivery_profile}"]
+        if dist_assets:
+            try:
+                cfg += _sdk_smoke_assets_module().prepare(
+                    sys.modules[__name__], t, sdk, bdir, env, fixture="scripting")
+            except (OSError, ValueError) as error:
+                die("smoke-scripting: authenticated DIST asset admission failed: " + str(error))
+    else:
+        cfg += ["-U", "JCE_BUILD_VARIANT", "-U", "JCE_DELIVERY_PROFILE"]
     run(cfg, env=env, cwd=ROOT)
-    run(["cmake", "--build", str(bdir)], env=env, cwd=ROOT)
+    run(["cmake", "--build", str(bdir), "--parallel", build_jobs(env)], env=env, cwd=ROOT)
     if DRY_RUN:
-        return
+        return "dry_run"
 
+    if dist_assets:
+        try:
+            _sdk_smoke_assets_module().verify(bdir, fixture="scripting")
+        except (OSError, ValueError) as error:
+            die("smoke-scripting: authenticated DIST asset proof failed: " + str(error))
     exe, payload = _smoke_target_artifacts(
         t, bdir, "jce_sdk_smoke_scripting")
     if not exe.exists():
@@ -1979,7 +2147,7 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
     if t["cross"] or t.get("emscripten"):
         log("smoke-scripting: BUILD/AUDIT PASS; EXECUTION PENDING (target "
             "requires actual browser/device validation)")
-        return
+        return "execution_pending"
 
     renv = dict(env)
     renv["JCE_BACKEND"] = "noop"
@@ -1991,7 +2159,7 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
                               capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
         die("smoke-scripting: consumer hung (>180 s)")
-    marker_ok = "JCE_SMOKE_SCRIPTING: OK" in (proc.stdout or "")
+    marker_ok = _smoke_runtime_ok(proc.stdout or "", "JCE_SMOKE_SCRIPTING: OK")
     if not marker_ok or proc.returncode != 0:
         sys.stderr.write(proc.stdout or "")
         sys.stderr.write(proc.stderr or "")
@@ -2001,31 +2169,46 @@ def _smoke_scripting_one(t: dict, sdk: Path, variant: str) -> None:
         if "JCE_SMOKE_SCRIPTING:" in line:
             log(line.strip())
     log(f"smoke-scripting: PASS ({variant} SDK at {sdk})")
+    return "passed"
 
 
 def cmd_smoke(args) -> None:
     t = resolve_target(args.arch)
+    consumer = getattr(args, "consumer", "both")
+    require_run = getattr(args, "require_run", False)
+    if require_run and not args.sdk:
+        die("smoke: --require-run needs an explicit --sdk install directory")
     sdk = Path(args.sdk).resolve() if args.sdk else sdk_install_dir(t, args.variant)
     introspect = getattr(args, "introspect", "") or ""
-    _smoke_one(t, sdk, args.variant, introspect,
-               getattr(args, "introspect_out", "") or "")
-    if introspect:
-        # The scripting half is a separate consumer with its own contract and
-        # nothing to introspect; running it would add a minute and a second
-        # pile of output to what is meant to be one JSON document on stdout.
-        return
-    _smoke_scripting_one(t, sdk, args.variant)
+    if introspect and consumer == "scripting":
+        die("smoke: introspection belongs to the C99 consumer")
+    directory = getattr(args, "build_dir", None)
+    delivery = getattr(args, "delivery_profile", "authoring")
+    statuses = []
+    if consumer in ("both", "c99"):
+        c99_dir = Path(directory) / "c99" if directory and consumer == "both" else directory
+        statuses.append(_smoke_one(t, sdk, args.variant, introspect,
+            getattr(args, "introspect_out", "") or "", c99_dir, require_run, delivery))
+    if not introspect and consumer in ("both", "scripting"):
+        script_dir = Path(directory) / "scripting" if directory and consumer == "both" else directory
+        statuses.append(_smoke_scripting_one(t, sdk, args.variant, script_dir, require_run, delivery))
+    if require_run:
+        if not statuses or any(status not in ("passed", "skipped", "execution_pending")
+                               for status in statuses):
+            die("smoke: native run did not produce a definitive result")
+        if any(status != "passed" for status in statuses):
+            raise SystemExit(77)
 
 
 # ── Subcommand: editor (Track A first-party desktop app) ──────────────────
-@_cache_owned(lambda values: [ROOT / "build/desktop" / (values["t"]["key"] + "-asan"), conan_dir(values["t"])])
+@_cache_owned(lambda values: [*_authoring_editor_paths(values["t"], "asan"), conan_dir(values["t"])])
 def _editor_asan(t: dict, env: dict) -> None:
     """x64-only AddressSanitizer editor (Release + /Zi + /fsanitize=address),
-    configured directly into a dedicated -asan tree.  Invoked via
+    configured into a dedicated authoring object directory. Invoked via
     scripts/<os>/build-editor.{bat,sh} --variant asan."""
     if t["arch"] != "x86_64":
         die("asan editor build is x64-only")
-    bdir = ROOT / "build" / "desktop" / f"{t['key']}-asan"
+    bdir, output = _authoring_editor_paths(t, "asan")
     conan_install(t, "Release", env)
     flags = ("/MD /O1 /Ob1 /Zi /DNDEBUG /fsanitize=address /Oy- /FS "
              "/D_DISABLE_STRING_ANNOTATION=1 /D_DISABLE_VECTOR_ANNOTATION=1")
@@ -2034,11 +2217,12 @@ def _editor_asan(t: dict, env: dict) -> None:
     run(["cmake", "-S", str(ROOT), "-B", str(bdir), "-G", "Ninja",
          f"-DCMAKE_TOOLCHAIN_FILE={toolchain_path(t, 'Release')}",
          "-DCMAKE_BUILD_TYPE=Release", "-DJCE_BUILD_VARIANT=asan",
+         f"-DJCE_EDITOR_ARTIFACT_DIR={output.as_posix()}",
          "-DJCE_DELIVERY_PROFILE=authoring",
          f"-DCMAKE_C_FLAGS_RELEASE={flags}",
          f"-DCMAKE_CXX_FLAGS_RELEASE={flags}"], env=env, cwd=ROOT)
     run(["cmake", "--build", str(bdir), "--target", "JCE_Editor"], env=env, cwd=ROOT)
-    log(f"editor (asan) -> {bdir}/asan")
+    log(f"editor (asan) -> {output}")
 
 
 def _git_short() -> str:
@@ -2226,6 +2410,13 @@ def _delivery_module():
     return module
 
 
+def _sdk_smoke_assets_module():
+    spec = importlib.util.spec_from_file_location("jce_sdk_smoke_assets", Path(__file__).with_name("sdk_smoke_assets.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _standalone_module():
     import importlib.util
     spec = importlib.util.spec_from_file_location("jce_standalone", Path(__file__).with_name("standalone.py"))
@@ -2252,24 +2443,22 @@ def cmd_editor(args) -> None:
     config = "Debug" if args.variant == "debug" else "Release"
     kind = {"debug": "debug", "dist": "dist"}.get(args.variant, "release")
     preset = preset_name(t, kind)        # windows-x64-{release|debug|dist}
-    bdir = preset_binary_dir(t, kind)
+    bdir, output = _authoring_editor_paths(t, args.variant)
     if args.clean:
+        _standalone_module().guard_cache_clean((bdir, conan_dir(t)), ROOT / "build/desktop")
         for directory in (bdir, conan_dir(t)):
             if directory.exists():
                 log(f"clean: {directory}")
                 if not DRY_RUN:
                     shutil.rmtree(directory, ignore_errors=True)
     conan_install(t, config, env)
-    # Pin the build variant on EVERY configure.  release & dist share one
-    # build dir (build/desktop/<stem>; exe lands in <stem>/<variant>) and the
-    # *-release presets do NOT set JCE_BUILD_VARIANT, so a prior dist/debug
-    # configure left it cached as 'dist' — making a later `--variant release`
-    # build silently emit into <stem>/dist/ and leave <stem>/release/ stale.
-    # An explicit -D always overrides the cached value.
+    # Release and Dist share authoring objects. Pin both the variant and
+    # output every time so a previous configure cannot redirect the EXE.
     artifacts = getattr(args, "artifact_dir", None)
-    output = Path(artifacts).resolve() if artifacts else bdir / args.variant
+    if artifacts:
+        output = Path(artifacts).resolve()
     overrides = ["-DJCE_BUILD_EDITOR=ON", f"-DJCE_BUILD_VARIANT={args.variant}",
-                 f"-DJCE_EDITOR_ARTIFACT_DIR={output.as_posix() if artifacts else ''}"]
+                 f"-DJCE_EDITOR_ARTIFACT_DIR={output.as_posix()}"]
     overrides += codec_overrides(args)
     overrides += _delivery_module().cmake_flags("authoring",
         restore_authoring=_delivery_module().restore_authoring(bdir / "CMakeCache.txt"))
@@ -2282,7 +2471,7 @@ def cmd_editor(args) -> None:
             overrides.append(f"-DJCE_SHADERC_EXECUTABLE={sc}")
     if not DRY_RUN:
         (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
-    run(["cmake", "--preset", preset, *overrides], env=env, cwd=ROOT)
+    run(["cmake", "--preset", preset, "-B", str(bdir), *overrides], env=env, cwd=ROOT)
     run(["cmake", "--build", str(bdir), "--target", "JCE_Editor"], env=env, cwd=ROOT)
     attach_binsize_reports(t, args.variant, bdir)
     # Run cppcheck for the x64 Windows RELEASE variant only — that is the only
@@ -2301,74 +2490,44 @@ def cmd_editor(args) -> None:
 
 
 # ── Subcommand: app (Track B — build via SDK as a real consumer) ──────────
+def _publish_sdk_product(*args, **kwargs):
+    spec = importlib.util.spec_from_file_location("jce_sdk_product", Path(__file__).with_name("sdk_product.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.publish_install(sys.modules[__name__], *args, **kwargs)
+
+
+def _sdk_target_module():
+    spec = importlib.util.spec_from_file_location("jce_sdk_target", Path(__file__).with_name("sdk_target.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def resolve_sdk(args, t: dict) -> Path:
+    variant = getattr(args, "variant", "release")
+    delivery = _delivery_module().profile(args)
     if args.sdk:
         sdk = Path(args.sdk).resolve()
     elif os.environ.get("JCE_SDK_DIR"):
         sdk = Path(os.environ["JCE_SDK_DIR"]).resolve()
     else:
-        variant = getattr(args, "variant", "release")
         sdk = sdk_install_dir(t, "dist" if variant == "dist" else "release")
-        if getattr(args, "delivery_profile", None) == "embedded" and not t.get("emscripten"):
+        if delivery == "embedded" and not t.get("emscripten"):
             sdk = sdk.with_name(sdk.name + "-single")
+        if variant == "debug":
+            sdk = sdk.with_name(sdk.name + "-debug")
     if not (sdk / "lib" / "cmake" / "JCE" / "JCEConfig.cmake").exists():
         die(f"no valid SDK at {sdk} (missing lib/cmake/JCE/JCEConfig.cmake). "
             f"Run `jce.py sdk` first, pass --sdk DIR, or set JCE_SDK_DIR.")
-    require_sdk_variant(sdk, getattr(args, "variant", "release"), t)
+    system = "Emscripten" if t.get("emscripten") else {
+        "windows": "Windows", "linux": "Linux", "darwin": "Darwin"}.get(t["host"], "")
+    config = "Debug" if variant == "debug" else "Release"
+    try:
+        _sdk_target_module().require_sdk_target(sdk, system, t["arch"], config, variant, delivery)
+    except ValueError as error:
+        die(str(error) + "; refresh/select the matching SDK")
     return sdk
-
-
-def sdk_variant_of(sdk: Path) -> str | None:
-    """The `variant:` line the SDK stamped into its own VERSION.txt, or None if
-    the tree predates that stamp / is unreadable."""
-    vf = sdk / "VERSION.txt"
-    if not vf.exists():
-        return None
-    for line in vf.read_text(encoding="utf-8", errors="replace").splitlines():
-        if line.startswith("variant:"):
-            return line.split(":", 1)[1].strip() or None
-    return None
-
-
-def require_sdk_variant(sdk: Path, variant: str, t: dict) -> None:
-    """Refuse to build a dist artifact against a release SDK.
-
-    `app` / `package game` do NOT build the engine — they configure the project
-    against a prebuilt SDK, so the patented-codec #ifdefs were already resolved
-    when that SDK was built.  -DJCE_BUILD_VARIANT=dist cannot subtract codecs
-    from a fat lib that already contains them, and JCEConfig.cmake links that
-    lib with /WHOLEARCHIVE, so every fdk-aac / OpenH264 / libhevc object comes
-    along.  The engine tree's two FATAL_ERROR asserts never run on this path —
-    add_subdirectory(engine) is never reached.
-
-    resolve_sdk() only picked the variant-correct tree in its fallback branch;
-    an explicit --sdk or JCE_SDK_DIR was taken verbatim.  So `--variant dist
-    --sdk dist/sdk/win32-x86_64` produced a royalty-bearing bundle whose log
-    line and VERSION.txt both announced "royalty-free".  Stamped variant vs.
-    requested variant is the check that was missing."""
-    want = "dist" if variant == "dist" else "release"
-    got = sdk_variant_of(sdk)
-    if got is None:
-        # Unstamped tree: cannot verify. Loud for dist (the direction with a
-        # licensing consequence), silent for release.
-        if want == "dist":
-            log(f"WARN: {sdk}\\VERSION.txt has no `variant:` line — cannot "
-                f"verify this SDK is royalty-free. Rebuild it with "
-                f"`jce.py sdk --variant dist`.")
-        return
-    if got == want:
-        return
-    if want == "dist":
-        die(f"--variant dist against a '{got}' SDK at {sdk}.\n"
-            f"  A prebuilt SDK already has the patented codecs compiled in or "
-            f"out; the dist variant cannot remove them at consumer-configure "
-            f"time, so this would ship AAC / H.264 / H.265 in a bundle labelled "
-            f"royalty-free.\n"
-            f"  Use the dist SDK instead: {sdk_install_dir(t, 'dist')}\n"
-            f"  (build it with `jce.py sdk --variant dist`).")
-    die(f"--variant {variant} against a '{got}' SDK at {sdk}.\n"
-        f"  Use {sdk_install_dir(t, 'release')}, or build it with "
-        f"`jce.py sdk --variant release`.")
 
 
 def read_manifest(project: Path) -> dict:
@@ -2447,7 +2606,16 @@ def _write_pak_key_shares_c(out_c: Path, key: bytes) -> None:
     out_c.write_text(src, encoding="ascii", newline="\n")
 
 def _stage_runtime_boot_settings(project: Path, cooked: Path, boot: Path) -> None:
-    """Authoring files are fallback configuration, never loose shipment inputs."""
+    """Match CMake's canonical cooked RP staging before prebuilt packing."""
+    pipeline = project / "Settings" / "RenderPipeline.rp.json"
+    canonical = cooked / "settings" / "render_pipeline.rp.json"
+    if pipeline.is_file():
+        data = pipeline.read_bytes()
+        if not canonical.is_file() or canonical.read_bytes() != data:
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            canonical.write_bytes(data)
+    # Without an authored RP, independent cooked policy remains untouched.
+    # Do not add a second canonical key to the generated boot resource root.
     for name in ("input_actions.json", "project-settings.json"):
         source = project / ".jce" / name
         output = boot / "settings" / name
@@ -2460,108 +2628,168 @@ def _stage_runtime_boot_settings(project: Path, cooked: Path, boot: Path) -> Non
 
 def _dist_prebuilt_assets(project: Path, t: dict, bdir: Path,
                           manifest: dict, env: dict, sdk: Path,
-                          sdk_tools: dict | None = None) -> list:
-    """Build the dist variant's prebuilt PAK + key shares, CLI-side.
+                          sdk_tools: dict | None = None,
+                          bundle_admission: dict | None = None) -> list:
+    """Encrypt the public cooked graph and declared Bundle union in one PAK.
 
-    **Why this exists.** `cmake/JCESDKHelpers.cmake` refuses to pack raw
-    resources for `--variant dist`: that path demands an authenticated
-    prebuilt PAK plus a key-share TU, which until 2026-09-14 only
-    `editor/src/core/jce_build_manager.cpp` produced.  A machine without the
-    editor could therefore not ship a dist build at all -- `jce.py app
-    --variant dist` died in configure, and `jce.py package game` died with it
-    because it is just cook + app.
-
-    **Nothing here re-implements packing.**  `tools/jce_pak.c` already does
-    the whole job in one invocation: it sets the same JceBundlePackOptions
-    fields the editor sets (encrypt / encryption_key /
-    encrypt_label="project_assets", jce_pak.c:1482-1486) and it already emits
-    the embed object under the symbol the gate requires (--symbol-prefix,
-    default assets_pak_data).  The only pieces the CLI lacked were the key
-    file and the share TU -- the two helpers above.
-
-    Returns the -D arguments the configure needs.
+    Public Bundle/Archive owners inspect and import actual payloads. A sidecar
+    cannot supply typed truth. Stock remains an explicitly unaudited superset.
     """
     if sdk_tools is None:
         sdk_tools = _sdk_host_tools(sdk, t)
     gen = bdir / "jce_generated"
     cooked = project / (manifest.get("cooked_assets") or "resources/_cooked")
-    if not (cooked.is_dir() and any(cooked.iterdir())):
-        cmd_cook(argparse.Namespace(project=str(project), sdk=sdk, sdk_target=t,
-                                    sdk_tools=sdk_tools))
     packer = sdk_tools.get("jce_pak", host_tool("jce_pak"))
     if not packer.exists():
         if "jce_pak" in sdk_tools:
             die("Confirmed SDK packer disappeared; retry app build")
         packer = ensure_host_tools(env, ("jce_pak",))["jce_pak"]
-    key = _project_pak_key(project)
-    key_file = project / ".jce" / "pak_key.hex"
+    delivery = _delivery_module()
+    owner = argparse.Namespace(HOST=HOST, ROOT=ROOT, DRY_RUN=DRY_RUN, run=run, _sha256=_sha256)
+    try:
+        if bundle_admission is None:
+            bundle_admission = delivery.inspect_project_bundles(owner, project, manifest, sdk, t, sdk_tools)
+        delivery.verify_bundle_inputs(owner, bundle_admission)
+        startup = bundle_admission['startup_scene'] if bundle_admission else manifest.get("startup_scene")
+        delivery._admission_address(startup)
+    except (ValueError, OSError) as error:
+        die("Dist requires a validated startup scene: " + str(error))
+    use_loose = bundle_admission is None or bundle_admission['use_loose_scene']
+    resources = (project / (manifest.get("source_assets") or "resources")).resolve()
+    scene = (resources / startup).resolve()
+    bundle_tool = None
+    if use_loose:
+        if not scene.is_relative_to(resources) or not scene.is_file():
+            die("Dist startup scene missing or outside source assets: " + str(scene))
+        bundle_tool = sdk_tools.get("jce_bundle_pack")
+        if bundle_tool is None:
+            name = "jce_bundle_pack" + (".exe" if HOST == "windows" else "")
+            bundle_tool = next((sdk / folder / name for folder in ("bin", "bin/host")
+                                if (sdk / folder / name).is_file()), sdk / "bin" / name)
+        if not bundle_tool.is_file():
+            die("Selected SDK lacks public cooked graph resolver; refresh SDK: " + str(bundle_tool))
+    graph_dir = gen / "content_graph"
+    selected_archive = graph_dir / "admission.jbundle"
+    generated_graph_files = (selected_archive, graph_dir / "admission.jbundle.json",
+                             graph_dir / "bundle_graph.json")
+    graph_files = generated_graph_files if use_loose else ()
     pak = gen / "project_assets.pak"
-    # Web has no COFF.  The editor's answer on non-Windows is a GAS `.incbin`
-    # wrapper, not a C array -- a 13 MB blob as a C array is ~80 MB of source
-    # and minutes of compile time for nothing.  jce_pak only offers
-    # coff|c-array, so the asm wrapper comes from jce_bin2obj (--format asm),
-    # which is the same tool the CMake path already uses for raw embeds.
-    web = bool(t.get("emscripten"))
-    embed = gen / ("project_assets.S" if web else "project_assets.obj")
-    if not DRY_RUN:
-        gen.mkdir(parents=True, exist_ok=True)
-    # **Three resource roots, not one.**  The CMake path packs the SDK's stock
-    # trees, the project's cooked assets, AND a generated boot root -- see
-    # jce_add_pak / _jce_prepare_runtime_boot_manifest in
-    # cmake/JCESDKHelpers.cmake.  Packing only the project tree produced an
-    # exe that linked and launched and then died with
-    # "jce_project.json and packed runtime boot manifest are both missing":
-    # the manifest lives at the reserved virtual path jce/runtime_boot.json
-    # and nothing else supplies it once the loose tree is gone.
+    bom = gen / "project_assets.bom.json"
+    receipt = gen / "project_assets.receipt.json"
     boot = gen / "runtime_boot"
     if not DRY_RUN:
+        graph_dir.mkdir(parents=True, exist_ok=True)
+        for path in (*generated_graph_files, bom, receipt, pak, gen / "project_assets.obj",
+                     gen / "project_assets.h", gen / "project_assets.cmake"):
+            path.unlink(missing_ok=True)
         (boot / "jce").mkdir(parents=True, exist_ok=True)
         (boot / "jce" / "runtime_boot.json").write_text(
             json.dumps({"contract": "jce.runtime_boot", "schema": 1,
-                        "startup_scene": manifest.get("startup_scene", "")},
-                       indent=2) + chr(10),
-            encoding="utf-8", newline=chr(10))
+                        "startup_scene": startup}, indent=2) + "\n",
+            encoding="utf-8", newline="\n")
         _stage_runtime_boot_settings(project, cooked, boot)
-    roots = []
-    for name in ("engine_resources", "engine_ui"):
-        d = sdk / "share" / "jce" / name
-        if d.is_dir():
-            roots.append(d)
-    roots += [cooked, boot]
-    res_flags = []
-    for d in roots:
-        res_flags += ["--resource-dir", str(d)]
-    cmd = [str(packer), *res_flags,
-           "--pak-file", str(pak),
+    if use_loose:
+        stock = delivery.shader_stock_root(sdk)
+        stock_flags = ["--shader-root", str(stock)] if stock else []
+        run([str(bundle_tool), "--resource-root", str(resources), "--scene", str(scene),
+             "--out", str(graph_dir), "--single-file", "--id", "admission",
+             "--cook-assets", "--target", delivery.bundle_platform(t), *stock_flags], env=env, cwd=ROOT)
+    selected_sources, selected_assets, provenance, identities = [], [], {}, {}
+    if not DRY_RUN:
+        try:
+            if use_loose:
+                _, assets = delivery._single_admission_assets(graph_dir, startup)
+                metadata = json.loads(graph_files[1].read_text(encoding="utf-8"))
+                selected_sources.append({'path': str(selected_archive), 'size': selected_archive.stat().st_size,
+                                         'content_id': metadata.get('content_hash'), 'assets': assets})
+            if bundle_admission:
+                selected_sources.extend(bundle_admission['bundles'])
+            selected_assets, provenance = delivery.merge_selected_assets(
+                (source['path'], source['assets']) for source in selected_sources)
+            if bundle_admission:
+                native = delivery.native_registry_module().plan(manifest, selected_assets,
+                    manifest.get('target') or manifest.get('name') or project.name)
+                delivery.admit(manifest, [asset['path'] for asset in selected_assets], 'embedded',
+                    ['lua', *sdk_shipped_script_backends(sdk)], selected_assets, native_plan=native)
+            proof_files = list(graph_files)
+            if bundle_admission:
+                for source in bundle_admission['bundles']:
+                    proof_files.extend((Path(source['path']), Path(source['inspection_path'])))
+                    if source['sidecar_sha256'] is not None:
+                        proof_files.append(Path(source['path'] + '.json'))
+            identities = {str(path): _sha256(path) for path in proof_files}
+        except (ValueError, OSError) as error:
+            die("Dist typed content admission failed: " + str(error))
+        addresses = set(provenance)
+        for name in ("render_pipeline.rp.json", "input_actions.json", "project-settings.json"):
+            address = "settings/" + name
+            source = cooked / address if name == "render_pipeline.rp.json" else project / ".jce" / name
+            output = boot / address
+            if source.is_file() and (name == "render_pipeline.rp.json" or address not in addresses):
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, output)
+            else:
+                output.unlink(missing_ok=True)
+        boot_addresses = {"jce/runtime_boot.json", "settings/render_pipeline.rp.json",
+                          "settings/input_actions.json", "settings/project-settings.json"}
+        if any(path.is_file() and path.relative_to(boot).as_posix() not in boot_addresses
+               for path in boot.rglob("*")):
+            die("Unexpected file in generated runtime boot inputs; refresh this build cache")
+    key = _project_pak_key(project)
+    key_file = project / ".jce" / "pak_key.hex"
+    web = bool(t.get("emscripten"))
+    embed = pak if web else gen / "project_assets.obj"
+    roots = [sdk / "share" / "jce" / name for name in ("engine_resources", "engine_ui")
+             if (sdk / "share" / "jce" / name).is_dir()]
+    res_flags = [part for root in (*roots, boot) for part in ("--resource-dir", str(root))]
+    # No raw Bundle is separately embedded: validated entries enter this same
+    # authenticated PAK, and runtime_boot chooses their actual selected scene.
+    archives = [source['path'] for source in selected_sources] if not DRY_RUN else [str(selected_archive)]
+    selected_flags = [part for path in archives for part in ("--selected-archive", path)]
+    cmd = [str(packer), *res_flags, *selected_flags,
+           "--pak-file", str(pak), "--json", str(bom),
            "--header-file", str(gen / "project_assets.h"),
            "--manifest-file", str(gen / "project_assets.cmake"),
            "--obj-format", "none" if web else "coff",
-           "--symbol-prefix", "assets_pak_data",
-           # dist is the shipping variant: the same ZSTD level the editor
-           # picks (asset_pack_zstd_level_for_variant -> 19).
-           "--level", "19",
-           "--platform", "web" if web else "desktop",
-           "--encrypt-key-file", str(key_file)]
+           "--symbol-prefix", "assets_pak_data", "--level", "19",
+           "--platform", "web" if web else ("mobile" if t.get("host") in ("android", "ios") else "desktop"),
+           "--bundle-target", delivery.bundle_platform(t), "--encrypt-key-file", str(key_file)]
     if not web:
-        arch = t["arch"] if t["arch"] in ("x64", "arm64", "x86", "arm") else "x64"
+        arch = t.get("eng_arch", t["arch"])
+        if arch not in ("x64", "arm64", "x86", "arm"):
+            die("Dist host wrapper lacks admitted object architecture: " + str(arch))
         cmd += ["--obj-file", str(embed), "--obj-arch", arch]
     run(cmd, env=env, cwd=ROOT)
-    if web:
-        wrapper = sdk_tools.get("jce_bin2obj", host_tool("jce_bin2obj"))
-        if not wrapper.exists():
-            if "jce_bin2obj" in sdk_tools:
-                die("Confirmed SDK wrapper disappeared; retry app build")
-            wrapper = ensure_host_tools(env, ("jce_bin2obj",))["jce_bin2obj"]
-        run([str(wrapper), "--input", str(pak), "--symbol", "assets_pak_data",
-             "--output", str(embed), "--format", "asm"], env=env, cwd=ROOT)
+    if not DRY_RUN:
+        try:
+            if any(_sha256(Path(path)) != digest for path, digest in identities.items()):
+                raise ValueError("selected content proof changed during packing")
+            delivery.verify_bundle_inputs(owner, bundle_admission)
+            report = json.loads(bom.read_text(encoding="utf-8"))
+            count = delivery.verify_selected_pack(report, pak, embed, selected_sources, selected_assets, provenance)
+            result = {"schema": "jce.dist.asset-receipt.v1",
+                      "project_assets": "declared-bundle-union" if bundle_admission else "selected-cooked-graph",
+                      "startup_scene": startup, "stock_assets": "safe-superset; closure not verified",
+                      "selected_count": len(selected_assets), "packed_count": count,
+                      "inputs_sha256": identities, "pak_sha256": _sha256(pak),
+                      "bom_sha256": _sha256(bom), "embed_sha256": _sha256(embed),
+                      "deep_verification": "PASS", "runtime_parity": "NOT VERIFIED"}
+            if bundle_admission:
+                result['bundle_inputs'] = [{field: source[field] for field in
+                    ('path', 'sha256', 'sidecar_sha256', 'sidecar_verified', 'sidecar_compatible',
+                     'content_id', 'size')} for source in bundle_admission['bundles']]
+                result['raw_bundle_embedding'] = 'OFF; entries share authenticated PAK'
+            receipt.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
+        except (ValueError, OSError, TypeError, AttributeError) as error:
+            die("Dist asset proof failed: " + str(error))
     _write_pak_key_shares_c(gen / "jce_pak_key.c", key)
-    var = ("JCE_PROJECT_PREBUILT_ASSETS_ASM" if web
-           else "JCE_PROJECT_PREBUILT_ASSETS_OBJ")
-    return [f"-D{var}={embed}",
-            f"-DJCE_PROJECT_PREBUILT_PAK_KEY_C={gen / 'jce_pak_key.c'}",
-            # The editor pins this the same way: an encrypted build must not
-            # also stage the loose tree beside the exe.
-            "-DJCE_PROJECT_STAGE_LOOSE_ASSETS=OFF"]
+    var = "JCE_PROJECT_PREBUILT_ASSETS_PAK" if web else "JCE_PROJECT_PREBUILT_ASSETS_OBJ"
+    result = [f"-D{var}={embed}",
+              f"-DJCE_PROJECT_PREBUILT_PAK_KEY_C={gen / 'jce_pak_key.c'}",
+              "-DJCE_PROJECT_STAGE_LOOSE_ASSETS=OFF"]
+    if bundle_admission:
+        result.append("-DJCE_PROJECT_BUNDLES=")
+    return result
 
 
 @_cache_owned(_app_cache_paths)
@@ -2573,10 +2801,16 @@ def cmd_app(args) -> None:
     t = resolve_target(args.arch)
     if t["host"] != HOST:
         die(f"app target {t['key']} must be built on host '{t['host']}'.")
+    proof = getattr(args, "registry_proof", None)
+    if proof and (not t.get("emscripten") or
+                  _delivery_module().profile(args) != "embedded" or
+                  args.clean or args.configure_only):
+        die("--registry-proof audits an existing embedded Web artifact; "
+            "it cannot combine with clean/configure-only or native targets")
     sdk = resolve_sdk(args, t)
     sdk_tools = _confirmed_app_sdk_tools(args, sdk, t)
     try:
-        required_languages = _delivery_module().admit_project(sys.modules[__name__], args, project, manifest, sdk, target=t)
+        required_languages = _delivery_module().admit_project(sys.modules[__name__], args, project, manifest, sdk, target=t, sdk_tools=sdk_tools)
     except ValueError as error:
         die(str(error))
     try:
@@ -2587,13 +2821,29 @@ def cmd_app(args) -> None:
     jce_cmake = sdk / "lib" / "cmake" / "JCE"
     if not (jce_cmake / "JCEConfig.cmake").exists():
         die(f"JCEConfig.cmake not under {jce_cmake}")
+    config = "Debug" if args.variant == "debug" else "Release"
+    bdir = _app_build_dir(project, t, args.variant)
+    target = args.target or manifest.get("target") or manifest.get("name") or project.name
+    if t.get("emscripten"):
+        exe = args.exe or f"{target}.html"
+    else:
+        exe = _delivery_module().native_artifact_name(
+            args.exe or manifest.get("exe") or manifest.get("name", project.name), HOST)
+    if proof:
+        # DIST emits fresh XOR key shares on every build. Rebuilding here would
+        # invalidate the nonce/hash-bound receipt from the previous browser run.
+        found = next((p for p in (bdir / exe, bdir / config / exe) if p.is_file()), None)
+        if not found:
+            die(f"registry proof artifact missing: {exe} (under {bdir})")
+        _delivery_module().audit_application(sys.modules[__name__], args, found)
+        log(f"app: verified existing {found} (without rebuilding)")
+        return
     # MSVC env would inject the wrong toolchain into a wasm consumer build;
     # the SDK fat lib carries all deps, so a clean env + Emscripten.cmake is
     # the whole toolchain story (mirrors _sdk_one).
     env = dict(os.environ) if t.get("emscripten") else msvc_env(t)
-    config = "Debug" if args.variant == "debug" else "Release"
-    bdir = project / "build" / f"{t['host']}-{t['arch']}-{args.variant}"
     if args.clean and bdir.exists():
+        _standalone_module().guard_cache_clean((bdir,), project / "build")
         log(f"clean: {bdir}")
         if not DRY_RUN:
             shutil.rmtree(bdir, ignore_errors=True)
@@ -2616,13 +2866,15 @@ def cmd_app(args) -> None:
             cfg.append(f"-D{variable}={sdk_tools[name]}")
     # dist: the SDK helper will not pack raw resources -- supply the prebuilt
     # authenticated PAK and key shares ourselves (see _dist_prebuilt_assets).
+    cfg.extend(["-U", "JCE_PROJECT_PREBUILT_ASSETS_PAK",
+                "-U", "JCE_PROJECT_PREBUILT_ASSETS_OBJ",
+                "-U", "JCE_PROJECT_PREBUILT_ASSETS_ASM",
+                "-U", "JCE_PROJECT_PREBUILT_ASSETS_C",
+                "-U", "JCE_PROJECT_PREBUILT_PAK_KEY_C"])
     if args.variant == "dist":
-        cfg.extend(["-U", "JCE_PROJECT_PREBUILT_ASSETS_OBJ",
-                    "-U", "JCE_PROJECT_PREBUILT_ASSETS_ASM",
-                    "-U", "JCE_PROJECT_PREBUILT_ASSETS_C",
-                    "-U", "JCE_PROJECT_PREBUILT_PAK_KEY_C"])
         cfg.extend(_dist_prebuilt_assets(project, t, bdir,
-                                         manifest, env, sdk, sdk_tools=sdk_tools))
+                                         manifest, env, sdk, sdk_tools=sdk_tools,
+                                         bundle_admission=getattr(args, "_bundle_admission", None)))
     if _delivery_module().profile(args) == "embedded":
         if args.variant == "debug":
             die("embedded SDK is release/dist; use authoring for debug applications")
@@ -2645,24 +2897,15 @@ def cmd_app(args) -> None:
     if args.configure_only:
         log(f"app: configured {project.name} (via SDK at {sdk}) [--configure-only]")
         return
-    # CMake target name comes from the manifest (CK: "CagedKingdom"), not the
-    # dir name; fall back to the dir name for manifest-less projects.
-    target = args.target or manifest.get("target") or manifest.get("name") or project.name
     run(["cmake", "--build", str(bdir), "--target", target], env=env, cwd=ROOT)
-    if t.get("emscripten"):
-        # Web delivery is a single HTML; desktop "exe" does not apply.
-        # The target is authoritative when its display name differs.
-        exe = args.exe or f"{target}.html"
-    else:
-        # Same source as the emscripten branch above: the artifact name comes
-        # from the project, never from a game this script happens to know.
-        default_exe = manifest.get("name", project.name)
-        exe = _delivery_module().native_artifact_name(
-            args.exe or manifest.get("exe") or default_exe, HOST)
     found = next((p for p in (bdir / exe, bdir / config / exe) if p.exists()), None)
     if not found and not DRY_RUN:
         die(f"build succeeded but artifact missing: {exe} (under {bdir})")
     if found:
+        try:
+            _delivery_module().verify_bundle_inputs(sys.modules[__name__], getattr(args, "_bundle_admission", None))
+        except (ValueError, OSError) as error:
+            die("Declared Bundle changed before artifact acceptance: " + str(error))
         _delivery_module().audit_application(sys.modules[__name__], args, found)
     log(f"app: {found if found else exe} (via SDK at {sdk})")
 
@@ -2722,10 +2965,22 @@ def _announce_codec_policy(variant: str, what: str) -> None:
             "adapters (AAC / H.264 / H.265). You are responsible for "
             "licensing. Use --variant dist for a royalty-free bundle.")
 
+def _package_editor_cache_paths(values):
+    paths = _editor_cache_paths(values)
+    args = values["args"]
+    return paths + _standalone_module().editor_package_cache_paths(
+        argparse.Namespace(**globals()), args, resolve_target(args.arch))
+
+
+@_cache_owned(_package_editor_cache_paths)
+def _package_embedded_editor(args) -> None:
+    _standalone_module().package_editor(sys.modules[__name__], args)
+
+
 def cmd_package_editor(args) -> None:
     """Stage the editor delivery selected by the caller."""
     if _delivery_module().profile(args) == "embedded":
-        _standalone_module().package_editor(sys.modules[__name__], args)
+        _package_embedded_editor(args)
         return
     t = resolve_target(args.arch)
     if t["host"] != HOST:
@@ -2733,16 +2988,17 @@ def cmd_package_editor(args) -> None:
     variant = args.variant                       # release | dist
     suffix  = "-dist" if variant == "dist" else ""
     _announce_codec_policy(variant, "editor bundle")
-    src     = preset_binary_dir(t, "dist" if variant == "dist" else "release") / variant
+    _, src  = _authoring_editor_paths(t, variant)
     editor_exe = src / _host_exe("jce_editor")
     sdk_dir = sdk_install_dir(t, variant)
     out = (Path(args.out).resolve() if args.out
            else ROOT / "dist" / "editor" / f"{SDK_TAG[t['host']]}-{t['arch']}{suffix}")
 
     if not args.skip_build:
-        cmd_editor(argparse.Namespace(arch=args.arch, variant=variant, clean=False))
+        cmd_editor(argparse.Namespace(arch=args.arch, variant=variant, clean=False,
+                                      delivery_profile="authoring"))
         cmd_sdk(argparse.Namespace(arch=args.arch, variant=variant,
-                                   no_debug=True, clean=False))
+                                   no_debug=True, clean=False, delivery_profile="authoring"))
 
     if not DRY_RUN:
         if not editor_exe.exists():
@@ -2835,82 +3091,87 @@ def _assert_no_profiler_listener(exe: Path, variant: str) -> None:
         f"default (dist) for anything you hand to someone else.")
 
 
+def _package_component(value: str) -> bool:
+    """Portable native package leaf contract; no filesystem mutation."""
+    if not isinstance(value, str) or not value or ".." in value or value[-1] in ". ":
+        return False
+    if any(ord(c) < 32 or ord(c) == 127 or c in '/\\:*?"<>|' for c in value):
+        return False
+    stem = value.split(".", 1)[0].upper()
+    return stem not in {"CON", "PRN", "AUX", "NUL"} and not (
+        len(stem) == 4 and stem[:3] in {"COM", "LPT"} and stem[3] in "123456789")
+
+
+def _project_package_output(args, project: Path, sdk: Path, manifest: dict,
+                            target: dict, target_name: str, exe: str) -> Path:
+    """Read-only CLI preflight. Native admission/publication rechecks ownership."""
+    app = manifest.get("name") or target_name
+    for leaf in (app, target_name, exe, SDK_TAG[target["host"]], target["arch"], args.variant):
+        if not _package_component(leaf):
+            die(f"package: unsafe filename component: {leaf!r}")
+    try:
+        output = (Path(args.out) if getattr(args, "out", None) else
+                  project / "dist/apps" / app /
+                  f"{SDK_TAG[target['host']]}-{target['arch']}-{args.variant}").resolve()
+        workspace = ROOT.resolve()
+        sdk = sdk.resolve()
+        if (len(str(output).encode("utf-8")) + len(exe.encode("utf-8")) + 2 >= 1024 or
+                any(ord(c) < 32 or ord(c) == 127 for c in str(output))):
+            die("package: unsafe or overlong output path")
+        if output == Path(output.anchor) or project.is_relative_to(output):
+            die(f"package: output overlaps project/root: {output}")
+        # A source checkout's final outputs belong to dist; explicit external
+        # directories remain allowed after the same content/overlap checks.
+        if output.is_relative_to(project) and not output.is_relative_to(project / "dist"):
+            die(f"package: output overlaps project source/build directory: {output}")
+        if (output.is_relative_to(workspace) and
+                not output.is_relative_to(workspace / "dist") and
+                not output.is_relative_to(project / "dist/apps")):
+            die(f"package: output overlaps workspace source/build directory: {output}")
+        protected = [sdk]
+        for field, default in (("source_assets", "assets"), ("cooked_assets", "resources/_cooked")):
+            value = manifest.get(field) or default
+            if not isinstance(value, str):
+                die(f"package: {field} must be a path string")
+            protected.append((project / value).resolve())
+        for directory in protected:
+            if output.is_relative_to(directory) or directory.is_relative_to(output):
+                die(f"package: output overlaps protected directory: {directory}")
+        if output.exists() and not output.is_dir():
+            die(f"package: output directory is a file: {output}")
+        if output.is_dir():
+            for entry in output.iterdir():
+                if (args.variant != "dist" or entry.name != exe or
+                        entry.is_symlink() or getattr(entry, "is_junction", lambda: False)() or
+                        not entry.is_file()):
+                    die(f"package: output contains an unowned entry (kept): {entry}")
+    except (OSError, ValueError) as error:
+        die(f"package: cannot safely resolve output: {error}")
+    return output
+
+
 def cmd_package_game(args) -> None:
-    """Cook -> build (via SDK) -> stage a game bundle (exe + dlls + cooked
-    assets + VERSION) into dist/games/<name>-<ver>-<tag>-<arch>.  Replaces
-    package-game.bat."""
+    """Compatibility entry to the single native headless build/package owner."""
     project = Path(args.project).resolve()
-    if not project.is_dir():
-        die(f"project dir not found: {project}")
+    if not (project / "jce_project.json").is_file():
+        die(f"no jce_project.json under {project}")
     manifest = read_manifest(project)
-    t = resolve_target(args.arch)
-    variant = args.variant
-    _announce_codec_policy(variant, "game bundle")
-    name    = args.name or manifest.get("name") or project.name
-    version = args.version or manifest.get("version") or "0.0.0"
-
-    cmd_cook(argparse.Namespace(project=str(project)))
-    cmd_app(argparse.Namespace(project=str(project), arch=args.arch, variant=variant,
-                               sdk=args.sdk, target=args.target, exe=args.exe,
-                               configure_only=False, clean=args.clean))
-
-    bdir   = project / "build" / f"{t['host']}-{t['arch']}-{variant}"
-    config = "Debug" if variant == "debug" else "Release"
-    exe    = args.exe or manifest.get("exe") or _host_exe(name)
-    if HOST == "windows" and not exe.lower().endswith(".exe"):
-        exe += ".exe"
-    built = next((p for p in (bdir / exe, bdir / config / exe) if p.exists()), None)
-    if not DRY_RUN and not built:
-        die(f"game exe not found under {bdir}: {exe}")
-    out = (Path(args.out).resolve() if args.out
-           else project / "dist" / "games"
-           / f"{name}-{version}-{SDK_TAG[t['host']]}-{t['arch']}")
-
-    log(f"stage game bundle -> {out}")
-    if not DRY_RUN:
-        if out.exists():
-            shutil.rmtree(out, ignore_errors=True)
-        out.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(built, out / built.name)
-        _assert_no_profiler_listener(out / built.name, variant)
-        for dll in built.parent.glob("*.dll"):
-            shutil.copy2(dll, out / dll.name)
-        # Cooked assets are embedded in the executable (jce_add_pak), but a
-        # project can still require the DLLs copied above. Asset embedding
-        # alone is not proof of single-executable delivery. --with-loose (or
-        # manifest "stage_loose": true) re-stages files for development or
-        # projects that deliberately load loose assets.
-        stage_loose = bool(getattr(args, "with_loose", False)) or \
-                      bool(manifest.get("stage_loose", False))
-        if stage_loose:
-            cooked_rel = (manifest.get("cooked_assets") or "resources/_cooked")
-            cooked_src = project / cooked_rel.replace("/", os.sep)
-            if cooked_src.is_dir():
-                shutil.copytree(cooked_src, out / cooked_rel.replace("/", os.sep),
-                                dirs_exist_ok=True)
-            else:
-                log(f"WARN: cooked assets dir missing: {cooked_src} (game ships without assets)")
-            # The runtime reads jce_project.json from the CWD to find
-            # startup_scene; without it the game boots to an empty default
-            # scene.  Loose deployments therefore always need the manifest.
-            proj_json = project / "jce_project.json"
-            if proj_json.is_file():
-                shutil.copy2(proj_json, out / "jce_project.json")
-            # Mirror extra loose runtime dirs the project's POST_BUILD staged
-            # beside the exe (e.g. particles/ — emitter descs are read
-            # CWD-relative by jce_particles_desc_load_json, not from the PAK).
-            for extra in ("particles",):
-                extra_src = built.parent / extra
-                if extra_src.is_dir():
-                    shutil.copytree(extra_src, out / extra, dirs_exist_ok=True)
-        else:
-            log("embedded-assets: loose cooked tree NOT staged (assets embedded "
-                "in exe; check staged DLLs before claiming a single EXE)")
-        (out / "VERSION.txt").write_text(
-            f"name:     {name}\nversion:  {version}\n"
-            f"platform: {SDK_TAG[t['host']]}\narch:     {t['arch']}\n"
-            f"variant:  {variant}\ncommit:   {git_short_sha()}\n", encoding="utf-8")
-    log(f"package game: {out}")
+    if getattr(args, "with_loose", False) or manifest.get("stage_loose", False):
+        die("package game: --with-loose/stage_loose is unsupported by the headless "
+            "request; use the editor's explicit authoring workflow")
+    for field, default in (("name", project.name), ("version", "0.0.0")):
+        requested = getattr(args, field, None)
+        if requested is not None and requested != (manifest.get(field) or default):
+            die(f"package game: --{field} override is unsupported; update "
+                f"jce_project.json {field!r} before packaging")
+    forwarded = argparse.Namespace(**vars(args))
+    for field in ("editor", "result", "registry_proof"):
+        if not hasattr(forwarded, field):
+            setattr(forwarded, field, None)
+    if not hasattr(forwarded, "delivery_profile"):
+        forwarded.delivery_profile = "embedded"
+    log("package game: using the native headless build/package pipeline")
+    cmd_build_project(forwarded)
 
 
 # ── Subcommand: cook / serve / lint (folded wrappers) ─────────────────────
@@ -2990,6 +3251,13 @@ def cmd_build_project(args) -> None:
     if t["host"] != HOST:
         die(f"build-project target {t['key']} must be built on host '{t['host']}'.")
     sdk = resolve_sdk(args, t)
+    target = args.target or manifest.get("target") or project.name
+    try:
+        exe = _delivery_module().native_artifact_name(
+            args.exe or manifest.get("exe") or target, HOST)
+    except ValueError as error:
+        die(str(error))
+    out = _project_package_output(args, project, sdk, manifest, t, target, exe)
     try:
         required_languages = _delivery_module().admit_project(sys.modules[__name__], args, project, manifest, sdk, target=t)
     except ValueError as error:
@@ -3000,10 +3268,6 @@ def cmd_build_project(args) -> None:
         die(str(error))
 
 
-    target = args.target or manifest.get("target") or project.name
-    exe = args.exe or manifest.get("exe") or (
-        target + (".exe" if HOST == "windows" else ""))
-
     # The editor exe: built by `jce.py editor`, landing in <build>/<variant>.
     #
     # NEWEST WINS, not a fixed dist-then-release order.  The first version of
@@ -3012,17 +3276,28 @@ def cmd_build_project(args) -> None:
     # five weeks earlier that predated the headless contract entirely.  It ran,
     # exited 0, and published nothing; only the missing-result check below said
     # anything.  Freshness is the property that matters for a driver.
-    build_dir = preset_binary_dir(t, "release")
     exe_name = "jce_editor.exe" if HOST == "windows" else "jce_editor"
     if args.editor:
         editor = Path(args.editor).resolve()
         if not editor.is_file():
             die(f"no editor executable at {editor}")
     else:
-        cands = [build_dir / v / exe_name for v in ("dist", "release")]
+        if _delivery_module().profile(args) == "embedded":
+            native = _standalone_module()
+            cands = []
+            for variant in ("dist", "release"):
+                request = argparse.Namespace(variant=variant)
+                try:
+                    plan = native.native_cache_plan(sys.modules[__name__], request, t,
+                                                     exact_variant=True)
+                except (ValueError, OSError):
+                    continue
+                cands.append(native.cached_editor_artifact(plan["build"], variant, HOST))
+        else:
+            cands = [_authoring_editor_paths(t, variant)[1] / exe_name for variant in ("dist", "release")]
         cands = [c for c in cands if c.is_file()]
         if not cands:
-            die(f"no editor executable under {build_dir}/(dist|release) -- "
+            die("no compatible configured editor executable for the selected delivery profile -- "
                 f"run `python scripts/jce.py editor` first, or pass --editor PATH")
         editor = max(cands, key=lambda p: p.stat().st_mtime)
 
@@ -3043,16 +3318,17 @@ def cmd_build_project(args) -> None:
     except OSError as e:  # noqa: BLE001
         die(f"cannot read editor executable {editor}: {e}")
 
-    out = (Path(args.out).resolve() if args.out
-           else ROOT / "dist" / "games" / f"{target}-{args.variant}-{t['arch']}")
     # RESULT must live OUTSIDE OUT: the request validator rejects a private
     # result path inside the public package, so it cannot leak into a bundle.
     result = (Path(args.result).resolve() if args.result
               else ROOT / "build" / "headless" /
               f"{target}-{args.variant}-{t['arch']}.result.json")
-    result.parent.mkdir(parents=True, exist_ok=True)
-    if result.exists():
-        result.unlink()
+    if result.is_relative_to(out):
+        die("build-project: private result path must be outside the public package")
+    if not DRY_RUN:
+        result.parent.mkdir(parents=True, exist_ok=True)
+        if result.exists():
+            result.unlink()
 
     env = dict(os.environ)
     env.update({
@@ -3109,9 +3385,14 @@ def cmd_build_project(args) -> None:
 
     state = res.get("state", "failed")
     for key in ("artifact_path", "package_path", "asset_bom_path",
-                "dist_audit_path"):
+                "dist_audit_path", "log_path"):
         if res.get(key):
             log(f"  {key.replace('_', ' '):<16} {res[key]}")
+    if res.get("log_complete") is False:
+        log(f"  build log {res.get('log_status', 'unavailable')}: "
+            f"complete=false truncated={res.get('log_truncated', False)} "
+            f"incomplete={res.get('log_incomplete', False)} "
+            f"reason={res.get('log_error') or 'no diagnostic text'}")
     if state != "succeeded":
         die(f"build-project FAILED (state={state} stage={res.get('stage')} "
             f"exit_code={res.get('exit_code')}): {res.get('error') or 'no error text'}")
@@ -3128,6 +3409,15 @@ def cmd_bundle(args):
     spec.loader.exec_module(module)
     module.execute(args, argparse.Namespace(HOST=HOST, ROOT=ROOT,
         ensure_host_tools=ensure_host_tools, run=run))
+
+
+def cmd_stock_app(args):
+    from tools.build import stock_app
+    try:
+        result = stock_app.execute(args, driver=sys.modules[__name__])
+    except (ValueError, OSError, subprocess.SubprocessError) as error:
+        die(f"stock-app: {error}")
+    print(json.dumps(result, sort_keys=True))
 
 
 def cmd_lint(args) -> None:
@@ -3197,7 +3487,19 @@ def cmd_test(args) -> None:
     returned nothing -- so the one command people run did not know the suite
     existed.
     """
-    targets = getattr(args, "target", None) or ["jce_tests"]
+    suite = getattr(args, "suite", "all")
+    if suite not in ("all", "engine", "editor", "consumer"):
+        die("test: invalid --suite (expected all, engine, editor or consumer)")
+    ai_flags = _test_ai_dispatch_flags(args)
+    sdk = getattr(args, "sdk", None)
+    sdk_variant = getattr(args, "sdk_variant", None)
+    sdk_delivery = getattr(args, "sdk_delivery_profile", None)
+    sdk_selected = sdk is not None
+    if (sdk_selected or sdk_variant or sdk_delivery) and not getattr(args, "configure", False):
+        die("test: installed-SDK selection requires --configure")
+    if (sdk_variant or sdk_delivery) and not sdk_selected:
+        die("test: --sdk-variant/--sdk-delivery-profile require --sdk")
+    targets = getattr(args, "target", None) or ["jce_tests" if suite == "all" else "jce_tests_" + suite]
     if getattr(args, "target", None) and not getattr(args, "filter", None):
         die("test: explicit --target requires --filter for the CTest run range")
     if any(not isinstance(target, str) or
@@ -3214,8 +3516,15 @@ def cmd_test(args) -> None:
         conan_install(tgt, "Debug" if variant == "debug" else "Release", env)
         if not DRY_RUN:
             (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
+        sdk_flags = []
+        if sdk_selected:
+            sdk_flags = [f"-DJCE_TEST_SDK_DIR={Path(sdk).resolve().as_posix()}",
+                         f"-DJCE_TEST_SDK_ARCH={tgt['arch']}",
+                         f"-DJCE_TEST_SDK_VARIANT={sdk_variant or 'release'}",
+                         f"-DJCE_TEST_SDK_DELIVERY={sdk_delivery or 'authoring'}"]
         run(["cmake", "--preset", preset_name(tgt, variant),
              "-DJCE_BUILD_TESTS=ON", "-DJCE_BUILD_EDITOR=OFF", f"-DJCE_BUILD_VARIANT={variant}",
+             *sdk_flags, *ai_flags,
              *_delivery_module().cmake_flags(getattr(args, "delivery_profile", "authoring"),
                  restore_authoring=_delivery_module().restore_authoring(build_dir / "CMakeCache.txt")),
              "-DJCE_ENABLE_CPPCHECK=OFF"], env=env, cwd=ROOT)
@@ -3224,8 +3533,10 @@ def cmd_test(args) -> None:
             "no configured build at %s -- run `python scripts/jce.py editor` "
             "first, or pass --arch for a different target" % build_dir)
     run(["cmake", "--build", str(build_dir), "--target", *targets], env=env, cwd=ROOT)
-    ctest = ["ctest", "--test-dir", str(build_dir), "-L", "unit",
+    ctest = ["ctest", "--test-dir", str(build_dir),
              "-j", ctest_jobs(getattr(args, "jobs", None))]
+    if suite != "all":
+        ctest += ["-L", "^domain:" + suite + "$"]
     ctest.append("--no-tests=error")
     if getattr(args, "filter", None):
         ctest += ["-R", args.filter]
@@ -3266,6 +3577,13 @@ def cmd_test(args) -> None:
         test_env[path_key] = os.pathsep.join(
             runtime_dirs + [test_env.get(path_key, "")])
     run(ctest, env=test_env, cwd=ROOT)
+
+    # Independent acceptance is part of a complete all-suite run. A caller
+    # selecting a target, regex, domain or failed-test subset must not acquire
+    # an unrelated cooker build after its selected CTest checks complete.
+    if (suite != "all" or getattr(args, "target", None)
+            or getattr(args, "filter", None) or getattr(args, "rerun_failed", False)):
+        return
 
     # The colour-space chain, which the unit suite structurally cannot reach.
     #
@@ -3336,9 +3654,6 @@ def cmd_checksums(args) -> None:
     (arch-tagged names) and hash them.  --dir: hash an already-collected release
     folder in place (use this to produce the global file after gathering every
     platform's artifacts)."""
-    import glob as _glob
-    import shutil
-
     # Mode 1 — hash a folder of already-collected (renamed) artifacts in place.
     if args.dir:
         base = Path(args.dir).resolve()
@@ -3353,14 +3668,12 @@ def cmd_checksums(args) -> None:
 
     # Mode 2 (default) — collect this machine's dist editor binaries.
     out_dir = Path(args.out).resolve() if args.out else (ROOT / "dist" / "release")
-    patterns = [
-        ROOT / "build" / "desktop" / "*" / "dist" / "jce_editor",
-        ROOT / "build" / "desktop" / "*" / "dist" / "jce_editor.exe",
-        ROOT / "build" / "desktop" / "macos-universal" / "jce_editor",
-    ]
-    found = []
-    for pat in patterns:
-        found += [Path(m) for m in _glob.glob(str(pat)) if Path(m).is_file()]
+    desktop = ROOT / "build/desktop"
+    # XP candidates have a separate audit and publication owner.
+    candidates = [desktop / key / "dist" / _delivery_module().native_artifact_name("jce_editor", target["host"])
+                  for key, target in TARGETS.items() if not target.get("emscripten")]
+    candidates.append(desktop / "macos-universal" / "jce_editor")
+    found = [path for path in candidates if path.is_file()]
     if not found:
         die("no dist editor binaries under build/desktop/*/dist "
             "(build with --dist first), or pass --dir <collected-folder>")
@@ -3383,6 +3696,139 @@ def cmd_checksums(args) -> None:
         # (where the copy hasn't happened).
         entries.append((name, src))
     _write_sha256sums(entries, out_dir / "SHA256SUMS")
+
+
+def _xp_tool(name):
+    # Parser schemas belong to this implementation, not a selected project root.
+    path = Path(__file__).with_name(name + ".py")
+    spec = importlib.util.spec_from_file_location("tools.build._jce_schema_" + name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run_xp_tool(name, command):
+    if DRY_RUN:
+        log(name + " DRY RUN: " + " ".join(command))
+        return
+    result = subprocess.run(command, cwd=ROOT)
+    if result.returncode != 0:
+        die(name + " failed or remains unverified (exit " + str(result.returncode) + ")")
+
+
+def dispatch_editor(args) -> None:
+    if not args.xp:
+        if args.toolchain_root is not None:
+            die("editor: --toolchain-root requires --xp")
+        cmd_editor(args)
+        return
+    if HOST != "windows" or args.arch not in (None, "x64", "x86"):
+        die("editor --xp requires a Windows build host and x64 or x86")
+    if (args.variant not in ("release", "dist") or args.delivery_profile != "embedded"
+            or args.clean or args.artifact_dir is not None or args.patented_codecs is not None):
+        die("editor --xp uses its own embedded GUI build; unsupported desktop option")
+    toolchain = _xp_tool("xp_compat").resolve_toolchain_root(ROOT, args.toolchain_root)
+    if not (toolchain / "bin").is_dir():
+        die(f"XP toolchain not found: {toolchain}; set --toolchain-root or JCE_XP_TOOLCHAIN_ROOT")
+    shaderc_override = os.environ.get("JCE_SHADERC_EXECUTABLE") or os.environ.get("BGFX_SHADERC")
+    shaderc = Path(shaderc_override).resolve() if shaderc_override else None
+    names = ("jce_pak", "jce_bin2obj")
+    with (nullcontext() if DRY_RUN else _cache_scope(_host_cache_paths())):
+        if DRY_RUN:
+            if shaderc is None:
+                log("XP Editor will resolve native shaderc at build time")
+            tools = {name: host_tool(name) for name in names}
+        else:
+            if shaderc is not None:
+                if not shaderc.is_file() or not _shaderc_runs(shaderc):
+                    die(f"explicit host shaderc cannot execute: {shaderc}")
+            else:
+                shaderc = find_host_shaderc()
+                if shaderc is None:
+                    die("XP Editor needs a native shaderc; set JCE_SHADERC_EXECUTABLE")
+            tools = ensure_host_tools(os.environ, names)
+        cmd_xp_editor(argparse.Namespace(arch=args.arch or "x64", toolchain_root=toolchain,
+                     jobs=None, phase="build", shaderc=shaderc, host_pak=tools["jce_pak"],
+                     host_bin2obj=tools["jce_bin2obj"]))
+
+
+def cmd_xp_editor(args) -> None:
+    command = [sys.executable, str(ROOT / "tools/build/xp_editor.py"),
+               "--arch", args.arch, "--toolchain-root", str(args.toolchain_root),
+               "--jobs", str(args.jobs if args.jobs is not None else build_jobs()),
+               "--phase", args.phase]
+    for key in ("conan_home", "base_conan_home", "build_profile", "shaderc", "host_pak", "host_bin2obj", "export_inventory"):
+        value = getattr(args, key, None)
+        if value is not None:
+            command.extend(("--" + key.replace("_", "-"), str(value)))
+    if getattr(args, "bgfx_bx_debug", "auto") != "auto":
+        command.extend(("--bgfx-bx-debug", args.bgfx_bx_debug))
+    _run_xp_tool("XP Editor", command)
+
+
+def cmd_xp_vm(args) -> None:
+    command = [sys.executable, str(ROOT / "tools/build/xp_vm.py")]
+    for key in ("host", "port", "user", "host_key_sha256", "artifact", "expected_arch",
+                "kind", "out", "output_root", "remote_dir", "password_env", "expect_marker",
+                "guest_encoding", "timeout", "connect_timeout", "probe_timeout",
+                "transfer_timeout", "max_output_bytes", "owned_launcher", "editor_window", "editor_locale"):
+        value = getattr(args, key, None)
+        if value is not None:
+            command.extend(("--" + key.replace("_", "-"), str(value)))
+    for value in args.env:
+        command.extend(("--env", value))
+    if getattr(args, "export_receipt", None) is not None:
+        command.extend(("--export-receipt", str(args.export_receipt)))
+    for value in getattr(args, "input_relative", []):
+        command.extend(("--input-relative", value))
+    for value in getattr(args, "collect_relative", []):
+        command.extend(("--collect-relative", value))
+    if getattr(args, "editor_run_in_background", False):
+        command.append("--editor-run-in-background")
+    if getattr(args, "require_terminal_ack", False):
+        command.append("--require-terminal-ack")
+    _run_xp_tool("XP VM smoke", command)
+
+
+def cmd_xp_os_probe(args) -> None:
+    command = [sys.executable, str(ROOT / "tools/build/xp_os.py"),
+               "--repo", str(ROOT), "--arch", args.arch,
+               "--toolchain-root", str(args.toolchain_root),
+               "--jobs", str(args.jobs if args.jobs is not None else build_jobs())]
+    if args.run_local:
+        command.append("--run-local")
+    _run_xp_tool("XP OS controls", command)
+
+
+def cmd_xp_guest_exports(args) -> None:
+    command = [sys.executable, str(ROOT / "tools/build/xp_guest_exports.py")]
+    for key in ("host", "port", "user", "host_key_sha256", "expected_arch", "remote_system32",
+                "password_env", "artifact", "out", "output_root", "guest_encoding", "timeout",
+                "connect_timeout", "probe_timeout", "transfer_timeout", "max_output_bytes",
+                "max_dlls", "max_dll_bytes", "max_total_bytes"):
+        value = getattr(args, key)
+        if value is not None:
+            command.extend(("--" + key.replace("_", "-"), str(value)))
+    for value in args.dll:
+        command.extend(("--dll", value))
+    if args.retain_dlls:
+        command.append("--retain-dlls")
+    _run_xp_tool("XP guest export evidence", command)
+
+
+def cmd_xp_probe(args) -> None:
+    """A1 probe-only LLVM-MinGW-XP route; never uses the MSVC/Conan SDK cache."""
+    command = [sys.executable, str(ROOT / "tools/build/xp_compat.py"),
+               "--repo", str(ROOT), "--arch", args.arch,
+               "--jobs", str(args.jobs if args.jobs is not None else build_jobs())]
+    if args.toolchain_root:
+        command.extend(("--toolchain-root", args.toolchain_root))
+    if DRY_RUN:
+        log("XP compatibility probe DRY RUN: " + " ".join(command))
+        return
+    result = subprocess.run(command, cwd=ROOT)
+    if result.returncode != 0:
+        die(f"XP probe failed with code {result.returncode}")
 
 
 # ── argparse ──────────────────────────────────────────────────────────────
@@ -3421,9 +3867,10 @@ def build_parser() -> argparse.ArgumentParser:
             "--graphics-api-tier",
             choices=GRAPHICS_API_TIERS,
             default=os.environ.get("JCE_GRAPHICS_API_TIER", "stable"),
-            help="bgfx API floor: stable=GL3.3/GLES3.0/Vulkan1.0, "
+            help="bgfx API floor: stable=GL3.1/GLES3.0/Vulkan1.0, "
                  "modern=GL4.3/GLES3.1/Vulkan1.2, "
-                 "current=GL4.6/GLES3.2/Vulkan1.4. "
+                 "current=GL4.6/GLES3.2/Vulkan1.4, "
+                 "compatibility=GL2.1/GLES2.0/Vulkan1.0. "
                  "WebGL2 supports stable only.")
 
     sp = sub.add_parser("sdk", help="build + install the redistributable SDK")
@@ -3435,6 +3882,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_variant(sp, ["release", "dist", "both"], "dist")
     add_codec_switch(sp)
     add_graphics_api_tier(sp)
+    _standalone_module().sdk_outputs().add_arguments(sp)
     sp.add_argument("--no-debug", action="store_true", help="skip the Debug SDK")
     sp.add_argument("--clean", action="store_true")
     sp.add_argument("--smoke", action="store_true",
@@ -3478,6 +3926,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sdk", help="SDK install dir "
                                   "(default: dist/sdk/<host-arch tag>)")
     sp.add_argument("--variant", choices=["release", "dist"], default="release")
+    sp.add_argument("--consumer", choices=("both", "c99", "scripting"), default="both",
+                    help="select one installed-SDK consumer gate (default: both)")
+    sp.add_argument("--build-dir", type=Path,
+                    help="isolated consumer scratch (both creates c99/scripting children)")
+    sp.add_argument("--require-run", action="store_true",
+                    help="require actual native run, explicit --sdk and target metadata; skip=77")
+    sp.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="authoring")
     sp.add_argument("--introspect-out", default="", metavar="PATH",
                     help="write the introspection JSON to PATH instead of "
                          "stdout (stdout also carries the [jce] build log)")
@@ -3497,7 +3952,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--sdk", help="SDK root (else JCE_SDK_DIR / dist/sdk/<host>-<arch>)")
     sp.add_argument("--target", help="CMake target (default: manifest 'target' or dir name)")
     sp.add_argument("--exe", help="expected artifact filename")
-    sp.add_argument("--registry-proof", help="actual target registry receipt for a previously built artifact")
+    sp.add_argument("--registry-proof", help="actual Web registry receipt; audit the previous artifact without rebuilding")
     sp.add_argument("--configure-only", action="store_true", help="configure, skip build")
     sp.add_argument("--clean", action="store_true")
     sp.set_defaults(func=cmd_app)
@@ -3514,8 +3969,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--target", help="CMake target (default: manifest 'target')")
     sp.add_argument("--exe", help="artifact filename (default: manifest 'exe')")
     sp.add_argument("--out", help="package staging dir "
-                                  "(default: dist/games/<target>-<variant>-<arch>)")
-    sp.add_argument("--registry-proof", help="actual target registry receipt for a previously built artifact")
+                                  "(default: <project>/dist/apps/<app>/<platform>-<arch>-<variant>)")
+    sp.add_argument("--registry-proof", help="actual Web registry receipt; audit the previous artifact without rebuilding")
     sp.add_argument("--result", help="where the editor publishes its result JSON; "
                                      "must be OUTSIDE --out (the request "
                                      "validator rejects it otherwise)")
@@ -3534,7 +3989,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--clean", action="store_true")
     sp.add_argument("--standalone", action="store_true", help="compatibility alias for embedded native delivery")
     sp.add_argument("--artifact-dir", type=Path, help="editor runtime output directory; reuse the existing native build cache")
-    sp.set_defaults(func=cmd_editor)
+    sp.add_argument("--xp", action="store_true", help="build the Windows XP+ single-EXE GUI editor")
+    sp.add_argument("--toolchain-root", type=Path,
+                    help="with --xp, override the LLVM-MinGW-XP toolchain directory")
+    sp.set_defaults(func=dispatch_editor)
 
     sp = sub.add_parser("host-tools", help="build host jce_pak/jce_cook/jce_bin2obj")
     add_arch(sp)
@@ -3585,6 +4043,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--id")
     sp.set_defaults(func=cmd_bundle)
 
+    sp = sub.add_parser("stock-app", help="seal Lua/JS applications with a prebuilt stock runtime")
+    from tools.build.stock_app import add_arguments as stock_arguments
+    stock_arguments(sp)
+    sp.set_defaults(func=cmd_stock_app)
+
     sp = sub.add_parser("lint",
                         help="run the lint suite AND the architecture audit")
     sp.add_argument("--lints-only", action="store_true",
@@ -3593,22 +4056,32 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_lint)
 
     sp = sub.add_parser("test",
-                        help="build jce_tests, then run the unit suite")
+                        help="build jce_tests, then run registered tests")
     sp.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="authoring",
                     help="native regression profile (default: full authoring coverage)")
     sp.add_argument("--arch", help="desktop target (default: host)")
     sp.add_argument("--variant", choices=["release", "debug"], default="release")
     sp.add_argument("--configure", action="store_true",
                     help="resolve dependencies and configure tests before building")
+    sp.add_argument("--ai-dispatch", choices=("on", "off"),
+                    help="explicit optional AI dispatch build selection (requires --configure; otherwise preserve cache)")
+    sp.add_argument("--sdk", type=Path,
+                    help="explicit installed SDK for formal consumers (requires --configure)")
+    sp.add_argument("--sdk-variant", choices=("release", "dist"),
+                    help="consumer SDK variant, independent of native tests (default release)")
+    sp.add_argument("--sdk-delivery-profile", choices=("authoring", "embedded"),
+                    help="consumer SDK delivery profile (default authoring)")
     # default=None, NOT 8: ctest_jobs() cannot tell "the user asked for 8" from
     # "nobody said" if argparse fills in the default, and CTEST_PARALLEL_LEVEL
     # must not override a value somebody typed.
     sp.add_argument("-j", "--jobs", type=int, default=None,
                     help="ctest parallelism (default 8, or "
                          "$CTEST_PARALLEL_LEVEL when set)")
+    sp.add_argument("--suite", choices=("all", "engine", "editor", "consumer"), default="all",
+                    help="build and run one ownership domain (default: every registered test)")
     sp.add_argument("--filter", help="CTest test-name regular expression")
     sp.add_argument("--target", action="append",
-                    help="explicit build target (repeatable; requires --filter; default jce_tests)")
+                    help="explicit build target (repeatable; requires --filter; default suite aggregate)")
     sp.add_argument("--repeat-until-fail", type=int,
                     help="repeat each selected test up to N times, stopping on failure")
     sp.add_argument("--rerun-failed", action="store_true",
@@ -3671,6 +4144,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--variant", choices=["release", "dist"], default="release")
     sp.set_defaults(func=cmd_agent_bridge)
 
+    sp = sub.add_parser("xp-probe", help="A1 isolated XP OS/Core probe (NOT full JCE SDK)")
+    sp.add_argument("--arch", choices=("x64", "x86"), default="x64")
+    sp.add_argument("--toolchain-root", help="verified llvm-mingw-xp MSVCRT distribution root")
+    sp.add_argument("--jobs", type=int, help="compiler budget (default: shared build budget)")
+    sp.set_defaults(func=cmd_xp_probe)
+
+    sp = sub.add_parser("xp-editor", help="Windows XP GNU/MSVCRT single-EXE Editor")
+    _xp_tool("xp_editor").add_arguments(sp)
+    sp.set_defaults(func=cmd_xp_editor, jobs=None)
+
+    sp = sub.add_parser("xp-vm", help="Pinned SSH Desktop delivery and process smoke",
+                        parents=[_xp_tool("xp_vm").build_parser()], add_help=False)
+    sp.set_defaults(func=cmd_xp_vm)
+
+    sp = sub.add_parser("xp-os-probe", help="Isolated XP C99 platform controls",
+                        parents=[_xp_tool("xp_os").build_parser()], add_help=False)
+    sp.set_defaults(func=cmd_xp_os_probe, jobs=None)
+
+    sp = sub.add_parser("xp-guest-exports", help="Read-only pinned XP DLL export inventory",
+                        parents=[_xp_tool("xp_guest_exports").build_parser()], add_help=False)
+    sp.set_defaults(func=cmd_xp_guest_exports)
+
     sp = sub.add_parser("targets", help="print the desktop target matrix")
     sp.set_defaults(func=cmd_targets)
 
@@ -3688,42 +4183,40 @@ def build_parser() -> argparse.ArgumentParser:
     pkg = sub.add_parser("package", help="stage redistributable bundles (editor/game/sdk)")
     pkg_sub = pkg.add_subparsers(dest="what", required=True)
 
-    pe = pkg_sub.add_parser("editor", help="stage editor bundle (exe + sdk/ + README)")
+    pe = pkg_sub.add_parser("editor", help="stage the native single-executable editor")
     add_arch(pe)
     add_variant(pe, ["release", "dist"], "release")
-    pe.add_argument("--standalone", action="store_true", help="native single EXE; SDK and managed runtimes separate")
-    pe.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="embedded")
+    pe.add_argument("--standalone", action="store_true", help="compatibility alias for default embedded native delivery")
+    pe.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="embedded",
+                    help="single executable (default); authoring explicitly stages the development SDK/runtime bundle")
     pe.add_argument("--python-runtime", help="original matching Windows Python embeddable runtime directory (including license)")
     pe.add_argument("--skip-build", action="store_true",
-                    help="reuse existing editor exe + SDK tree")
-    pe.add_argument("--out", help="override output dir")
+                    help="reuse an exactly matching configured editor artifact")
+    pe.add_argument("--out", help="output executable path (authoring: bundle directory)")
     pe.set_defaults(func=cmd_package_editor)
 
-    pg = pkg_sub.add_parser("game", help="cook + build + stage a game bundle")
+    pg = pkg_sub.add_parser("game", help="compatibility entry to native build-project packaging")
     pg.add_argument("project")
     add_arch(pg)
-    # `dist` would be the natural default for something being handed to a
-    # player -- it forces Tracy off and royalty-free codecs on -- but it
-    # is not reachable from here: jce_target_embed_pak refuses a dist
-    # build without the editor's authenticated prebuilt PAK, so every
-    # CLI-packaged project using raw resources fails at configure time.
-    # The default therefore stays `release`, and the profiler listener is
-    # caught at stage time instead (_assert_no_profiler_listener).
+    # The native headless owner handles authenticated Dist packaging.
     add_variant(pg, ["release", "dist"], "release")
     pg.add_argument("--sdk", help="SDK root (else JCE_SDK_DIR / dist/sdk/...)")
     pg.add_argument("--target", help="CMake target (default: manifest 'target')")
     pg.add_argument("--exe", help="built artifact filename")
-    pg.add_argument("--name", help="bundle name (default: manifest 'name' / dir)")
-    pg.add_argument("--version", help="bundle version (default: manifest 'version')")
-    pg.add_argument("--out", help="override output dir")
+    pg.add_argument("--name", help="compatibility check: must match manifest name (edit the manifest to rename)")
+    pg.add_argument("--version", help="compatibility check: must match manifest version (edit the manifest to change)")
+    pg.add_argument("--out", help="safe final directory (default: <project>/dist/apps/<app>/<platform>-<arch>-<variant>)")
+    pg.add_argument("--editor", help="editor executable for the native headless pipeline")
+    pg.add_argument("--result", help="private build result JSON, outside the package")
+    pg.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="embedded")
     pg.add_argument("--clean", action="store_true")
     pg.add_argument("--with-loose", action="store_true",
-                    help="also stage the loose cooked tree beside the exe "
-                         "(default: assets embedded; runtime DLLs may remain)")
+                    help="unsupported compatibility option; use the explicit editor authoring workflow")
     pg.set_defaults(func=cmd_package_game)
 
     ps = pkg_sub.add_parser("sdk", help="build + install the SDK (alias of `sdk`)")
     ps.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="embedded")
+    _standalone_module().sdk_outputs().add_arguments(ps)
     add_arch(ps)
     add_variant(ps, ["release", "dist", "both"], "dist")
     ps.add_argument("--no-debug", action="store_true")

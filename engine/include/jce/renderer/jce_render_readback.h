@@ -72,11 +72,18 @@ JCE_API bool jce_render_readback_layout(JceRenderFormat format,
 /* Queries the active backend for same-format blit/readback support. */
 JCE_API bool jce_render_readback_format_supported(JceRenderFormat format);
 
+/* API-owner-thread service. NULL, detached and unrelated renderers refuse
+ * creation. Renderer shutdown detaches queues and fails remaining tickets
+ * after the backend stops. Detached wrappers may be destroyed later without
+ * touching the old or a subsequently created GPU backend. */
 JCE_API JceRenderReadbackQueue *jce_render_readback_create(
     JceRenderer *renderer);
+/* May advance at most eight real central submissions for pending readbacks.
+ * Unresolved destinations retire to backend shutdown; CPU storage still
+ * borrowed by bgfx is retained. This does not establish GPU idle. */
 JCE_API void jce_render_readback_destroy(JceRenderReadbackQueue *queue);
 
-/* Submission is render-thread only. Completion is asynchronous and is
+/* Submission is on the bgfx API-owner thread. Completion is asynchronous and is
  * observed through poll; no callback runs on the renderer thread. */
 JCE_API bool jce_render_readback_submit(JceRenderReadbackQueue *queue,
                                         const JceRenderReadbackDesc *desc,

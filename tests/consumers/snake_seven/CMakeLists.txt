@@ -22,28 +22,27 @@ if(NOT DEFINED JCE_DIR AND DEFINED ENV{JCE_SDK_DIR})
 endif()
 find_package(JCE REQUIRED)
 
-# The two native script modules are COMPILED IN, not loaded as plugins.
-# jce_script_cpp.hpp:566 says a statically linked module never needs the
-# exported entry and gives the macro for it; shipping them as .dll was a
-# choice, not a requirement, and it made a "single executable" that was four
-# files.  JCE_SCRIPT_MODULE_NO_ENTRY suppresses the per-shared-object entry
-# symbol -- two modules in one binary would otherwise both define
-# jce_cpp_script_module and fail to link (LNK2005).
-option(SNAKE_SINGLE_FILE "One .exe, no companion DLLs" OFF)
-set(SNAKE_SINGLE_FILE_LANGUAGES js CACHE STRING
-    "languages for the single-file build; adding c/cpp adds jce_script_api.dll")
-
-# The native modules are only compiled when their languages are in the build.
-# Compiling them regardless would drag jce_script_api.dll back in through the
-# link, which is the very file the single-file mode exists to avoid.
-set(_snake_native "")
-if(NOT SNAKE_SINGLE_FILE
-   OR "cpp" IN_LIST SNAKE_SINGLE_FILE_LANGUAGES
-   OR "c" IN_LIST SNAKE_SINGLE_FILE_LANGUAGES)
-    set(_snake_native native/snake_body.cpp native/snake_manager.c)
+# Authored source requires seven languages. Portable Lua is a distinct Bundle
+# consumer; a build flag cannot remove required scene modules.
+option(SNAKE_SINGLE_FILE "Request a single-file product without dropping source-required VMs" OFF)
+set(SNAKE_SINGLE_FILE_LANGUAGES js CACHE STRING "Legacy requested language closure; must cover the authored scene")
+set(_snake_required lua js python java c cpp csharp)
+if(SNAKE_SINGLE_FILE)
+    foreach(_required js python java c cpp csharp)
+        if(NOT "${_required}" IN_LIST SNAKE_SINGLE_FILE_LANGUAGES)
+            message(FATAL_ERROR "SNAKE_SINGLE_FILE_LANGUAGES omits required authored backend '${_required}'. Use the existing portable Bundle for the separate Lua variant; no source Script is silently removed.")
+        endif()
+    endforeach()
 endif()
+set(_snake_native native/snake_body.cpp native/snake_manager.c)
 
 add_executable(SnakeSeven src/main.c ${_snake_native})
+if(NOT COMMAND jce_script_enable)
+    message(FATAL_ERROR "SnakeSeven needs the installed SDK scripting helper and compiled backend roster")
+endif()
+jce_script_enable(SnakeSeven LANGUAGES ${_snake_required} REQUIRED
+    NATIVE_FACTORIES snake_c_module snake_cpp_module)
+
 if(_snake_native)
     # ON THE TARGET, not on the source files.
     #
@@ -59,7 +58,7 @@ if(_snake_native)
     # unit would otherwise emit, and main.c declares no module.
     target_compile_definitions(SnakeSeven PRIVATE
         JCE_SCRIPT_MODULE_NO_ENTRY
-        SNAKE_HAVE_NATIVE_MODULES=1)
+        )
 
     # THE SAME TWO SOURCES, BUILT A SECOND TIME AS SHARED MODULES.
     #
@@ -94,13 +93,16 @@ if(_snake_native)
             target_link_libraries(snake_${_mod} PRIVATE ${_lib})
             set_target_properties(snake_${_mod} PROPERTIES
                 PREFIX ""
-                LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build")
+                LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build"
+                RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build")
+            foreach(_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+                set_target_properties(snake_${_mod} PROPERTIES
+                    LIBRARY_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_SOURCE_DIR}/native/build"
+                    RUNTIME_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_SOURCE_DIR}/native/build")
+            endforeach()
             add_dependencies(SnakeSeven snake_${_mod})
         else()
-            message(WARNING
-                "JCE::${_mod} module target missing: the editor will refuse "
-                "this project's ${_mod} scripts in Play, while the shipped "
-                "exe runs them.")
+            message(FATAL_ERROR "Required editor native provider target ${_lib} is absent in this compiled SDK")
         endif()
     endforeach()
     # Asserted, not assumed: scripting/c's claim is that a PURE C translation
@@ -140,7 +142,7 @@ target_link_libraries(SnakeSeven PRIVATE JCE::JCE)
 # assembly from the path nobody had written to.  A built artefact and a
 # consumer that looks somewhere else is the same defect as not building it
 # at all, and it is harder to see because the build log says success.
-set(SNAKE_CS_OUT "${CMAKE_BINARY_DIR}/csharp")
+set(SNAKE_CS_OUT "${CMAKE_SOURCE_DIR}/csharp/build")
 target_compile_definitions(SnakeSeven PRIVATE
     SNAKE_CS_ASSEMBLY="${SNAKE_CS_OUT}/SnakeScripts.dll")
 
@@ -197,53 +199,13 @@ if(SNAKE_DOTNET AND SNAKE_JCESCRIPT_DLL)
         COMMENT "Staging the C# gameplay assembly beside the exe"
         VERBATIM)
 else()
-    message(WARNING
-        "C# gameplay module will NOT be rebuilt (dotnet=${SNAKE_DOTNET}, "
-        "bridge=${SNAKE_JCESCRIPT_DLL}). The game will run with six of its "
-        "seven languages and the HUD will not update.")
+    message(FATAL_ERROR
+        "Required C# gameplay assembly cannot be rebuilt (dotnet=${SNAKE_DOTNET}, bridge=${SNAKE_JCESCRIPT_DLL}); seven-language source has no complete producer. Installed backend catalog alone is not runtime/build availability.")
 endif()
 
-# SINGLE-FILE MODE.
-#
-# Which languages can live INSIDE the executable is not a packaging choice, it
-# is a property of each runtime:
-#
-#   lua        the engine's own VM            embedded
-#   js         the engine's own VM            embedded
-#   c, cpp     compiled classes, linked in    embedded (see add_executable)
-#   python     CPython -- python312.dll       NOT OURS
-#   java       a JVM, found via JAVA_HOME     NOT OURS, not even in the folder
-#   csharp     .NET, via nethost.dll          NOT OURS
-#
-# So -DSNAKE_SINGLE_FILE=ON yields one .exe and nothing else, running four
-# languages; OFF yields six languages and the third-party runtimes beside it.
-# The three it drops are dropped because their interpreters are somebody
-# else's binary, not because of how this project is packaged.
-if(COMMAND jce_script_enable)
-    if(SNAKE_SINGLE_FILE)
-        # LANGUAGES is how few files the build can get to:
-        #   lua+js      -> ONE file.  Both VMs are inside the engine archive
-        #                  and neither links jce_script_api.
-        #   +c,cpp      -> TWO files.  The compiled classes link in fine, but
-        #                  they CALL jce_script_api, which is SHARED by owner
-        #                  decision 7 (Python's ctypes and Java's JNI must be
-        #                  able to load it, and the sandbox claim rests on the
-        #                  surface being exactly what that object exports).
-        #   +py/java/cs -> EIGHT.  Those interpreters are not ours to embed.
-        jce_script_enable(SnakeSeven LANGUAGES ${SNAKE_SINGLE_FILE_LANGUAGES})
-    else()
-        jce_script_enable(SnakeSeven)
-        # jce_script_enable generates no per-language feature macro, so the
-        # app cannot ask "was csharp linked?" -- and calling
-        # jce_script_vm_csharp_load_assembly() when it was not is LNK2019.
-        # Declared here, where the language list is decided.
-        target_compile_definitions(SnakeSeven PRIVATE SNAKE_HAVE_CSHARP=1)
-    endif()
-else()
-    message(WARNING
-        "SnakeSeven: jce_script_enable() is not available in this SDK -- "
-        "only .lua scripts will run in the standalone build.")
-endif()
+# A compiled roster is not a self-contained external VM payload. The public
+# delivery admission/audit must separately qualify every required runtime;
+# this authoring producer never changes the selected seven-language scene.
 
 # Cooked-asset tree to pack into the embedded PAK.  build-project.bat
 # scrapes jce_project.json's cooked_assets field and forwards it via

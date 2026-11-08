@@ -54,6 +54,12 @@ def publish(source, destination):
         Path(temporary).unlink(missing_ok=True)
 
 
+def publish_output(blob, output, checksum):
+    # Ninja restat can keep downstream packs clean when the blob is unchanged.
+    if not output.is_file() or digest(output) != checksum:
+        publish(blob, output)
+
+
 def compile_cached(compiler, arguments, inputs, cache):
     key, index = fingerprint(compiler, arguments, inputs)
     output = Path(arguments[index])
@@ -61,12 +67,11 @@ def compile_cached(compiler, arguments, inputs, cache):
     blob = cache / (key + ".bin")
     checksum = cache / (key + ".sha256")
     with cache_locks([blob], cache / "locks"):
-        valid = False
         if blob.is_file() and checksum.is_file():
-            valid = digest(blob) == checksum.read_text(encoding="ascii").strip()
-        if valid:
-            publish(blob, output)
-            return "hit"
+            blob_checksum = checksum.read_text(encoding="ascii").strip()
+            if digest(blob) == blob_checksum:
+                publish_output(blob, output, blob_checksum)
+                return "hit"
         cache.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=cache, prefix="compile-") as directory:
             temporary = Path(directory) / "shader.bin"
@@ -79,10 +84,11 @@ def compile_cached(compiler, arguments, inputs, cache):
             if fingerprint(compiler, arguments, inputs)[0] != key:
                 raise RuntimeError("shader compilation inputs changed during compilation")
             stamp = Path(directory) / "checksum"
-            stamp.write_text(digest(temporary) + "\n", encoding="ascii")
+            blob_checksum = digest(temporary)
+            stamp.write_text(blob_checksum + "\n", encoding="ascii")
             publish(temporary, blob)
             publish(stamp, checksum)
-            publish(blob, output)
+            publish_output(blob, output, blob_checksum)
         return "miss"
 
 

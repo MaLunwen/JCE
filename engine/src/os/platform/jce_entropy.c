@@ -16,9 +16,16 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
-#  include <bcrypt.h>
-#  if defined(_MSC_VER)
-#    pragma comment(lib, "bcrypt.lib")
+#  if defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+#    include <wincrypt.h>
+#    if defined(_MSC_VER)
+#      error "The XP legacy profile requires the verified LLVM-MinGW-XP toolchain"
+#    endif
+#  else
+#    include <bcrypt.h>
+#    if defined(_MSC_VER)
+#      pragma comment(lib, "bcrypt.lib")
+#    endif
 #  endif
 #else
 #  include <stdio.h>
@@ -30,9 +37,37 @@ bool jce_host_random_bytes(void *out, size_t n)
     if (!dst || n == 0) return false;
 
 #if JCE_PLATFORM_WINDOWS
-    if (BCRYPT_SUCCESS(BCryptGenRandom(NULL, dst, (ULONG)n,
+#  if defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+    {
+        /* XP x86/x64 has CryptoAPI, not Bcrypt.dll.  This branch is compiled
+         * only for the independent LLVM-MinGW-XP legacy target.  It has no
+         * static import of Vista's BCryptGenRandom.  CryptGenRandom accepts
+         * DWORD lengths, so split larger buffers without narrowing size_t. */
+        HCRYPTPROV provider = 0;
+        if (CryptAcquireContextW(&provider, NULL, NULL, PROV_RSA_FULL,
+                                 CRYPT_VERIFYCONTEXT | CRYPT_SILENT)) {
+            size_t offset = 0;
+            bool ok = true;
+            while (offset < n) {
+                size_t remaining = n - offset;
+                DWORD chunk = (DWORD)(remaining > 1048576u ? 1048576u : remaining);
+                if (!CryptGenRandom(provider, chunk, dst + offset)) {
+                    ok = false;
+                    break;
+                }
+                offset += chunk;
+            }
+            CryptReleaseContext(provider, 0);
+            if (ok) return true;
+        }
+    }
+#  else
+    /* Do not truncate size_t to BCrypt's ULONG length. */
+    if (n <= 0xFFFFFFFFu &&
+        BCRYPT_SUCCESS(BCryptGenRandom(NULL, dst, (ULONG)n,
                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
         return true;
+#  endif
 #else
     {
         /* Platform shim: raw stdio on the urandom device is the sanctioned

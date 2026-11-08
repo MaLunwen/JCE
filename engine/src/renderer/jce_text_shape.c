@@ -8,15 +8,12 @@
 #include <stdbool.h>
 #include <string.h>
 
-/* DIRECT-MAPPED, 256 slots, and the simplicity is the point.
- *
- * An LRU needs bookkeeping on every HIT, which is the path that has to stay
- * cheap; direct mapping does nothing on a hit but compare. The cost is that a
- * collision evicts rather than probes, and for the workload -- a screen of UI
- * labels, tens of distinct strings -- 256 slots make that rare. If it ever
- * stops being rare the symptom is a miss count that does not fall, which
- * jce_text_shape_stats reports; a silent one is not possible. */
-enum { SHAPE_SLOTS = 256 };
+/* Four ways per set retain colliding labels without growing the 256-entry
+ * budget. Lookup examines at most four entries; round-robin admission needs
+ * one byte per set and no recency bookkeeping on a hit. A full set may still
+ * evict, so the actual hit/miss counters remain the workload authority. */
+enum { SHAPE_SLOTS = 256, SHAPE_WAYS = 4 };
+enum { SHAPE_SETS = SHAPE_SLOTS / SHAPE_WAYS };
 
 /* Strings longer than this bypass the table and land in a single scratch slot
  * that is always overwritten.
@@ -48,6 +45,7 @@ typedef struct {
  * global-state count, which is a budget this tree keeps for a reason. */
 static struct {
     ShapeSlot        slots[SHAPE_SLOTS];
+    uint8_t          next_way[SHAPE_SETS]; /* advance only after admission */
     ShapeSlot        bypass;    /* for text longer than the cap          */
     hb_buffer_t     *buf;       /* reused; create/destroy per call was a
                                  * malloc pair per string per frame on
@@ -257,22 +255,43 @@ const JceShapedGlyph *jce_text_shape(const void *owner,
     }
 
     const uint64_t h = shape_hash(owner, chain->generation, text, len);
-    ShapeSlot *s = &s_cache.slots[(size_t)(h & (SHAPE_SLOTS - 1))];
-
-    if (s->hash == h && s->owner == owner &&
-        s->generation == chain->generation && s->text_len == len &&
-        memcmp(s->text, text, len) == 0) {
-        s_cache.hits++;
-        s_cache.last = s;
-        if (out_count) *out_count = s->count;
-        return s->glyphs ? s->glyphs : &s_cache.empty;
+    const size_t set = (size_t)(h & (SHAPE_SETS - 1));
+    ShapeSlot *const entries = &s_cache.slots[set * SHAPE_WAYS];
+    ShapeSlot *s = NULL;
+    unsigned selected = 0;
+    for (unsigned way = 0; way < SHAPE_WAYS; way++) {
+        ShapeSlot *entry = &entries[way];
+        if (entry->hash == h && entry->owner == owner &&
+            entry->generation == chain->generation && entry->text_len == len &&
+            memcmp(entry->text, text, len) == 0) {
+            s_cache.hits++;
+            s_cache.last = entry;
+            if (out_count) *out_count = entry->count;
+            return entry->glyphs ? entry->glyphs : &s_cache.empty;
+        }
+        if (!s && !entry->hash) {
+            s = entry;
+            selected = way;
+        }
     }
 
-    /* A collision would evict the run the caller is still holding from the
-     * PREVIOUS call, which is the one thing the header promises not to do. */
-    if (s == s_cache.last) s = &s_cache.bypass;
+    /* Never replace the immediately preceding borrowed run. Keep the bounded
+     * scratch fallback if every candidate is protected. */
+    if (!s) {
+        for (unsigned offset = 0; offset < SHAPE_WAYS; offset++) {
+            const unsigned way = (s_cache.next_way[set] + offset) % SHAPE_WAYS;
+            if (&entries[way] != s_cache.last) {
+                s = &entries[way];
+                selected = way;
+                break;
+            }
+        }
+    }
+    if (!s) s = &s_cache.bypass;
 
     if (!slot_fill(s, owner, chain, text, len)) return NULL;
+    if (s != &s_cache.bypass)
+        s_cache.next_way[set] = (uint8_t)((selected + 1u) % SHAPE_WAYS);
     s_cache.misses++;
     s_cache.last = s;
     if (out_count) *out_count = s->count;
@@ -300,6 +319,7 @@ void jce_text_shape_shutdown(void)
     slot_release(&s_cache.bypass);
     if (s_cache.buf) { hb_buffer_destroy(s_cache.buf); s_cache.buf = NULL; }
     s_cache.last = NULL;
+    memset(s_cache.next_way, 0, sizeof s_cache.next_way);
     s_cache.hits = s_cache.misses = 0;
 }
 

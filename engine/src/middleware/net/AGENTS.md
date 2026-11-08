@@ -219,3 +219,5 @@
 已接进 Debug 测试套件；`session`（绑 27015 端口）与 `lan_discovery`（LAN 广播）
 额外受 `JCE_NET_SELF_TEST` 约束、从不编译，已在
 `tools/lint/self_test_exempt.txt` 里带理由豁免。
+
+The existing jce_quant_f32_to_f16 ABI delegates to the private core binary16 encoder in os/core/jce_half_internal.h. Its rounding and wire bits are unchanged; rendering can reuse the same encoder without a dependency on networking.

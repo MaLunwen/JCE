@@ -15,6 +15,7 @@ FILES = (
     "engine/cmake/codec_ports/libhevc/CMakeLists.txt",
     "engine/cmake/codec_ports/openh264/CMakeLists.txt",
     "contracts/vendor-sources.json", "editor/src/core/jce_build_manager.cpp",
+    "editor/src/core/jce_project_build_target.cpp",
 )
 
 
@@ -34,15 +35,65 @@ class SourcePinsGateTests(unittest.TestCase):
         self.assertIn(old, text)
         path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
-    def gate(self, passes=False):
+    def gate(self, passes=False, reason=None):
         result = subprocess.run([sys.executable, str(GATE), str(self.root)],
                                 capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(result.returncode, 0 if passes else 1, result.stdout + result.stderr)
         if not passes:
             self.assertIn("check_patented_codec_gate: FAIL", result.stdout)
+        if reason:
+            self.assertIn(reason, result.stdout)
 
     def test_current_tree(self):
         self.gate(passes=True)
+
+    def test_sdk_metadata_owner_must_exist(self):
+        (self.root / "editor/src/core/jce_project_build_target.cpp").unlink()
+        self.gate(reason="lost actual SDK metadata variant comparison")
+
+    def test_comment_cannot_replace_sdk_metadata_definition(self):
+        self.replace("editor/src/core/jce_project_build_target.cpp",
+                     "std::string jce_project_build_sdk_target_error(",
+                     "// std::string jce_project_build_sdk_target_error(")
+        self.gate(reason="lost actual SDK metadata variant comparison")
+
+    def test_sdk_parser_must_consume_real_archive_metadata(self):
+        self.replace("editor/src/core/jce_project_build_target.cpp",
+                     "jce_fs_host_read_capped(", "jce_fake_read_stamp(")
+        self.gate(reason="lost actual SDK metadata variant comparison")
+
+    def test_unrelated_call_and_comment_cannot_replace_build_admission(self):
+        name = "editor/src/core/jce_build_manager.cpp"
+        self.replace(name, "jce_project_build_sdk_target_error(sdk,",
+                     'std::string("") /* jce_project_build_sdk_target_error */ (sdk,')
+        path = self.root / name
+        path.write_text(path.read_text(encoding="utf-8") +
+                        '\nvoid unrelated() { auto stamp = jce_project_build_sdk_target_error(sdk, arch, platform, variant); }\n',
+                        encoding="utf-8")
+        self.gate(reason="lost SDK target/variant rejection")
+
+    def test_reading_metadata_without_variant_comparison_is_rejected(self):
+        self.replace("editor/src/core/jce_project_build_target.cpp",
+                     'std::strcmp(text(expected.first), expected.second)', 'false')
+        self.gate(reason="lost actual SDK metadata variant comparison")
+
+    def test_comparison_without_failure_is_rejected(self):
+        self.replace("editor/src/core/jce_build_manager.cpp",
+                     "            selected_arch, build_platform, variant); !error.empty()) {",
+                     "            selected_arch, build_platform, variant); false) {")
+        self.gate(reason="lost SDK target/variant rejection")
+
+    def test_cli_cannot_omit_archive_variant_admission(self):
+        self.replace("tools/build/jce.py", '.require_sdk_target(sdk, system, t["arch"], config, variant, delivery)',
+                     '.ignore_sdk_target(sdk, system, t["arch"], config, variant, delivery)')
+        self.gate(reason="lost actual per-archive SDK target/variant admission")
+
+    def test_dist_effective_codec_switch_still_must_be_forced_off(self):
+        name = "CMakeLists.txt"
+        self.replace(name,
+                     "\tset(JCE_PATENTED_CODECS_ENABLED OFF)\nendif()\nif(JCE_PLATFORM_WEB)",
+                     "\tset(JCE_PATENTED_CODECS_ENABLED ON)\nendif()\nif(JCE_PLATFORM_WEB)")
+        self.gate(reason="CMakeLists.txt no longer forces JCE_PATENTED_CODECS_ENABLED OFF")
 
     def test_missing_acquisition(self):
         self.replace("engine/CMakeLists.txt",

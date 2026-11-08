@@ -273,6 +273,7 @@ local D = {
   water = nil,                  -- cached decoded components (get-modify-set)
   sun = nil, fill = nil, lamp = nil, fire = nil,
   grass = {},                   -- { {e=, comp=}, ... }
+  flower_visibility = {},        -- owned complete entity + last accepted visible bit
   flick_t = 0,
   wind_t = 0, wind_st = {},
   bolt_next = 14, bolt_t = -1, flash = 0,
@@ -387,19 +388,6 @@ local function apply_mix(k)
     D.rim.intensity = rr[4]
     comp_write(D.ids.rim, "Light", D.rim)
   end
-  -- Flower visibility per state (reference grass.flowerVisibility): a stable
-  -- per-flower hash keeps the same SUBSET visible for a given fraction.
-  if D.ids.flowers then
-    local fv = FLOWER_VIS[D.season * 2 + D.tod + 1]
-    for i, fe in ipairs(D.ids.flowers) do
-      local mr = comp(fe, "MeshRenderer")
-      if mr then
-        mr.visible = (((i * 61) % 100) / 100.0) < fv
-        comp_write(fe, "MeshRenderer", mr)
-      end
-    end
-  end
-
   -- Water colors + shore ripple + ice.
   if D.water then
     local sh, dp = m3("water_shallow"), m3("water_deep")
@@ -446,8 +434,25 @@ local function retint_leaves()
   if D.ids.leaves2 then jce.particle_set_color(D.ids.leaves2, lc[1], lc[2], lc[3]) end
 end
 
+-- Visibility is a discrete state policy, independent of the color tween.
+-- Preserve the authored index hash and patch only the owned visible field.
+local function apply_flower_visibility()
+  local fv = FLOWER_VIS[D.season * 2 + D.tod + 1]
+  for _, flower in ipairs(D.flower_visibility) do
+    local visible = (((flower.index * 61) % 100) / 100.0) < fv
+    if flower.visible ~= visible then
+      local patch = visible and '{"visible":true}' or '{"visible":false}'
+      if not jce.comp_set(flower.e, "MeshRenderer", patch) then
+        error("ES flower visibility write failed: " .. tostring(flower.e))
+      end
+      flower.visible = visible
+    end
+  end
+end
+
 local function apply_state_discrete()
   retint_leaves()
+  apply_flower_visibility()
   local p = preset(D.season, D.tod)
 
   -- THE ROCKS RETINT USED TO BE HERE AND IT NEVER RAN ONCE.  It iterated
@@ -808,8 +813,11 @@ local function update_camera(dt)
   D.pol  = D.pol  + (D.pol_t  - D.pol)  * k
   D.dist = D.dist + (D.dist_t - D.dist) * k
 
-  local vc = comp(D.cam, "VirtualCamera")
-  if not vc then return end
+  -- This director owns only the pose. Keep missing cameras absent and let
+  -- comp_set's public partial merge preserve live priority/fov/active fields.
+  if not jce.has_component(D.cam, "VirtualCamera") then return end
+  local vc = D.cam_pose
+  if not vc then vc = {}; D.cam_pose = vc end
   local sp, cp = math.sin(D.pol), math.cos(D.pol)
   vc.posX = D.dist * sp * math.sin(D.az)
   vc.posY = D.dist * cp
@@ -821,6 +829,22 @@ end
 -- ==========================================================================
 -- Lifecycle
 -- ==========================================================================
+-- The same message bridge in generated/native and portable directors.
+function script.es_mood_apply(self, request_seq, state_key)
+  local keys = {spring_day=0, spring_night=1, winter_day=2, winter_night=3,
+                autumn_day=4, autumn_night=5, rainy_day=6, rainy_night=7}
+  -- Resolve Next from committed state, including changes from the top HUD.
+  local index = state_key == "next" and (D.season * 2 + D.tod + 1) % 8 or keys[state_key]
+  local ack = jce.find_by_name("MoodAck")
+  if not ack then return end
+  if type(request_seq) ~= "number" or request_seq ~= math.floor(request_seq) or
+     request_seq < 1 or request_seq > 16777215 or index == nil then
+    jce.set_position(ack, 0, 0, -1); return
+  end
+  set_state(math.floor(index / 2), index % 2)
+  jce.set_position(ack, request_seq, D.season * 2 + D.tod, 1)
+end
+
 function script.on_start(self)
   local ids = D.ids
   ids.sun    = jce.find_by_name("Sun")
@@ -834,6 +858,18 @@ function script.on_start(self)
   ids.snow      = jce.find_by_name("Snow")
   ids.fireflies_ring = jce.find_by_prefix("Firefly_")
   ids.flowers = jce.find_by_prefix("flower_")   -- per-state visibility gating
+  -- This Director owns these resolved flower components for its lifetime.
+  -- Read presence/visibility once; a missing component must not be created by
+  -- a partial patch. Preserve original indices even when one is absent.
+  D.flower_visibility = {}
+  for i, fe in ipairs(ids.flowers) do
+    local mr = comp(fe, "MeshRenderer")
+    if mr then
+      D.flower_visibility[#D.flower_visibility + 1] = {
+        e = fe, index = i, visible = mr.visible,
+      }
+    end
+  end
   ids.leaves  = jce.find_by_name("FallingLeaves")
   ids.leaves2 = jce.find_by_name("FallingLeaves2")
   ids.flame     = jce.find_by_name("FireFlame")

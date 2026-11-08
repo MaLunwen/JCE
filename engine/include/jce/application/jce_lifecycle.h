@@ -60,7 +60,7 @@ JCE_EXTERN_C_BEGIN
 typedef enum JceLifecycleEvent {
     JCE_LIFECYCLE_FOCUS_GAINED = 0,
     JCE_LIFECYCLE_FOCUS_LOST,
-    JCE_LIFECYCLE_PAUSE,         /* app backgrounded (mobile / minimized desktop) */
+    JCE_LIFECYCLE_PAUSE,         /* OS/mobile suspension; desktop minimize is focus loss */
     JCE_LIFECYCLE_RESUME,        /* app foregrounded again                        */
     JCE_LIFECYCLE_LOW_MEMORY,    /* OS signals memory pressure                    */
     JCE_LIFECYCLE_WILL_QUIT,     /* about to exit — last chance to save           */

@@ -7,9 +7,11 @@
 
 #include "panels/jce_panel_preferences.h"
 
+/* Current content includes an admitted scene/Bundle or a pending scene load,
+ * even when no authoring project is open. Manual Welcome commands are separate. */
 bool jce_editor_welcome_should_open_on_startup(
     JceEditorStartupBehavior startup_behavior,
-    bool has_current_project,
+    bool has_current_content,
     bool has_known_project);
 
 #endif /* JCE_EDITOR_WELCOME_POLICY_H */

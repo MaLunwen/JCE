@@ -63,11 +63,17 @@
 #include "unity.h"
 
 #include "renderer/jce_text_shape.h"
+#include <jce/os/core/jce_timer.h>
+
+/* Same-source policy control supplies these symbols instead of the archive. */
+#ifdef JCE_TEST_TEXT_SHAPE_OWNER
+#include JCE_TEST_TEXT_SHAPE_OWNER
+#endif
 
 #include <hb.h>
 
+#include <stdbool.h>
 #include <stdlib.h>
-#include <time.h>
 #include <string.h>
 
 void setUp(void)    { }
@@ -238,6 +244,76 @@ static void test_two_owners_do_not_share_an_entry(void)
     TEST_ASSERT_EQUAL_UINT64(h0, h1);
 }
 
+/* Each pair is either ASCII "B " or UTF-8 U+00A0 (C2 A0). XORing bit 7 in
+ * both adjacent bytes leaves the low eight FNV bits unchanged for EVERY
+ * incoming hash, since multiplication by an odd value preserves that bit.
+ * Three pairs give eight valid UTF-8 keys with the same bucket, independent
+ * of the owner pointer, generation or process address layout. No cache hash
+ * implementation or observed address is copied into this fixture. */
+static void conflicting_label(unsigned pattern, char text[7])
+{
+    for (unsigned pair = 0; pair < 3; pair++) {
+        const bool nbsp = (pattern & (1u << pair)) != 0;
+        text[pair * 2] = (char)(nbsp ? 0xc2 : 0x42);
+        text[pair * 2 + 1] = (char)(nbsp ? 0xa0 : 0x20);
+    }
+    text[6] = '\0';
+}
+
+static void test_colliding_labels_are_retained_without_reshaping(void)
+{
+    const JceTextFontChain c = plain_chain();
+    char labels[4][7];
+    uint32_t counts[4];
+    uint64_t h0, m0, h1, m1;
+    for (unsigned i = 0; i < 4; i++) {
+        conflicting_label(i, labels[i]);
+        TEST_ASSERT_NOT_NULL(jce_text_shape(OWNER_A, &c, labels[i], &counts[i]));
+    }
+    jce_text_shape_stats(&h0, &m0);
+    for (unsigned repeat = 0; repeat < 16; repeat++) {
+        for (unsigned i = 0; i < 4; i++) {
+            uint32_t count = 0;
+            const JceShapedGlyph *run = jce_text_shape(OWNER_A, &c, labels[i], &count);
+            TEST_ASSERT_NOT_NULL(run);
+            TEST_ASSERT_EQUAL_UINT32(counts[i], count);
+            TEST_ASSERT_EQUAL_UINT32((i & 1u) ? 0xa0u : (uint32_t)'B', run[0].codepoint);
+        }
+    }
+    jce_text_shape_stats(&h1, &m1);
+    TEST_ASSERT_EQUAL_UINT64_MESSAGE(m0, m1,
+        "four colliding UI labels were repeatedly shaped after warmup");
+    TEST_ASSERT_EQUAL_UINT64(h0 + 64, h1);
+    jce_text_shape_forget(OWNER_A);
+    for (unsigned i = 0; i < 4; i++)
+        TEST_ASSERT_NOT_NULL(jce_text_shape(OWNER_A, &c, labels[i], &counts[i]));
+    jce_text_shape_stats(&h1, &m1);
+    TEST_ASSERT_EQUAL_UINT64(m0 + 4, m1);
+    TEST_ASSERT_EQUAL_UINT64(h0 + 64, h1);
+}
+
+static void test_full_set_replacement_keeps_the_previous_borrowed_run(void)
+{
+    const JceTextFontChain c = plain_chain();
+    char labels[5][7];
+    uint32_t count = 0;
+    uint64_t h0, m0, h1, m1;
+    for (unsigned i = 0; i < 5; i++) conflicting_label(i, labels[i]);
+    for (unsigned i = 0; i < 4; i++)
+        TEST_ASSERT_NOT_NULL(jce_text_shape(OWNER_A, &c, labels[i], &count));
+    const JceShapedGlyph *borrowed = jce_text_shape(OWNER_A, &c, labels[0], &count);
+    TEST_ASSERT_NOT_NULL(borrowed);
+    TEST_ASSERT_EQUAL_UINT32(6, count);
+    jce_text_shape_stats(&h0, &m0);
+    TEST_ASSERT_NOT_NULL(jce_text_shape(OWNER_A, &c, labels[4], &count));
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)'B', borrowed[0].codepoint);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)' ', borrowed[5].codepoint);
+    TEST_ASSERT_EQUAL_PTR(borrowed, jce_text_shape(OWNER_A, &c, labels[0], &count));
+    jce_text_shape_stats(&h1, &m1);
+    TEST_ASSERT_EQUAL_UINT64(m0 + 1, m1);
+    TEST_ASSERT_EQUAL_UINT64(h0 + 1, h1);
+}
+
 /* A closed font's runs must go with it -- the key is its address, and the next
  * allocation can land there. */
 static void test_forget_drops_that_owners_runs(void)
@@ -336,62 +412,111 @@ static void test_an_empty_string_is_a_run_of_zero_not_a_failure(void)
     TEST_ASSERT_EQUAL_UINT32(0, n);
 }
 
-/* THE SAVING, AS A NUMBER, WITH A DELIBERATELY LOOSE THRESHOLD.
- *
- * A count assertion ("the second lookup did not run HarfBuzz") proves the
- * cache works; it does not prove the cache is worth having.  This times the
- * two paths over the same strings.
- *
- * The threshold is 2x and the measured ratio is far above it, on purpose: this
- * runs against hb_font_get_empty(), which is the CHEAPEST shape HarfBuzz can
- * perform -- no cmap, no GSUB, no GPOS, no kerning.  A real font does strictly
- * more work per shape and none of it per cache hit, so this is a lower bound
- * on the saving. CTest runs this executable serially: competing processes can
- * preempt either loop asymmetrically, regardless of the machine's clock speed.
- *
- * A timing assertion has to justify itself in a suite that runs on whatever
- * hardware is present.  This one measures a RATIO between two loops in the
- * same process, back to back, so it is insensitive to clock speed.  MEASURED
- * on this machine over three runs at 200k iterations: 14.3x, 19.0x and 20.0x,
- * against a threshold of 2x -- seven times the margin, and every one of those
- * numbers is a lower bound because the font is the empty one. */
-static void test_a_cache_hit_is_much_cheaper_than_a_shape(void)
+static const char *const PERF_LABELS[] = {
+    "Play", "Options", "Quit", "Resume", "Save Game", "Load Game",
+    "Graphics", "Audio", "Controls", "Back"
+};
+enum { PERF_LABEL_COUNT = sizeof PERF_LABELS / sizeof PERF_LABELS[0] };
+
+static void measurement_number(const char *name, uint64_t value)
 {
-    const JceTextFontChain c = plain_chain();
-    enum { ITERS = 200000 };
-    static const char *const LABELS[] = {
-        "Play", "Options", "Quit", "Resume", "Save Game", "Load Game",
-        "Graphics", "Audio", "Controls", "Back"
-    };
-    enum { NLABELS = (int)(sizeof LABELS / sizeof LABELS[0]) };
+    char digits[21];
+    char *at = digits + sizeof digits;
+    *--at = '\0';
+    do {
+        *--at = (char)('0' + value % 10u);
+        value /= 10u;
+    } while (value);
+    UnityPrint(name);
+    UnityPrint(at);
+}
 
-    /* Warm every entry so the timed loop is all hits. */
-    uint32_t n = 0;
-    for (int i = 0; i < NLABELS; i++)
-        jce_text_shape(OWNER_A, &c, LABELS[i], &n);
+static uint64_t measure_cached_labels(const JceTextFontChain *chain, int iters)
+{
+    uint32_t count = 0;
+    const uint64_t begin = jce_time_perf_counter();
+    for (int k = 0; k < iters; k++)
+        jce_text_shape(OWNER_A, chain, PERF_LABELS[k % PERF_LABEL_COUNT], &count);
+    const uint64_t end = jce_time_perf_counter();
+    TEST_ASSERT_TRUE_MESSAGE(end >= begin, "the monotonic cache timer moved backwards");
+    return end - begin;
+}
 
-    clock_t t0 = clock();
-    for (int k = 0; k < ITERS; k++)
-        jce_text_shape(OWNER_A, &c, LABELS[k % NLABELS], &n);
-    clock_t t1 = clock();
-
-    /* The path this replaced, verbatim: a fresh buffer and a full shape. */
-    for (int k = 0; k < ITERS; k++) {
+static uint64_t measure_reference_labels(int iters)
+{
+    const uint64_t begin = jce_time_perf_counter();
+    for (int k = 0; k < iters; k++) {
         hb_buffer_t *b = hb_buffer_create();
-        hb_buffer_add_utf8(b, LABELS[k % NLABELS], -1, 0, -1);
+        hb_buffer_add_utf8(b, PERF_LABELS[k % PERF_LABEL_COUNT], -1, 0, -1);
         hb_buffer_guess_segment_properties(b);
         hb_shape(hb_font_get_empty(), b, NULL, 0);
         hb_buffer_destroy(b);
     }
-    clock_t t2 = clock();
+    const uint64_t end = jce_time_perf_counter();
+    TEST_ASSERT_TRUE_MESSAGE(end >= begin, "the monotonic shape timer moved backwards");
+    return end - begin;
+}
 
-    double cached = (double)(t1 - t0);
-    double shaped = (double)(t2 - t1);
-    TEST_ASSERT_TRUE_MESSAGE(shaped > 0.0,
-        "the reference loop took no measurable time -- raise ITERS");
-    TEST_ASSERT_TRUE_MESSAGE(cached * 2.0 < shaped,
-        "a cache hit is not even twice as cheap as re-shaping, against the "
-        "cheapest font HarfBuzz has -- the cache is not paying for itself");
+/* Keep the 2x requirement and the original 200k lookups over ten UI labels.
+ * Four equal-work pairs alternate ordering; every pair is retained, including
+ * slow samples. Counter deltas prove the measured cache workload is all hits.
+ * Public monotonic counters measure wall time, so scheduling and frequency
+ * changes remain possible influences. This CPU fixture is neither a Release
+ * application benchmark nor a font-atlas, GPU, or presentation measurement. */
+static void test_a_cache_hit_is_much_cheaper_than_a_shape(void)
+{
+    const JceTextFontChain c = plain_chain();
+    enum { PAIRS = 4, ITERS = 50000 };
+    const uint64_t frequency = jce_time_perf_freq();
+    uint64_t cached_total = 0, shaped_total = 0, hits_total = 0, misses_total = 0;
+    uint32_t n = 0;
+    TEST_ASSERT_TRUE_MESSAGE(frequency > 0, "the monotonic timer has no valid frequency");
+    for (int i = 0; i < PERF_LABEL_COUNT; i++)
+        TEST_ASSERT_NOT_NULL(jce_text_shape(OWNER_A, &c, PERF_LABELS[i], &n));
+    for (int pair = 0; pair < PAIRS; pair++) {
+        uint64_t h0, m0, h1, m1, cached, shaped;
+        jce_text_shape_stats(&h0, &m0);
+        if (pair & 1) {
+            shaped = measure_reference_labels(ITERS);
+            cached = measure_cached_labels(&c, ITERS);
+        } else {
+            cached = measure_cached_labels(&c, ITERS);
+            shaped = measure_reference_labels(ITERS);
+        }
+        jce_text_shape_stats(&h1, &m1);
+        cached_total += cached;
+        shaped_total += shaped;
+        hits_total += h1 - h0;
+        misses_total += m1 - m0;
+        UnityPrint("text_shape_cache wall sample");
+        measurement_number(" pair=", (uint64_t)pair);
+        UnityPrint((pair & 1) ? " order=shape,cache" : " order=cache,shape");
+        measurement_number(" iterations=", ITERS);
+        measurement_number(" frequency_hz=", frequency);
+        measurement_number(" cache_ticks=", cached);
+        measurement_number(" shape_ticks=", shaped);
+        measurement_number(" hits=", h1 - h0);
+        measurement_number(" misses=", m1 - m0);
+        UnityPrint("\n");
+    }
+    UnityPrint("text_shape_cache wall totals");
+    measurement_number(" cache_ticks=", cached_total);
+    measurement_number(" shape_ticks=", shaped_total);
+    UnityPrint(" cache_ms=");
+    UnityPrintFloat((double)cached_total * 1000.0 / (double)frequency);
+    UnityPrint(" shape_ms=");
+    UnityPrintFloat((double)shaped_total * 1000.0 / (double)frequency);
+#ifdef JCE_TEXT_SHAPE_BUILD_CONFIG
+    UnityPrint(" build=" JCE_TEXT_SHAPE_BUILD_CONFIG);
+#endif
+    UnityPrint("\n");
+    TEST_ASSERT_EQUAL_UINT64_MESSAGE(0, misses_total,
+        "the purported cache-hit timing workload actually reshaped labels");
+    TEST_ASSERT_EQUAL_UINT64((uint64_t)PAIRS * ITERS, hits_total);
+    TEST_ASSERT_TRUE_MESSAGE(cached_total > 0 && shaped_total > 0,
+        "a timing loop took no measurable time -- raise ITERS");
+    TEST_ASSERT_TRUE_MESSAGE((double)cached_total * 2.0 < (double)shaped_total,
+        "measured pure cache hits are not twice as cheap as the fresh-buffer shape path");
 }
 
 /* -- itemization: the half that ends tofu ---------------------------- */
@@ -566,11 +691,16 @@ static void test_font_local_glyph_indices_survive_rtl_and_cache(void)
 int main(void)
 {
     UNITY_BEGIN();
+#ifdef JCE_TEXT_SHAPE_CONFLICT_CONTROL
+    RUN_TEST(test_colliding_labels_are_retained_without_reshaping);
+#else
     RUN_TEST(test_the_cached_run_equals_what_harfbuzz_produced);
     RUN_TEST(test_font_local_glyph_indices_survive_rtl_and_cache);
     RUN_TEST(test_the_second_lookup_does_not_run_harfbuzz);
     RUN_TEST(test_a_different_string_is_a_different_run);
     RUN_TEST(test_two_owners_do_not_share_an_entry);
+    RUN_TEST(test_colliding_labels_are_retained_without_reshaping);
+    RUN_TEST(test_full_set_replacement_keeps_the_previous_borrowed_run);
     RUN_TEST(test_forget_drops_that_owners_runs);
     RUN_TEST(test_a_very_long_string_still_shapes);
     RUN_TEST(test_the_run_does_not_refer_into_the_callers_buffer);
@@ -580,5 +710,6 @@ int main(void)
     RUN_TEST(test_consecutive_uncovered_codepoints_are_one_run);
     RUN_TEST(test_a_new_chain_generation_is_a_new_run);
     RUN_TEST(test_a_cache_hit_is_much_cheaper_than_a_shape);
+#endif
     return UNITY_END();
 }

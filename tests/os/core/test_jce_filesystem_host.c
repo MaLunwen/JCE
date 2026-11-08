@@ -9,11 +9,15 @@
 #include "unity.h"
 
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_process.h>
+#include <jce/os/core/jce_thread.h>
 
 #include <stdint.h>
 #include <string.h>
 
 static char g_root[1024];
+static JceProcess *g_child;
 
 void setUp(void)
 {
@@ -30,6 +34,8 @@ void setUp(void)
 
 void tearDown(void)
 {
+    jce_process_destroy(g_child);
+    g_child = NULL;
     (void)jce_fs_host_remove_recursive(g_root);
 }
 
@@ -142,6 +148,92 @@ static void test_base_path_nonempty(void)
     char buf[1024] = { 0 };
     TEST_ASSERT_TRUE(jce_fs_host_get_base_path(buf, sizeof(buf)));
     TEST_ASSERT_TRUE(strlen(buf) > 0);
+}
+
+static void test_executable_path_invalid_and_tiny_output(void)
+{
+    char output[2] = { 'x', 'y' };
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(NULL, 0));
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(NULL, 128));
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(output, 0));
+    TEST_ASSERT_EQUAL_CHAR('x', output[0]); /* zero capacity grants no write */
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(output, 1));
+    TEST_ASSERT_EQUAL_CHAR('\0', output[0]);
+    TEST_ASSERT_EQUAL_CHAR('y', output[1]);
+}
+
+static void test_executable_path_is_full_native_filename(void)
+{
+    /* UTF-8 may need more bytes than the bounded native UTF-16 path. */
+    char path[131072];
+    memset(path, 'x', sizeof(path));
+#if (JCE_PLATFORM_WINDOWS || JCE_PLATFORM_LINUX) && \
+    !JCE_PLATFORM_WEB && !JCE_PLATFORM_MOBILE && !JCE_PLATFORM_TVOS
+    char exact[131072];
+    TEST_ASSERT_TRUE(jce_fs_host_get_executable_path(path, sizeof(path)));
+    TEST_ASSERT_TRUE(jce_path_is_absolute(path));
+    TEST_ASSERT_TRUE(jce_fs_host_exists_file(path));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_dir(path));
+    const size_t size = strlen(path);
+    TEST_ASSERT_TRUE(size > 1 && size + 1 < sizeof(path));
+    memset(exact, 'y', sizeof(exact));
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(exact, (uint32_t)size));
+    TEST_ASSERT_EQUAL_CHAR('\0', exact[0]);
+    TEST_ASSERT_EQUAL_CHAR('y', exact[size]);
+    TEST_ASSERT_TRUE(jce_fs_host_get_executable_path(exact, (uint32_t)size + 1));
+    TEST_ASSERT_EQUAL_STRING(path, exact);
+    TEST_ASSERT_EQUAL_CHAR('y', exact[size + 1]);
+#else
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(path, sizeof(path)));
+    TEST_ASSERT_EQUAL_CHAR('\0', path[0]);
+#endif
+}
+
+/* The child reads its expected filename relative to the deliberately different
+ * working directory. Neither the API nor this oracle consumes argv[0]. */
+static int executable_path_child(void)
+{
+    char path[131072];
+    uint64_t size = 0;
+    char *expected = jce_fs_host_read_all("executable-path.expected", &size);
+    const bool valid = expected && size > 1 && expected[size - 1] == '\0' &&
+        jce_fs_host_get_executable_path(path, sizeof(path)) &&
+        strcmp(path, expected) == 0 && jce_fs_host_exists_file(path);
+    jce_fs_buffer_free(expected);
+    return valid ? 0 : 71;
+}
+
+static void test_executable_path_is_independent_of_child_working_directory(void)
+{
+#if (JCE_PLATFORM_WINDOWS || JCE_PLATFORM_LINUX) && \
+    !JCE_PLATFORM_WEB && !JCE_PLATFORM_MOBILE && !JCE_PLATFORM_TVOS
+    char path[131072], expected[1100], directory[131072];
+    TEST_ASSERT_TRUE(jce_fs_host_get_executable_path(path, sizeof(path)));
+    TEST_ASSERT_TRUE(jce_path_parent(directory, sizeof(directory), path));
+    jce_path_canonicalise_inplace(directory);
+    TEST_ASSERT_TRUE(strcmp(directory, g_root) != 0);
+    join(expected, sizeof(expected), "executable-path.expected");
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(expected, path, strlen(path) + 1));
+    const JceProcessConfig config = {
+        path, g_root, "--jce-fs-executable-child", false, false
+    };
+    g_child = jce_process_spawn(&config);
+    TEST_ASSERT_NOT_NULL_MESSAGE(g_child, jce_process_get_last_spawn_error());
+    bool exited = false;
+    int code = -1;
+    for (unsigned attempt = 0; attempt < 2000; ++attempt) {
+        if (jce_process_poll_exit(g_child, &code)) { exited = true; break; }
+        jce_thread_sleep_ms(5);
+    }
+    jce_process_destroy(g_child);
+    g_child = NULL;
+    TEST_ASSERT_TRUE_MESSAGE(exited, "executable-path child exceeded 10-second polling budget");
+    TEST_ASSERT_EQUAL_INT(0, code);
+#else
+    char path[2] = { 'x', 'y' };
+    TEST_ASSERT_FALSE(jce_fs_host_get_executable_path(path, sizeof(path)));
+    TEST_ASSERT_EQUAL_CHAR('\0', path[0]);
+#endif
 }
 
 /* ---- additional surface (was uncovered) ----------------------------- */
@@ -268,8 +360,10 @@ static void test_atomic_write_overwrites_and_no_temp(void)
     TEST_ASSERT_FALSE(jce_fs_host_exists_file(tmp));
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--jce-fs-executable-child") == 0)
+        return executable_path_child();
     UNITY_BEGIN();
     RUN_TEST(test_create_and_exists_dir);
     RUN_TEST(test_write_read_and_size);
@@ -278,6 +372,9 @@ int main(void)
     RUN_TEST(test_make_unique_path_when_taken);
     RUN_TEST(test_walk_visits_entries);
     RUN_TEST(test_base_path_nonempty);
+    RUN_TEST(test_executable_path_invalid_and_tiny_output);
+    RUN_TEST(test_executable_path_is_full_native_filename);
+    RUN_TEST(test_executable_path_is_independent_of_child_working_directory);
     RUN_TEST(test_list_dir_enumerates);
     RUN_TEST(test_copy_recursive_clones_tree);
     RUN_TEST(test_remove_recursive_deletes_nested_tree);

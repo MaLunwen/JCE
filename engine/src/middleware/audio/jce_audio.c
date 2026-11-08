@@ -1,4 +1,5 @@
 #include "jce_audio_stream_gate.h"
+#include "jce_audio_master_lifecycle_internal.h"
 /*
  * jce_audio.c  miniaudio audio implementation.
  *
@@ -714,160 +715,8 @@ static void dsp_node_uninit(DspNode *dn)
     }
 }
 
-/* ================================================================== */
-/* Process-wide master mix (single shared output device)               */
-/* ================================================================== */
-/* Every JceAudio engine is DEVICE-LESS (ma_engine_config.noDevice — the
- * miniaudio-documented multi-engine form) and is pumped + summed by ONE
- * shared playback device, the engine's "master bus" (the same shape as
- * Unreal's master submix / Unity's AudioListener / Godot's Master bus).
- * Consequences:
- *   - the process opens exactly one OS audio stream, resident once created
- *     (Play start/stop no longer opens/closes devices);
- *   - jce_audio_master_tap_set() observes the final mixed PCM — sample-
- *     exact, cross-platform capture of everything THIS process plays
- *     (the editor recorder's audio source; see
- *     .docs/AUDIO_MASTER_MIX_DESIGN.md);
- *   - the tap stream is gapless by construction: the device callback runs
- *     at a constant cadence and sums to silence when engines are idle.
- * Threading: create/destroy/tap_set are main-thread (the existing JceAudio
- * contract); the mix callback runs on the device thread and never blocks —
- * slots publish via "pointer first, flag second" over SDL atomic ints
- * (full barriers), teardown waits one callback generation (RCU-lite). */
-
-#define JCE_AUDIO_MAX_ENGINES 8
-#define JCE_AUDIO_MASTER_RATE 48000u  /* Opus/recording expectation */
-#define JCE_AUDIO_MASTER_CH   2u
-
-typedef struct {
-    SDL_AtomicInt live;   /* 1 = ptr readable by the mix callback */
-    JceAudio     *ptr;
-} MasterSlot;
-
-static struct {
-    bool                 device_inited;
-    bool                 device_failed;  /* don't retry every create */
-    ma_device            device;
-    MasterSlot           slots[JCE_AUDIO_MAX_ENGINES];
-    SDL_AtomicInt        generation;    /* bumped each callback entry */
-    SDL_AtomicInt        tap_live;
-    JceAudioMasterTapFn  tap_fn;
-    void                *tap_ud;
-} s_master;
-
-/* Wait until the mix callback has entered at least once more, so a slot or
- * tap cleared BEFORE this call can no longer be referenced.  No-op when the
- * device never started (nothing runs the callback). */
-static void master_wait_generation(void)
-{
-    if (!s_master.device_inited) return;
-    int g0 = SDL_GetAtomicInt(&s_master.generation);
-    for (int spin = 0; spin < 400; ++spin) {   /* ~2 s worst case */
-        if (SDL_GetAtomicInt(&s_master.generation) != g0) return;
-        SDL_Delay(5);
-    }
-}
-
-static void master_device_cb(ma_device *dev, void *out, const void *in,
-                             ma_uint32 frames)
-{
-    (void)dev; (void)in;
-    SDL_AddAtomicInt(&s_master.generation, 1);
-
-    float *dst = (float *)out;   /* f32/2ch as requested at device init */
-    memset(dst, 0, (size_t)frames * JCE_AUDIO_MASTER_CH * sizeof(float));
-
-    enum { CHUNK = 1024 };
-    static float tmp[CHUNK * JCE_AUDIO_MASTER_CH];  /* device thread only */
-    ma_uint32 done = 0;
-    while (done < frames) {
-        ma_uint32 n = frames - done;
-        if (n > CHUNK) n = CHUNK;
-        float *acc = dst + (size_t)done * JCE_AUDIO_MASTER_CH;
-        for (int i = 0; i < JCE_AUDIO_MAX_ENGINES; ++i) {
-            if (!SDL_GetAtomicInt(&s_master.slots[i].live)) continue;
-            JceAudio *a = s_master.slots[i].ptr;
-            if (!a) continue;
-            ma_uint64 read = 0;
-            ma_engine_read_pcm_frames(&a->engine, tmp, n, &read);
-            const ma_uint32 cnt = (ma_uint32)read * JCE_AUDIO_MASTER_CH;
-            for (ma_uint32 s = 0; s < cnt; ++s) acc[s] += tmp[s];
-        }
-        done += n;
-    }
-
-    if (SDL_GetAtomicInt(&s_master.tap_live) && s_master.tap_fn)
-        s_master.tap_fn(s_master.tap_ud, dst, frames,
-                        JCE_AUDIO_MASTER_RATE, JCE_AUDIO_MASTER_CH);
-}
-
-static bool master_device_ensure(void)
-{
-    if (s_master.device_inited) return true;
-    if (s_master.device_failed) return false;
-
-    ma_device_config dc = ma_device_config_init(ma_device_type_playback);
-    dc.playback.format   = ma_format_f32;
-    dc.playback.channels = JCE_AUDIO_MASTER_CH;
-    dc.sampleRate        = JCE_AUDIO_MASTER_RATE;
-    dc.dataCallback      = master_device_cb;
-
-    if (ma_device_init(NULL, &dc, &s_master.device) != MA_SUCCESS) {
-        s_master.device_failed = true;
-        LOG_WARN("jce_audio", "master mix device init failed — engines run "
-                              "silent, master tap unavailable");
-        return false;
-    }
-    if (ma_device_start(&s_master.device) != MA_SUCCESS) {
-        ma_device_uninit(&s_master.device);
-        s_master.device_failed = true;
-        LOG_WARN("jce_audio", "master mix device start failed");
-        return false;
-    }
-    s_master.device_inited = true;
-    LOG_SUCCESS("jce_audio", "master mix device started (48kHz/2ch)");
-    return true;
-}
-
-static bool master_register(JceAudio *a)
-{
-    for (int i = 0; i < JCE_AUDIO_MAX_ENGINES; ++i) {
-        if (SDL_GetAtomicInt(&s_master.slots[i].live) ||
-            s_master.slots[i].ptr)
-            continue;
-        s_master.slots[i].ptr = a;                  /* pointer first… */
-        SDL_SetAtomicInt(&s_master.slots[i].live, 1); /* …flag second */
-        return true;
-    }
-    return false;
-}
-
-static void master_unregister(JceAudio *a)
-{
-    for (int i = 0; i < JCE_AUDIO_MAX_ENGINES; ++i) {
-        if (s_master.slots[i].ptr != a) continue;
-        SDL_SetAtomicInt(&s_master.slots[i].live, 0);
-        master_wait_generation();   /* callback can no longer touch it */
-        s_master.slots[i].ptr = NULL;
-        return;
-    }
-}
-
-bool jce_audio_master_tap_set(JceAudioMasterTapFn fn, void *ud)
-{
-    if (fn) {
-        if (!master_device_ensure()) return false;
-        s_master.tap_fn = fn;                    /* fields first… */
-        s_master.tap_ud = ud;
-        SDL_SetAtomicInt(&s_master.tap_live, 1); /* …flag second */
-        return true;
-    }
-    SDL_SetAtomicInt(&s_master.tap_live, 0);
-    master_wait_generation();   /* no further calls into the old fn */
-    s_master.tap_fn = NULL;
-    s_master.tap_ud = NULL;
-    return true;
-}
+/* Shared output persists across graph/Play lifetimes, retires at Engine tail. */
+#include "jce_audio_master.inc.h"
 
 /* -- Lifecycle ------------------------------------------------------ */
 
@@ -875,6 +724,7 @@ bool jce_audio_master_tap_set(JceAudioMasterTapFn fn, void *ud)
  * device pumps this graph, or the caller does. */
 static JceAudio *audio_create_common(bool offline)
 {
+    if (!offline && (!master_control_allowed() || s_master.session_closed)) return NULL;
     JceAudio *audio = (JceAudio *)JCE_CALLOC(1, sizeof(*audio));
     if (!audio) return NULL;
 
@@ -958,7 +808,7 @@ void jce_audio_destroy(JceAudio *audio)
     /* FIRST detach from the master mix — after this the shared device
      * callback can no longer pump this engine, making the teardown below
      * race-free against the audio thread. */
-    master_unregister(audio);
+    if (!audio->offline && !master_unregister(audio)) return;
 
     /* Uninit all voices first (they reference engine). */
     for (int i = 0; i < JCE_MAX_VOICES; i++)
@@ -2595,6 +2445,7 @@ JceAudio *jce_audio_create_offline(void) {
     return NULL;
 }
 void jce_audio_destroy(JceAudio *audio) { (void)audio; }
+#include "jce_audio_master_lifecycle.inc.h"
 JceSound jce_audio_load(JceAudio *audio, JcePakArchive *pak, const char *path) {
     (void)audio; (void)pak; (void)path; return JCE_SOUND_INVALID;
 }

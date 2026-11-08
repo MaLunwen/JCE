@@ -95,5 +95,224 @@
       "families": ["*"],
       "why": "Drops the cascade block for a material that does not receive shadows. MEASURED, which is why it is the axis that proves this machinery: fs_pbr is 8311 instructions and CSM is 6766 of them (81.4%), so this is the only axis worth an entry file at all -- a Unity-style pile of material keywords would have been spent on the other 18.6%. No #else is needed: `shadow` is 1.0 above the guarded block and the prologue the rest of the shader consumes stays outside it."
     }
+  ],
+
+  "stock_profile_table_out": "engine/src/renderer/jce_shader_stock_profiles.inc",
+  "stock_profile_catalog_out": "engine/shaders/stock_profiles.json",
+  "stock_programs": [
+    {
+      "member": "color",
+      "vertex": "color",
+      "fragment": "color"
+    },
+    {
+      "member": "textured",
+      "vertex": "textured",
+      "fragment": "textured"
+    },
+    {
+      "member": "text_sdf",
+      "vertex": "textured",
+      "fragment": "text_sdf"
+    },
+    {
+      "member": "mesh",
+      "vertex": "mesh",
+      "fragment": "mesh"
+    },
+    {
+      "member": "pbr_toon",
+      "vertex": "pbr_skinned",
+      "fragment": "pbr_toon"
+    },
+    {
+      "member": "outline_skinned",
+      "vertex": "pbr_skinned_outline",
+      "fragment": "outline"
+    },
+    {
+      "member": "shadow",
+      "vertex": "shadow",
+      "fragment": "shadow"
+    },
+    {
+      "member": "shadow_inst",
+      "vertex": "shadow_inst",
+      "fragment": "shadow"
+    },
+    {
+      "member": "shadow_skinned",
+      "vertex": "shadow_skinned",
+      "fragment": "shadow"
+    },
+    {
+      "member": "terrain",
+      "vertex": "terrain",
+      "fragment": "terrain"
+    }
+  ],
+  "stock_profiles": [
+    {
+      "name": "full",
+      "stock_members": [
+        "*"
+      ],
+      "pbr_cells": "*",
+      "cook_unrestricted": true,
+      "additional_cook_pairs": []
+    },
+    {
+      "name": "compatibility",
+      "stock_members": [
+        "color",
+        "textured",
+        "text_sdf",
+        "mesh",
+        "shadow"
+      ],
+      "pbr_cells": [
+        {
+          "variant": "pbr",
+          "keywords": []
+        },
+        {
+          "variant": "pbr",
+          "keywords": [
+            "noshadow"
+          ]
+        }
+      ],
+      "cook_unrestricted": false,
+      "additional_cook_pairs": [
+        {
+          "vertex": "imgui",
+          "fragment": "imgui"
+        },
+        {
+          "vertex": "pick",
+          "fragment": "pick"
+        },
+        {
+          "vertex": "grid",
+          "fragment": "grid"
+        },
+        {
+          "vertex": "sky",
+          "fragment": "sky"
+        },
+        {
+          "vertex": "sky",
+          "fragment": "sky_physical_compat"
+        },
+        {
+          "vertex": "water",
+          "fragment": "water"
+        },
+        {
+          "vertex": "water_physical",
+          "fragment": "water_physical"
+        },
+        {
+          "vertex": "foliage",
+          "fragment": "foliage"
+        },
+        {
+          "vertex": "foliage_shadow",
+          "fragment": "foliage_shadow"
+        },
+        {
+          "vertex": "foliage_cards",
+          "fragment": "foliage"
+        },
+        {
+          "vertex": "foliage_cards_shadow",
+          "fragment": "foliage_shadow"
+        },
+        {
+          "vertex": "particle",
+          "fragment": "particle"
+        },
+        {
+          "vertex": "particle_expanded",
+          "fragment": "particle"
+        },
+        {
+          "vertex": "grass",
+          "fragment": "grass"
+        },
+        {
+          "vertex": "grass_expanded",
+          "fragment": "grass"
+        },
+        {
+          "vertex": "grass_expanded",
+          "fragment": "grass_shadow"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "bloom_extract"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "bloom_blur"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "bloom_combine"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "fxaa"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "vignette"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "chromatic"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "grayscale"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "composite"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "present"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "rcas"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "reveal_dissolve"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "tsr"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "motion_vec"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "taa"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "bloom_down"
+        },
+        {
+          "vertex": "postfx",
+          "fragment": "bloom_up"
+        }
+      ]
+    }
   ]
 }

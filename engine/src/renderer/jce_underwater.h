@@ -33,6 +33,7 @@ JCE_EXTERN_C_BEGIN
 
 typedef struct JcePakArchive JcePakArchive;
 typedef struct JceUnderwater JceUnderwater;
+typedef struct JceRenderer JceRenderer;
 
 typedef struct {
     float sigma[3];    /* per-channel extinction, 1/m                        */
@@ -45,14 +46,16 @@ typedef struct {
 JceUnderwater *jce_underwater_create(const JcePakArchive *pak);
 void           jce_underwater_destroy(JceUnderwater *u);
 
-/* Apply absorption to whatever is already in `dst_fb_idx`.
+/* Apply absorption to the color in `dst_fb_idx`.
+ * Managed offscreen targets provide a color-only alias for a depth read.
+ * For a custom destination, the caller supplies an independent depth texture.
  *
  * `view_id` must come after the pass that produced the colour, and reserves
  * ONE view: both submits share it, ordered by BGFX_VIEW_MODE_SEQUENTIAL --
  * the multiply must land before the add, and any other order silently
  * produces `(dst + tint*(1-T)) * T`, which is dimmer and looks like a
  * plausible tuning of the same effect. */
-void jce_underwater_render(JceUnderwater *u,
+void jce_underwater_render(JceUnderwater *u, const JceRenderer *renderer,
                                    uint16_t depth_tex_handle,
                                    uint16_t dst_fb_idx,
                                    uint16_t width, uint16_t height,

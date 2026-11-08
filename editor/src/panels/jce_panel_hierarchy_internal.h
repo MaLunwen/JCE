@@ -23,6 +23,7 @@
 
 extern const ImVec4 s_tag_colors[JCE_TAG_COLOR_COUNT];
 extern const char  *s_tag_names[];
+extern const char *const s_tag_filter_keys[JCE_TAG_COLOR_COUNT];
 
 /* Dynamic flattened rows retain the existing visible-row clipper. The three
  * backing arrays share a bounded 64 MiB budget; failure is surfaced, not a

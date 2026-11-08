@@ -17,10 +17,8 @@ bool jce_grass_shadow_field_casts(const JceGrassFieldComponent *g,
                                   uint32_t resident_blades)
 {
     if (!g) return false;
-    /* resident_blades is inst_vb_count.  0 means no persistent instance
-     * buffer, which is what LOW/MED tiers and JCE_PERSIST_GRASS=0 produce --
-     * they degrade to no grass shadows with the colour pass untouched, the
-     * same degrade the vegetation scatter takes. */
+    /* This helper only admits a nonempty current resident request. A zero
+     * authored result is accepted separately by the production transaction. */
     return g->cast_shadow && comp_enabled && visible && resident_blades > 0u;
 }
 
@@ -87,72 +85,152 @@ uint32_t jce_grass_shadow_runs(const uint32_t *cell_start,
     return n_runs;
 }
 
-/* ── the submit half ─────────────────────────────────────────────────── */
-
+/* Current-content preparation and per-cascade streaming share one provider. */
 #include "jce_sr_internal.h"
-#include <jce/middleware/scene/jce_component_registry.h>
+#include "jce_sr_grass_shadow_content.h"
+#include "renderer/jce_shader_deferred.h"
+#include "os/core/jce_trace_scope_internal.h"
 
-#include <bgfx/c99/bgfx.h>
+typedef struct {
+    JceSceneRenderer *sr;
+    JceScene *scene;
+    EntityList *list;
+    const JceCamera *camera;
+    const jce_vec4 *planes;
+    uint16_t view;
+    int prepared_slot;
+} SrGrassShadowContext;
 
-void sr_submit_grass_shadows(struct JceSceneRenderer *sr_, struct JceScene *scene_,
-                             uint16_t cv, uint16_t shadow_inst_idx,
-                             const jce_vec4 *planes, jce_vec3 cam)
+static JceSrGrassShadowRead sr_grass_shadow_read(uint32_t index,
+    JceSrGrassShadowItem *item, void *user)
 {
-    JceSceneRenderer *sr = (JceSceneRenderer *)sr_;
-    JceScene *scene = (JceScene *)scene_;
-    if (!sr || !scene || !planes || shadow_inst_idx == UINT16_MAX) return;
+    SrGrassShadowContext *context = user;
+    if (index >= (uint32_t)context->list->count) return JCE_GRASS_SHADOW_READ_FAILED;
+    const JceEntity entity = context->list->entities[index];
+    const JceGrassFieldComponent *field =
+        jce_scene_get_grass_field(context->scene, entity);
+    if (!field || !field->cast_shadow ||
+        !sr_grass_field_admitted(context->sr, context->scene, entity))
+        return JCE_GRASS_SHADOW_ABSENT;
+    item->entity = entity;
+    item->visible = item->cast_shadow = true;
+    if (jce_scene_has_transform(context->scene, entity)) return JCE_GRASS_SHADOW_CASTER;
+    if (!(context->sr->grass_gate_reported_reasons & 2048u)) {
+        context->sr->grass_gate_reported_reasons |= 2048u;
+        LOG_WARN(LOG_TAG, "grass shadow source rejected first_reason=missing_transform "
+            "owner=%p view=%u entity=%llu mask='%.*s' current_shadow_ready=0",
+            (void *)context->sr, (unsigned)context->view, (unsigned long long)entity,
+            255, field->density_mask_path);
+    }
+    return JCE_GRASS_SHADOW_READ_FAILED;
+}
 
-    const bgfx_program_handle_t prg = { shadow_inst_idx };
-    /* Depth-only, matching sr_submit_scatter_shadows exactly.  Grass blades
-     * are two-sided cards, so CULL_NONE rather than CULL_CW: culling them
-     * would drop half of every blade's shadow depending on which way the
-     * cascade happens to look at the field. */
-    const uint64_t state = BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                         | BGFX_STATE_MSAA;
+static bool sr_grass_shadow_prepare(JceSrGrassShadowItem *item, void *user)
+{
+    SrGrassShadowContext *context = user;
+    const int slot = sr_grass_prepare_roots(context->sr, context->scene,
+        context->list, item->entity, true, NULL);
+    context->prepared_slot = slot;
+    if (slot < 0) return false;
+    JceSceneRenderer *sr = context->sr;
+    const JceGrassFieldComponent *field = jce_scene_get_grass_field(context->scene, item->entity);
+    item->placement_hash = sr->grass_cache[slot].param_hash;
+    item->count = sr->grass_cache[slot].inst_count;
+    const jce_vec3 position = context->camera
+        ? jce_camera_get_position(context->camera) : jce_v3(0.0f, 0.0f, 0.0f);
+    item->geometry_hash = sr_grass_shadow_geometry_key(field,
+        sr->grass_cache[slot].blade_h, sr->grass_cache[slot].blade_w,
+        sr->grass_cache[slot].blade_cards, position,
+        jce_environment_wind_speed_now(sr->env), sr->grass_time);
+    return true;
+}
 
-    for (int slot = 0; slot < (int)(sizeof sr->grass_cache /
-                                    sizeof sr->grass_cache[0]); ++slot) {
-        if (!sr->grass_cache[slot].used) continue;
-        const JceEntity e = sr->grass_cache[slot].entity;
-        JceGrassFieldComponent *g = jce_scene_get_grass_field(scene, e);
-        if (!g) continue;
+static bool sr_grass_shadow_submit(const JceSrGrassShadowItem *item, void *user)
+{
+    SrGrassShadowContext *context = user;
+    JceSceneRenderer *sr = context->sr;
+    const int slot = context->prepared_slot;
+    if (!item->count) return true;
+    const bool expanded = sr_grass_expanded_mode();
+    if (slot < 0 || !sr->grass_cache[slot].ready ||
+        sr->grass_cache[slot].entity != item->entity ||
+        sr->grass_cache[slot].inst_count != item->count ||
+        sr->grass_cache[slot].param_hash != item->placement_hash) return false;
+    if (!expanded && (sr->grass_cache[slot].inst_vb_count != item->count ||
+        sr->grass_cache[slot].inst_vb_hash != item->placement_hash ||
+        !BGFX_HANDLE_IS_VALID(sr->grass_cache[slot].inst_vb))) return false;
+    const JceGrassFieldComponent *field = jce_scene_get_grass_field(context->scene, item->entity);
+    JceMesh *blade = sr->grass_cache[slot].blade;
+    if (!field || !blade) return false;
+    const bgfx_program_handle_t program = {
+        jce_shader_deferred_resolve(sr->prog_grass_shadow.idx)
+    };
+    const bgfx_vertex_buffer_handle_t vertices = {(uint16_t)jce_mesh_get_vbh(blade)};
+    const bgfx_index_buffer_handle_t indices = {(uint16_t)jce_mesh_get_ibh(blade)};
+    if (!BGFX_HANDLE_IS_VALID(program) || !BGFX_HANDLE_IS_VALID(vertices) ||
+        !BGFX_HANDLE_IS_VALID(indices)) return false;
 
-        /* GrassField carries no legacy JCE_COMP_FLAG_* bit -- the 64-bit space
-         * filled before it existed -- so its enable state is id-keyed through
-         * the registry, resolved once. */
-        static int s_grass_cid = -2;
-        if (s_grass_cid == -2) s_grass_cid = jce_component_find("GrassField");
-        const bool enabled = s_grass_cid < 0 ||
-                             jce_scene_comp_enabled(scene, e, s_grass_cid);
-        if (!jce_grass_shadow_field_casts(g, enabled, g->visible,
-                                          sr->grass_cache[slot].inst_vb_count))
-            continue;
-
-        JceMesh *blade = sr->grass_cache[slot].blade
-                       ? sr->grass_cache[slot].blade : sr->grass_blade;
-        if (!blade) continue;
-
-        JceGrassShadowRun runs[64];
-        const uint32_t n = jce_grass_shadow_runs(
-            sr->grass_cache[slot].cell_start,
+    /* At most one run per cell; the old 64-run scratch could silently omit
+     * later alternating visible cells. Unbinned packing remains a full draw. */
+    JceGrassShadowRun runs[JCE_GRASS_CELL_CAP];
+    uint32_t run_count = 1u;
+    runs[0].start = 0u;
+    runs[0].count = item->count;
+    if (sr->grass_cache[slot].grid_gx) {
+        run_count = jce_grass_shadow_runs(sr->grass_cache[slot].cell_start,
             sr->grass_cache[slot].grid_gx, sr->grass_cache[slot].grid_gz,
             sr->grass_cache[slot].grid_min_x, sr->grass_cache[slot].grid_min_z,
-            sr->grass_cache[slot].cell_size,
-            sr->grass_cache[slot].field_ymin, sr->grass_cache[slot].field_ymax,
-            planes, cam, g->fade_end,
-            runs, (uint32_t)(sizeof runs / sizeof runs[0]));
-
-        const bgfx_vertex_buffer_handle_t vbh = { (uint16_t)jce_mesh_get_vbh(blade) };
-        const bgfx_index_buffer_handle_t  ibh = { (uint16_t)jce_mesh_get_ibh(blade) };
-        for (uint32_t i = 0; i < n; ++i) {
-            if (runs[i].count == 0u) continue;
-            bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
-            if (ibh.idx != UINT16_MAX)
-                bgfx_set_index_buffer(ibh, 0, jce_mesh_index_count(blade));
-            bgfx_set_instance_data_from_dynamic_vertex_buffer(
-                sr->grass_cache[slot].inst_vb, runs[i].start, runs[i].count);
-            bgfx_set_state(state, 0);
-            bgfx_submit(cv, prg, 0, BGFX_DISCARD_ALL);
-        }
+            sr->grass_cache[slot].cell_size, sr->grass_cache[slot].field_ymin,
+            sr->grass_cache[slot].field_ymax, context->planes,
+            context->camera ? jce_camera_get_position(context->camera) : jce_v3(0.0f, 0.0f, 0.0f),
+            field->fade_end, runs, JCE_GRASS_CELL_CAP);
     }
+    const uint64_t state = BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA;
+    for (uint32_t index = 0u; index < run_count; ++index) {
+        if (!runs[index].count) continue;
+        if (runs[index].start > item->count ||
+            runs[index].count > item->count - runs[index].start) return false;
+        if (expanded) {
+            if (!sr_grass_expanded_bind(sr, slot, runs[index].start, runs[index].count))
+                return false;
+        } else {
+            bgfx_set_vertex_buffer(0, vertices, 0u, UINT32_MAX);
+            bgfx_set_index_buffer(indices, 0u, jce_mesh_index_count(blade));
+            bgfx_set_instance_data_from_dynamic_vertex_buffer(sr->grass_cache[slot].inst_vb,
+                runs[index].start, runs[index].count);
+        }
+        sr_grass_bind_geometry_uniforms(sr, field, context->camera);
+        bgfx_set_state(state, 0u);
+        bgfx_submit(context->view, program, 0u, BGFX_DISCARD_ALL);
+    }
+    return true;
+}
+
+bool sr_prepare_grass_shadows(JceSceneRenderer *sr, JceScene *scene,
+    EntityList *list, const JceCamera *camera, uint64_t *key)
+{
+    if (!sr || !scene || !list || list->count < 0 || !key) return false;
+    SrGrassShadowContext context = {sr, scene, list, camera, NULL, 0u, -1};
+    const JceSrGrassShadowProvider provider = {
+        sr_grass_shadow_read, sr_grass_shadow_prepare, NULL, &context
+    };
+    JceTraceScope scope = jce_trace_scope_begin("sr.grass.prepare");
+    const bool complete = sr_grass_shadow_content_walk((uint32_t)list->count, &provider, key);
+    jce_trace_scope_end(scope, complete ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return complete;
+}
+
+bool sr_submit_grass_shadows(JceSceneRenderer *sr, JceScene *scene,
+    EntityList *list, uint16_t view, const jce_vec4 *planes, const JceCamera *camera)
+{
+    if (!sr || !scene || !list || list->count < 0 || !planes) return false;
+    SrGrassShadowContext context = {sr, scene, list, camera, planes, view, -1};
+    const JceSrGrassShadowProvider provider = {
+        sr_grass_shadow_read, sr_grass_shadow_prepare, sr_grass_shadow_submit, &context
+    };
+    uint64_t key;
+    JceTraceScope scope = jce_trace_scope_begin("sr.grass.shadow.submit");
+    const bool complete = sr_grass_shadow_content_walk((uint32_t)list->count, &provider, &key);
+    jce_trace_scope_end(scope, complete ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return complete;
 }

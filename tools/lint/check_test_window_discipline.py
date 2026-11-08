@@ -38,7 +38,7 @@ TESTS = ROOT / "tests"
 # descriptor this file never marked headless.
 WINDOWED = re.compile(r"\.headless\s*=\s*false")
 HEADLESS_ENV = re.compile(r'"JCE_HEADLESS"')
-BOOT = re.compile(r"\bjce_engine_create\s*\(")
+BOOT = re.compile(r"\bjce_engine_create(?:_owned)?\s*\(")
 HIDDEN = re.compile(r'"JCE_WINDOW_HIDDEN"')
 
 

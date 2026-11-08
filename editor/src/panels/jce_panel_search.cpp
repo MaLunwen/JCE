@@ -200,33 +200,14 @@ static void scan_menus_panels(const char *q)
     s_mp_hits.clear();
     if (!q || !*q) return;
 
-    const int n_loc = jce_editor_i18n_locale_count();
-
-    /* Panels: for each panel walk every installed locale; first locale
-     * that matches the query (or matches the raw key) → emit hit. */
-    for (int i = 0; i < kPanelKeyCount; i++) {
+    const JceLocale active = jce_editor_i18n_get_locale();
+    for (int i = 0; i < kPanelKeyCount; ++i) {
         const PanelKeyRow &row = kPanelKeys[i];
-
-        bool       matched = false;
-        JceLocale  match_loc = JCE_LOCALE_EN;
-
-        /* Raw key match (allows searching by identifier). */
-        if (jce_panel_contains_ci(row.key, q)) {
-            matched   = true;
-            match_loc = jce_editor_i18n_get_locale();
-        }
-
-        /* Cross-locale string match. */
-        for (int li = 0; !matched && li < n_loc; li++) {
-            JceLocale loc = (JceLocale)li;
-            const char *s = jce_editor_i18n_lookup_locale(loc, row.key);
-            if (s && jce_panel_contains_ci(s, q)) {
-                matched   = true;
-                match_loc = loc;
-                break;
-            }
-        }
-        if (!matched) continue;
+        JceLocale match_loc = JCE_LOCALE_INVALID;
+        if (!jce_panel_contains_ci(row.key, q) &&
+            !jce_editor_i18n_search_match(row.key, nullptr, q, &match_loc))
+            continue;
+        if (match_loc == JCE_LOCALE_INVALID) match_loc = active;
 
         MpHit h;
         h.is_panel = true;
@@ -241,25 +222,12 @@ static void scan_menus_panels(const char *q)
     for (int i = 0; i < kMenuKeyCount; i++) {
         const MenuKeyRow &row = kMenuKeys[i];
 
-        bool       matched   = false;
-        JceLocale  match_loc = JCE_LOCALE_EN;
-
-        if (jce_panel_contains_ci(row.child_key, q)) {
-            matched   = true;
-            match_loc = jce_editor_i18n_get_locale();
-        }
-        for (int li = 0; !matched && li < n_loc; li++) {
-            JceLocale loc = (JceLocale)li;
-            const char *cs = jce_editor_i18n_lookup_locale(loc, row.child_key);
-            const char *ps = jce_editor_i18n_lookup_locale(loc, row.parent_key);
-            if ((cs && jce_panel_contains_ci(cs, q)) ||
-                (ps && jce_panel_contains_ci(ps, q))) {
-                matched   = true;
-                match_loc = loc;
-                break;
-            }
-        }
-        if (!matched) continue;
+        JceLocale match_loc = JCE_LOCALE_INVALID;
+        if (!jce_panel_contains_ci(row.child_key, q) &&
+            !jce_editor_i18n_search_match(row.child_key, nullptr, q, &match_loc) &&
+            !jce_editor_i18n_search_match(row.parent_key, nullptr, q, &match_loc))
+            continue;
+        if (match_loc == JCE_LOCALE_INVALID) match_loc = active;
 
         MpHit h;
         h.is_panel = false;

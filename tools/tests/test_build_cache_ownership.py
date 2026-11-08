@@ -46,7 +46,52 @@ class DriverCacheOwnershipTests(unittest.TestCase):
                 patch.object(driver, "resolve_sdk", return_value=ROOT / "dist/sdk/chosen"):
             paths = driver._app_cache_paths({"args": args})
         self.assertIn(ROOT / "examples/fixture/build/linux-arm64-release", paths)
+        self.assertIn(ROOT / "examples/fixture/build/delivery-admission", paths)
         self.assertIn(ROOT / "dist/sdk/chosen", paths)
+
+    def test_actual_app_admission_runs_inside_the_shared_inspection_lease(self):
+        import tempfile
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            sdk = project / 'selected-sdk'
+            owned = project / 'build/delivery-admission'
+            args = SimpleNamespace(project=str(project), arch='x64', variant='dist',
+                delivery_profile='embedded', registry_proof=None)
+            target = {'host':driver.HOST,'arch':'x86_64'}
+            active, events = [], []
+
+            @contextmanager
+            def lease(paths):
+                self.assertIn(owned, paths)
+                active.extend(paths)
+                events.append('acquired')
+                try:
+                    yield
+                finally:
+                    active.clear()
+                    events.append('released')
+
+            def inspect(*unused, **keywords):
+                self.assertIn(owned, active)
+                events.append('actual-admission-dispatch')
+                raise ValueError('stop before compiler')
+
+            delivery = Mock()
+            delivery.admit_project.side_effect = inspect
+            with patch.dict(driver.sys.modules, {driver.__name__:driver}), \
+                 patch.object(driver,'DRY_RUN',False), \
+                 patch.object(driver,'resolve_target',return_value=target), \
+                 patch.object(driver,'resolve_sdk',return_value=sdk), \
+                 patch.object(driver,'_sdk_host_tools',return_value={}), \
+                 patch.object(driver,'_confirmed_app_sdk_tools',return_value={}), \
+                 patch.object(driver,'_cache_scope',side_effect=lease), \
+                 patch.object(driver,'_delivery_module',return_value=delivery), \
+                 patch.object(driver,'run') as run:
+                with self.assertRaises(SystemExit):
+                    driver.cmd_app(args)
+                run.assert_not_called()
+            self.assertEqual(events,['acquired','actual-admission-dispatch','released'])
 
     def test_whole_lifecycle_exception_release_and_dry_run(self):
         events = []

@@ -31,7 +31,7 @@ conan/hooks/.
 from conan import ConanFile
 from conan.tools.cmake import CMake, CMakeToolchain, cmake_layout
 from conan.tools.files import copy, get
-from conan.tools.scm import Version
+from conan.errors import ConanInvalidConfiguration
 
 import os
 
@@ -55,6 +55,28 @@ class QuickJSNgConan(ConanFile):
         if self.settings.os == "Windows":
             self.options.rm_safe("fPIC")
 
+    def _windows_xp_profile(self):
+        enabled = self.conf.get("user.jce:windows_xp", default=False)
+        if type(enabled) is not bool:
+            raise ConanInvalidConfiguration("user.jce:windows_xp must be an explicit boolean")
+        if not enabled:
+            if str(self.version) == "0.4.1":
+                raise ConanInvalidConfiguration("quickjs-ng/0.4.1 requires explicit XP configuration")
+            return False
+        if str(self.version) != "0.4.1":
+            raise ConanInvalidConfiguration("XP requires the pinned quickjs-ng/0.4.1 provider")
+        if (str(self.settings.os) != "Windows" or str(self.settings.compiler) != "clang"
+                or str(self.settings.compiler.get_safe("libcxx")) != "libc++"
+                or self.settings.compiler.get_safe("frontend") not in (None, "GNU", "gnu")
+                or str(self.settings.arch) not in ("x86", "x86_64")
+                or any(self.settings.compiler.get_safe(key) is not None for key in
+                       ("runtime", "runtime_type", "runtime_version"))):
+            raise ConanInvalidConfiguration("XP requires a Windows GNU Clang/libc++ x86 or x86_64 profile without MSVC runtime settings")
+        return True
+
+    def validate(self):
+        self._windows_xp_profile()
+
     def layout(self):
         cmake_layout(self)
 
@@ -62,7 +84,12 @@ class QuickJSNgConan(ConanFile):
         get(self, **self.conan_data["sources"][self.version], strip_root=True)
 
     def generate(self):
+        xp = self._windows_xp_profile()
         tc = CMakeToolchain(self)
+        if xp:
+            # Upstream 0.4.1's digit lookup intentionally omits a trailing NUL.
+            # Preserve Clang's warning while avoiding its upstream -Werror.
+            tc.extra_cflags.append("-Wno-error=unterminated-string-initialization")
         # The library only.  qjs/qjsc are a REPL and an offline compiler, and
         # the test suite needs a checkout this package does not ship.
         tc.cache_variables["BUILD_QJS_LIBC"] = False
@@ -90,7 +117,10 @@ class QuickJSNgConan(ConanFile):
                  os.path.join(self.package_folder, "lib"), keep_path=False)
 
     def package_info(self):
+        xp = self._windows_xp_profile()
         self.cpp_info.libs = ["qjs"]
+        if xp:
+            self.cpp_info.defines.append("JCE_QUICKJS_LEGACY_EXCEPTION_API=1")
         self.cpp_info.set_property("cmake_file_name", "quickjs-ng")
         self.cpp_info.set_property("cmake_target_name", "quickjs-ng::quickjs-ng")
         if self.settings.os in ("Linux", "FreeBSD"):

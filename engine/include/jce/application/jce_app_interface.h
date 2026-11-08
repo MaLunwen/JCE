@@ -64,7 +64,9 @@ typedef struct JceAppDesc {
     /* Called once before subsystems are torn down. */
     void (*exit)(void *user_data);
 
-    /* Called once per frame. dt = seconds since last frame. */
+    /* CPU update, including permitted minimized/non-drawable ticks. dt is
+       accepted bounded seconds; resumed suspension time is discarded. No
+       render frame is guaranteed here: draw/submit work belongs in draw(). */
     void (*update)(float dt, void *user_data);
 
     /* Called between renderer begin_frame / end_frame.
@@ -88,10 +90,14 @@ typedef struct JceAppDesc {
        Typically points to game state struct. */
     void *user_data;
 
-    /* Start the window maximized. Default: false. */
+    /* Default windowed maximization. Default: false. An INI [window]
+     * maximized key overrides this value; fullscreen takes precedence
+     * for the created window. */
     bool  maximized;
 
-    /* Default window dimensions. 0 = use config default. */
+    /* Default logical dimensions. Zero or values not representable as
+     * positive int retain the engine default. INI [window] width/height
+     * keys override each dimension independently. */
     uint32_t window_width;
     uint32_t window_height;
 

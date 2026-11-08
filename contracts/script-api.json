@@ -3,12 +3,12 @@
   "_generated_by": "python tools/scriptgen/gen_script_bindings.py --write",
   "_note": "vtable_index is emitted for traceability only. No binding may key off it: the append-only rule plus the min(caller, engine) copy over a zeroed destination is what makes a short host safe, and a slot-indexed binding would defeat it.",
   "declared_totals": {
-    "host_members": 112,
-    "expose": 108,
+    "host_members": 113,
+    "expose": 109,
     "hand_written": 8,
     "constants": 1,
-    "table_keys": 117,
-    "members_reached_by_generated": 107,
+    "table_keys": 118,
+    "members_reached_by_generated": 108,
     "members_reached_only_by_hand_written": 5
   },
   "constants": [
@@ -1043,7 +1043,7 @@
       "vtable": "pointer_position",
       "shape": "void_out_array",
       "since": 1,
-      "doc": "Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime.",
+      "doc": "Viewport-local Canvas pixel x, y, width, height (native drawable or Editor GameView FBO after render_scale); zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime.",
       "vtable_index": 105,
       "c_signature": "void (*)(void *user, float out_xywh[4])",
       "params": [],
@@ -2544,6 +2544,24 @@
       "c_signature": "bool (*)(void *user)",
       "params": [],
       "out_params": [],
+      "nullable_host_member": true
+    },
+    {
+      "name": "get_viewport_size",
+      "vtable": "viewport_size",
+      "shape": "void_out_array",
+      "since": 1,
+      "doc": "Host presentation width and height in Canvas pixels (native drawable or Editor GameView FBO after render_scale), independent of pointer availability, focus or hover. Persistent until the host replaces or clears it; unavailable or absent sized-host callbacks return zero, zero.",
+      "vtable_index": 112,
+      "c_signature": "void (*)(void *user, float out_wh[2])",
+      "params": [],
+      "out_params": [
+        {
+          "name": "out_wh",
+          "c_type": "float",
+          "arity": 2
+        }
+      ],
       "nullable_host_member": true
     }
   ]

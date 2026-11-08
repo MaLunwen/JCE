@@ -5,6 +5,9 @@
 #include <jce/os/core/jce_process.h>
 
 #include "jce_memory.h"
+#include "jce_process_stdio_internal.h"
+#include "jce_trace_scope_internal.h"
+#include <jce/os/core/jce_log.h>
 
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_process.h>
@@ -112,12 +115,13 @@ JceProcess *jce_process_spawn(const JceProcessConfig *cfg)
     if (!cfg || !cfg->executable_path || !cfg->executable_path[0])
         return NULL;
 
+    JceTraceScope spawn_scope=jce_trace_scope_begin("process.spawn");
     int    argc = 0;
     char **argv = split_args(cfg->executable_path, cfg->arguments, &argc);
-    if (!argv) return NULL;
+    if (!argv) { jce_trace_scope_end(spawn_scope,JCE_TRACE_TASK_FAILED); return NULL; }
 
     SDL_PropertiesID props = SDL_CreateProperties();
-    if (!props) { free_argv(argv, argc); return NULL; }
+    if (!props) { free_argv(argv, argc); jce_trace_scope_end(spawn_scope,JCE_TRACE_TASK_FAILED); return NULL; }
 
     SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER,
                            (void *)argv);
@@ -128,26 +132,41 @@ JceProcess *jce_process_spawn(const JceProcessConfig *cfg)
     }
     SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDIN_NUMBER,
                           SDL_PROCESS_STDIO_NULL);
-    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER,
-                          cfg->capture_stdout ? SDL_PROCESS_STDIO_APP
-                                              : SDL_PROCESS_STDIO_INHERITED);
-    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDERR_NUMBER,
-                          cfg->capture_stderr ? SDL_PROCESS_STDIO_APP
-                                              : SDL_PROCESS_STDIO_INHERITED);
+    const JceProcessStdioDecision output=jce_process_stdio_resolve(cfg->capture_stdout,false);
+    const JceProcessStdioDecision error=jce_process_stdio_resolve(cfg->capture_stderr,true);
+    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER,output.mode);
+    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDERR_NUMBER,error.mode);
+    if(spawn_scope.id) {
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE,"process.stdio.stdout.mode",
+            output.mode,spawn_scope.id,spawn_scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE,"process.stdio.stderr.mode",
+            error.mode,spawn_scope.id,spawn_scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE,"process.stdio.stdout.reason",
+            output.reason,spawn_scope.id,spawn_scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE,"process.stdio.stderr.reason",
+            error.reason,spawn_scope.id,spawn_scope.id);
+    }
 
     SDL_Process *raw = SDL_CreateProcessWithProperties(props);
-    /* Stash any SDL error before we destroy the property bag (some
-     * implementations clear errno on success). */
-    const char *err = NULL;
-    if (!raw) err = SDL_GetError();
+    /* Own the error bytes before cleanup can replace SDL's borrowed buffer. */
+    char err[512]={0};
+    if (!raw) SDL_strlcpy(err,SDL_GetError(),sizeof err);
+    if(output.mode==SDL_PROCESS_STDIO_NULL || error.mode==SDL_PROCESS_STDIO_NULL) {
+        /* One startup observation, no command arguments/environment payload. */
+        jce_log_write(JCE_LOG_LEVEL_INFO,"process",__FILE__,__LINE__,
+            "stdio policy: stdout=%s stderr=%s spawn=%s",
+            jce_process_stdio_reason_name(output.reason),jce_process_stdio_reason_name(error.reason),
+            raw ? "created" : "failed");
+    }
     SDL_DestroyProperties(props);
     free_argv(argv, argc);
     if (!raw) {
-        if (err && err[0]) {
+        if (err[0]) {
             /* Surface the message via SDL_SetError so callers can
              * retrieve it through jce_process_get_last_spawn_error(). */
             SDL_SetError("%s", err);
         }
+        jce_trace_scope_end(spawn_scope,JCE_TRACE_TASK_FAILED);
         return NULL;
     }
 
@@ -155,6 +174,7 @@ JceProcess *jce_process_spawn(const JceProcessConfig *cfg)
     if (!p) {
         SDL_KillProcess(raw, true);
         SDL_DestroyProcess(raw);
+        jce_trace_scope_end(spawn_scope,JCE_TRACE_TASK_FAILED);
         return NULL;
     }
     p->handle = raw;
@@ -168,6 +188,7 @@ JceProcess *jce_process_spawn(const JceProcessConfig *cfg)
         p->stderr_stream = (SDL_IOStream *)SDL_GetPointerProperty(
             pp, SDL_PROP_PROCESS_STDERR_POINTER, NULL);
     }
+    jce_trace_scope_end(spawn_scope,JCE_TRACE_TASK_SUCCEEDED);
     return p;
 }
 

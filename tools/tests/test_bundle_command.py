@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+import re
 from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -104,6 +105,43 @@ class BundleControls(unittest.TestCase):
 
 
 class HostBundleClosureTests(unittest.TestCase):
+    def assert_late_host_admission(self, root):
+        loops = list(re.finditer(r"foreach\(_host_asset_target\s+([^)]*)\)", root))
+        self.assertEqual(len(loops), 1)
+        wire = loops[0]
+        self.assertTrue({"jce_pak", "jce_cook", "jce_bundle_pack"}.issubset(wire.group(1).split()))
+        self.assertGreater(wire.start(), root.index("add_subdirectory(engine)"))
+        admission = root[wire.start():root.index("endforeach()", wire.start())]
+        self.assertIn('target_include_directories(${_host_asset_target} PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")', admission)
+        self.assertIn("add_dependencies(${_host_asset_target} jce_vendor_verify_stb_image)", admission)
+
+    def test_late_host_admission_rejects_removed_cook_member(self):
+        root = (ROOT/"CMakeLists.txt").read_text(encoding="utf-8")
+        wire = re.search(r"foreach\(_host_asset_target\s+([^)]*)\)", root)
+        self.assertIsNotNone(wire)
+        replacement = "foreach(_host_asset_target " + " ".join(
+            member for member in wire.group(1).split() if member != "jce_cook") + ")"
+        with self.assertRaises(AssertionError):
+            self.assert_late_host_admission(root[:wire.start()] + replacement + root[wire.end():])
+
+    def test_late_host_admission_rejects_removed_verify_dependency(self):
+        root = (ROOT/"CMakeLists.txt").read_text(encoding="utf-8")
+        marker = "add_dependencies(${_host_asset_target} jce_vendor_verify_stb_image)"
+        self.assertEqual(root.count(marker), 1)
+        with self.assertRaises(AssertionError):
+            self.assert_late_host_admission(root.replace(marker, ""))
+
+    def test_late_host_admission_rejects_before_pristine_source_owner(self):
+        root = (ROOT/"CMakeLists.txt").read_text(encoding="utf-8")
+        wire = re.search(r"foreach\(_host_asset_target\s+([^)]*)\)", root)
+        self.assertIsNotNone(wire)
+        end = root.index("endforeach()", wire.start()) + len("endforeach()")
+        block = root[wire.start():end]
+        removed = root[:wire.start()] + root[end:]
+        before = removed.index("add_subdirectory(engine)")
+        with self.assertRaises(AssertionError):
+            self.assert_late_host_admission(removed[:before] + block + "\n" + removed[before:])
+
     def test_offline_targets_share_real_implementations_without_render_layers(self):
         root = (ROOT/"CMakeLists.txt").read_text(encoding="utf-8")
         shared = (ROOT/"cmake/JCEHostAssetSources.cmake").read_text(encoding="utf-8")
@@ -125,11 +163,7 @@ class HostBundleClosureTests(unittest.TestCase):
         self.assertNotIn("bgfx::bgfx", shared)
         self.assertNotIn("jce_vendor_source(", shared)
         self.assertNotIn("JCE_STB_IMAGE_SOURCE_DIR", shared)
-        late = root.index("foreach(_host_asset_target jce_cook jce_bundle_pack)")
-        self.assertGreater(late, root.index("add_subdirectory(engine)"))
-        admission = root[late:root.index("endforeach()", late)]
-        self.assertIn('target_include_directories(${_host_asset_target} PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")', admission)
-        self.assertIn("add_dependencies(${_host_asset_target} jce_vendor_verify_stb_image)", admission)
+        self.assert_late_host_admission(root)
         self.assertIn("cgltf::cgltf", shared)
 
     def test_cook_only_excludes_gpu_definitions_and_retains_cpu_paths(self):

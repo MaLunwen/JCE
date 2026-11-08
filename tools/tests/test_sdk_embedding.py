@@ -24,7 +24,7 @@ class SDKEmbeddingTests(unittest.TestCase):
         self.assertEqual(result.returncode,0,result.stderr)
         self.assertNotIn('-E;rm;-f;',trace)
 
-    def recipe(self, msvc=False, web=False, prebuilt=False, wrapper=True, manifest=False, remove_settings=False, cook=False):
+    def recipe(self, msvc=False, web=False, prebuilt=False, wrapper=True, manifest=False, remove_settings=False, cook=False, prebuilt_kind="ASM", missing_pak=False, repeat_web=False, installed=False, custom_root_position=None):
         cmake = shutil.which("cmake")
         ninja = shutil.which("ninja")
         if not cmake or not ninja:
@@ -33,6 +33,15 @@ class SDKEmbeddingTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as tmp:
             root = Path(tmp)
+            helper = ROOT / "cmake/JCESDKHelpers.cmake"
+            if installed:
+                sdk_cmake = root / "installed SDK with spaces/lib/cmake/JCE"
+                sdk_cmake.mkdir(parents=True)
+                for name in ("JCESDKHelpers.cmake", "JCESDKTarget.cmake"):
+                    shutil.copyfile(ROOT / "cmake" / name, sdk_cmake / name)
+                shutil.copyfile(ROOT / "engine/src/os/platform/jce_webgl_interop.js",
+                                sdk_cmake / "jce_webgl_interop.js")
+                helper = sdk_cmake / "JCESDKHelpers.cmake"
             (root / "resources").mkdir()
             (root / "resources" / "sample.txt").write_text("asset")
             if manifest:
@@ -41,6 +50,9 @@ class SDKEmbeddingTests(unittest.TestCase):
                 (root / ".jce/project-settings.json").write_text('{"graphics":{"color_space":0}}')
             (root / "fixture.jbundle").write_bytes(b"bundle")
             (root / "assets.S").write_text("/* prebuilt */\n")
+            if not missing_pak:
+                (root / "assets.pak").write_bytes(b"JPAK")
+            custom_root = 'target_link_options(app PRIVATE "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$consumerStartup")'
             (root / "CMakeLists.txt").write_text(f'''cmake_minimum_required(VERSION 3.20)
 project(EmbeddingRecipe LANGUAGES NONE)
 add_custom_target(app)
@@ -53,9 +65,10 @@ set(JCE_BIN2OBJ_EXECUTABLE {"fixture-wrapper" if wrapper else ""})
 function(enable_language)
  file(APPEND "${{CMAKE_BINARY_DIR}}/trace.txt" "LANGUAGE|${{ARGV}}\\n")
 endfunction()
-include("{(ROOT / "cmake/JCESDKHelpers.cmake").as_posix()}")
+include("{helper.as_posix()}")
 function(jce_configure_application_target)
  file(APPEND "${{CMAKE_BINARY_DIR}}/trace.txt" "DIST_POLICY|${{ARGV}}\\n")
+ _jce_configure_web_target(${{ARGV}})
 endfunction()
 foreach(command add_custom_command target_sources set_source_files_properties
                 add_custom_target add_dependencies target_link_options)
@@ -63,9 +76,12 @@ foreach(command add_custom_command target_sources set_source_files_properties
   file(APPEND "${{CMAKE_BINARY_DIR}}/trace.txt" "${{CMAKE_CURRENT_FUNCTION}}|${{ARGV}}\\n")
  endfunction()
 endforeach()
-{"set(JCE_PROJECT_PREBUILT_ASSETS_ASM ${CMAKE_SOURCE_DIR}/assets.S)" if prebuilt else ""}
+{("set(JCE_PROJECT_PREBUILT_ASSETS_" + prebuilt_kind + " ${CMAKE_SOURCE_DIR}/assets." + ("pak" if prebuilt_kind == "PAK" else "S") + ")") if prebuilt else ""}
+{custom_root if custom_root_position == 'before' else ''}
 {"jce_add_pak" if cook else "jce_target_embed_pak"}(app RESOURCE_DIRS resources NO_ENGINE_RESOURCES)
 {"" if web or prebuilt else "jce_target_embed_bundle(app BUNDLE fixture.jbundle SYMBOL bundle_fixture)"}
+{"_jce_configure_web_target(app)" if repeat_web else ""}
+{custom_root if custom_root_position == 'after' else ''}
 ''', encoding="utf-8", newline="\n")
             result = subprocess.run(
                 [cmake, "-S", str(root), "-B", str(root / "out"), "-G", "Ninja"],
@@ -91,6 +107,51 @@ endforeach()
             result, trace = self.recipe(prebuilt=True, cook=cook)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("DIST_POLICY|app", trace)
+
+    def test_web_prebuilt_paths_keep_single_html_policy(self):
+        # Execute the actual shared Web policy before the prebuilt early return.
+        for cook in (False, True):
+            result, trace = self.recipe(web=True, prebuilt=True, cook=cook, prebuilt_kind="PAK")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(trace.count('-sSINGLE_FILE=1'), 1)
+            self.assertEqual(trace.count('-sSINGLE_FILE_BINARY_ENCODE=0'), 1)
+            self.assertEqual(trace.count('--embed-file'), 1)
+            self.assertIn('assets.pak@/game_assets.pak', trace)
+            self.assertIn('wasm_pak_stub.c', trace)
+            self.assertNotIn('LANGUAGE|ASM', trace)
+            self.assertNotIn('COMMAND;fixture-wrapper', trace)
+            self.assertNotIn('COMMAND;fixture-packer', trace)
+
+    def test_web_library_preserves_consumer_roots_in_source_and_installed_helpers(self):
+        consumer = "-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=$consumerStartup"
+        for installed in (False, True):
+            for prebuilt in (False, True):
+                for position in ("before", "after"):
+                    with self.subTest(installed=installed, prebuilt=prebuilt, position=position):
+                        result, trace = self.recipe(web=True, installed=installed,
+                            prebuilt=prebuilt, prebuilt_kind="PAK", repeat_web=True,
+                            custom_root_position=position)
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertEqual(trace.count(consumer), 1)
+                        self.assertEqual(trace.count('-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE='), 1)
+                        self.assertEqual(trace.count('--js-library'), 1)
+                        self.assertNotIn('$jceWebTerminalAckBootstrap', trace)
+                        self.assertNotIn('INCLUDE_FULL_LIBRARY', trace)
+                        self.assertNotIn('--pre-js', trace)
+                        self.assertIn('jce_webgl_interop.js', trace)
+                        if installed:
+                            self.assertIn('installed SDK with spaces/lib/cmake/JCE/jce_webgl_interop.js', trace)
+        result, trace = self.recipe(repeat_web=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('-sDEFAULT_LIBRARY_FUNCS_TO_INCLUDE=', trace)
+        self.assertNotIn('--js-library', trace)
+
+    def test_prebuilt_web_pak_rejects_missing_archive_and_native_host(self):
+        for web, missing in ((True, True), (False, False)):
+            result, _ = self.recipe(web=web, prebuilt=True,
+                                    prebuilt_kind="PAK", missing_pak=missing)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('Prebuilt Web PAK requires', result.stderr)
 
     def test_native_pak_and_bundle_share_wrapper_and_dependencies(self):
         result, trace = self.recipe()

@@ -1227,6 +1227,15 @@ static bool mk_stat_flush(void *user)
     return true;
 }
 
+static void mk_viewport_size(void *user, float out_wh[2])
+{
+    (void)user;
+    jce_java_diff_tracef("viewport_size");
+    jce_java_diff_tracef("\n");
+    out_wh[0] = 10.5f;
+    out_wh[1] = 11.5f;
+}
+
 static JceScriptHost g_full;
 static JceScriptHost g_partial;
 static int g_ready;
@@ -1352,6 +1361,7 @@ static void build(void)
     g_full.stat_set = mk_stat_set;
     g_full.stat_get = mk_stat_get;
     g_full.stat_flush = mk_stat_flush;
+    g_full.viewport_size = mk_viewport_size;
 }
 
 const JceScriptHost *jce_java_diff_host_full(void)
@@ -1494,6 +1504,7 @@ static const char *const g_case_labels[] = {
     "stat_set",
     "stat_get",
     "stat_flush",
+    "get_viewport_size",
     "get_position [no host]",
     "set_position [no host]",
     "get_rotation [no host]",
@@ -1602,6 +1613,7 @@ static const char *const g_case_labels[] = {
     "stat_set [no host]",
     "stat_get [no host]",
     "stat_flush [no host]",
+    "get_viewport_size [no host]",
 };
 
 int jce_java_diff_case_count(void)

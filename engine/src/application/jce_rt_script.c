@@ -10,6 +10,9 @@
  */
 
 #include "jce_rt_script_services.h"
+#include "os/core/jce_filesystem_read_internal.h"
+#include "os/core/jce_trace_scope_internal.h"
+#include <jce/os/core/jce_path.h>
 
 #include <jce/middleware/scene/jce_vcam_system.h>
 
@@ -22,35 +25,15 @@
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset_format.h>        /* the offline script catalog */
 
-/* JceScriptHost::log, and the tag says "[script]" rather than "[lua]".
- *
- * MEASURED (elemental_serenity, four scripted entities, 2026-08-16): a Python
- * script's jce.log line and a Java script's JceEntityScript.log line both
- * arrived tagged "[lua]" —
- *
- *     runtime: [lua] es_fireflies (python) online: 12 fireflies
- *     runtime: [lua] es_campfire (java) online: CampfireLight=ok
- *
- * — because ONE JceScriptHost is shared by every language VM the runtime
- * stands up (rt_script_vm_get passes &rt->script_host to every
- * jce_script_vm_create), and a host callback receives only `user`, which is
- * the JceRuntime.  The callback cannot know which VM called it, and a wrong
- * language name is worse than none: it sends the reader to the wrong file.
- *
- * NOT fixed by naming the language, deliberately.  Doing that means one host
- * copy per language with a per-language `user`, and `user` is cast to
- * JceRuntime * by all ~60 other callbacks in this file — a change with sixty
- * sites and one benefit.  The line that DOES name the language already
- * exists and is printed once per script at load:
- *
- *     script: loaded 'scripts/es_fireflies.py' (python) for entity 641
- *
- * *Enforced by:* nothing, and it needs nothing — the string is a literal with
- * no branch behind it. */
+/* One shared host serves every language VM; this callback cannot infer its
+ * caller's language. Explicit user-script logs use the runtime logger, including
+ * DIST, while the logger's level/filter/sink policy remains authoritative.
+ * Internal LOG_INFO chatter stays compile-time gated. */
 static void rt_script_log(void *user, const char *msg)
 {
 	(void)user;
-	LOG_INFO(LOG_TAG, "[script] %s", msg ? msg : "");
+	jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+		"[script] %s", msg ? msg : "");
 }
 
 static bool rt_script_get_position(void *user, JceScriptEntity e, float out_xyz[3])
@@ -183,6 +166,13 @@ void *rt_read_asset_with_fallback(JceRuntime *rt, const char *path,
 {
 	if (out_size) *out_size = 0;
 	if (!path || !path[0]) return NULL;
+    /* Keep relative content in the mounted VFS before resolving loose paths.
+     * Absolute tooling paths remain host-owned; isolated misses never escape. */
+    if (jce_fs_get_active() && !jce_path_is_absolute(path)) {
+        void *mounted = jce_fs_host_read_all(path, out_size);
+        if (mounted || jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED)
+            return mounted;
+    }
 	/* Editor / dev: live file on the host filesystem (resolved so loose
 	 * project-relative paths work regardless of the process CWD). */
 	char        rbuf[1024];
@@ -220,6 +210,14 @@ static void *rt_read_asset_with_fallback_capped(JceRuntime *rt,
 
 	if (out_size) *out_size = 0;
 	if (!path || !path[0] || max_bytes == 0) return NULL;
+    JceFileSystem *active = jce_fs_get_active();
+    if (active && !jce_path_is_absolute(path)) {
+        void *mounted = jce_fs_read_all_bounded_internal(active, path, max_bytes, &total_size);
+        if (mounted || total_size || jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED) {
+            if (out_size) *out_size = total_size;
+            return mounted;
+        }
+    }
 	host_path = rt_resolve_host_path(rt, path, rbuf, sizeof rbuf);
 	buf = jce_fs_host_read_capped(host_path, max_bytes,
 	                              &read_size, &total_size);
@@ -1382,6 +1380,26 @@ static void rt_script_broadcast(void *user, const char *msg,
 	}
 }
 
+void rt_script_viewport_changed(JceRuntime *rt)
+{
+    /* Publish extent before the optional handler; this is presentation work,
+     * never a simulation tick. Absent handlers use the existing message seam. */
+    JceTraceScope scope = jce_trace_scope_begin("runtime.viewport.publish");
+    if (scope.id && rt) {
+        uint32_t width_bits = 0, height_bits = 0;
+        memcpy(&width_bits, &rt->viewport_wh[0], sizeof width_bits);
+        memcpy(&height_bits, &rt->viewport_wh[1], sizeof height_bits);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "runtime.viewport.owner",
+            (int64_t)(uintptr_t)rt, scope.id, scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "runtime.viewport.width_bits",
+            width_bits, scope.id, scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "runtime.viewport.height_bits",
+            height_bits, scope.id, scope.id);
+    }
+    rt_script_broadcast(rt, "on_viewport_resize", 0.0, NULL);
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
+}
+
 /* jce.has_component / is_component_enabled / set_component_enabled: lightweight
  * runtime reflection over the dense component registry, resolving the component
  * BY NAME.  Unknown name → safe default (query false / set no-op). */
@@ -2468,7 +2486,7 @@ void rt_script_install_vm(JceRuntime *rt)
 	host.pointer_delta = rt_script_pointer_delta;
 	host.pointer_wheel = rt_script_pointer_wheel;
 	host.pointer_button = rt_script_pointer_button;
-	host.pointer_position = rt_script_pointer_position;
+	host.pointer_position = rt_script_pointer_position; host.viewport_size = rt_script_viewport_size;
 	host.cursor_set = rt_script_cursor_set;
 	host.touch_count = rt_script_touch_count;
 	host.touch_get = rt_script_touch_get;

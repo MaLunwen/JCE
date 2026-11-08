@@ -8,11 +8,9 @@
  *
  * Single-threaded by contract; see jce_player_loop.h.
  *
- * The near-identical slot list in application/jce_lifecycle.c is a
- * deliberate second instance, not un-deduplicated code: its dispatch
- * contract differs from run_phase's id-identity snapshot below, and
- * merging the two would undo the F81 fix.  Full verdict at the top of
- * that file.
+ * Phase callbacks and lifecycle event listeners remain separate registries.
+ * Each dispatch freezes an identity ceiling and walks immutable priority/id
+ * ordering, preserving live enable/removal with no per-frame snapshot heap.
  */
 
 #include <jce/runtime/jce_player_loop.h>
@@ -20,6 +18,7 @@
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_timer.h>
+#include "os/core/jce_trace_scope_internal.h"
 
 #include <string.h>
 
@@ -43,7 +42,9 @@ typedef struct PhaseList {
 } PhaseList;
 
 static PhaseList        s_phases[JCE_PHASE_COUNT];
-static uint32_t         s_next_id;     /* monotonically increasing, never reuses 0 */
+static uint32_t         s_next_id;     /* process-lifetime; stale handles never alias */
+static uint64_t         s_dispatch_epoch;
+static bool             s_epoch_exhausted;
 static jce_allocator_t  s_alloc;
 static bool             s_alloc_ready;
 
@@ -97,6 +98,11 @@ jce_player_loop_register(JcePlayerLoopPhase phase,
         return h;
     }
 
+    if (s_epoch_exhausted || s_next_id == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "phase callback identity exhausted");
+        return h;
+    }
+
     ensure_alloc();
     PhaseList *p = &s_phases[phase];
 
@@ -109,9 +115,8 @@ jce_player_loop_register(JcePlayerLoopPhase phase,
                 (size_t)(p->count - pos) * sizeof(PhaseSlot));
     }
 
-    /* Skip id 0 (reserved as "invalid handle"). */
-    if (++s_next_id == 0u)
-        s_next_id = 1u;
+    /* Exhaustion was checked before mutating the registry. */
+    ++s_next_id;
 
     p->items[pos].priority = priority;
     p->items[pos].id       = s_next_id;
@@ -157,65 +162,65 @@ static PhaseSlot *find_slot_in_phase(PhaseList *p, uint32_t id)
     return NULL;
 }
 
+static JceTraceTaskState player_loop_run_phase_impl(JcePlayerLoopPhase phase, float dt)
+{
+    PhaseList *p = &s_phases[phase];
+    if (p->count == 0u) return JCE_TRACE_TASK_SUCCEEDED;
+    const uint64_t epoch = s_dispatch_epoch;
+    const uint32_t ceiling = s_next_id;
+    const uint64_t freq = jce_time_perf_freq();
+    int32_t last_priority = 0;
+    uint32_t last_id = 0;
+    bool visited = false;
+
+    /* Allocation-free identity snapshot. New registrations exceed ceiling;
+     * removal/enable changes are live. Never retain a table pointer across a
+     * callback, which may reallocate it or shut down the entire registry. */
+    while (s_dispatch_epoch == epoch && !s_epoch_exhausted) {
+        PhaseSlot next;
+        bool found = false;
+        for (uint32_t i = 0; i < p->count; ++i) {
+            const PhaseSlot candidate = p->items[i];
+            if (candidate.id > ceiling) continue;
+            if (visited && (candidate.priority < last_priority ||
+                (candidate.priority == last_priority && candidate.id <= last_id)))
+                continue;
+            next = candidate;
+            found = true;
+            break;
+        }
+        if (!found) break;
+        last_priority = next.priority;
+        last_id = next.id;
+        visited = true;
+        if (!next.fn || !next.enabled) continue;
+
+        JceTraceScope trace = {0, 0, 0, NULL};
+        if (jce_trace_enabled())
+            trace = jce_trace_scope_begin(next.debug_name[0]
+                                          ? next.debug_name : "loop.callback");
+        const uint64_t t0 = jce_time_perf_counter();
+        next.fn(dt, next.user);
+        const uint64_t t1 = jce_time_perf_counter();
+        jce_trace_scope_end(trace, JCE_TRACE_TASK_SUCCEEDED);
+        if (s_dispatch_epoch == epoch && !s_epoch_exhausted) {
+            PhaseSlot *live = find_slot_in_phase(p, next.id);
+            if (live)
+                live->last_ms = (freq > 0u)
+                    ? ((double)(t1 - t0) * 1000.0 / (double)freq) : 0.0;
+        }
+    }
+    return (s_dispatch_epoch == epoch && !s_epoch_exhausted)
+        ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_CANCELLED;
+}
+
 void JCE_CALL
 jce_player_loop_run_phase(JcePlayerLoopPhase phase, float dt)
 {
     if ((unsigned)phase >= (unsigned)JCE_PHASE_COUNT) return;
-
-    PhaseList *p = &s_phases[phase];
-    const uint32_t n = p->count;
-    if (n == 0u) return;
-
-    /* Dispatch by IDENTITY, not by position.  A callback may register or
-     * unregister a same-phase slot mid-loop, which memmoves the dense array;
-     * iterating by index would then skip a shifted-in sibling or re-run a
-     * shifted-up slot (audit Round-3 P2).  We snapshot the ids present at
-     * entry and run each by id-lookup, which yields exactly-once dispatch:
-     *   - ids registered during this call are absent from the snapshot, so
-     *     they do not fire this frame (the documented contract); and
-     *   - ids unregistered during this call are no longer found, so they do
-     *     not fire.
-     * last_ms is written back via the same id, so a mid-loop insert can never
-     * misattribute a duration to the wrong slot. */
-    uint32_t  ids_stack[64];
-    uint32_t *ids = ids_stack;
-    bool      ids_heap = false;
-    if (n > (uint32_t)(sizeof(ids_stack) / sizeof(ids_stack[0]))) {
-        uint32_t *h = (uint32_t *)JCE_AREALLOC(s_alloc, NULL,
-                                               (size_t)n * sizeof(uint32_t));
-        if (h) { ids = h; ids_heap = true; }
-    }
-    /* When the heap snapshot fails (OOM) we cap to the stack buffer; better to
-     * dispatch the first 64 than to crash. */
-    const uint32_t cap = ids_heap
-        ? n
-        : (n < (uint32_t)(sizeof(ids_stack) / sizeof(ids_stack[0]))
-               ? n
-               : (uint32_t)(sizeof(ids_stack) / sizeof(ids_stack[0])));
-    for (uint32_t i = 0u; i < cap; ++i)
-        ids[i] = p->items[i].id;
-
-    const uint64_t freq = jce_time_perf_freq();
-    for (uint32_t k = 0u; k < cap; ++k) {
-        PhaseSlot *s = find_slot_in_phase(p, ids[k]);
-        if (!s || !s->fn || !s->enabled) continue;   /* unregistered/disabled */
-        const JcePlayerLoopFn fn   = s->fn;
-        void *const           user = s->user;
-        /* Single timestamp diff per call: cheap enough to keep
-         * unconditionally compiled in (baseline target: ~30 ns / call). */
-        const uint64_t t0 = jce_time_perf_counter();
-        fn(dt, user);
-        const uint64_t t1 = jce_time_perf_counter();
-        /* Re-find by id: fn() may have realloc'd/memmoved the array. */
-        s = find_slot_in_phase(p, ids[k]);
-        if (s) {
-            s->last_ms = (freq > 0u)
-                ? ((double)(t1 - t0) * 1000.0 / (double)freq)
-                : 0.0;
-        }
-    }
-
-    if (ids_heap) JCE_AFREE(s_alloc, ids);
+    JceTraceScope trace = jce_trace_scope_begin(jce_player_loop_phase_to_string(phase));
+    const JceTraceTaskState state = player_loop_run_phase_impl(phase, dt);
+    jce_trace_scope_end(trace, state);
 }
 
 uint32_t JCE_CALL
@@ -307,6 +312,8 @@ jce_player_loop_phase_to_string(JcePlayerLoopPhase phase)
 void JCE_CALL
 jce_player_loop_shutdown(void)
 {
+    if (s_dispatch_epoch != UINT64_MAX) ++s_dispatch_epoch;
+    else s_epoch_exhausted = true;
     if (!s_alloc_ready) return;
     for (int phase = 0; phase < (int)JCE_PHASE_COUNT; ++phase) {
         PhaseList *p = &s_phases[phase];
@@ -315,5 +322,5 @@ jce_player_loop_shutdown(void)
         p->count    = 0u;
         p->capacity = 0u;
     }
-    s_next_id = 0u;
+    /* Preserve monotonic identities across shutdown/reinitialization. */
 }

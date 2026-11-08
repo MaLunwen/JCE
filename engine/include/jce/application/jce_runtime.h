@@ -30,6 +30,7 @@
 #include <jce/middleware/animation/jce_anim_ik.h>  /* JceAnimEvent (anim-event dispatch) */
 #include <jce/os/platform/jce_input_actions.h>  /* JceInputActions (data-driven action bridge) */
 #include <stdbool.h>
+#include <stddef.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -237,6 +238,7 @@ typedef struct {
 	 * so every host supplies the current state immediately before step().
 	 * Button bits use JCE's 1-based numbering:
 	 * bit 0 = button 1 (left), bit 1 = button 2 (middle), etc. */
+	/* Same Canvas pixels as pointer_position, independent of OS point density. */
 	float pointer_dx;
 	float pointer_dy;
 	float pointer_wheel;
@@ -429,6 +431,14 @@ JCE_API void        JCE_CALL jce_runtime_shake_camera(JceRuntime *rt, float amou
  * gameplay scripts as jce.audio_play(e) / jce.audio_stop(e) /
  * jce.audio_is_playing(e). */
 JCE_API bool        JCE_CALL jce_runtime_audio_play(JceRuntime *rt, uint64_t entity);
+/* Stop tracked voices and pending play intent on the runtime owner thread.
+ * Returns true if either existed; false for no match, NULL runtime or no audio
+ * service. Does not wait for decoding: unsubmitted slots are freed immediately,
+ * while submitted work retains its decode storage until terminal polling or
+ * scene teardown. Stop also disarms already completed results before polling;
+ * a later play starts a fresh request. Completion requires the original full
+ * entity binding and unchanged clip path, so an old decode cannot restart a
+ * stopped source or play bytes from a replaced clip. */
 JCE_API bool        JCE_CALL jce_runtime_audio_stop(JceRuntime *rt, uint64_t entity);
 JCE_API bool        JCE_CALL jce_runtime_audio_is_playing(const JceRuntime *rt,
                                                           uint64_t entity);
@@ -501,7 +511,7 @@ JCE_API void        JCE_CALL jce_runtime_set_input(JceRuntime *rt,
 JCE_API void        JCE_CALL jce_runtime_set_pointer_input(
     JceRuntime *rt, float dx, float dy, float wheel, uint32_t buttons);
 
-/** Submit viewport-local pointer coordinates and logical viewport size for
+/** Submit viewport-local Canvas pixel coordinates and Canvas viewport size for
  * this frame. Main-thread only; copied, cleared after step. Invalid/nonfinite
  * values or nonpositive dimensions clear the sample. NULL runtime is a no-op. */
 JCE_API void JCE_CALL jce_runtime_set_pointer_position(
@@ -880,10 +890,37 @@ JCE_API JceGameplayAbilitySystem *JCE_CALL jce_runtime_entity_gas(JceRuntime *rt
 JCE_API JceRagdoll *JCE_CALL jce_runtime_entity_ragdoll(JceRuntime *rt,
                                                         uint64_t entity);
 
+struct JcePlatformServices;
+
+/* Initial host presentation, independent of pointer input. Dimensions use the
+ * same Canvas pixels as rendering and pointer_position: native drawable or
+ * Editor GameView FBO after render_scale. Both zero
+ * means unavailable; otherwise both must be finite and in (0, 65535]. */
+typedef struct JceRuntimeCreateOptions {
+    float viewport_width;
+    float viewport_height;
+} JceRuntimeCreateOptions;
+
+/* One constructor owner. Options are copied by explicit size before on_start.
+ * NULL/zero preserves legacy behavior. A nonzero short prefix, NULL/nonzero,
+ * or invalid dimensions fails creation and logs the reason; larger options
+ * ignore their unknown tail. Services remain borrowed as below. */
+JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_options(
+    const JceRuntimeDesc *desc, struct JcePlatformServices *services,
+    const JceRuntimeCreateOptions *options, size_t options_size);
+
+/* Main-thread copied presentation state, persistent across step/input expiry,
+ * focus and hover. Both zero clears availability. Invalid values clear it and
+ * return false; the first invalid request warns once per runtime. NULL returns
+ * false. Changed extent dispatches optional on_viewport_resize through the
+ * existing script message seam after publishing. It never changes pointer
+ * coordinates, advances simulation time or admits an input event. */
+JCE_API bool JCE_CALL jce_runtime_set_viewport_size(
+    JceRuntime *rt, float width, float height);
+
 /* Optional borrowed platform service. Main-thread setter; NULL disables stats.
  * Host keeps it alive until detached or runtime destruction. No automatic store,
  * flush or shutdown is performed by the runtime. */
-struct JcePlatformServices;
 /* Same constructor as create, with a borrowed service installed BEFORE script
  * on_start. Desc layout and legacy constructor behavior are unchanged. The
  * service must outlive this runtime; failed creation leaves ownership to host. */

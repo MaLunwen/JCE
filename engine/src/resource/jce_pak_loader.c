@@ -41,6 +41,8 @@
 #include <jce/resource/jce_archive.h>
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_filesystem_pak_internal.h"
+#include "jce_pak_mount_internal.h"
 
 #include <SDL3/SDL.h>
 #include <string.h>
@@ -74,7 +76,50 @@ struct JcePakArchive {
      * the tail (FIFO), so priority is: this archive, then the first layer
      * pushed, and so on.  NOT an override stack — see the file header. */
     struct JcePakArchive *fallback_next;
+    bool inspection_only; /* irreversible; inspect same handle cannot mount */
 };
+
+void jce_pak_mark_inspection_only_internal(JcePakArchive *pak)
+{
+    if (pak) pak->inspection_only = true;
+}
+
+/* Floyd's pointer walk terminates on legacy/corrupt cycles without a registry
+ * or an arbitrary valid-chain length cap. Mutation remains owner-thread serial. */
+static bool pak_chain_acyclic(const JcePakArchive *pak)
+{
+    const JcePakArchive *slow = pak, *fast = pak;
+    while (fast && fast->fallback_next) {
+        slow = slow->fallback_next;
+        fast = fast->fallback_next->fallback_next;
+        if (slow == fast) return false;
+    }
+    return true;
+}
+
+static bool JCE_CALL pak_mount_allowed(const JcePakArchive *pak)
+{
+    if (!pak || !pak_chain_acyclic(pak)) return false;
+    for (const JcePakArchive *p = pak; p; p = p->fallback_next)
+        if (p->inspection_only) return false;
+    return true;
+}
+
+static const void *JCE_CALL pak_provider_find(const JcePakArchive *pak,
+                                              const char *path)
+{ return jce_pak_find(pak, path); }
+static uint64_t JCE_CALL pak_provider_size(const void *asset)
+{ return ((const JcePakAsset *)asset)->original_size; }
+static size_t JCE_CALL pak_provider_decompress(const void *asset, void *buf, size_t n)
+{ return jce_pak_decompress((const JcePakAsset *)asset, buf, n); }
+static const JceFsPakProvider PAK_PROVIDER = {
+    pak_provider_find, pak_provider_size, pak_provider_decompress
+};
+
+void jce_pak_register_filesystem_provider_internal(void)
+{
+    jce_fs_register_pak_provider_internal(&PAK_PROVIDER, pak_mount_allowed);
+}
 
 /* ================================================================== */
 /* Construction                                                        */
@@ -236,13 +281,17 @@ bool jce_image_decode_pak(const JcePakArchive *pak,
  * The historical "overlay" spelling means *fallback*, not *override*. */
 void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer) {
     if (!base || !layer || base == layer) return;
-    for (JcePakArchive *p = layer; p; p = p->fallback_next)
-        if (p == base) return; /* would form a cycle */
+    /* A runtime base may already be mounted; refuse inspection injection
+     * before changing either chain. Raw/native fallback behavior is unchanged. */
+    if (!pak_mount_allowed(base) || !pak_mount_allowed(layer)) return;
+    /* Acyclic singly linked chains intersect exactly when their tails match.
+     * Checking both tails also refuses shared-tail attachment, which the old
+     * head-only cycle check missed. These walks are linear and allocation-free. */
     JcePakArchive *tail = base;
-    while (tail->fallback_next) {
-        if (tail->fallback_next == layer) return; /* already attached */
-        tail = tail->fallback_next;
-    }
+    while (tail->fallback_next) tail = tail->fallback_next;
+    JcePakArchive *layer_tail = layer;
+    while (layer_tail->fallback_next) layer_tail = layer_tail->fallback_next;
+    if (tail == layer_tail) return;
     tail->fallback_next = layer;
 }
 

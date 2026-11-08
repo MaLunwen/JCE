@@ -83,10 +83,19 @@ void repoint_jce_loc(const char *dir)
 bool parse_locale_file(const char *path, const char *code)
 {
     JceJson *root = jce_json_parse_file(path);
-    if (!root) {
+    if (!root || !jce_json_is_object(root)) {
         jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
-                      "could not parse locale file: %s", path);
+                      "could not parse flat locale object: %s", path);
+        if (root) jce_json_free(root);
         return false;
+    }
+    for (JceJson *it = jce_json_first_child(root); it; it = jce_json_next_sibling(it)) {
+        if (!jce_json_is_string(it)) {
+            jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                          "locale values must be strings: %s", path);
+            jce_json_free(root);
+            return false;
+        }
     }
     auto &table = g_l10n.tables[code];
     for (JceJson *it = jce_json_first_child(root); it;
@@ -134,15 +143,19 @@ bool jce_editor_gl10n_load(const char *project_root, const char *source_assets)
         if (code.empty()) continue;
         char path[1024];
         jce_path_join(path, sizeof(path), i18n_dir, f.c_str());
-        g_l10n.locales.push_back(code);
-        if (parse_locale_file(path, code.c_str())) ++parsed;
+        if (parse_locale_file(path, code.c_str())) {
+            g_l10n.locales.push_back(code);
+            ++parsed;
+        }
     }
     sort_locales();
     rebuild_key_union();
 
     /* Editor-side jce_loc init point: game view / Play preview resolve
      * locale_key against this host dir from now on. */
-    repoint_jce_loc(i18n_dir);
+    /* Empty optional catalogs are unconfigured, not a missing requested en
+       asset. Bad present catalogs retain their parse diagnostics above. */
+    repoint_jce_loc(parsed > 0 ? i18n_dir : nullptr);
 
     jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
                   "game string tables: %d locale(s), %d key(s) from %s",
@@ -307,12 +320,10 @@ bool jce_editor_gl10n_save_all(void)
     /* Hot-refresh the live preview / Play session: re-fire the active
      * locale so jce_loc re-reads the files we just wrote.  (Copy the tag —
      * jce_loc_set_locale snprintf's into the same buffer get returns.) */
-    char cur[64] = {0};
-    const char *tag = jce_loc_get_locale();
-    if (tag && tag[0]) {
-        snprintf(cur, sizeof(cur), "%s", tag);
-        jce_loc_set_locale(cur);
-    }
+    /* Saving the first catalog after an empty-project detach must attach
+       the actual new host directory too, not only reload a detached locale. */
+    if (all_ok && !g_l10n.locales.empty())
+        repoint_jce_loc(g_l10n.dir.c_str());
     return all_ok;
 }
 

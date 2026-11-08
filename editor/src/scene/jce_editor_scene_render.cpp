@@ -11,12 +11,16 @@
 #include "io/jce_editor_mesh_predecode.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_frustum.h>
 
 #include "io/jce_editor_file_util.h"
 #include "jce_scene_content_context.h"
 #include "jce_scene_render_internal.h"
+#include "jce_editor_dynres_policy.h"
+#include "jce_editor_probe_maintenance.h"
 #include "jce_editor_viewport_common.h"   /* plumbing shared with the Game View */
 #include "core/jce_assetdb.h"
+#include "core/jce_editor_viewport_trace.h"
 #include "core/jce_editor_project.h"
 #include "ui/jce_editor_panels.h"
 
@@ -50,6 +54,7 @@ extern "C" {
 /* ── State instance (shared via extern in internal header) ────────── */
 
 SceneRenderState s_sr;
+static JceEditorProbeMaintenanceState s_probe_maintenance;
 
 /* ── Helpers (shared via internal header) ─────────────────────────── */
 
@@ -263,9 +268,15 @@ struct EdQueryCacheEntry {
 };
 static EdQueryCacheEntry s_query_cache[ED_QUERY_CACHE_MAX];
 
-static JceFileSystem *s_content_context_fs = nullptr;
-static JceFsActivePolicy s_content_context_policy = JCE_FS_ACTIVE_OVERLAY;
-static char s_content_context_project_root[1024] = {0};
+/* Content selection outlives viewport GPU shutdown/reinitialization. The
+ * applied-context witness and selected loose base share this module owner. */
+struct SceneContentContext {
+    JceFileSystem *fs = nullptr;
+    JceFsActivePolicy policy = JCE_FS_ACTIVE_OVERLAY;
+    char project_root[1024] = {0};
+    char loose_root[1024] = {0};
+};
+static SceneContentContext s_content_context;
 
 /* Apply the complete content-addressing context before scene components begin
  * resolving assets.  Source scenes use project-root paths; Bundle Preview is
@@ -283,12 +294,12 @@ static void sr_apply_content_context(void)
         isolated,
         proj ? proj->project_root : nullptr,
         proj ? proj->source_assets : nullptr,
-        proj ? proj->cooked_assets : nullptr);
+        proj ? proj->cooked_assets : nullptr, s_content_context.loose_root);
 
-    s_content_context_fs = active_fs;
-    s_content_context_policy = active_policy;
-    snprintf(s_content_context_project_root,
-             sizeof(s_content_context_project_root), "%s",
+    s_content_context.fs = active_fs;
+    s_content_context.policy = active_policy;
+    snprintf(s_content_context.project_root,
+             sizeof(s_content_context.project_root), "%s",
              (proj && proj->project_root) ? proj->project_root : "");
 
     jce_scene_particles_set_asset_root(
@@ -320,7 +331,9 @@ static void sr_apply_content_context(void)
     const bool loaded = jce_editor_effective_render_settings(
         isolated,
         (proj && proj->project_root) ? proj->project_root : nullptr,
-        &rs, &settings_path);
+        &rs, &settings_path,
+        proj ? proj->source_assets : nullptr,
+        proj ? proj->cooked_assets : nullptr, s_content_context.loose_root);
 
     /* One line for every project-level render setting the editor applies, so
      * "does Play match the build?" is answerable from the log.  It used to
@@ -343,13 +356,15 @@ static void sr_apply_content_context(void)
      * keeps 1.0, which is exactly the case a reader needs to be able to see.
      * (The first cut logged before the call and would have printed the
      * PREVIOUS value on every project change.) */
-    LOG_INFO("scene_render",
-             "project render settings %s from '%s' (root %s): grass=%d "
+    jce_log_write(JCE_LOG_LEVEL_INFO, "scene_render", __FILE__, __LINE__,
+             "project render settings source=%s from '%s' (root %s): grass=%d "
              "lod_bias=%.2f softparticles=%.2f",
-             loaded ? "applied" : "NOT FOUND, using defaults",
-             settings_path.c_str(),
+             !settings_path.empty() ? "authored-file" :
+                 (loaded ? "quality-only" : "defaults"),
+             settings_path.empty() ? "(none)" : settings_path.c_str(),
              isolated ? "(bundle-vfs)" :
-                 ((proj && proj->project_root) ? proj->project_root : "(none)"),
+                 ((proj && proj->project_root) ? proj->project_root :
+                     (s_content_context.loose_root[0] ? s_content_context.loose_root : "(none)")),
              (int)rs.grass_enabled,
              (double)jce_lod_get_global_bias(),
              (double)jce_particles_get_soft_fade_distance());
@@ -358,6 +373,94 @@ static void sr_apply_content_context(void)
 void jce_editor_scene_render_refresh_content_context(void)
 {
     sr_apply_content_context();
+}
+
+/* These are the same owned objects released by normal shutdown. Partial
+ * init must release them explicitly because initialized has not been set. */
+static void sr_destroy_ui_canvas(void)
+{
+    if (s_sr.ui_canvas) {
+        jce_ui_canvas_destroy(s_sr.ui_canvas);
+        s_sr.ui_canvas = NULL;
+    }
+}
+
+static void sr_destroy_view_resources(void)
+{
+    if (s_sr.present) {
+        jce_offscreen_target_destroy(s_sr.present);
+        s_sr.present = NULL;
+    }
+
+    if (s_sr.bridge) {
+        jce_offscreen_target_destroy(s_sr.bridge);
+        s_sr.bridge = NULL;
+    }
+
+    if (s_sr.camera)     { jce_camera_destroy(s_sr.camera);   s_sr.camera = NULL; }
+
+    if (jce_gfx_texture_valid(s_sr.white_tex)) {
+        jce_gfx_texture_destroy(s_sr.white_tex);
+        s_sr.white_tex.idx = UINT16_MAX;
+    }
+
+    if (jce_program_valid(s_sr.prog_grid)) {
+        jce_program_destroy(s_sr.prog_grid);
+        s_sr.prog_grid.idx = UINT16_MAX;
+    }
+    if (jce_uniform_valid(s_sr.u_grid_camera)) {
+        jce_uniform_destroy(s_sr.u_grid_camera);
+        s_sr.u_grid_camera.idx = UINT16_MAX;
+    }
+    if (jce_uniform_valid(s_sr.u_grid_fade)) {
+        jce_uniform_destroy(s_sr.u_grid_fade);
+        s_sr.u_grid_fade.idx = UINT16_MAX;
+    }
+    if (jce_uniform_valid(s_sr.u_light_dir)) {
+        jce_uniform_destroy(s_sr.u_light_dir);
+        s_sr.u_light_dir.idx = UINT16_MAX;
+    }
+    if (jce_uniform_valid(s_sr.u_light_color)) {
+        jce_uniform_destroy(s_sr.u_light_color);
+        s_sr.u_light_color.idx = UINT16_MAX;
+    }
+
+}
+
+static void sr_cleanup_failed_init(void)
+{
+    sr_destroy_ui_canvas();
+    sr_destroy_view_resources();
+    jce_editor_scene_asset_cache_shutdown();
+}
+
+static void JCE_CALL sr_temporal_lifecycle_event(JceLifecycleEvent event, void *user)
+{
+    auto *state = static_cast<SceneRenderState *>(user);
+    switch (event) {
+    case JCE_LIFECYCLE_FOCUS_LOST: case JCE_LIFECYCLE_FOCUS_GAINED:
+    case JCE_LIFECYCLE_PAUSE: case JCE_LIFECYCLE_RESUME:
+    case JCE_LIFECYCLE_DEVICE_LOST: case JCE_LIFECYCLE_DEVICE_RESET:
+        state->tsr_history.valid = false;
+        break;
+    default: break;
+    }
+}
+
+static bool sr_temporal_lifecycle_begin(void)
+{
+    if (s_sr.temporal_listener.id) return true;
+    s_sr.tsr_history.valid = false;
+    s_sr.temporal_listener = jce_lifecycle_register(sr_temporal_lifecycle_event, 100, &s_sr);
+    return s_sr.temporal_listener.id != 0;
+}
+
+static void sr_temporal_lifecycle_end(void)
+{
+    const JceLifecycleHandle listener = s_sr.temporal_listener;
+    s_sr.temporal_listener = {};
+    s_sr.tsr_history.valid = false;
+    if (listener.id) jce_lifecycle_unregister(listener);
 }
 
 /* ── Init ─────────────────────────────────────────────────────────── */
@@ -370,7 +473,14 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 
     memset(&s_sr, 0, sizeof(s_sr));
     jce_editor_scene_asset_cache_init(assets);
+    /* Handle 0 is valid. Mark every not-yet-created owned handle invalid so
+     * an early failure cannot destroy an engine-owned object at index 0. */
     s_sr.white_tex.idx = UINT16_MAX;
+    s_sr.prog_grid.idx = UINT16_MAX;
+    s_sr.u_grid_camera.idx = UINT16_MAX;
+    s_sr.u_grid_fade.idx = UINT16_MAX;
+    s_sr.u_light_dir.idx = UINT16_MAX;
+    s_sr.u_light_color.idx = UINT16_MAX;
     s_sr.postfx_output_tex = UINT16_MAX;
     s_sr.renderer = renderer;
     /* ECS-UI Canvas overlay for the Scene View (mirrors the game view's
@@ -383,7 +493,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
                                                   (uint16_t)JCE_VIEW_EDITOR_SCENE);
     if (!s_sr.bridge) {
         LOG_WARN(LOG_TAG, "failed to create editor render bridge");
-        jce_editor_scene_asset_cache_shutdown();
+        sr_cleanup_failed_init();
         return false;
     }
 
@@ -416,12 +526,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.camera = jce_camera_create(&cam_desc);
     if (!s_sr.camera) {
         LOG_WARN(LOG_TAG, "failed to create editor camera");
-        if (s_sr.present) { jce_offscreen_target_destroy(s_sr.present); s_sr.present = NULL; }
-        if (s_sr.bridge) {
-            jce_offscreen_target_destroy(s_sr.bridge);
-            s_sr.bridge = NULL;
-        }
-        jce_editor_scene_asset_cache_shutdown();
+        sr_cleanup_failed_init();
         return false;
     }
 
@@ -486,10 +591,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.scene_renderer = jce_scene_renderer_create(renderer, pak, &cbs);
     if (!s_sr.scene_renderer) {
         LOG_WARN(LOG_TAG, "failed to create engine scene renderer");
-        if (s_sr.camera) { jce_camera_destroy(s_sr.camera); s_sr.camera = NULL; }
-        if (s_sr.present) { jce_offscreen_target_destroy(s_sr.present); s_sr.present = NULL; }
-        if (s_sr.bridge) { jce_offscreen_target_destroy(s_sr.bridge); s_sr.bridge = NULL; }
-        jce_editor_scene_asset_cache_shutdown();
+        sr_cleanup_failed_init();
         return false;
     }
 
@@ -544,6 +646,11 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     jce_editor_scene_render_streaming_rebuild();
 
     s_sr.initialized = true;
+    if (!sr_temporal_lifecycle_begin()) {
+        LOG_ERROR(LOG_TAG, "failed to register scene temporal lifecycle listener");
+        jce_editor_scene_render_shutdown();
+        return false;
+    }
     LOG_INFO(LOG_TAG, "editor scene renderer initialized (engine-backed)");
     return true;
 }
@@ -552,12 +659,12 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 
 void jce_editor_scene_render_shutdown(void)
 {
+    sr_temporal_lifecycle_end();
+    jce_editor_scene_render_cancel_probe_capture();
+    s_probe_maintenance.busy_this_frame = false;
     if (!s_sr.initialized) return;
 
-    if (s_sr.ui_canvas) {
-        jce_ui_canvas_destroy(s_sr.ui_canvas);
-        s_sr.ui_canvas = NULL;
-    }
+    sr_destroy_ui_canvas();
     if (s_sr.pick_pass) {
         jce_scene_pick_destroy(s_sr.pick_pass);
         s_sr.pick_pass = NULL;
@@ -579,31 +686,7 @@ void jce_editor_scene_render_shutdown(void)
 
     jce_editor_scene_asset_cache_shutdown();
 
-    if (s_sr.present) {
-        jce_offscreen_target_destroy(s_sr.present);
-        s_sr.present = NULL;
-    }
-
-    if (s_sr.bridge) {
-        jce_offscreen_target_destroy(s_sr.bridge);
-        s_sr.bridge = NULL;
-    }
-
-    if (s_sr.camera)     { jce_camera_destroy(s_sr.camera);   s_sr.camera = NULL; }
-
-    if (jce_gfx_texture_valid(s_sr.white_tex))
-        jce_gfx_texture_destroy(s_sr.white_tex);
-
-    if (jce_program_valid(s_sr.prog_grid))
-        jce_program_destroy(s_sr.prog_grid);
-    if (jce_uniform_valid(s_sr.u_grid_camera))
-        jce_uniform_destroy(s_sr.u_grid_camera);
-    if (jce_uniform_valid(s_sr.u_grid_fade))
-        jce_uniform_destroy(s_sr.u_grid_fade);
-    if (jce_uniform_valid(s_sr.u_light_dir))
-        jce_uniform_destroy(s_sr.u_light_dir);
-    if (jce_uniform_valid(s_sr.u_light_color))
-        jce_uniform_destroy(s_sr.u_light_color);
+    sr_destroy_view_resources();
 
     s_sr.initialized = false;
 
@@ -660,6 +743,7 @@ void jce_editor_scene_render_streaming_teardown(void)
 
 void jce_editor_scene_render_invalidate_model_caches(void)
 {
+    s_sr.tsr_history.valid = false;
     /* Scene-switch cache reset: the renderer's model cache never evicts and
      * caches load FAILURES, and the pick pass keeps its own model cache — both
      * survive a scene swap, so a model that failed (or a name that collided
@@ -788,6 +872,30 @@ void jce_editor_scene_render_streaming_autostart(void)
  * (jce_editor_scene_render_screenshot sizes its read-back staging to match). */
 static uint16_t s_cap_w = 0, s_cap_h = 0;
 
+/* Render-admitted probe maintenance and current-frame modal ownership. */
+void jce_editor_scene_render_maintenance(bool viewport_gpu_allowed)
+{
+    jce_editor_probe_maintenance_tick(s_probe_maintenance, viewport_gpu_allowed,
+        s_sr.initialized, s_sr.scene_renderer, jce_state_get_scene(), s_sr.renderer);
+}
+bool jce_editor_scene_render_probe_busy(void)
+{
+    return jce_editor_probe_maintenance_busy(s_probe_maintenance);
+}
+void jce_editor_scene_render_cancel_probe_capture(void)
+{
+    jce_editor_probe_maintenance_cancel(s_probe_maintenance);
+}
+uint64_t jce_editor_scene_render_begin_probe_capture(JceScene *scene, JceEntity entity,
+    char *out_path, int capacity)
+{
+    return jce_editor_probe_maintenance_begin(s_probe_maintenance, scene, entity, out_path, capacity);
+}
+bool jce_editor_scene_render_probe_capture_matches(uint64_t request, JceScene *scene, JceEntity entity)
+{
+    return jce_editor_probe_maintenance_matches(s_probe_maintenance, request, scene, entity);
+}
+
 /* Sub-attribution of the editor-side viewport frame: ed_sv_vp measured 9.87 ms
  * against the engine's scene_render at 6.77 ms, so ~3.1 ms/frame is spent here,
  * around the engine call.  ~10 marks per frame - free at this granularity. */
@@ -800,9 +908,15 @@ static inline void ed_vp_mark(const char *name, uint64_t *t)
 
 void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 {
+    JceEditorViewportRenderTrace render_trace("editor.scene.render", "editor.scene.render.reason",
+        "editor.scene.render.admitted");
     uint64_t _vpt = jce_time_perf_counter();
-    if (!s_sr.initialized || !s_sr.renderer) return;
-    if (width == 0 || height == 0) return;
+    if (!s_sr.initialized || !s_sr.renderer) {
+        render_trace.reason(JceEditorViewportRenderReason::Unavailable); return;
+    }
+    if (width == 0 || height == 0) {
+        render_trace.reason(JceEditorViewportRenderReason::EmptyExtent); return;
+    }
 
     /* A modal impostor bake owns the frame's view ids (127..227), which is
      * inside the Game View's range, and the guard reports it either way.
@@ -814,31 +928,29 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      *
      * The bake is driven from the Inspector / the QA harness, not from here,
      * so skipping this render does not stall it. */
-    if (jce_impostor_bake_in_flight()) return;
+    if (jce_impostor_bake_in_flight()) {
+        render_trace.reason(JceEditorViewportRenderReason::ImpostorBusy); return;
+    }
 
-    /* REFLECTION PROBE CAPTURE, driven here and yielded to here.
+    /* REFLECTION PROBE CAPTURE, driven once before panel layout.
+     * Yield even when that poll completed: this host frame's capture uses
+     * this viewport's base id. Hidden/clipped Scene panels no longer own its
+     * progress; the admitted host pump retains focus/drawable restrictions.
      *
-     * Driven: this is the one place that runs every frame AND holds both the
-     * scene renderer and the JceRenderer the capture needs, so a probe bake
-     * proceeds whichever panel started it and whether or not that panel is
-     * still open.
-     *
-     * Yielded to: the capture renders the scene from THIS viewport's base id,
+     * The capture renders the scene from THIS viewport's base id,
      * because a full scene render claims 117 view ids and bgfx's 256 do not
      * hold a third span of that size.  Same arrangement, and same reason, as
      * the impostor bake immediately above. */
-    if (jce_scene_probe_capture_in_flight()) {
-        (void)jce_scene_probe_capture_poll(s_sr.scene_renderer,
-                                           jce_state_get_scene(),
-                                           jce_editor_get_renderer());
+    if (jce_editor_scene_render_probe_busy()) {
+        render_trace.reason(JceEditorViewportRenderReason::ProbeBusy);
         return;
     }
-
+    render_trace.admitted();
 
     /* iGPU ADAPTIVE dynamic resolution (editor scene view): steer the 3D render
-     * scale from the LAST frame's measured GPU time (Unity DynamicResolution /
-     * UE dynamic-res).  A light scene rides the scale back to 1.0 (crisp); only a
-     * genuinely GPU-bound frame downscales, at ANY panel size.  The smaller color
+     * scale from distinct available latched whole-backend GPU intervals. A
+     * sustained light interval sequence restores 1.0; sustained over-target
+     * intervals downscale at any panel size. The smaller color
      * target is upscaled by the panel's ImGui::Image (uv=1.0, target sized exactly
      * to the render); disp_w/disp_h keep the NATIVE size for the on-demand full-
      * res PICK pass, so click->entity stays pixel-exact regardless of scale (pick
@@ -864,37 +976,24 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                 if (v >= 0.25f && v <= 1.0f) { s_mode = 2; s_fixed = v; }
             }
         }
-        /* s_scale is QUANTIZED to 0.1 steps and only moves on SUSTAINED load, so
-         * a transient GPU spike never resizes the target (each resize is a RT
+        /* Scale is quantized to 0.1 steps and moves on distinct sustained GPU
+         * intervals; repeated latched reads never resize the target (a RT
          * realloc = a hitch).  This is the anti-flicker/anti-hitch core: the
          * viewport holds a stable resolution and steps only when the load is
          * genuinely sustained, then settles. */
-        static float s_scale = 1.0f;
-        static int   s_over = 0, s_under = 0;
+        static JceEditorDynresPolicy s_dynres;
         if (s_mode == 2) {
-            s_scale = s_fixed;
+            s_dynres.scale = s_fixed;
         } else if (s_mode == 1) {
-            JceGpuStats gs;
-            if (jce_renderer_get_gpu_stats(&gs) && gs.valid && gs.gpu_ms > 0.01) {
-                const double target = 16.0;           /* ~60 FPS whole-frame GPU */
-                const double lo     = target * 0.65;  /* grow only well below     */
-                if (gs.gpu_ms > target)  { s_over++;  s_under = 0; }
-                else if (gs.gpu_ms < lo) { s_under++; s_over  = 0; }
-                else                     { s_over = 0; s_under = 0; } /* dead zone: hold */
-                /* 3 sustained over-target frames shrink a step; 12 sustained
-                 * under-lo frames grow one back (asymmetric: quick to relieve a
-                 * real hitch, slow to restore res so a light scene doesn't hunt). */
-                if (s_over >= 3 && s_scale > 0.551f)       { s_scale -= 0.1f; s_over = 0; }
-                else if (s_under >= 12 && s_scale < 0.999f) { s_scale += 0.1f; s_under = 0; }
-                if (s_scale < 0.55f) s_scale = 0.55f;
-                if (s_scale > 1.0f)  s_scale = 1.0f;
-            }
+            JceGpuTimingObservation sample{};
+            const bool observed = jce_renderer_get_gpu_timing_observation(&sample, sizeof(sample));
+            jce_editor_dynres_consume(&s_dynres, observed ? &sample : nullptr);
         } else {
-            s_scale = 1.0f;
+            s_dynres.scale = 1.0f;
         }
-        if (s_scale < 0.999f) {
-            uint32_t nw = (uint32_t)((float)width * s_scale);
-            uint32_t nh = (uint32_t)((float)height * s_scale);
+        if (s_dynres.scale < 0.999f) {
+            uint32_t nw = (uint32_t)((float)width * s_dynres.scale);
+            uint32_t nh = (uint32_t)((float)height * s_dynres.scale);
             if (nw >= 16u && nh >= 16u) { width = nw; height = nh; }
         }
     }
@@ -910,9 +1009,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         const char *groot = (gp && gp->project_root) ? gp->project_root : "";
         JceFileSystem *active_fs = jce_fs_get_active();
         JceFsActivePolicy active_policy = jce_fs_get_active_policy();
-        if (active_fs != s_content_context_fs ||
-            active_policy != s_content_context_policy ||
-            strcmp(groot, s_content_context_project_root) != 0) {
+        if (active_fs != s_content_context.fs ||
+            active_policy != s_content_context.policy ||
+            strcmp(groot, s_content_context.project_root) != 0) {
             sr_apply_content_context();
         }
     }
@@ -931,6 +1030,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         if (dt_sec > 0.1f) dt_sec = 0.1f;
     }
     s_sr.anim_last_ticks = now_ticks;
+    /* Navigation uses wall time; scene content follows the accepted Play step. */
+    const float content_dt_sec = jce_state_get_play_state() == JCE_PLAY_STOPPED
+        ? dt_sec : jce_editor_play_render_delta();
 
     /* Headless overview-capture hook: env JCE_DBG_OVERVIEW=1 frames the whole
      * world from a bird's-eye angle once, on the first scene-render frame, so a
@@ -975,128 +1077,10 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     memcpy(s_sr.cached_view, view.raw[0], sizeof(s_sr.cached_view));
     memcpy(s_sr.cached_proj, proj.raw[0], sizeof(s_sr.cached_proj));
 
-    /* TAA (r.taa; the DEFAULT is tier >= MEDIUM && has_discrete_gpu, see
-     * jce_scene_renderer.c's cvar registration -- so it is ON, not off, on any
-     * discrete-GPU machine.  This said "default OFF", which is the kind of
-     * stale sentence that turns a measurement into a wrong conclusion: it made
-     * a 19% frame-to-frame residual difference look like it could not be TAA.)
-     * When active, sub-pixel-jitter the colour
-       pass's projection and arm the engine PostFX pipeline's TAA resolve.
-       When OFF this returns false and leaves color_proj == proj, so the
-       prepare/render path is byte-identical to the legacy FXAA path. The
-       clean (un-jittered) view+proj are kept for the postfx reproject and
-       for end_frame's history record. */
-    jce_mat4 color_proj = proj;
-    bool taa_on = false;
-    if (s_sr.scene_renderer) {
-        taa_on = jce_scene_renderer_taa_begin_frame(s_sr.scene_renderer,
-                                                    width, height,
-                                                    &view, &proj, &color_proj);
-        /* STANDARD per-object motion vectors: when TAA is on, ask the renderer
-         * to write a per-object/per-bone velocity buffer in its depth pre-pass
-         * (gated => zero cost when TAA is off).  jce_scene_renderer_render then
-         * binds it into the scene PostFX TAA resolve automatically, so moving /
-         * skinned characters stop ghosting. */
-        jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, taa_on);
-    }
-
-    /* TSR (JCE_TSR=1): temporal super-resolution upscale of the dynamic-resolution
-     * render. Jitter the colour projection ourselves (Halton) even though TAA is
-     * off on the iGPU, so successive low-res frames carry distinct sub-pixel
-     * offsets to accumulate into a native-res history. v1 accumulates across a
-     * STATIC view only: feedback -> 0 whenever the clean view/proj changes (no
-     * motion reprojection yet), so history is only trusted pixel-for-pixel. Only
-     * when dynres is downscaling and TAA isn't already jittering. Opt-in; RCAS
-     * stays the default upscale. */
-    /* r.upscaler (LIVE): 0=Off/bilinear, 1=RCAS, 2=TSR. Read the cvar each frame
-     * so the Render Pipeline panel dropdown A/Bs instantly on the same scene.
-     * JCE_TSR / JCE_RCAS env forced the boot value at cvar registration. */
-    static JceCvar *s_cv_up = NULL;
-    static bool     s_cv_up_tried = false;
-    if (!s_cv_up_tried) { s_cv_up = jce_cvar_find("r.upscaler"); s_cv_up_tried = true; }
-    int   upscaler     = s_cv_up ? jce_cvar_get_int(s_cv_up) : 1;
-    bool  tsr_active   = false;
-    float tsr_jit_u    = 0.0f, tsr_jit_v = 0.0f;
-    float tsr_feedback = 0.0f;
-    float tsr_inv_vp[16] = {0};   /* inverse of current clean view*proj  */
-    float tsr_prev_vp[16] = {0};  /* previous frame's clean view*proj    */
-    bool  tsr_has_prev = false;   /* prev VP available -> motion reproject */
-    if (upscaler == 2 && !taa_on && width < disp_w && height < disp_h) {
-        static JceTaaState s_tsr_state = {};
-        static float       s_tsr_prev_vp[16];
-        static bool        s_tsr_prev_valid = false;
-        tsr_active = true;
-        jce_taa_advance(&s_tsr_state, width, height);
-        jce_taa_apply_jitter(&color_proj, s_tsr_state.current_jitter);
-        tsr_jit_u = s_tsr_state.current_jitter[0] * 0.5f;   /* NDC -> render-UV */
-        tsr_jit_v = s_tsr_state.current_jitter[1] * 0.5f;
-        tsr_feedback = 0.9f;   /* base; the shader tapers by motion speed */
-        /* Clean (un-jittered) VP + its inverse drive the motion-vector pass so
-         * the history reprojects under camera movement (v2). Roll prev<-cur. */
-        jce_mat4 clean_vp = jce_m4_multiply(&proj, &view);
-        jce_mat4 inv_vp   = jce_m4_inverse(&clean_vp);
-        memcpy(tsr_inv_vp, inv_vp.raw[0], sizeof(tsr_inv_vp));
-        if (s_tsr_prev_valid) {
-            memcpy(tsr_prev_vp, s_tsr_prev_vp, sizeof(tsr_prev_vp));
-            tsr_has_prev = true;
-        }
-        memcpy(s_tsr_prev_vp, clean_vp.raw[0], sizeof(s_tsr_prev_vp));
-        s_tsr_prev_valid = true;
-    }
-
-    /* TSR v3: drive the scene renderer's per-object velocity prepass
-     * (gbuffer_vel) when TSR is active so moving/skinned geometry reprojects,
-     * not just the camera. TAA is off on the iGPU, so the taa_on-gated enable
-     * above leaves it off — turn it on here for TSR. This adds a full-scene
-     * velocity geometry pass — cheap for typical scenes (~0.4ms CPU / negligible
-     * GPU at ~200 entities, measured) but the vertex/submit side scales with
-     * entity count, so it stays OPT-IN (a perf feature shouldn't add a scaling
-     * pass by default): JCE_TSR_VELOCITY=1 enables it. Default = camera-only v2,
-     * the neighbourhood clamp bounding animated-object ghosting. */
-    static int s_tsr_vel = -1;
-    if (s_tsr_vel < 0) {
-        const char *v = getenv("JCE_TSR_VELOCITY");
-        s_tsr_vel = (v && v[0] != '0') ? 1 : 0;
-    }
-    if (tsr_active && s_tsr_vel && s_sr.scene_renderer)
-        jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, true);
-
-    {
-        jce_vec3 eye = jce_camera_get_position(s_sr.camera);
-        s_sr.cached_eye[0] = eye.x;
-        s_sr.cached_eye[1] = eye.y;
-        s_sr.cached_eye[2] = eye.z;
-    }
-    s_sr.camera_cache_valid = true;
-
-    JceSceneViewMode view_mode = jce_state_get_view_mode();
-    bool is_plain_wireframe = (view_mode == JCE_VIEW_WIREFRAME);
-
-    uint32_t clear_color = is_plain_wireframe
-        ? 0x373737FF
-        : BG_COLOR_RGBA;
-
-    if (!jce_offscreen_target_prepare(
-            s_sr.bridge,
-            width,
-            height,
-            view.raw[0],
-            color_proj.raw[0],   /* jittered when r.taa on; == proj when off */
-            clear_color,
-            "EditorScene")) {
-        return;
-    }
-
-    ed_vp_mark("evp_target", &_vpt);
-    jce_editor_scene_asset_cache_finalize();
-    ed_vp_mark("evp_assetcache", &_vpt);
-
-    /* Engine renders sky, shadows, entities, and PostFX into the bridge view.
-     * PostFX is driven via the engine's pipeline (same one the panel controls). */
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
 
     /* Map editor view mode to engine config. */
-    switch (view_mode) {
+    switch (jce_state_get_view_mode()) {
     case JCE_VIEW_WIREFRAME:
         cfg.view_mode = JCE_SCENE_VIEW_WIREFRAME; break;
     case JCE_VIEW_TEXTURED:
@@ -1172,25 +1156,137 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                                  "leaving the current view\n", vm);
     }
 
-    /* Debug views bypass post-processing -- ALL of them, from NORMALS on.
-     *
-     * These three write a colour that MEANS something -- a cascade index, a
-     * shadow factor, a depth bucket -- and tonemapping plus exposure plus the
-     * gamma encode turn it into a different colour. That is fine for a picture
-     * and fatal for a readout: the first attempt to count cascade coverage from
-     * this view classified 0.29% of the ground because the tints it was looking
-     * for had been graded away. A view whose colours are data must deliver the
-     * data.
-     *
-     * Extended to cover the material channels (normals, roughness, metallic,
-     * AO) as well, which had been shipping through the tonemapper since they
-     * were added. A normal encoded as N*0.5+0.5 and then graded is not a
-     * normal any more -- it still LOOKS like a normal buffer, which is why
-     * nobody noticed, and it cannot be decoded back to a direction. The first
-     * attempt to use it here to hold N.L constant would have measured the
-     * tonemapper. */
-    if (cfg.view_mode >= JCE_SCENE_VIEW_NORMALS)
-        cfg.apply_postfx = false;
+    const bool shaded = cfg.view_mode == JCE_SCENE_VIEW_SHADED;
+    cfg.apply_postfx = shaded;
+
+    /* TAA (r.taa; the DEFAULT is tier >= MEDIUM && has_discrete_gpu, see
+     * jce_scene_renderer.c's cvar registration -- so it is ON, not off, on any
+     * discrete-GPU machine.  This said "default OFF", which is the kind of
+     * stale sentence that turns a measurement into a wrong conclusion: it made
+     * a 19% frame-to-frame residual difference look like it could not be TAA.)
+     * When active, sub-pixel-jitter the colour
+       pass's projection and arm the engine PostFX pipeline's TAA resolve.
+       When OFF this returns false and leaves color_proj == proj, so the
+       prepare/render path is byte-identical to the legacy FXAA path. The
+       clean (un-jittered) view+proj are kept for the postfx reproject and
+       for end_frame's history record. */
+    jce_mat4 color_proj = proj;
+    bool taa_on = false;
+    if (shaded && s_sr.scene_renderer) {
+        taa_on = jce_scene_renderer_taa_begin_frame(s_sr.scene_renderer,
+                                                    width, height,
+                                                    &view, &proj, &color_proj);
+        /* STANDARD per-object motion vectors: when TAA is on, ask the renderer
+         * to write a per-object/per-bone velocity buffer in its depth pre-pass
+         * (gated => zero cost when TAA is off).  jce_scene_renderer_render then
+         * binds it into the scene PostFX TAA resolve automatically, so moving /
+         * skinned characters stop ghosting. */
+        jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, taa_on);
+    }
+
+    /* TSR has its own camera reprojection while TAA is off. Only the admitted
+     * downscaled Scene View jitters; PostFX owns the output-resolution history.
+     * Continuous camera motion retains that history. Cuts, lifecycle changes
+     * and skipped/failed submissions start with the current frame instead. */
+    /* r.upscaler (LIVE): 0=Off/bilinear, 1=RCAS, 2=TSR. Read the cvar each frame
+     * so the Render Pipeline panel dropdown A/Bs instantly on the same scene.
+     * JCE_TSR / JCE_RCAS env forced the boot value at cvar registration. */
+    static JceCvar *s_cv_up = NULL;
+    static bool     s_cv_up_tried = false;
+    if (!s_cv_up_tried) { s_cv_up = jce_cvar_find("r.upscaler"); s_cv_up_tried = true; }
+    int   upscaler     = s_cv_up ? jce_cvar_get_int(s_cv_up) : 1;
+    bool  tsr_active   = false;
+    float tsr_jit_u    = 0.0f, tsr_jit_v = 0.0f;
+    float tsr_feedback = 0.0f;
+    float tsr_inv_vp[16] = {0};   /* inverse of current clean view*proj  */
+    float tsr_prev_vp[16] = {0};  /* previous frame's clean view*proj    */
+    bool  tsr_has_prev = false;   /* prev VP available -> motion reproject */
+    JceSubmittedPayloadStats tsr_submission = {};
+    bool tsr_submission_valid = false;
+    const JceScene *tsr_scene = nullptr;
+    bool tsr_play_active = false;
+    jce_mat4 tsr_current_vp = {};
+    const bool tsr_previous_valid = s_sr.tsr_history.valid;
+    /* Consume once. A closed gate, missing pipeline or failed resolve cannot
+     * leave an older camera eligible for an unrelated following submission. */
+    s_sr.tsr_history.valid = false;
+    if (shaded && upscaler == 2 && !taa_on && width < disp_w && height < disp_h &&
+        s_sr.present && s_view_id_override == UINT16_MAX) {
+        tsr_active = true;
+        tsr_scene = jce_state_get_scene();
+        tsr_play_active = jce_state_get_play_state() != JCE_PLAY_STOPPED;
+        tsr_submission_valid = tsr_scene &&
+            jce_renderer_get_submitted_payload_stats(s_sr.renderer, &tsr_submission) &&
+            tsr_submission.valid && tsr_submission.context_generation != 0;
+        tsr_has_prev = tsr_previous_valid && tsr_submission_valid &&
+            s_sr.tsr_history.scene == tsr_scene &&
+            s_sr.tsr_history.context_generation == tsr_submission.context_generation &&
+            tsr_submission.frame_index == s_sr.tsr_history.frame_index + 1u &&
+            s_sr.tsr_history.play_active == tsr_play_active &&
+            s_sr.tsr_history.render_width == width && s_sr.tsr_history.render_height == height &&
+            s_sr.tsr_history.output_width == disp_w && s_sr.tsr_history.output_height == disp_h &&
+            memcmp(s_sr.tsr_history.previous_projection.raw[0], proj.raw[0], sizeof(proj)) == 0;
+        jce_taa_advance(&s_sr.tsr_history.jitter, width, height);
+        jce_taa_apply_jitter(&color_proj, s_sr.tsr_history.jitter.current_jitter);
+        tsr_jit_u = s_sr.tsr_history.jitter.current_jitter[0] * 0.5f;
+        tsr_jit_v = s_sr.tsr_history.jitter.current_jitter[1] * 0.5f;
+        tsr_feedback = tsr_has_prev ? 0.9f : 0.0f;
+        tsr_current_vp = jce_m4_multiply(&proj, &view);
+        jce_mat4 inv_vp = jce_m4_inverse(&tsr_current_vp);
+        memcpy(tsr_inv_vp, inv_vp.raw[0], sizeof(tsr_inv_vp));
+        if (tsr_has_prev)
+            memcpy(tsr_prev_vp, s_sr.tsr_history.previous_view_projection.raw[0], sizeof(tsr_prev_vp));
+    }
+
+    /* TSR v3: drive the scene renderer's per-object velocity prepass
+     * (gbuffer_vel) when TSR is active so moving/skinned geometry reprojects,
+     * not just the camera. TAA is off on the iGPU, so the taa_on-gated enable
+     * above leaves it off — turn it on here for TSR. This adds a full-scene
+     * velocity geometry pass — cheap for typical scenes (~0.4ms CPU / negligible
+     * GPU at ~200 entities, measured) but the vertex/submit side scales with
+     * entity count, so it stays OPT-IN (a perf feature shouldn't add a scaling
+     * pass by default): JCE_TSR_VELOCITY=1 enables it. Default = camera-only v2,
+     * the neighbourhood clamp bounding animated-object ghosting. */
+    static int s_tsr_vel = -1;
+    if (s_tsr_vel < 0) {
+        const char *v = getenv("JCE_TSR_VELOCITY");
+        s_tsr_vel = (v && v[0] != '0') ? 1 : 0;
+    }
+    if (tsr_active && s_tsr_vel && s_sr.scene_renderer)
+        jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, true);
+
+    {
+        jce_vec3 eye = jce_camera_get_position(s_sr.camera);
+        s_sr.cached_eye[0] = eye.x;
+        s_sr.cached_eye[1] = eye.y;
+        s_sr.cached_eye[2] = eye.z;
+    }
+    s_sr.camera_cache_valid = true;
+
+    const uint32_t clear_color = cfg.view_mode == JCE_SCENE_VIEW_WIREFRAME
+        ? 0x373737FF
+        : BG_COLOR_RGBA;
+
+    if (!jce_offscreen_target_prepare(
+            s_sr.bridge,
+            width,
+            height,
+            view.raw[0],
+            color_proj.raw[0],   /* jittered when r.taa on; == proj when off */
+            clear_color,
+            "EditorScene")) {
+        render_trace.reason(JceEditorViewportRenderReason::TargetRefused);
+        return;
+    }
+
+    ed_vp_mark("evp_target", &_vpt);
+    jce_editor_scene_asset_cache_finalize();
+    JceScene *scene = jce_state_get_scene();
+    if (scene && s_sr.scene_renderer &&
+        !jce_scene_renderer_prepare_resources(s_sr.scene_renderer, scene)) {
+        render_trace.reason(JceEditorViewportRenderReason::ResourcesRefused); return;
+    }
+    ed_vp_mark("evp_assetcache", &_vpt);
 
     /* Wire the editor's Show menu flags into engine config so toggles
        actually take effect. */
@@ -1273,7 +1369,6 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         }
     }
 
-    JceScene *scene = jce_state_get_scene();
     if (scene && s_sr.scene_renderer) {
         /* Ambient override from the editor Lighting panel — applied on both
          * viewports so panel changes reach whichever one renders. */
@@ -1292,9 +1387,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
          * colour pass that samples it.  Running it first costs nothing and
          * leaves the main render owning the state. */
         jce_scene_renderer_render_planar_reflection(s_sr.scene_renderer, scene,
-                                                     s_sr.camera, dt_sec);
+                                                     s_sr.camera, content_dt_sec);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
-                                  scene_view_id(), dt_sec, &cfg);
+                                  scene_view_id(), content_dt_sec, &cfg);
         ed_vp_mark("evp_scene_render", &_vpt);
 
         /* Forensic occlusion KPI (JCE_KPI_OCCLUSION_LOG=1): log the scene-view
@@ -1341,7 +1436,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     const bool fullscreen_composited =
         jce_editor_viewport_apply_fullscreen_effects(
             s_sr.scene_renderer, scene, s_sr.camera, s_sr.bridge,
-            scene_view_id(), 1, width, height, dt_sec);
+            scene_view_id(), 1, width, height, content_dt_sec);
     ed_vp_mark("evp_composite", &_vpt);
 
     /* Tick the world streamer each frame so pending chunk loads are applied
@@ -1417,7 +1512,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     /* Apply the engine PostFX pipeline AFTER overlays so they receive
      * tonemapping along with the scene (matches 0.5.7 behavior). */
     JcePostFXPipeline *postfx = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
-    if (postfx) {
+    if (postfx && shaded) {
         /* TSR is the anti-aliaser (jittered temporal accumulation resolves
          * aliasing), so FXAA must NOT run first — it would pre-blur the very
          * samples TSR reconstructs (the classic double-AA anti-pattern). Disable
@@ -1497,7 +1592,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     jce_editor_viewport_claim_view_band("editor-scene-view", scene_view_id());
 
     const bool postfx_composited = jce_editor_viewport_composite_postfx(
-        s_sr.bridge, scene_view_id(), s_sr.postfx_output_tex, width, height);
+        s_sr.bridge, scene_view_id(), s_sr.postfx_output_tex, width, height,
+        s_sr.renderer, scene, s_sr.ui_canvas && jce_state_show_flag(JCE_SHOW_FLAG_UI),
+        s_sr.present && width < disp_w && height < disp_h && (tsr_active || upscaler == 1));
     if (postfx_composited)
         s_sr.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
 
@@ -1516,7 +1613,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                 scene_view_id(), postfx_composited);
             uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
             jce_ui_canvas_render(s_sr.ui_canvas, ui_scene, ui_view, ui_fb,
-                                 (float)width, (float)height, NULL, dt_sec);
+                                 (float)width, (float)height, NULL, content_dt_sec);
         }
     }
     ed_vp_mark("evp_uicanvas", &_vpt);
@@ -1534,8 +1631,8 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         /* TSR temporal upscale (opt-in via JCE_TSR): reconstruct native res from
          * the jittered scaled bridge by depositing sub-pixel samples into an
          * output-res history, reprojected by camera motion (v2). Owns its own
-         * history buffers (no s_sr.present target). Uses base+25 (motion) and
-         * base+26 (resolve) — after the screenshot readback (+24). */
+         * history buffers (no s_sr.present target). The shared viewport table
+         * owns its two view offsets after the screenshot readback. */
         JcePostFXPipeline *pfx = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
         JceTextureHandle src = {
             jce_offscreen_target_get_color_texture(s_sr.bridge) };
@@ -1549,8 +1646,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
          * (enabled above). When valid it drives the reprojection (moving/skinned
          * geometry stops ghosting); otherwise the resolve falls back to
          * camera-only motion from depth + the VP matrices (v2). */
-        JceTextureHandle ext_motion = {
-            jce_scene_renderer_get_velocity_texture(s_sr.scene_renderer) };
+        JceTextureHandle ext_motion = { UINT16_MAX };
+        if (tsr_has_prev)
+            ext_motion.idx = jce_scene_renderer_get_velocity_texture(s_sr.scene_renderer);
         if (pfx && jce_gfx_texture_valid(src)) {
             uint16_t out = jce_postfx_tsr_resolve(
                 pfx, base, src, depth,
@@ -1559,7 +1657,21 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                 ext_motion,
                 width, height, disp_w, disp_h,
                 tsr_jit_u, tsr_jit_v, tsr_feedback, flip);
-            if (out != UINT16_MAX) s_sr.present_tex = out;
+            if (out != UINT16_MAX) {
+                s_sr.present_tex = out;
+                /* Retain only a successful consecutive CPU submission. */
+                s_sr.tsr_history.previous_view_projection = tsr_current_vp;
+                s_sr.tsr_history.previous_projection = proj;
+                s_sr.tsr_history.scene = tsr_scene;
+                s_sr.tsr_history.context_generation = tsr_submission.context_generation;
+                s_sr.tsr_history.frame_index = tsr_submission.frame_index;
+                s_sr.tsr_history.render_width = width;
+                s_sr.tsr_history.render_height = height;
+                s_sr.tsr_history.output_width = disp_w;
+                s_sr.tsr_history.output_height = disp_h;
+                s_sr.tsr_history.play_active = tsr_play_active;
+                s_sr.tsr_history.valid = tsr_submission_valid;
+            }
         }
     } else if (upscaler == 1 && s_sr.present && s_view_id_override == UINT16_MAX &&
         width < disp_w && height < disp_h) {
@@ -1637,13 +1749,13 @@ bool jce_editor_scene_render_screenshot(const char *path)
         return false;
     return jce_editor_viewport_screenshot_submit(
         s_sr.bridge, scene_view_id(), s_sr.postfx_output_tex,
-        s_cap_w, s_cap_h, path);
+        s_cap_w, s_cap_h, path, JCE_EDITOR_SCREENSHOT_SCENE);
 }
 
 /* Pump the in-flight read-back capture (no-op when idle).  Call once per frame. */
 int jce_editor_scene_render_capture_poll(void)
 {
-    return jce_renderer_readback_capture_poll();
+    return jce_editor_viewport_capture_poll(JCE_EDITOR_SCREENSHOT_SCENE);
 }
 
 /* Panel-local px -> the canvas's own space.  The canvas was rendered at the
@@ -1686,6 +1798,107 @@ bool jce_editor_scene_ui_entity_rect(uint32_t id, float avail_w, float avail_h,
     out_rect4[0] = x / sx; out_rect4[1] = y / sy;
     out_rect4[2] = w / sx; out_rect4[3] = h / sy;
     return true;
+}
+
+struct EditorSceneRaySearch {
+    jce_vec3 origin;
+    jce_vec3 direction;
+    float best_t;
+    JceEditorSceneRayPick result;
+};
+
+/* Only an entity with a visible drawable can contribute a coarse proxy.
+ * Transform-only helpers and exact misses must not hide rendered geometry. */
+static bool scene_pick_has_visible_proxy(JceScene *scene, JceEntity e)
+{
+    const JceMeshRenderer *mesh = jce_scene_get_mesh_renderer(scene, e);
+    if (mesh && mesh->visible &&
+        jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_MESH_RENDERER))
+        return true;
+
+    const JceTerrainComponent *terrain = jce_scene_get_terrain(scene, e);
+    if (terrain && terrain->visible && terrain->terrain_path[0] &&
+        jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_TERRAIN))
+        return true;
+
+    const JceFoliageClusterComponent *foliage = jce_scene_get_foliage_cluster(scene, e);
+    const JceGrassFieldComponent *grass = jce_scene_get_grass_field(scene, e);
+    const JceWaterComponent *water = jce_scene_get_water(scene, e);
+    return (foliage && foliage->visible) || (grass && grass->visible) ||
+           (water && water->visible && water->size_x > 0.0f && water->size_z > 0.0f);
+}
+
+static bool scene_pick_proxy_ray(const jce_mat4 &world,
+                                 const EditorSceneRaySearch &search, float *t)
+{
+    const jce_vec3 lo = jce_v3(-0.5f, -0.5f, -0.5f);
+    const jce_vec3 hi = jce_v3(0.5f, 0.5f, 0.5f);
+    jce_vec3 min, max;
+    jce_transform_aabb(&world, lo, hi, &min, &max);
+    if (!jce_ray_aabb_intersect(search.origin, search.direction, min, max, t) ||
+        *t > search.best_t)
+        return false;
+
+    const jce_vec3 x = jce_v3(world.col[0].x, world.col[0].y, world.col[0].z);
+    const jce_vec3 y = jce_v3(world.col[1].x, world.col[1].y, world.col[1].z);
+    const jce_vec3 z = jce_v3(world.col[2].x, world.col[2].y, world.col[2].z);
+    const float determinant = jce_v3_dot(x, jce_v3_cross(y, z));
+    if (!(fabsf(determinant) >= 1e-8f && isfinite(determinant)))
+        return false;
+
+    const jce_mat4 inv = jce_m4_inverse(&world);
+    const jce_vec3 o = search.origin;
+    const jce_vec3 d = search.direction;
+    const jce_vec4 ro = jce_m4_mul_v4(&inv, jce_v4(o.x, o.y, o.z, 1.0f));
+    const jce_vec4 rd = jce_m4_mul_v4(&inv, jce_v4(d.x, d.y, d.z, 0.0f));
+    /* Keep the original ray parameter so geometry and proxies compare in
+     * world-distance units even under non-uniform parent scaling. */
+    return jce_ray_aabb_intersect(jce_v3(ro.x, ro.y, ro.z),
+                                 jce_v3(rd.x, rd.y, rd.z), lo, hi, t);
+}
+
+static void scene_pick_ray_entity(JceScene *scene, JceEntity e, void *user)
+{
+    auto *search = static_cast<EditorSceneRaySearch *>(user);
+    if (!jce_scene_has_transform(scene, e))
+        return;
+    const JceEditorMeta *meta = jce_scene_get_editor_meta(scene, e);
+    if (meta && !meta->enabled)
+        return;
+
+    float t = search->best_t;
+    const JceSceneRayPickResult result = jce_scene_pick_model_ray(
+        s_sr.scene_renderer, scene, e, search->origin, search->direction,
+        search->best_t, &t);
+    const bool geometry_hit = result == JCE_SCENE_RAY_PICK_HIT;
+    if (result != JCE_SCENE_RAY_PICK_UNAVAILABLE) {
+        ++search->result.models_tested;
+        if (!geometry_hit)
+            return;
+    } else {
+        if (!scene_pick_has_visible_proxy(scene, e))
+            return;
+        const jce_mat4 world = jce_scene_get_world_matrix(scene, e);
+        if (!scene_pick_proxy_ray(world, *search, &t))
+            return;
+    }
+
+    if (t >= 0.0f && t <= search->best_t &&
+        (t < search->best_t || !search->result.entity ||
+         (geometry_hit && !search->result.geometry_hit))) {
+        search->best_t = t;
+        search->result.entity = jce_state_from_ecs_entity(e);
+        search->result.geometry_hit = geometry_hit;
+    }
+}
+
+JceEditorSceneRayPick jce_editor_scene_pick_ray(
+    JceScene *scene, jce_vec3 origin, jce_vec3 direction, float max_t)
+{
+    EditorSceneRaySearch search = { origin, direction, max_t, {} };
+    if (scene && max_t > 0.0f)
+        jce_scene_each_entity(scene, scene_pick_ray_entity, &search);
+    return search.result;
 }
 
 bool jce_editor_scene_pick_supported(void)
@@ -1741,6 +1954,16 @@ bool jce_editor_scene_pick_poll_rect(uint32_t *out_ids, uint32_t max_ids,
 void jce_editor_scene_set_scene_dir(const char *dir)
 {
     jce_editor_scene_asset_cache_set_scene_dir(dir);
+    /* Reuse the state owner's existing Scenes-parent rule. A virtual content
+     * address never becomes a host directory when its Bundle is later closed. */
+    snprintf(s_content_context.loose_root, sizeof(s_content_context.loose_root), "%s",
+             dir && !strstr(dir, "://") ? dir : "");
+    sr_apply_content_context();
+}
+
+const char *jce_editor_scene_content_root(void)
+{
+    return s_content_context.loose_root;
 }
 
 /* ── Ghost (drag-preview) model ────────────────────────────────────── */

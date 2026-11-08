@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tower Defense</title><link rel="icon" href="data:,">
+<style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000}canvas{display:block;width:100%;height:100%;outline:0}#qa{position:fixed;left:0;bottom:0;font:10px monospace;background:#fff;color:#000;max-width:400px}#qa-log{display:none}</style></head><body>
+<canvas id="canvas" width="1280" height="720" tabindex="0" aria-label="Tower Defense game" oncontextmenu="event.preventDefault()"></canvas>
+<script>
+var query=new URLSearchParams(location.search), evidence={logs:[],started:performance.now()};
+function record(text){text=String(text);evidence.logs.push(text);if(evidence.logs.length>10000)evidence.logs.shift();if(query.has('qa')){var box=document.getElementById('qa-log');if(box)box.value=evidence.logs.join('\n');var state=document.getElementById('qa-state');if(state&&text.indexOf('TD_BOOT')>=0)state.textContent='Game ready';}if(/ERROR -|FATAL -/.test(text))console.error(text);else if(/WARN -/.test(text))console.warn(text);else console.info(text);}
+var Module={canvas:document.getElementById('canvas'),print:record,printErr:record,preRun:[function(){
+  ENV.TD_SEED=query.get('seed')||'7';
+  if(query.has('qa') && window.jceRegistryEnvironment){
+    ['JCE_NATIVE_REGISTRY_REPORT','JCE_NATIVE_REGISTRY_NONCE'].forEach(function(key){
+      if(typeof window.jceRegistryEnvironment[key]==='string')ENV[key]=window.jceRegistryEnvironment[key];
+    });
+  }
+  if(query.has('qa'))ENV.TD_TRACE='1';
+  if(query.has('fixture'))ENV.TD_FIXTURE=query.get('fixture');
+  if(query.has('fixed-dt'))ENV.JCE_FRAME_DT_FIXED='0.016666667';
+  if(query.has('timing'))ENV.TD_TIMING='1';
+  if(query.has('legacy-frame'))ENV.TD_LEGACY_FRAME_MODE='1';
+  if(query.has('stress'))ENV.TD_STRESS=query.get('stress');
+  if(query.has('autodefense'))ENV.TD_AUTODEFENSE='1';
+  if(query.has('frames')){ENV.JCE_MAX_FRAMES=query.get('frames');ENV.JCE_KPI_FRAME_LOG='/frames.csv';}
+}],onAbort:function(message){record('ABORT '+message);}};
+if(query.has('qa')){
+ document.write('<div id="qa"><span id="qa-state">Loading</span> <button id="qa-export">Save evidence</button><textarea id="qa-log" aria-label="Runtime log"></textarea><pre id="qa-result" style="display:none"></pre></div>');
+ document.getElementById('qa-export').onclick=function(){
+  var files={};try{files.frames=Module.FS.readFile('/frames.csv',{encoding:'utf8'});}catch(e){files.frame_error=String(e);}
+  var result={logs:evidence.logs,files:files,elapsed_ms:performance.now()-evidence.started,canvas:[Module.canvas.width,Module.canvas.height],viewport:[innerWidth,innerHeight],visibility:document.visibilityState,wasm_heap_bytes:typeof HEAPU8!=='undefined'?HEAPU8.byteLength:null};
+  document.getElementById('qa-result').textContent=JSON.stringify(result);document.getElementById('qa-state').textContent='Evidence ready';
+ };
+}
+</script>
+{{{ SCRIPT }}}
+</body></html>

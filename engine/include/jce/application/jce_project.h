@@ -28,8 +28,9 @@
  * defaults (source_assets falls back to assets[0] or "assets",
  * cooked_assets defaults to "resources/_cooked", startup_scene NULL).
  *
- * All fields are optional except `name`.  Unknown keys are preserved on
- * round-trip via the underlying JSON tree (future work; v1+v2 drop them).
+ * All fields are optional except `name`. Saving an existing manifest retains
+ * unowned JSON nodes, including nested extensions, and replaces the fields
+ * represented below. Invalid input and duplicate root keys refuse the save.
  */
 
 #ifndef JCE_PROJECT_H
@@ -170,7 +171,12 @@ JCE_API JceProject *JCE_CALL jce_project_load(const char *project_root);
 JCE_API JceProject *JCE_CALL jce_project_new(const char *project_root,
                                              const char *name);
 
-/* Serialise `p` back to its manifest_path. */
+/* Serialise `p` back to its manifest_path. Existing data must be a readable
+ * strict JSON object without duplicate root keys or unrepresentable NUL text.
+ * Failed preparation/publication preserves the existing file. Absent manifests
+ * use exclusive creation; existing ones use host atomic replacement. Callers
+ * serialize writers; this does not provide concurrent-editor merge semantics
+ * or power-loss durability. */
 JCE_API bool JCE_CALL jce_project_save(const JceProject *p);
 
 JCE_API void JCE_CALL jce_project_free(JceProject *p);

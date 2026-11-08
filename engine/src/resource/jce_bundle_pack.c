@@ -56,12 +56,20 @@ JCE_API int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
 /* a second function argument on every call site.                      */
 /* ================================================================== */
 
+typedef struct PackProjectSettings {
+    void *bytes; /* Immutable host buffer, borrowed by all cook workers. */
+    size_t size;
+    PackResolveFn fallback;
+    void *fallback_user;
+} PackProjectSettings;
+
 typedef struct PackCtx {
     JceBundlePackLogFn log_fn;
     void              *log_user;
     bool               quiet;
     jmp_buf            jmp;
     int                error_code; /* set before longjmp                */
+    PackProjectSettings *project_settings; /* Owned across the failure jump. */
 } PackCtx;
 
 /* Thread-local so concurrent jce_bundle_pack_run() calls (e.g. CLI on
@@ -136,9 +144,11 @@ static void pack_log_ok(const char *fmt, ...)
 /* Fatal → bail out of the run with a non-zero return code instead of
  * exit().  Must only be called inside a jce_bundle_pack_run /
  * jce_bundle_pack_diff invocation. */
-static void die(const char *m)
+static void die(const char *m, ...)
 {
-    pack_log_err("%s", m);
+    va_list ap; va_start(ap, m);
+    pack_emit(JCE_BUNDLE_PACK_LOG_ERROR, m, ap);
+    va_end(ap);
     PackCtx *ctx = pack_ctx_get();
     if (ctx) {
         ctx->error_code = -1;
@@ -534,6 +544,94 @@ static uint8_t *read_file(const char *path, size_t *out_size) {
     return buf;
 }
 
+static void normalise_sep(char *s);
+static const char kPipelineAddress[] = "settings/render_pipeline.rp.json";
+
+static bool project_settings_resolve(const char *path, char *out, size_t capacity,
+                                     void *user)
+{
+    const PackProjectSettings *settings = (const PackProjectSettings *)user;
+    return settings->fallback &&
+        settings->fallback(path, out, capacity, settings->fallback_user);
+}
+
+/* Only these two explicit host locations participate in boot settings. Do not
+ * consult the process VFS: an editor's open project is not this build's input. */
+static void project_settings_path(char *out, size_t capacity,
+                                  const char *root, const char *relative)
+{
+    char cwd[1024] = "";
+    if (!pack_is_abs_path(root) &&
+        !jce_fs_host_get_current_dir(cwd, sizeof(cwd)))
+        die("cannot resolve project settings directory: %s", root);
+    const int n = cwd[0]
+        ? snprintf(out, capacity, "%s/%s/%s", cwd, root, relative)
+        : snprintf(out, capacity, "%s/%s", root, relative);
+    if (n < 0 || (size_t)n >= capacity)
+        die("project settings path exceeds capacity: %s", root);
+    normalise_sep(out);
+}
+
+static void *project_settings_read(const char *path, size_t *size)
+{
+    *size = 0;
+    const JceFsPresence presence = jce_fs_probe_read(path);
+    if (presence == JCE_FS_PRESENCE_ABSENT) return NULL;
+    if (presence != JCE_FS_PRESENCE_PRESENT)
+        die("project render pipeline is not a readable regular file: %s", path);
+    uint64_t read = 0, total = 0;
+    void *bytes = jce_fs_host_read_capped(path, 1024 * 1024, &read, &total);
+    if (!bytes || !total || total != read) {
+        jce_fs_buffer_free(bytes);
+        die("project render pipeline read failed or exceeds 1 MiB: %s", path);
+    }
+    cJSON *doc = cJSON_ParseWithLength((const char *)bytes, (size_t)read);
+    const bool valid = cJSON_IsObject(doc);
+    cJSON_Delete(doc);
+    if (!valid) {
+        jce_fs_buffer_free(bytes);
+        die("project render pipeline must contain a JSON object: %s", path);
+    }
+    *size = (size_t)read;
+    return bytes;
+}
+
+static void project_settings_prepare(PackProjectSettings *settings,
+                                      JceBundlePackOptions *opts,
+                                      const char *resource_root)
+{
+    char source[1536] = "", canonical[1536];
+    if (opts->project_root && opts->project_root[0]) {
+        project_settings_path(source, sizeof(source), opts->project_root,
+                              "Settings/RenderPipeline.rp.json");
+        settings->bytes = project_settings_read(source, &settings->size);
+    }
+    project_settings_path(canonical, sizeof(canonical), resource_root,
+                          kPipelineAddress);
+    size_t staged_size = 0;
+    void *staged = project_settings_read(canonical, &staged_size);
+    if (settings->bytes && staged) {
+        const bool equal = settings->size == staged_size &&
+            memcmp(settings->bytes, staged, staged_size) == 0;
+        jce_fs_buffer_free(staged);
+        if (!equal)
+            die("project render pipeline conflicts with canonical resource: %s <> %s",
+                source, canonical);
+    } else if (staged) {
+        settings->bytes = staged;
+        settings->size = staged_size;
+        snprintf(source, sizeof(source), "%s", canonical);
+    }
+    if (!settings->bytes) return; /* No authored policy: runtime tier defaults. */
+    settings->fallback = opts->resolve_fn;
+    settings->fallback_user = opts->resolve_user;
+    opts->resolve_fn = project_settings_resolve;
+    opts->resolve_user = settings;
+    LOG("project render pipeline: source=%s address=%s bytes=%llu hash=%016llx",
+         source, kPipelineAddress, (unsigned long long)settings->size,
+         (unsigned long long)XXH3_64bits(settings->bytes, settings->size));
+}
+
 /* Read an asset by its virtual path, preferring the editor/runtime VFS so
  * assets coming from *any* mounted root (engine builtins, project, plus
  * arbitrary developer-added folders like `halloween-test/`) all get
@@ -552,6 +650,19 @@ uint8_t *read_asset(const char *vpath, const char *resource_root,
                            size_t *out_size) {
     *out_size = 0;
     if (!vpath || !vpath[0]) return NULL;
+
+    /* The selected boot policy has one immutable source for dependency probes,
+     * hashes and parallel cook. Neither an active VFS nor a resolver can replace
+     * it between those phases. All unrelated assets retain their source order. */
+    if (resolve_fn == project_settings_resolve &&
+        strcmp(vpath, kPipelineAddress) == 0) {
+        const PackProjectSettings *settings = (const PackProjectSettings *)resolve_user;
+        uint8_t *copy = (uint8_t *)JCE_MALLOC(settings->size);
+        if (!copy) return NULL;
+        memcpy(copy, settings->bytes, settings->size);
+        *out_size = settings->size;
+        return copy;
+    }
 
     if (emap) {
         const char *abs = ext_lookup_abs(emap, vpath);
@@ -805,7 +916,7 @@ static bool stage_push_dep(DepStage *st, const char *vpath,
         uint32_t nc = deps->capacity ? deps->capacity * 2 : 16;
         JceBundleDep *g = (JceBundleDep *)JCE_REALLOC(
             deps->items, nc * sizeof(*g));
-        if (!g) return false;
+        if (!g) die("oom");
         deps->items    = g;
         deps->capacity = nc;
     }
@@ -1206,6 +1317,8 @@ static int run_diff_impl(const char *old_path, const char *new_path,
 
 static int run_build_impl(const JceBundlePackOptions *opts)
 {
+    JceBundlePackOptions effective_opts = *opts;
+    opts = &effective_opts;
     /* Local mutable copies of the path inputs for normalisation. */
     char scenes_dir   [1024];
     char resource_root[1024];
@@ -1373,6 +1486,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
     for (char *p = resource_root + strlen(resource_root); p > resource_root && p[-1] == '/'; --p) p[-1] = '\0';
     for (char *p = out_dir       + strlen(out_dir);       p > out_dir       && p[-1] == '/'; --p) p[-1] = '\0';
 
+    project_settings_prepare(pack_ctx_get()->project_settings,
+                             &effective_opts, resource_root);
     mkdir_p(out_dir);
     {
         char stale_graph[1280];
@@ -1575,6 +1690,11 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 .parent = scene_address,
                 .origin = "scene"
             };
+
+            if (opts->resolve_fn == project_settings_resolve) {
+                st.origin = "project_settings";
+                (void)stage_push_dep(&st, kPipelineAddress, JCE_BUNDLE_TAG_FORCE_SHARED);
+            }
 
             if (have_project_roots) {
                 st.parent = scene_address;
@@ -2051,6 +2171,13 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         } else if (r->refs.n == 1) {
             target_id = r->refs.items[0];
         } else {
+            /* Below the shared threshold, keep an ordinary dependency in
+             * each referencing scene. The threshold controls placement, not
+             * whether a referenced asset survives packaging. */
+            for (size_t s = 0; s < r->refs.n; ++s) {
+                Bundle *local = bv_get(&bundles, r->refs.items[s]);
+                if (local) bundle_add_asset(local, r->asset);
+            }
             continue;
         }
 
@@ -2083,14 +2210,14 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         {
             uint8_t cook_flag = opts->cook_assets ? 1u : 0u;
             int     cook_plat = opts->target_platform;
-            /* 3: mip averaging became colour-space aware
-             * (jce_cook_path_is_srgb -> JceCookOptions::texture_srgb).  The
+            /* 4: Web defaults to portable RGBA8 rather than optional ASTC.
+             * Earlier revisions covered colour-space-aware mips. The
              * bump is not optional: the source bytes, the cook flag and the
              * platform are all unchanged, so without it the incremental cache
              * reports `reused` and the corrected mips are never written --
              * the fix would land in the source and not in the output, which
              * is indistinguishable from it not working. */
-            uint32_t writer_revision = 3u;
+            uint32_t writer_revision = 4u;
             XXH3_64bits_update(xs, &cook_flag, sizeof(cook_flag));
             XXH3_64bits_update(xs, &cook_plat, sizeof(cook_plat));
             XXH3_64bits_update(xs, &writer_revision,
@@ -2691,6 +2818,10 @@ JCE_API int jce_bundle_pack_run(const JceBundlePackOptions *opts,
     ctx.log_fn   = log_fn;
     ctx.log_user = log_user;
     ctx.quiet    = opts->quiet;
+    PackProjectSettings *const settings =
+        (PackProjectSettings *)JCE_CALLOC(1, sizeof(PackProjectSettings));
+    if (!settings) return -1;
+    ctx.project_settings = settings;
     PackCtx *prev = pack_ctx_get();
     pack_ctx_set(&ctx);
     int rc;
@@ -2699,6 +2830,8 @@ JCE_API int jce_bundle_pack_run(const JceBundlePackOptions *opts,
     } else {
         rc = ctx.error_code ? ctx.error_code : -1;
     }
+    jce_fs_buffer_free(settings->bytes);
+    JCE_FREE(settings);
     pack_ctx_set(prev);
     return rc;
 }

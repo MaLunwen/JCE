@@ -1,0 +1,22 @@
+{
+  "contract": {
+    "name": "jce.bundle.dependencies",
+    "major": 1,
+    "minor": 0
+  },
+  "assets": [
+    "textures/ground_baked2/spring_day.png",
+    "textures/ground_baked2/spring_night.png",
+    "textures/ground_baked2/winter_day.png",
+    "textures/ground_baked2/winter_night.png",
+    "textures/ground_baked2/autumn_day.png",
+    "textures/ground_baked2/autumn_night.png",
+    "textures/ground_baked2/rainy_day.png",
+    "textures/ground_baked2/rainy_night.png",
+    "audio/sounds/thunder/near/thunder_strike.mp3"
+  ],
+  "labels": [
+    "runtime",
+    "weather"
+  ]
+}

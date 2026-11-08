@@ -143,3 +143,72 @@ nonblocking public stream quiescence query acknowledges completed user pulls,
 not device silence callbacks. Owner controls/queries are serialized; the real-time
 callback uses atomics without waiting. Regular/invalid/disabled voices cannot
 provide this acknowledgement.
+
+## Shared master final ownership
+
+`jce_audio_master.inc.h` owns the existing process device, eight graph slots and
+one tap. `jce_audio_master_gate.h` owns actual callback admission/in-flight
+quiescence with lock-free I32 atomics. Actual thread IDs retain both halves;
+zero is valid on Web. No U64 facade atomic (mutex-backed), allocation, log or
+wait is introduced on callback entry. The existing single-device callback
+serialization remains required by the shared temporary PCM buffer.
+
+The private lifecycle entries live in `jce_audio_master_lifecycle.inc.h` and
+its internal declaration header. Engine admission opens only for an admitted
+new owner and closes on every DRAINING route. Final callback quiescence may
+refuse after two seconds while retaining every borrowed target and the device;
+the closed gate remains latched for retry. Native `ma_device_uninit` follows
+quiescence and owns its join without a portable latency bound. Do not call
+`ma_device_stop` first. Graph/Play/Stop lifetime never retires the shared device;
+the last graph still leaves a gapless silence tap until final Engine shutdown.
+
+Legacy graph destruction and tap clear/replacement remain caller-serialized
+operations; they do not acquire a new global-main-thread restriction. They synchronously wait for actual borrows instead of freeing on a
+two-second generation timeout. This can block behind a stalled user callback.
+Callback/self-wait calls refuse before mutation; a void destroy refusal does
+not certify destruction, and its caller must retain the original owner for a
+valid serialized owner release. Tap false never authorizes releasing its old context.
+New device-driven graphs/taps refuse during Engine closure; offline graphs do
+not own the device. Final shutdown disarms old slots/tap but never frees foreign
+caller graphs. Reopening a session does not reactivate old retained slots.
+
+Actual-owner controls include the production master body with typed device and
+clock ports, normal/zero-thread-ID reentry, timeout retention, synchronous old
+callback retirement, startup rollback and last-graph silence. The disabled-hook
+fixture compiles the actual new JCE_NO_AUDIO lifecycle entries only; it does not
+certify the historically incomplete full disabled facade. Real-device gapless
+coverage remains separate; physical Web/mobile audio retirement is unverified.
+
+A failed callback-gate allocation releases partial atomics, latches device failure
+and emits one owner-thread ERROR for that session. Only final retirement and an
+admitted next session permit retry. Actual-owner controls inject an atomic
+allocation failure, observe the real log call and partial cleanup, and restore
+only the old silent/retrying wire as an ordinary negative. An unmarked-owner
+fixture runs without mark_main to cover the default standalone initialization;
+the complete-audio-TU worker fixture separately checks post-mark offline creation,
+actual rendering and actual graph free. Device-less graph controls bypass master
+admission; private Engine lifecycle hooks alone enforce global-main ownership.
+
+The private `jce_audio_master_device_live_internal` observer returns the actual
+master `device_inited` flag for serialized owner-thread lifecycle use only;
+it performs no device creation, callback admission, wait or logging. It is
+false for never-created, init/start failure rollback, retired and disabled
+backends. Engine samples it only around its existing final-retirement service
+scope. Actual-master typed-native controls cover live, timed-out retention,
+retirement and repeated no-op reads; the disabled hook fixture stays explicit.
+This getter is not a concurrent public device-status API or native-join proof.
+
+## Windows COM reference ownership
+
+The selected original miniaudio0.11.25 release owns WASAPI COM initialization
+and shutdown; do not patch its header or add an application COM workaround.
+A successful CoInitializeEx result of either S_OK or S_FALSE acquires one
+reference. A failure, including RPC_E_CHANGED_MODE on an existing SDL STA,
+acquires none and must not release that other owner's reference. Keep SDL,
+audio, WASAPI and gamepad features enabled.
+
+The Windows CPU target `test_jce_miniaudio_com` consumes the complete selected
+`ma_context_get_MMDevice__wasapi` body with typed COM/enumerator/log ports.
+Its selected-header and function hashes are printed by the executable. This
+proves the tested reference ledger, not native audio output or a Win7 exit;
+those require the rebuilt Engine/Editor and actual platform validation.

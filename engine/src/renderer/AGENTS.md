@@ -1,11 +1,259 @@
 # engine/src/renderer — Renderer Layer (L3)
 
+Accepted canonical readbacks emit transition-only `readback.operation` packets
+from their existing slot owner. Capture-local operation/context/ticket identity,
+provider promise, observed serial, readiness and actual CPU release remain
+separate fields. Repeated pending polls add no packets; capture-generation
+changes leave old work unlinked. Ready observations use the existing wrap-safe
+provider contract, including valid zero/MAX serials, not a whole-device fence.
+All native/headless/rollback/destroy `bgfx_shutdown` calls have a nested
+`renderer.backend_shutdown_cpu` interval; its return never asserts Present.
+The legacy PNG/video staging path reuses the canonical RGBA16F blit/read-back/
+2D-format admission before allocation or file admission. Unsupported requests
+refuse and warn once per backend lifetime, reset after backend shutdown. A
+black/transparent image is not itself a failure heuristic or proof of rendering.
+
+Stock acquisition/cook profiles are declared once in contracts/shader-keywords.json.
+Its existing generator emits the private profile table and machine catalog;
+normal shader entries/public variant layout remain unchanged. Both PAK and FS
+stock routes initialize every owned/variant handle to INVALID, then acquire only
+the selected profile's programs. Compatibility applies only to a compiled
+compatibility tier on actual GL/GLES. Its static-only table excludes unsupported
+families rather than treating zero as missing; acquired handle zero stays valid.
+Cached successful acquires still normalize before named aliases borrow them.
+Declared catalog membership is not shader/link/device/Editor acceptance.
+
+When object-ID readback is unavailable, model meshes own retained triangle
+data. Rigid meshes retain positions and indices, while skinned and morph
+meshes reuse their immutable source vertices. The CPU ray query is bounded
+and uses one temporary buffer to apply morph and skin data on demand.
+A failed or over-budget source reports unavailable rather than a partial hit.
+`JCE_DBG_PICK_CPU=1` forces this route from launch for QA.
+
+Compatibility GL/ES keeps the GPU skinning family excluded. Its skinned meshes
+retain immutable base vertices for the private CPU deformation path.
+The CPU deformer consumes the existing model-space joint palette after any
+morphing and leaves material attributes intact. Posed geometry binds through
+the existing static programs, using a per-instance dynamic buffer or a frame
+transient source for direct model draws. The renderer does not own animation
+sampling or editor pick state. Modern non-morph meshes retain no CPU copy.
+
+The public compatibility API tier appends value 4 after the legacy COUNT
+sentinel 3. The renderer maps cached bgfx package ordinal 3 to public policy 4.
+Public COUNT stays invalid for name and floor lookup. The compatibility package
+uses GL 2.1 / GLES 2.0 and checks observed versions before and after initialization.
+Its Vulkan 1.0 policy row is advisory, not new dependency compile metadata.
+Version admission does not certify required extensions, shader families,
+offscreen formats or a usable Editor. A native UNANSWERED vertex-fetch field
+is conservative for compatibility; explicit backend YES/NO remain authoritative
+and the original native policies retain their existing guarantee fallback.
+
+The shader loader owns the public blob-program create/destroy bodies in
+`jce_shaders.c`. The blob path checks the uint32 backend size limit, submits
+one owned copy at a time, and uses `link_program_owned` for creator release
+on success or partial/link failure. Caller buffers remain borrowed.
+The renderer submission path owns the actual backend frame call and raw
+counter edges. Reuse its existing service and packet identity.
+
+Native synchronous `jce_shaders.c` PAK/FS/overlay loading has optional CPU provenance
+under the existing device session's JCE_RENDER_RESOURCE_DIAG latch and Core
+trace admission. It fingerprints the complete actual bgfx Memory before
+create_shader consumes it: eight digest-order big-endian uint32 SHA-256 words,
+byte count, capture generation, known/unknown device generation and returned
+handle. Stack receipts directly qualify that invocation's link and partial
+creator release; no global handle registry, copied SHA or submit hook exists.
+The native evidence wrapper keeps the existing shared link_program_owned body
+and its destroyShaders=false plus explicit creator-release policy unchanged.
+Its existing six child counters report actual link return and creator-release
+calls. Void destroy return is not final resource destruction.
+
+Missing, capture-changed, wrong-handle and unavailable/changed-context receipts
+have explicit reasons and zero joined create IDs. Duplicate cached handles
+remain independent acquisitions; these facts do not certify bgfx's internal
+cache payload, program final references, backend execution or presentation.
+The Web deferred resolver, other shader loaders, final program destruction and
+all submit/dispatch paths remain outside this synchronous owner scope. Default
+off neither hashes nor allocates nor reads a new clock; this is not a measured
+zero-cost or frame-performance claim. Capture reset still requires producer
+quiescence. Core owns SHA once; private policy reads reuse the device latch.
+
+PBR static PCF selects its cascade sampler outside the unchanged nine/twenty-five
+tap loops. The shared sampler-parameter helper retains tier decisions, kernel
+rotation and arithmetic; hard taps, PCSS blocker search, coverage/bias and the
+dynamic-atlas combine keep their original owners. This declaration is also
+consumed by PBR variants, graph/classic materials and unlit shader parsing;
+compiling or replaying the default PBR entry alone does not qualify them all.
+Static shadow targets currently have one mip, point filtering and clamp. Revisit
+implicit-LOD behavior before changing that policy; a varying cascade branch
+does not establish derivative correctness for a future filtered mip chain.
+
+Grass CSM selects its cascade sampler once outside the unchanged four-tap PCF.
+Coverage, bias, tap order, cascade fallthrough and edge blending remain owned
+by the existing grass shader. Shadow targets currently have one mip and point
+filtering; changing either requires revisiting implicit-LOD sampling within the
+per-fragment cascade branches. D3D11 replay pixel parity or local event timing
+does not certify dynamic boundaries, another backend or native whole-frame gain.
+
+Mounted RenderPipeline boot resolution seeds only absent MSAA from the current
+requested descriptor, so the stock launcher's legacy quality fallback precedes
+an explicit canonical field. Private seeded host/PAK readers share the existing
+strict JSON parser; public load/load_pak/load_fs retain their LOW defaults and
+do not inherit active state. JSON key presence distinguishes explicit 1/off
+from an absent field and preserves the existing legacy 16-sample fallback.
+The final effective RP remains the only configuration policy consumed by the
+stock launcher's existing renderer setter. This concerns swapchain requests,
+not scene-geometry multisampling or backend/GPU acknowledgement.
+
+The private renderer session reads JCE_RENDER_RESOURCE_DIAG once after device
+admission, using the shared environment flag convention. Offscreen wrappers copy
+that default-off policy. Explicit DIST-capable render-resource records describe
+CPU create/resize publication, rollback/destroy-call return and the main view's
+actual forwarded rectangle/FBO tuple after both void calls return. Allocation
+extent and requested extent remain distinct; rollback extents are unknown, even
+when staged dimensions exist. Existing creation serial/capture generation and
+handles qualify identity. Only first/changed allocation/view tuples log; repeated
+prepares neither re-read environment nor query the backend. Overlay/composite
+view changes, Fog/other RT owners and subsequent overwrite by other view users
+are outside this first-stage diagnostic. No record proves GPU execution, backend
+allocation acknowledgement, residency release or presentation. Pure CPU controls
+consume complete offscreen ownership plus actual session admission/accessors.
+
+Separately, enabled Core tracing publishes the existing offscreen identity plus
+forwarded rectangle width/height and CPU submission ordinal inside every
+successful main/overlay renderer.view_configure service. Its 22 ordered counters
+reuse creation serial, origin/current capture generations, actual view,
+allocation extent, formats, single-sample policy and handles; overlay uses its
+actual forwarded view id. Only successful tails publish this tuple, after the
+existing view calls return. Allocation lifecycle consumers must qualify the
+parent service and create_committed, not count repeated identity/logical-byte
+appearances as new resources. First/change INFO diagnostics remain unchanged.
+Complete-owner real-ring controls verify the tuple against counted allocation
+and view ports; the missing_rect_height whole-owner control must compile then
+fail unchanged ordinary assertions. These records describe CPU configuration,
+not backend acceptance, GPU completion or the final displayed texture.
+
+These diagnostics use schema=2 with exactly two bounded messages per observation,
+part=1 then part=2. Each repeats event_ordinal, creation_serial,
+origin_capture_generation and view; consumers require both parts with identical
+keys before accepting a resource witness. The wrapper-owned ordinal advances
+only for a diagnostic observation, not each frame. Its last UINT64_MAX event is
+valid; a following attempt emits part=0 diagnostic_exhausted once and disables
+that wrapper's diagnostics. Missing, malformed, duplicate or exhausted records
+cannot prove the resource observation. Part1 owns allocation/phase/submission;
+part2 owns request, forwarded rect and destroy/CPU/GPU-known fields. Both fit the
+actual logger's 512-byte message including NUL even at maximum integer widths
+(402/455 payload characters); no logger buffer or rendering policy is expanded.
+Steady unchanged prepares still emit neither part. Logger loss is unavailable
+evidence, never permission to reconstruct a missing part from requested state.
+
+PostFX TAA history and camera-motion targets keep explicit caller texture
+references; their FBOs use destroyTextures=false. Pinned bgfx's validation
+failure retains caller ownership, while post-validation handle exhaustion
+still honors destroyTextures=true, so failure cleanup must never guess which
+branch consumed a texture. create_taa_target publishes only a complete pair
+and rolls back an unadmitted texture; history-valid publishes only on success.
+Motion can exist without history when only motion blur is enabled. Resize and
+destroy therefore retire each target's handles independently, clear them before
+release and reset history validity. Disabling a feature retains reusable targets
+until resize/destruction; no GPU fence or immediate residency claim is made.
+
+RenderPipeline load_fs uses the public explicit archive-only bounded read with
+a 1 MiB limit before decode. All loaders share the strict JSON-object parser;
+the explicit-FS loader clears output on failure and does not apply. The public
+get_requested snapshot preserves the last applied unclamped intent; deferred
+edits are excluded until end_frame commits them. Temporary hosts must snapshot
+that intent rather than the cost-clamped active descriptor.
+
+Tracing-enabled actual RP application publishes one render_pipeline.publish
+service before observer callbacks, with same-scope core counters rp.volfog,
+rp.csm, rp.ssao, rp.ssr, rp.taa, rp.bloom, rp.mblur, rp.scale_milli, rp.shadow
+and rp.cascades. The same publication includes rp.shadow_filter,
+rp.backbuffer_msaa, rp.post_quality, rp.hdr, rp.depth_prepass and rp.ssgi.
+Boolean queries include existing QA forces; numeric values follow resolved
+policy. Backbuffer MSAA policy does not report offscreen target samples.
+Queries and unchanged end_frame do not emit. This is effective CPU policy
+publication, not pass execution, GPU completion or final framebuffer appearance.
+
+RenderPipeline asset save publishes its existing serialized JSON through the
+shared public atomic host writer. Failed write, close or rename retains the
+previous authored file; a successful save does not itself apply the descriptor.
+The shared writer's same-destination serialization requirement and absence of
+fsync/power-loss durability remain authoritative. No second file writer or new
+asset schema is introduced. Real RP/host-owner failure and old-direct controls
+live in tests/renderer/render_pipeline_persistence_controls.cmake.
+
+The private KTX bridge validates complete RGBA8/RGBA16F cube wire layout before
+allocating decoded storage. Reads accept typed KTX1 or the exact legacy pinned
+bimg zero-type triple; writes normalize checked, owned blobs to typed headers.
+Single/full chains, uint16 edge, uint32 upload and encoder int32 wire limits are
+explicit; partial chains cannot be passed to the backend's boolean hasMips API.
+Upstream bimg remains unchanged. CPU roundtrip/malformed/ordinary controls live
+in tests/renderer/ktx_container_controls.cmake; external-tool and GPU liveness
+require their own actual evidence.
+
+Cube-source probe convolution uses a checked complete chain through 1x1:
+256/512 edges require 9/10 levels. Count, RGBA8 byte sizing and both RGBA8/HDR
+convolution consumers share this layout; invalid backend edges and count/float
+allocation overflow return zero before narrowing or copying. The independent
+equirectangular sky prefilter retains its existing eight-level budget. Do not
+weaken the KTX single/full-chain guard to admit a truncated probe chain.
+
 > Sub-memory for the renderer. See repo-root `AGENTS.md` for global rules.
+
+Launch Vsync policy is object-local and fed by the existing lifecycle bridge;
+Renderer never reads Engine state; the lifecycle bridge owns the Vsync launch override. Initial
+config resolution precedes backend creation, and the same public Vsync setter
+resolves later requests without extra resets when its effective flag is stable.
+Resize/MSAA/rebind preserve unrelated reset bits. Renderer-only
+jce_renderer_launch_policy_internal.h/.inc.h keep this below the main TU cap.
+The bridge's explicit observations read the actual flag getter and distinguish
+headless/Noop/fallback unavailability. Repeated identical requests do not publish;
+scope success means CPU observation, never backend acknowledgement or GPU idle.
+
+Windows D3D12 uses an observed unmapped-window constraint on effective Vsync.
+Each backend attempt queries the public window flags before bgfx initialization;
+only a successful flags query containing HIDDEN masks BGFX_RESET_VSYNC. Visible,
+MINIMIZED-only, unknown flags, other backends and other platforms keep their
+requested policy. The successful attempt publishes its actual reset flags and
+private presentation snapshot together. Neither config values nor explicit launch
+override presence/value change. Later setters retain the latest request even
+without a launch override, then apply the existing launch pin and the constraint.
+Explicit platform rebind refreshes that snapshot and restores/clears the Vsync bit
+inside its existing single reset, preserving MSAA and unrelated flags. There is
+no per-frame query, hidden-to-headless conversion, new visibility API or dependency
+patch. Constraint transitions and opt-in launch observations describe CPU flags,
+not display synchronization acknowledgement or GPU completion.
+
+Private device launch diagnostics reuse `jce_renderer_launch_policy_internal.h` /
+`.inc.h`. `JCE_GFX_FLIP_AFTER_RENDER=0|1` and
+`JCE_GFX_MAX_FRAME_LATENCY=0..3` are independent, default-absent experiments.
+Only one ASCII digit is valid; missing/empty retains exact bgfx ctor/reset values.
+Windowed creation snapshots once before native/allocator/device acquisition and
+refuses malformed requests explicitly. Every fallback attempt borrows that same
+immutable value, never process environment pointers. Headless and software entry
+points report inapplicability without changing their existing device policy.
+The flip control selects bgfx CPU flip scheduling, not DXGI flip-model; the bit
+persists through Vsync/MSAA/resize/rebind and hidden D3D12 clears only VSYNC.
+Latency forwards at init only for pinned bgfx 1.146.9306-550 D3D11/Vulkan.
+A forwarded zero asks for backend defaults, not a zero-depth queue.
+D3D12's command-queue-to-IDXGIDevice1 path does not apply this field; GL has no
+consumer. Other backends retain ctor defaults. Full device recreation is required
+for another request; Vulkan's fence/release-ring change may reduce throughput.
+Opt-in bounded log/trace packets record requested/forwarded fields, init bits and
+CPU admission outcome. `latency_support` reasons: 1 D3D11/Vulkan forwarding,
+2 D3D12 unsupported, 3 GL/GLES unsupported, 4 Noop inapplicable, 5 other/unknown.
+`phase` distinguishes invalid refusal (0), init failure (1), CPU admission (2),
+API refusal (3), headless entry (4) and software entry (5). Only phase 2 is a
+successful CPU scope; all backend ACK and GPU completion fields remain unknown.
+Default-off emits no new log/trace packets, and no frame loop reads these flags.
+Actual complete attempt/prefix and reset CPU fixtures test parsing, latching,
+forwarding, refused publication and bit preservation; they do not prove backend
+acceptance, latency improvement, pixels or performance on any physical device.
 
 ## Identity
 
 - **Layer**: L3 (Renderer) — sits above OS, below middleware.
-- **Language**: **C99** (.c). Implementation TUs ending in `.cpp` only when bridging C++ third-party (none here today).
+- **Language**: **C99** (.c). Implementation TUs ending in `.cpp` only when bridging C++ third-party interfaces.
 - **Public headers**: `engine/include/jce/renderer/jce_*.h`
 - **Public umbrella**: `<jce/api_graphics.h>` (low-level) + `<jce/api_render.h>` (graph/scene/lighting/postfx).
 - **Backend**: **bgfx** is the ONLY graphics backend. Do not introduce raw GL/Vulkan/D3D/Metal calls — go through bgfx.
@@ -17,6 +265,7 @@
 | File | Role |
 |------|------|
 | `jce_renderer.c` / `jce_renderer_caps.c` | bgfx init, frame loop, capability query |
+| `jce_renderer_bgfx_callback.c` / `jce_renderer_bgfx_profiler_internal.h` | Backend diagnostics, screenshots/capture and bounded per-thread CPU-profiler callback consumption; callback package availability and GPU completion remain separate |
 | `jce_render_graph.c` / `jce_render_queue.c` | Render graph & sorted queue |
 | `jce_scene_renderer.c` | Scene-level render path (ties ECS → passes) |
 | `jce_gpu_scene.c` | Adaptive GPU Scene / MDI backend: per-model visibility groups, explicit compacted-indirect/fixed-count policy independent of capability, compute culling, bounded growth, frame counters, and CPU fallback |
@@ -28,9 +277,9 @@
 | `jce_lighting*.c` / `jce_light_cluster.c` / `jce_ibl.c` / `jce_lightmapper.c` | Lighting (forward+ cluster, IBL, baked).  `jce_ibl.c`'s two convolutions are pure functions of a DIRECTION and take their sampler as a parameter, which is how the reflection probe reuses them (`jce_ibl_convolve.h`) instead of carrying a second copy of the same integrals.  Two conventions live here and the difference is PI: the sky path passes PI, the probe path passes 1.0, and `fs_pbr_body.sh` wants the latter -- see the note on `ibl_convolve_irradiance_f32`. |
 | `jce_csm.c` / `jce_shadow_filter.c` | Cascaded shadow maps |
 | `jce_postfx.c` / `jce_taa.c` / `jce_ssao.c` / `jce_ssr.c` / `jce_volumetric_fog.c` | Post processing |
-| `jce_render_pipeline.c` | Render Pipeline Asset (`.rp.json`) — JSON I/O, 4 tier presets, boot autopick, cached descriptor surfaced via `jce_render_pipeline_is_feature_enabled()` (P3-E.4) |
+| `jce_render_pipeline.c` | Render Pipeline Asset (`.rp.json`) — JSON I/O, 4 tier presets, boot autopick, and the sole requested/active/pending authority. Material-look intent is distinct from effective postfx budgets; full apply replaces pending, tier re-resolution preserves it. |
 | `jce_reflection_probe_bake.c` | Reflection probe bake worker (P3-E.3) — single-slot dedicated `jce_thread`, atomic status/progress/cancel.  The faces come from `jce_scene_probe_capture.c` (six real 90-degree renders); the CPU procedural sky gradient is now only the FALLBACK for a host with no renderer, and it has an f16 twin so an HDR bake that falls back still produces a container at the stride its header declares. Encode stage now writes a **real KTX1 cubemap** via the `jce_ktx2_writer` bridge + an `.irr.ktx` irradiance sidecar (placeholder source data shared with the specular write for v2). Rewrites caller-supplied `.cube`/`.ktx2` suffixes to `.ktx` in place. Stable public API in `<jce/renderer/jce_reflection_probe_bake.h>`.  **Steps 2 and 3 used to do no work at all** -- the irradiance sidecar was a copy of the specular faces and the container declared one mip, so every roughness read the mirror image and the diffuse term read a mirror of the scene.  They now call the real integrals.  Mip 0 is copied from the source, not integrated: roughness 0 is a mirror, and integrating it cost ~800M samples to compute a copy.  **`desc.hdr` carries RGBA16F through the whole worker** -- both convolutions, the chain allocation (`mipchain_bytes` counts ELEMENTS, so the byte count doubles and the element count does not) and both writer calls.  The one place that must agree and is easy to miss is the SUBMIT-time copy of the caller's faces: it sized itself at 4 bytes per texel while the worker read 8, so an HDR bake read faces 3-5 past the allocation and faces 0-2 looked right. |
-| `jce_ktx2_writer.h` / `jce_ktx2_writer.cpp` | Private C↔C++ bridge to bgfx's bundled `bimg::imageWriteKtx`. In-memory `bx::WriterI` backed by `jce_alloc`, blob flushed via `jce_fs_host_write_all` (no raw `fopen`). Ships **KTX1** because bimg has no KTX2 supercompression writer in the vendored bgfx — file is still parseable by bgfx + RenderDoc + KTXSoftware. Also exposes `jce__ktx_load_cubemap(path)` (P1-baked-gi-consume): a **hand-rolled KTX1 reader** that loads the cube via `bgfx_create_texture_cube`.  It takes the pixel format FROM THE CONTAINER (`glInternalFormat`, with `glType` cross-checked only when non-zero -- bimg writes 0 for RGBA8): 0x8058 -> 4 bytes, 0x881A -> 8 (RGBA16F), anything else refused rather than guessed.  It used to assume 4 in three separate places, which was true while the writer could only emit RGBA8 and stopped being true the moment an HDR probe could be baked. It does NOT use `bimg::imageParse` on purpose — that pulls in `bimg_decode`'s vendored `miniz`, which collides at link with the engine's `zip` dep (LNK2005). NOT a public header.  **TWO LAYOUTS, transposes of each other:** KTX1 (and `imageWriteKtx`'s source pointer) is MIP-MAJOR -- each mip, then its 6 faces; `bgfx_create_texture_cube` wants SIDE-MAJOR -- each face, then its whole chain.  `jce__ktx_parse_cubemap` does that transpose and is split out so a test can round-trip the real container with no GPU.  This file's own comment claimed face-major and was believed once. |
+| `jce_ktx2_writer.h` / `jce_ktx2_writer.cpp` | Private C/C++ bimg bridge. Owned, checked output uses typed KTX1 RGBA8/RGBA16F headers and host filesystem wrappers; original upstream stays unchanged. The preflighted reader accepts typed or exact legacy zero-type headers, then transposes mip-major wire bytes to side-major backend bytes. Single/full chains and integer limits match the encoder/upload contracts. CPU roundtrip and malformed controls do not certify external tools or GPU use. |
 | `jce_particles.c` / `jce_gpu_particles.c` | CPU/GPU particles.  Both submit the SAME `fs_particle` program, so anything per-draw (texture flag, blend, the soft-particle depth fade) must be wired in BOTH or it is a setting that works for some emitters.  Soft particles: `jce_particles_set_soft_fade_distance()` is the process-global both hosts write; `JceGpuParticleSoft` carries the frame's depth into the GPU draw via `_render_soft` (`_render_ex` keeps its ABI and delegates with NULL). |
 | `jce_sprite.c` / `jce_sprite_batch.c` / `jce_text.c` / `jce_skybox.c` / `jce_decals.c` | 2D/quad systems. **`jce_text.c` batches a glyph run into ONE draw** via `jce_draw_textured_quads_view` (`jce_renderer_internal.h`); it submitted one draw call PER GLYPH until 2026-09-01. The batch breaks only on an atlas change (`g->dynamic`), a full staging array, or the end of the run — all three preserve submit order, which IS draw order on the SEQUENTIAL UI views. `jce_sprite_batch.c` is unrelated: world-space, 4x4 transform per sprite. The quad geometry is checked headless by `jce_primitives_self_test()` (`jce_primitives_selftest.h`). |
 | `jce_debug_draw.c` | Debug line/box/text drawing |
@@ -64,9 +313,95 @@ and unsupported routes return unavailable, never invented survivor totals.
 8. **Profiling**: each pass `JCE_PROFILE_ZONE("pass_name")` so Tracy GPU/CPU traces line up.
 9. **Adding a pass**: register it in `jce_render_graph.c`, allocate resources via the graph, integrate into `jce_scene_renderer.c` per-view path.
 10. **File caps**: hot files like `jce_scene_renderer.c` approach the limit — split before adding large features (see `jce_render_queue.c` / `internal/` pattern).
-11. **Mip streaming** (`jce_texture_*_mip_*` API): `effective_top_mip = max(global_bias, per_texture_bias, caps_floor)`, clamped so the 4×4 mip-tail is always resident. Caps-floor matrix: **Low → 1**, **Mid → 0**, **High → 0**. The global bias is driven by the streaming pressure hook installed in `engine/src/resource/jce_world_streamer.c` (OK→0 / SOFT→1 / HARD→2); textures must opt-in (call any of the streaming setters) to be affected. **Honest-demotion rule (audit F29):** a demotion is physically applied **only** for source-backed textures (those holding a retained CPU mip-0). Default textures keep no redundant CPU mirror (low-RAM baseline), so their requests are recorded as intent and `get_size`/`get_resident_top_mip` keep reporting the **true** GPU level — never fake a shrink that did not happen. Real default-texture streaming awaits an on-disk mip-chain asset format (stream from PAK, not a RAM mirror). Do **not** "fix" this by stashing a CPU copy of every texture.
+11. **Mip residency intent** (`jce_texture_*_mip_*` API): `effective_top_mip = max(global_bias, per_texture_bias, caps_floor)`, clamped to the 4x4 tail. Low/Mid/High floors remain 1/0/0 and pressure requests remain 0/1/2. Initial creation applies supported quality choices; runtime requests preserve raw handles borrowed by value, dimensions, registry/source ownership and actual resident queries. This includes source-backed textures: retained pixels cannot repair existing material/UI handle copies. Runtime replacement is currently unsupported, logged once per entry and traced once per capture; it is not physical demotion or memory reclamation. A future stable handle/binding contract is required before that claim can return.
 
 ## Common tasks
+
+The private readback deferred-destroy path never submits a frame. It transfers
+the existing queue to closing/destroy-requested ownership while retaining CPU
+destinations still borrowed by bgfx. Central submission collects these queues
+only after its actual backend frame serial is published; half-range ambiguity
+retains them. Only closing, destroy-requested queues of that renderer are freed;
+caller-owned wrappers retired at shutdown survive until their public destroy.
+After-backend-stop remains the final fallback. Public destroy's existing bounded
+advance loop keeps its queue until its own deferred exit and is not changed into
+a second collector owner. Probe admission reuses the existing retiring count
+with the public queue capacity as backpressure; public queue creation policy is
+unchanged. These ownership observations do not establish GPU idle/presentation.
+
+`jce_renderer_reset_trace_internal.h` owns bounded CPU observations around the
+actual void bgfx reset invocation. Resize/rebind/vsync/MSAA preserve their
+existing guards, queries, flags and argument sanitation. Fixed scoped details
+retain reason, raw requested extent, extent-known, exact forwarded extent/flags
+and call-returned; backend-result-known and GPU-completion-known stay false.
+Request-known describes observed raw arguments, including known zero resize
+values and vsync fallback sentinels; MSAA supplies no extent and remains unknown.
+Forwarded dimensions are not acknowledged backend dimensions. SUCCEEDED means
+the void call returned, not swapchain recreation, successful presentation or GPU
+completion. Unchanged/refused entries produce no reset span, so absence alone
+does not establish why a request was skipped. Disabled/suppressed tracing adds
+no detail/clock/id work or backend queries; no new logs or reset deduplication
+policy is installed. Native event delivery and performance require real devices.
+
+`jce_renderer_bgfx_callback.c` consumes bgfx's dynamic/literal CPU-profiler
+callbacks through `jce_renderer_bgfx_profiler_internal.h`. A fixed 64-entry
+compiler-TLS stack copies bounded `bgfx.cpu.*` labels and reuses `JceTraceScope`
+for parent identity, current-thread IDs and paired completion. Disabled or
+suppressed begins occupy zero-scope positions; overflow has separate skipped
+depth and explicit `bgfx.cpu.stack_overflow` counters, so its ends cannot pop
+admitted parents. Unsupported compiler TLS emits an unavailable counter instead
+of sharing a mutable stack between threads. Capture switches/reset require
+quiescent producers; the bridge does not discard open spans to fake completeness.
+There is no new thread registry or explicit per-callback heap allocation, but
+this does not assert that compiler TLS, trace or external profilers never allocate.
+Actual callback use is separate from whether a particular upstream bgfx package
+enabled its optional profiler. Missing callbacks remain unknown/unavailable,
+not measured zero CPU work. These spans do not establish GPU completion.
+The private `jce_rcb_cpu_profiler_witness()` separately reports the package's
+`JCE_BGFX_CPU_PROFILER_COMPILED` value (missing/invalid is -1 unknown), compiler
+TLS bridge support and an atomic count of actual dynamic/literal begins, even
+with trace capture off. The count saturates at INT32_MAX as an explicit lower
+bound. `jce_rcb_callback_interface()` resets it before each serialized init
+attempt and publishes one `init_attempt` log/optional scoped trace record.
+Every entered attempt retains a once-only terminal: `init_failed` after bgfx's
+false init return has destroyed its Context and joined any owned render thread;
+`api_refused` / `allocation_failed` after their actual shutdowns; successful
+destruction uses `after_backend_shutdown`. Failure terminals are FAILED even
+with zero callbacks and use a narrow finalizer without readback cleanup. An
+unexpected open attempt is preserved before reset as FAILED
+`superseded_unfinalized`; the factory itself proves neither quiescence nor join.
+No failed/unattempted owner later publishes a successful shutdown terminal.
+Neither zero observations nor bridge support infers
+the package's compiled state. The witness neither registers bgfx-owned threads
+nor establishes capture completeness. Software-fallback readback cleanup does
+not invent a successful backend attempt; each phase names its actual boundary.
+The complete-vtbl CPU fixture uses real JCE threads and trace events; its ordinary
+same-owner old-no-op control must compile and fail unchanged assertions.
+
+`jce_text_shape.c` owns a bounded 256-entry, four-way/64-set cache with 64 bytes
+of admission cursors. Lookup examines at most four ways; round-robin replacement
+skips the preceding borrowed run and advances only after successful fill. Keys
+remain bounded; overlong strings use the existing scratch path. Forget/shutdown
+release ownership. Actual hit/miss counters establish reuse for a workload.
+
+Custom-program provenance stays inside the existing PBR cache-miss owner.
+`material.custom_program.load` covers both path resolutions, reads, program
+creation and actual cache admission. The original order (resolve both paths,
+then read VS/FS) remains; nested `material.custom_shader.vs` / `.fs` cover source
+read/fallback only, with existing host/VFS FS spans parented to those scopes.
+Shared FNV-1a64 hashes identify the NUL-delimited original composite request and
+each requested/resolved stage key in uint32 halves; they are diagnostic, not
+content authentication. Routes 0/1/2/3 mean none/HOST_API/explicit VFS_API/engine
+PAK. HOST_API may itself dispatch active VFS; nested FS dispatch owns that fact.
+Blob reasons follow the private enum: read success, empty reader data, forbidden
+fallback, absent engine, absent/empty entry, allocation failure or decompression
+failure. Stage outcomes not attempted use -1; conditional byte halves exist only
+where observed. A successful nonzero decompress preserves the existing admission
+policy; size-match is separately observed. Program invalidity after an actual
+create remains an opaque/unknown create failure. Failed results remain cached;
+cache hits add no reload, log or trace. The cache owns valid programs, with
+existing warnings, frees and shutdown unchanged. CPU provenance is neither a
+successful GPU link/execute nor GPU completion or graphical correctness proof.
 
 `jce_model_texture_pool.c/h` owns model-local image/mode staging and unique GPU
 texture handles. Material slots borrow handles; they never destroy shared
@@ -114,9 +449,14 @@ Spot lights ship end-to-end (cookie texture + IES LM-63 photometric LUT) via `Jc
 
 The layers are filled by one `bgfx_blit` per (slot, texture) on `JCE_VIEW_MORPH_DEFORM` — a view id BELOW every scene base, because bgfx orders blits by view id exactly as it orders draws, and a blit on a higher id lands after the colour pass that samples it.
 
-**There is no 2D fallback, deliberately.** `s_cookie` is `SAMPLER2DARRAY` in every program, so a plain 2D texture bound there is a sampler TYPE mismatch: desktop D3D/GL tolerate it silently, WebGL2 rejects the whole draw. When `BGFX_CAPS_TEXTURE_2D_ARRAY` is missing (no backend at this engine's GL 3.1 / GLES 3.0 tier floor is), the bind is a 1×1 white **one-layer array** and every slot is forced to 0 — cookies switch off cleanly. `JCE_COOKIE_NO_ARRAY=1` forces that path, which is the cookies-on/off ablation without editing a scene.
-
-**No shader permutation guards any of this.** bgfx rewrites each shader's `#version` to 140 at the GL floor and emits `#define texture2DArray texture`, so profile-120 source compiles to valid GLSL 1.40 — read in bgfx's `renderer_gl.cpp`, not assumed. An earlier note claiming the desktop GL profile 120 made `texture2DArray` impossible was wrong; the lever for a newer GL is the graphics TIER, never that profile.
+The modern stock sampler is a 2D array. Without array/layer support, or on
+explicit compatibility GL/ES, the owner creates and binds no cookie resource.
+Array-capable paths keep the atlas; disabled/unavailable atlases use a real
+1x1 two-layer initialized white array. bgfx treats one layer as a 2D texture,
+which cannot satisfy this sampler. `JCE_COOKIE_NO_ARRAY=1` forces the white-array
+path when arrays are supported. Compatibility shader guards remove the array
+declaration and both cookie blocks; ordinary shader formulas remain unchanged.
+Actual driver compile/link and rendered output still require separate acceptance.
 
 **Zero is a valid bgfx handle.** A `memset` desc therefore claims a cookie it never asked for, and the atlas used to treat handle 0 as its "empty slot" sentinel — both measured, both fixed. Build light descs with `jce_dir_light_desc_default()` / `jce_spot_light_desc_default()`; the atlas sentinels are `JCE_COOKIE_SLOT_EMPTY` / `_RESERVED`.
 
@@ -126,9 +466,20 @@ The layers are filled by one `bgfx_blit` per (slot, texture) on `JCE_VIEW_MORPH_
 
 Directional light cookies now project. CPU builds `u_cookieDirVP` as a **world-aligned ortho box** (±50 m half-extent, 0.1–200 m near/far) centred on the camera position and aimed along the chosen directional light's forward — v1 chooses stability over CSM-tight fit (CSM cascade-0 reuse is the v2 path). `fs_pbr.sc` adds a `u_cookieDirParams` vec4 + `u_cookieDirVP` mat4 and a directional-loop branch that samples `s_cookie` with clamp-to-zero outside `[0,1]`. Sampler 13 is no longer shared — see the section above. The directional VP is still ONE matrix, and legitimately so: there is at most one cookie-bearing directional light (the sun), and `u_cookieDirParams.x` gates the whole block. Its atlas layer comes from the light's own pack (`u_dirLights[i*2+1].w`); the dead array code read `u_cookieDirParams.w`, which is packed as literal 0, so it would have sampled the white layer forever.
 
-The multi-cookie **atlas** is plumbed: `JceLightEnv` owns a 16-slot LRU table (`JCE_COOKIE_ATLAS_CAPACITY` = 16, slot 0 reserved white default), and `jce_light_env_register_cookie()` returns a stable per-handle slice index used in `u_dirLights[i*2+1].w` and `u_spotLights[i*4+3].y`. Eviction policy: smallest `last_used` counter wins. Sampler 13 still single-binds (one cookie image per draw) on the current ship — the indices unlock per-light array sampling the moment `s_cookie` is promoted to `SAMPLER2DARRAY` and `fs_pbr.sc` swaps `texture2D` → `texture2DArray` (no CPU changes required). Promotion gated on `BGFX_CAPS_TEXTURE_2D_ARRAY` (already queried in `jce_gpu_caps.c`) + a `bgfx_blit` slice-population pass into a fixed-size array texture (deferred — requires authoring cookies at a canonical resolution, e.g. 256×256, to satisfy bgfx blit equal-rect rule). **Rebuild shaders**: `fs_pbr.sc` adds `u_cookieDirParams` + `u_cookieDirVP` — run shaderc to refresh `_cooked/*/shaders/*/fs_pbr.bin`.
+The multi-cookie atlas uses a 16-slot LRU table, with slot 0 reserved white.
+`jce_light_env_register_cookie()` returns each admitted texture's slice index;
+modern shaders consume the per-light index through the shared array sampler.
+The actual typed texture owner below gates array/layer/blit support. A source
+atlas declaration is not proof of a successful upload, driver link or pixels;
+rebuild affected stock shader families through the supported cook entry point.
 
 ## Shader cross-backend portability (`engine/shaders/*.sc`)
+
+The mode2 water overlay retains its final alpha discard after procedural
+alpha evaluation. Small positive or HDR masks can survive that threshold;
+the sampled mask alone is not the final alpha. Shader branch movement needs
+actual backend pixel controls and paired whole-frame measurements before
+adoption; fewer instructions or an exact screenshot alone proves no gain.
 
 Every normally shipped `.sc` compiles to HLSL s_5_0, SPIR-V, GLSL 330, ESSL 300,
 Metal). Danger class: code that compiles everywhere but *means something different
@@ -558,6 +909,11 @@ Exact poles preserve the prior interactive yaw because their horizontal heading
 is undefined; signed-zero atan2 must not invent a 180-degree turn. Near-pole
 nonzero horizontal components still determine their actual heading.
 
+Scene GPU emitters consume the asset's full world-space box widths and velocity
+stretch via private particle entry points. Public point emission and soft
+billboard draw defaults retain their established semantics. Scene admission
+requires compute, instancing, and D3D11, plus explicit scene or QA opt-in.
+
 GPU particles allocate from a GPU-compacted list of actual dead slots. Reset the
 uint counters, append one unique index per dead pool slot, then let each emit
 invocation consume one list entry; non-atomic lifetime probing is forbidden.
@@ -681,3 +1037,853 @@ and default textures for one renderer device lifetime. Release them before
 bgfx shutdown, reset their lazy initialization flags, and recreate them on the
 next device. Light environments borrow shared bindings; destroying one
 environment must not invalidate other environments on the same device.
+
+The private directional/ambient light upload in
+`jce_lighting_system_internal.h` uses the same packed freshness and receiver-layer
+selection as the ordinary full upload. It publishes the same ambient, used
+directional lanes and complete light-count vec4, preserving shadow slot indices
+and layer-excluded zero intensity. It owns no camera or unrelated point/spot/area,
+cookie or IES writes. Standalone scene shading owns its final camera value once.
+The full public upload retains all previous fields and camera ownership. Exact
+CPU comparison controls include zero directional lights and a masked second
+shadow-casting directional slot; they do not establish rendered equivalence.
+
+Renderer lifecycle instrumentation lives in jce_renderer_trace.c over private
+jce_renderer_lifecycle_internal.h entry points. It wraps actual device creation,
+view configuration, CPU submission and teardown for every host, including the
+editor. Core service spans are idle when capture is off. These CPU observations
+never establish GPU completion or presentation; null frame/cleanup attempts
+retain cancellation, creation failures retain failure.
+
+Headless and windowed initialization share `jce_rcb_callback_interface()` so
+bgfx fatal records remain observable through the existing logger owner. Headless
+initialization does not activate the windowed file-capture success hook. Noop
+lifecycle controls must fail on any observed fatal, including records emitted
+during backend shutdown; returning from the callback is not a successful outcome.
+
+Startup transient budgets are selected by jce_renderer_budget_internal.h:
+Web and native low-memory defaults use 6/2 MiB vertex/index pools; ordinary
+native defaults use 8/2 MiB. Native multithreaded bgfx has two Frame pool pairs,
+and WebGL orphans full GPU capacity every frame. CPU pool storage is reserved
+at initialization even before submissions use it. Logical reserved capacity is
+not process RSS or GPU residency. JCE_TRANSIENT_VB_MB / JCE_TRANSIENT_IB_MB
+accept explicit 1..256 MiB budgets for large geometry/UI workloads. Encoder
+headroom is selected independently. The same private budget owner sets
+minUniformBufferSize to 128 KiB per encoder per bgfx Frame; bgfx retains its
+on-demand growth, so this is an initial capacity rather than a hard limit.
+Sixteen encoders and two native Frames start with 4 MiB of logical uniform
+command capacity rather than the backend default's 32 MiB. The theoretical
+28 MiB difference is not measured heap, private commit, RSS or GPU residency.
+Startup renderer.uniform_initial_encoder_frame_bytes records the per-encoder,
+per-Frame initial capacity, never a process total. test_jce_renderer_budget
+compiles the complete actual apply_transient_limits body with typed ports; its
+missing_uniform_wire control removes only the real limit assignment while
+retaining the counter and must fail ordinary unchanged runtime assertions.
+These CPU controls do not certify backend growth or rendered workloads.
+Capacity changes preserve authored shader and asset settings; verify actual
+pool use, exhaustion, pixels and uninterrupted timing before claiming acceptance.
+The single ShaderSet owner aliases named PBR members into its variant table.
+jce_shader_set_owned_internal.h retires every unique named/variant handle once,
+including SDF and partially loaded reload sets, while bgfx remains alive.
+
+Capture-only renderer snapshots record actual resource counts, transient used
+bytes, estimated texture/RT bytes and backend timer availability at 60-frame
+intervals. The private C99 snapshot emitter also records frame-acquired encoder
+handles and effective backend capacity. Startup `renderer.encoder_capacity`
+remains the requested limit; `renderer.encoder_effective_capacity` reports the
+backend-clamped limit, or -1 without caps. `renderer.encoder_frame_used` counts
+the reserved default/API slot 0 (even without draws), plus successful new handle
+acquisitions until the next frame boundary. It is neither OS thread count nor
+peak simultaneous occupancy. Backend observations can trail the CPU submission
+index. Selected adapter vendor/device IDs and raw bgfx renderer type share this
+caps observation; the type is not the JCE backend enum. Reported zero values
+remain zero; missing caps yields -1 for all three identifiers.
+Adapter-reported GPU memory is not process heap; unavailable counters remain
+negative. A snapshot is not proof of GPU completion or presentation.
+
+The same private snapshot preserves timing provenance as integer counters:
+`renderer.api_frame_number` is the actual bgfx_frame return (the legacy
+`renderer.cpu_submission_index` spelling stays compatible), host submission
+ordinal is separate, and the existing upload context_generation scopes device
+epochs. Unknown/zero or non-int64-representable epochs are explicitly unavailable.
+Frame and per-view gpuFrameNum identify the provider frames that generated their
+raw begin/end ticks; source frame zero is valid. Frequencies and ticks remain
+int64 through the existing JSON exporter, including values above double precision.
+A plausible nonempty interval requires positive frequency, nonnegative ordered
+ticks and not both timestamps zero. Invalid/initial intervals preserve their raw
+values and report duration unavailable; this is not absence of GPU cost. Repeated
+(epoch, view/source frame, ticks) tuples remain latched samples, not new GPU work.
+All borrowed provider views are emitted at the existing first/60-frame cadence
+without another registry or heap; absent view metadata is explicitly unavailable.
+Accepted end_frame dispatches the private snapshot independently of trace scope.
+Null/fallback/headless and the existing first/60-frame cadence precede the single
+PERF_LOG environment read; with both observers off, no stats/caps are queried.
+Canonical allocator/global/per-view emission remains trace-only. Explicit
+PERF_LOG independently enables the existing provenance and bounded view-name
+logs at that same node; enabling both observers consumes one provider snapshot.
+Trace off skips per-view counters. Explicit JCE_PERF_LOG records one
+bounded integer provenance line per sampled node in DIST, never per-view logs.
+Dynamic per-view counter names use the existing canonical ring-only writer,
+which synchronously copies each name and preserves the current task span as
+id and parent. They never enter optional Tracy plots, whose asynchronous queue
+borrows the name pointer; only static global counter names retain that route.
+The two-view CPU control checks every suffix, value and copied name plus full-width
+parent span after formatter reuse. It does not certify a Tracy-enabled application.
+Explicit PERF_LOG also emits one view-name mapping line at that same node,
+with epoch/API/global source and each view-specific source ID. Its224-byte
+stack mapping stays below the existing512-byte logger payload with the full
+integer prefix. Complete entries percent-encode unsafe provider bytes (including
+UTF8/control bytes) and never partly append a name. actual/listed/start/truncated/
+unavailable distinguish bounded selection from a complete list. The deterministic
+start uses the existing submission ordinal/60, without registry/history, so
+later nodes cover views that did not fit the first list. Names come only from
+the borrowed256-byte provider fields; this cannot recover an upstream name
+already clipped by bgfx. Formatting/logging is inside explicit PERF_LOG only,
+never trace/Tracy plots. Exact-capacity, encoding, rotation and missing-provider
+controls share the existing snapshot fixture; actual name observations still
+require a fresh native capture.
+Public overlay/raw-stats POD layouts stay unchanged and omit these timing IDs.
+Private emitter/actual JSON controls and the compiled missing-source-frame
+ordinary-failure mutation do not prove real query latency, device fences,
+resource retirement, optical presentation, OS memory or cross-clock alignment.
+
+Stock ShaderSet preparation records only actual loader-call acquisitions in a
+bounded stack batch. The shared jce_shader_stock_table_internal.h loader reuses
+identical (vs,fs) name pairs: its borrowed table cells do not acquire. The nine
+scalar PBR aliases also borrow. Cached duplicate IDs from distinct actual loads
+cancel only those extra acquires before publication, retaining one live ref per
+unique handle. Manual set_shaders aliases are not normalized. Web deferred IDs
+retain independent resolve-time refs and retire per prepared ID. Trace records
+actual stock duplicate-acquire counts; zero is valid. CPU refcount controls do
+not replace actual backend startup, draw, reload and teardown acceptance.
+
+Actual offscreen keep and overlay configuration also emit renderer.view_configure
+through the same private core scope authority. Full prepare delegates to keep and
+records once. A true result is CPU configuration success; non-null rejected targets
+record failure, null attempts cancellation, and parent scope ownership is restored.
+Production Noop controls verify real APIs without a GPU. These spans do not prove
+GPU completion, framebuffer residency or presentation.
+
+## Screenshot and readback file ownership
+
+`jce_renderer_bgfx_callback.c` owns one bounded file request and the existing
+serial PNG writer. Main-thread request/poll/shutdown operations share a short
+SDL lock with render-callback/writer completion; it protects only state and
+bounded path copies. No allocation, GPU API, encode, IO or wait runs under that
+lock. Paths exceeding 511 bytes reject instead of truncating. A monotonic
+identity-bearing bgfx pseudo-path rejects stale/duplicate callbacks, including
+repeated output paths; identity exhaustion rejects rather than aliasing.
+
+File screenshots and texture-readback PNGs share admission and real write
+outcomes. Raw FBO/recording sinks do not complete a file request. The readback
+poll returns pending until the actual writer completes, and its RGBA surface
+has one owner. Writer-unavailable backbuffer and allocation/full-queue
+fallbacks retain checked inline encoding; unavailable readback workers fail
+explicitly. `renderer.screenshot_write` traces actual encode/write CPU work
+through the existing core scope, including real FAILED outcomes.
+
+The private screenshot ledger uses RENDER COUNTER names
+`renderer.screenshot.admit` and `renderer.screenshot.terminal`, both keyed by
+the accepted uint64 file identity in event.id with parent zero. Admit values
+are backbuffer=0/readback=1; terminal values are the actual
+JCE_TRACE_TASK_SUCCEEDED/FAILED/CANCELLED enum. A traced admission records once
+before submission; only its matching pending-to-terminal transition records
+success/failure or shutdown cancellation. A matched backend screenshot callback
+publishes `renderer.screenshot.cpu_pixels` once after pixel layout validation
+and before conversion or encoding. It carries the same file identity, parent
+zero and the requested uint16 framebuffer index (65535 is the default
+backbuffer). Staged texture readbacks, video callbacks, invalid payloads and
+stale requests do not publish it. This is a CPU-readable pixel observation;
+source-frame, GPU completion and Present correlation need separate evidence.
+State and the admission trace flag
+are copied/cleared under the existing lock; ring publication runs outside it.
+Rejected, stale and repeated completions do not record. These counters create
+no task lifetime, TLS ownership or active-work accounting; public poll still
+maps both failure and cancellation to 2. Complete ledger evidence requires a
+continuously enabled capture from admission through terminal and the Core
+quiescence/loss rules. An admission made with tracing off cannot create an
+orphan terminal when tracing later turns on; crossing capture toggles does not
+certify a complete pair. No per-frame/poll work or pixel ownership is added.
+
+PNG shutdown closes callback admission, waits only for callbacks already
+owning pixels and bounded queued CPU work, then joins the writer. It never
+waits for a GPU callback not yet delivered. An unfinished read_texture
+destination stays allocated until `jce_rcb_after_backend_shutdown`, called
+after bgfx joins; its handle retires in command order. That private hook frees
+CPU scratch without calling a stopped graphics backend. The success hook
+activates file capture only for a real windowed renderer callback. New
+contexts reopen the service without resetting request identities.
+
+This is a single main-thread file-consumer contract, not general concurrent
+consumer tickets or a blanket recording-control thread-safety claim. Shutdown
+is a blocking drain of actual callback/encoder/file IO; the host filesystem
+can determine its wall time. Focused tests use real SDL IO and a deliberate
+early-release mutation to verify the borrowed-buffer guard, without a GPU.
+
+## Classic material power boundary
+
+`fs_classic_lit.sc` maps roughness to nonnegative Blinn-Phong shininess. Its
+three shininess lobes share a local `classic_lobe_power`: exponent zero is a
+constant lobe of one, zero/nonpositive base with a positive exponent is zero,
+and positive inputs retain the original pow. Bare pow(0,0) is not portable
+across shader languages or GPU implementations. Do not substitute an epsilon
+that biases every highlight, or mask NaN output by forcing side faces black.
+The fixed-exponent Fresnel powers and material/uniform ABI remain unchanged.
+This finite-domain boundary is not a cure for non-finite input vectors.
+
+`tests/cmake/verify_classic_lit_power.py` compiles the exact source and a
+runtime-uniform witness through the existing project-shader recipe, all five
+modern profiles at shipping optimization. The witness imports the production
+helper from the same byte snapshot as the compiled source and hash. Legacy
+witnesses derive their expression from an archived source. Compilation and
+source/witness provenance controls are not numeric GPU acceptance; real float
+output or shader debugging on the actual driver is still required.
+
+## Render-pipeline request lifecycle
+
+The existing requested descriptor owns unclamped user intent; active owns the
+resolved hardware/GLES cost budget; pending owns the next frame's user edits.
+The cheap stylized material gate reads requested quality: explicit LOW remains
+neutral, MID/HIGH/ULTRA honors scene values even if active bloom is budgeted LOW.
+The existing boolean QA force remains highest priority; do not invent a numeric
+post_quality force knob. All other feature/capability clamps remain unchanged.
+
+Pending setters begin from requested, or the existing LOW preset on cold calls.
+Frame-end copies and clears pending before the sole apply implementation,
+retaining capability clamps, existing numeric forces and observer-queued work.
+A newer full apply replaces old pending; tier re-resolution preserves it. No
+request/state duplicate or public ABI is needed. Record parsed asset identity,
+requested quality and active gates separately; scene JSON alone cannot prove
+actual submitted GPU quality. The sun_soft_size accessor uses angular degrees,
+matching the member and PCSS, not a shadow-map texel distance.
+
+Offscreen targets register with their renderer. Retired FBOs age by submitted
+renderer frames (eight frames), including inactive viewports; prepare calls
+do not advance their age. Full retirement slots reject resizing without replacing
+the current target. Renderer teardown releases GPU handles and detaches caller-owned
+wrappers, which can subsequently be destroyed safely. Maintenance runs on the
+owner thread; the private synchronous submission seam also supports Noop tests.
+
+`jce_offscreen_target_get_extent` reads the current live allocation's admitted
+dimensions, including the existing 16..8192 clamp, without a backend query,
+allocation, mutation or trace event. Both outputs are required; unavailable
+targets and invalid arguments clear supplied outputs to zero. A failed resize
+can retain an older live target when retirement is full, or leave no current
+target after retirement and failed creation. Renderer shutdown detaches the
+wrapper and makes the query unavailable. Success is allocation observation,
+not preparation in this frame, draw submission, GPU completion or presentation.
+The actual offscreen-owner fixture checks these distinctions and asymmetric
+clamped dimensions through real Noop and counted creation ports.
+
+Offscreen retirement uses a private submission ordinal incremented once per
+synchronous host submission, independent of bgfx initialization/internal frame
+indices. The public raw frame index remains unchanged for readback scheduling.
+
+Offscreen resource observations remain in the existing target and its eight
+retired slots. Creation serials come from the core trace authority and are
+qualified by their original capture generation; handle 0 and handle reuse are
+valid and never resource identities. Reset/late capture records an origin gap,
+rather than fabricating an earlier creation or retaining a completed task span.
+Actual create/rollback/retire/destroy-submit scopes include attachment/FBO
+handles, clamped dimensions, RGBA16F-or-RGBA8/D24S8 formats and single sampling.
+Logical bytes describe uncompressed attachment estimates and CPU owner transfer,
+not physical GPU memory or completion. Destroy-submit includes the actual
+submission ordinal, reason and remaining logical bytes after submission.
+Capture off emits no resource events; unchanged dimensions emit no resource
+lifecycle events (the existing view-configuration scope is independent).
+The private immutable provider is copied into each target; its user context
+must outlive the target. Public APIs use one default bgfx allocation/cleanup
+chain, and every release uses that same provider. Counted test handles never
+enter actual Noop view submission. The existing Noop test also drains the whole
+bounded core ring and rejects cursor loss; it does not certify GPU execution.
+
+## Shared CPU instance uploads
+
+jce_instance_upload.c/.h is the private renderer lifetime owner for qualified
+32/64/80-byte instance layouts. Reuse its provider and existing device context
+generation and submission ordinal; do not add scene-specific allocation policy
+or a second mutable global identity. The 128 MiB logical budget includes live
+lanes, pending candidates and same-epoch retired handles. It is not a physical
+GPU or process memory bound. CPU staging and backend-deferred reclamation have
+separate lifetimes and trace observations.
+
+Begin and commit run on the owner thread. Commit publishes the admitted cursor
+and candidate only after upload acceptance, transferring staging once. Tokens
+retain their admitted handle and context/epoch identity. Already committed
+tokens may bind through an encoder in the same epoch; workers do not reserve,
+commit, grow or retire the shared owner. Overflow, allocation failure and partial
+admission must retain honest counts and cleanup/retry behavior.
+
+The renderer supplies an explicit transient reserve for later non-instance
+submissions (1 MiB by default, configurable by
+JCE_INSTANCE_TRANSIENT_RESERVE_KB). This design budget does not guarantee space
+for every UI workload. Queue dispatch checks aggregate bytes and this reserve
+before parallel recording; pressure falls back to the serial owner route.
+Keep material/state/stencil, transparent order, index ranges and encoder TLS.
+Explicit authored instance payloads retain every admitted item when automatic
+merging is disabled. Queue statistics count actual accepted submissions, not
+requested work or hardware invocations.
+
+Model uploads retain node transforms, material and LOD traversal. Impostor cards
+retain their two-vec4 packing and rebind complete state after every submit.
+Scene particle adapters consume this owner without private device ownership.
+Exact provider/production-TU controls live in test_jce_instance_upload.c,
+test_jce_render_queue_capacity.c and test_jce_impostor_upload.c under
+tests/renderer/. These CPU controls require separate
+artifact-bound GPU pixels, instance populations and timing acceptance.
+
+Instance resource traces use the existing core scoped-counter encoder, retaining
+context generation, token/allocation serials, submission epoch, encoder and
+retirement identity. The optional staging observation state has 256 fixed leases
+and a copied allocator context; references survive owner destruction until actual
+backend release callbacks finish. Tracing off allocates no observation state.
+Metadata allocation failure or saturation leaves rendering ownership unchanged
+and records unavailable evidence; it cannot certify complete resource tracing.
+A complete resource observation requires zero capture loss, metadata-unavailable
+and origin-capture gaps, paired transfers/releases or cancellations, and balanced
+handle creation/destruction. These observations concern CPU acceptance and backend
+ownership callbacks, not GPU fences or physical memory reclamation. Counter scope
+IDs are real producer identities; never assume an unscoped ID of zero.
+Do not clean up worker TLS from a resource callback that does not own that thread.
+
+TSR history, motion and auto-exposure metering textures belong to the PostFX
+pipeline. Their framebuffers
+borrow attachments with destroyTextures disabled; resize and destruction release
+framebuffers before the pipeline's explicit texture references. Keep this single
+owner on validation rejection, framebuffer-handle exhaustion and partial creation.
+Exact production-TU controls check these CPU reference requests with the pinned
+bgfx contract, including failure followed by retry. Auto-exposure staging readbacks
+remain a separate lifetime. Actual draws and resize/shutdown still need GPU
+validation.
+
+Shader load failure diagnostics belong to `jce_shaders.c`: preserve the actual
+asset key/stages/backend through source allocation, upload, shader creation and
+program link failure. Deferred realization reports failure once per prepared slot
+and preserves its attempted state; prepared handles are not proof of successful
+GPU realization. Reject zero/oversized/truncated blobs before uint32 upload.
+
+Stock `jce_shaders_load_all_fs` delegates each pair to the existing public
+`shader_load_program_overlay_named` owner. Each existing overlay stage wins;
+an absent stage quietly uses the PAK/embedded fallback, while an existing but
+invalid stage fails closed instead of replacing the entire pair with baseline.
+The shared owner retains stock deferred preparation and creator-ref cleanup;
+stock pair reuse, acquire normalization and borrowed aliases remain unchanged.
+The existing real-stock/Noop shader-link target selects only a compiled profile
+through a typed renderer-type port and forwards actual host-file reads. It
+verifies fragment-only overlay consumption, invalid-stage rejection, null/empty
+dev-dir equivalence and independent cached acquires returning shader/program/
+uniform counts to baseline. The suffix port does not change the actual Noop
+backend or certify native GPU compilation, pixels or a performance gain.
+
+The shared private `link_program_owned` in `jce_shaders.c` links with bgfx's
+automatic shader destruction disabled, then releases each creator reference
+exactly once on either outcome. A program retains its own stage references;
+cached program acquisitions retain independent references. bgfx can reject a
+stage-interface mismatch before its automatic ownership branch, so relying on
+`destroyShaders=true` leaks shader/uniform ownership on that path. Native PAK,
+filesystem, overlay and deferred realization all consume this same transaction.
+`renderer.shader.link` records VS/FS/program handle values, actual creator-release
+count, success and rejection (1 invalid stages, 2 failed link); handles are not
+stable resource identities, and these counters do not prove GPU completion.
+Keep trace-disabled ownership identical and deferred attempted/log-once policy.
+Counted production-owner controls include an ordinary compiled old-behavior
+contrast. `test_jce_shader_link_owned` additionally consumes actual public stock
+PAK bytes on Noop, verifies matched/mismatched pairs, cached refs and shader,
+program and uniform baselines. It calls the private link owner because Noop has
+no public loader suffix; do not call this physical backend/pixel acceptance.
+
+## Shader reload, custom-program and asynchronous bake owners
+
+`jce_renderer_reload_shaders_fs` rejects null, fallback and headless renderers
+before loading a candidate. A failed required color program releases every
+unique candidate handle and leaves the installed set intact. A successful
+reload installs the candidate before retiring every unique old named/variant
+handle through `jce_shader_set_release_owned`; SDF and table aliases follow the
+same owner. `jce_renderer_set_shaders` admission must agree with reload admission.
+
+`jce_pbr_material.c` owns custom graph programs in the existing 64-entry cache;
+returned material handles borrow them. Cache hits remain usable at capacity.
+A new key at capacity rejects before blob IO or linking, rather than returning
+an uncached program without a destroy owner. The entry-budget warning fires once
+per device session and includes count, limit and material path. Failed links
+retain the existing negative-cache policy. Shutdown destroys admitted valid
+programs once and resets both count and warning state; no public budget changed.
+Entries, admission count and the once-warning flag reside in the same private
+cache object. A new cache/device lifetime may warn once again; repeated shutdown
+remains idempotent. Actual-owner CPU controls cover both epochs and a compiled
+runtime contrast with only the warning reset removed; they do not prove GPU work.
+
+`jce_render_readback.c` owns each staging texture and submitted CPU destination.
+Its private backend-open/before-stop/after-stop hooks share the actual renderer
+lifetime; NULL, unrelated and detached renderer admission rejects before a
+dereference. Cancellation changes intent, never the backend borrow. Readback,
+screenshot and impostor readiness consume the shared uint32 serial-order helper:
+zero and UINT32_MAX are valid, related observations must be less than 2^31
+advances apart, and exact half-range remains pending rather than proving order.
+Release invalidates a ticket through its generation only after its borrow ends.
+Queue destruction advances through the real central submission owner, including
+its ordinal, offscreen retirement and instance-upload fan-out. It attempts at
+most eight advances, stops on ambiguity/no progress, then retires handles while
+retaining CPU destinations until the actual backend-stop hook. Stop detaches
+live wrappers; after-stop releases pixels without any GPU call. A caller may
+destroy a detached wrapper after a new backend starts, without affecting it.
+Transition-only trace counters report service admission, attached/retiring queues
+and owned CPU destinations/bytes; backend_stop_cpu_releases counts CPU releases
+after shutdown. They allocate nothing, do not scan queues with trace disabled,
+and never report GPU residency, a fence or presentation.
+
+The central frame scope measures CPU API submission/handshake. Latched global
+and per-view GPU timestamps describe provider intervals and their source frame;
+they do not establish a full-device completed watermark. Public bgfx readTexture
+readiness proves the particular CPU destination is available. Screenshot flush
+joins queued CPU encoding/file work, not pending GPU writes. Public frame FLUSH
+omits present; it is not a GPU-idle contract. D3D11 Flush remains asynchronous.
+The legacy leakstats fields remain a pre-shutdown backend handle snapshot with
+explicit gpu_completion=unavailable; queued destruction/nonzero counts cannot
+alone prove a leak. Actual presented/whole-device completion need a backend
+contract and physical evidence, not relabeled CPU scopes or guessed frame age.
+
+`jce_renderer_submission_trace_internal.h` emits four static counters inside
+each accepted central `renderer.frame_advance_cpu` scope: the still-owned
+renderer context generation, actual backend serial before/after the call, and
+the submission ordinal before the existing retirement/upload fan-out. These
+reuse the scope ID as both counter ID and parent, so ordinary submissions and
+teardown drains retain their actual CPU caller. No GPU query, allocation, log,
+flush or extra frame is introduced. Trace-off scopes skip identity-field reads;
+the emitter returns before counter calls. The original perf-phase timer excludes
+the counter writes;
+the trace scope retains the normal instrumentation overhead.
+Generation survives upload unbind as retained renderer identity; it does not
+restore backend availability. Zero or non-int64-representable generations emit
+-1; backend serial zero/wrap and ordinal zero remain valid. This per-call packet
+does not join latched GPU sample frames, identify individual readback tickets,
+or establish physical presentation/completion. Resource collection and ordinal
+advancement remain after the API-call scope in their original order.
+
+`jce_impostor.c` has one bake slot with explicit invalid GPU handle sentinels;
+zero is a valid owned handle. Shutdown retires its FBO/staging handles while
+bgfx is alive. Unissued pixels free immediately; pixels already passed to
+`bgfx_read_texture` remain in that same slot with cleared borrowed model/renderer
+pointers and closed submit/poll admission. The private
+`jce_impostor_after_backend_shutdown` hook runs only after `bgfx_shutdown` has
+joined the producer, frees retained CPU pixels without backend calls and resets
+the slot to IDLE for the next session. Repeated shutdown/finalize is idempotent.
+Do not replace this completion boundary with cancellation, handle destruction,
+a guessed frame delay or a second retirement queue.
+
+Ownership controls use exact production owners in
+`tests/renderer/test_jce_render_readback_contract.c`,
+`tests/renderer/test_jce_impostor_upload.c` and
+`tools/tests/test_material_owned_cleanup.py`. Counted CPU ports cover real
+submitted destination pointers, zero handles, partial failures, aliases,
+capacity and repeated teardown; they do not prove GPU pixels, physical memory
+reclamation, driver completion or host device-loss recovery.
+
+Device-loss callback handoff uses an existing JceAtomicI32 exchange, not a
+volatile load/store. Notifications raised after consumption remain pending;
+multiple pending notifications may coalesce. Backend attempt/after-join resets
+prevent a previous session notification from reaching a new host. This CPU
+notification contract is separate from recovery or hardware device-loss proof.
+
+Font atlas failure transactions: static nonempty-glyph bitmap allocation failure
+aborts build_atlas/font_open_from_memory rather than publishing a partial font.
+Its diagnostic names source, font, codepoint and phase. Dynamic pixel/map/texture
+creation failures release unadmitted staging and retain retry. Rejected updates
+restore unused CPU pixels and publish neither glyph, count nor shelf cursor,
+preserving admitted glyphs. One diagnostic per font/failure stage records identity
+and codepoint. Update acceptance is command admission, not GPU completion.
+Exact-owner CPU probes in tools/tests/test_font_atlas_failure.py cover failures,
+retry and compiled historical negatives; actual glyph pixels remain separate.
+
+Mesh creation transactions: jce_mesh_create_internal.h supplies immutable private
+creation ports to the actual constructor. Each mesh copies provider identity;
+its user context must outlive it. Initialize VB/IB/wireframe IB to invalid before
+acquisition. Staging or attempted GPU buffer failure retires acquired handles
+once and returns NULL. Optional CPU wireframe-generation fallback stays explicit.
+renderer.mesh.create records CPU outcomes. Counted ports in
+tests/renderer/test_jce_mesh_create_lifecycle.c are not GPU completion evidence.
+
+Scene directional/local depth surfaces are owned by
+`middleware/scene/jce_sr_shadow_targets.c` and admitted by the corresponding
+shadow pass, rather than by resolution configuration. The dynamic atlas is
+created only for a requested dual pass with dynamic casters. Renderer counters
+report logical backend estimates; a source byte calculation or CPU/Noop owner
+control does not certify process Private/RSS or physical VRAM savings.
+
+`jce_image.c` remains the single raw-memory image dispatcher. Signature formats
+keep SDL_image auto-detection priority. A failed auto decode may retry TGA only
+after bounded header/ID/palette/pixel or RLE packet admission; no filename hint,
+second codec or pixel decoder is introduced. Both SDL streams close once, and
+only the final failed decode logs its stage, byte count and codec reason. The
+shipped SDL TGA subset excludes right-origin/interleaved images and nonzero
+indexed-palette origins. `test_jce_image_tga` checks actual SDL pixels/alpha,
+malformed inputs, and a real `.tga` cooked into a Bundle with zero raw warnings;
+these CPU decode/cook controls do not certify GPU upload or presentation.
+
+## Runtime texture residency reliability
+
+`jce_texture.c` owns the single static texture registry and its handle-to-slot
+map. Published `JceTexture` values are raw bgfx indices copied by materials,
+scene components and UI consumers; there is no binding indirection. Runtime
+residency requests retain desired intent but must not destroy/recreate those
+handles. Existing dimensions, resident mip, registry mapping and retained
+source ownership stay unchanged. Initial upload quality/size/mip selection
+still applies before handle publication. A source mirror alone cannot safely
+replace a borrowed handle. Dynamic replacement is unsupported until an
+explicit stable-handle contract reaches every binding consumer.
+
+Unsupported requests log once per entry and emit a cancelled service scope
+once per capture with requested/resident mip counters. This is a reliability
+fix, not completed streaming or proven memory reclamation. The exact-owner
+CPU regression uses counted allocation/create/destroy ports, actual registry
+lookup/swap-removal and retained-source release; it does not create a GPU.
+
+TGA admission rejects decoded RGBA byte/pitch totals beyond INT_MAX before
+palette/RLE traversal or typed codec allocation. The pinned SDL 15/16-bit path
+discards attribute alpha, and palette32 reduces alpha to a single colourkey;
+attribute-alpha 15/16-bit inputs and nonopaque palette32 therefore fail closed
+with an explicit tga-admission reason. Opaque palette32 and true-colour32 alpha
+remain supported. Counted-decoder controls use complete 32768-square RLE input
+without allocating decoded GiB buffers; they complement actual small-image and
+Bundle pixels rather than replacing those native decode/cook controls.
+
+Offscreen FBO construction normalizes the pinned bgfx ownership boundary
+through one private helper. Raw creation uses destroyTextures=false: invalid
+creation leaves both creator references with target rollback, including
+validation and handle-pool failures. A valid FBO has acquired attachment
+references before the helper drops each creator reference once. Retirement,
+query failure and teardown then release the FBO final references. Counted
+controls model these transitions and the pinned destroyTextures=true failure
+behavior through this same helper. The old-owner mutation changes only the
+fixture helper, never the real Noop backend. Logical release observations
+are CPU owner submissions, not physical GPU completion.
+
+Explicit JCE_BGFX_ALLOC_TRACE defaults off and owns a fixed 4096-slot
+allocation ledger inside the existing singleton device. Addresses remain
+private lookup keys; emitted backend_epoch/allocation_id identify a logical
+allocation across resize and address reuse without exposing pointers or paths.
+Alloc, realloc, failed resize and zero-size free preserve the actual raw
+mimalloc provider contract. The short OS-atomic metadata gate covers only
+fixed metadata; provider calls and ring-only trace writes happen outside it.
+The immutable raw provider and allocation-free ring writer avoid self-tracing;
+no profiler, task registration or TLS setter is called from this closure.
+
+The former 512-request prefix no longer truncates lifecycle events. Operations
+use the existing bounded ring and continuous capture authority. The identity
+ledger continues across trace-off intervals while event-history completeness
+fails explicitly. Full storage, unknown input, duplicate live addresses,
+identity/byte exhaustion and invalid begin/end mark pairing incomplete without
+changing allocation forwarding. Realloc reserves its old slot until the
+provider result, allowing an unrelated birth to reuse the old address safely.
+Failed realloc restores identity and size. The observed accounting peak can
+include reserved in-flight records; it is not a physical-residency peak.
+Tracked bytes mean requested live allocation sizes, not mimalloc usable size,
+OS Private/RSS or GPU memory. Nonquiescent snapshots expose pending operations.
+
+Begin is permitted only at quiescent backend initialization; end runs after
+failed bgfx init cleanup or the real shutdown join, including API rejection and
+renderer-object OOM exits. End preserves residual live identities/count/bytes.
+Fallback/null destruction does not close an unrelated backend. A complete
+ledger can still report unreleased allocations. all_released requires a closed,
+quiescent and complete ledger with zero live records; event_history_complete
+also requires an uninterrupted original capture. Consumers must additionally
+require existing capture_complete/write_ok, stable generation and zero
+lost/unexported events. No counter by itself certifies a global capture.
+
+Renderer snapshots retain the first-submission plus sixty-frame cadence.
+test_jce_bgfx_allocator_trace consumes the actual private owner, real core ring,
+OS atomics and aligned allocator with failure/move/pool-reuse ports. Original
+forwarding/capture/saturation controls remain; ledger controls add reuse,
+reservation overlap, capacity, unknown/duplicate input, identity exhaustion,
+invalid begin/end and concurrent release. The exact-source Python positive and
+runtime mutants reject lost resize identity, address-derived identity and
+publication under the metadata gate. The existing profiler negative remains.
+These CPU controls do not certify bgfx/GPU execution or physical reclamation.
+
+The singleton device owns atomic idle/creating/active admission. Both public bgfx create adapters reject an active or pending device before platform/caps/allocator initialization; failed creation releases only after quiescent cleanup, and active admission remains held until destroy returns after backend join. Fallback/null destruction never releases a live bgfx admission. Registered-main policy rejects foreign creation; unmarked standalone callers retain the bgfx API-owner contract. Atomic admission does not enable arbitrary-thread rendering. Opted-in allocator observation warms jce_time_ticks_ns on this quiescent owner even while capture is off, avoiding SDL timer first-use initialization inside the callback. Concurrent capture reset remains unsupported; request/result gap diagnostics do not promise an atomic event group. Refused creates record one ring-only renderer.create.rejection_reason counter (1 busy, 2 registered foreign) correlated with the existing create task. Trace-off remains silent; no repeated INFO/WARN path is added.
+
+The public VSync wrapper delegates dimensions to the existing size-aware owner.
+Null/fallback renderers and unchanged state return before querying bgfx or
+resetting the swapchain. Only an actual state change resolves current dimensions;
+explicit complete dimensions remain query-free. Actual wrapper/size-owner CPU
+ports cover these guards and the historical unconditional-query runtime failure.
+This does not certify device VBlank timing or every-other-VBlank scheduling.
+
+The font subsystem has one `s_text` owner for its FreeType library, next-open
+SDF setting and live immutable source references. Fonts remain subject to the
+existing single-thread create/draw/close contract. Each font owns an independent
+FT/HB face, size, shaping key and static/dynamic glyph atlas. Source bytes may
+share only after the existing host/PAK/VFS read succeeds and actual size,
+`jce_archive_content_hash` and byte comparison all match. Paths, labels, mount
+addresses and stored PAK hashes are not content authority; failures never fall
+back to cached bytes. A hash collision must not merge different bytes.
+
+The blob registry contains live references only. Each node has a monotonic
+internal serial, independent of addresses. Acquisition consumes its temporary
+owned input once; the memory API still retains no caller-owned pointer. Every
+failed FT/Font/atlas transaction drops the acquired reference. Close destroys
+HB/FT before releasing bytes, and the last reference unlinks/frees immediately.
+Shutdown retains its existing closed-font precondition and never clears a live
+registry to fabricate closure. Serial/reference/live-byte overflow rejects
+admission with a bounded reason diagnostic rather than saturating into success.
+Common acquire/hit/release scopes report identity, references and unique live
+raw bytes; trace-off ordinary operations emit no events or routine logs.
+
+`test_font_atlas_failure.py` consumes actual source owners with counted ports,
+including content-collision and missing-release runtime negatives. The existing
+real-font fixture includes the production text owner once and tests actual
+FreeType/HarfBuzz independence and Noop texture teardown/reopen using licensed
+stock bytes. These controls establish byte ownership and font behavior, not
+default Print identity, physical GPU completion or an OS RSS/IO saving. Source
+reads and temporary buffers still occur on open.
+
+`jce_postfx_taa_supported` exposes the same current target-format predicate
+used by `jce_postfx_set_taa`: live backend RGBA16F framebuffer capability and
+the active pipeline's HDR policy. Projection drivers query before jitter;
+the setter still rejects incompatible direct requests. Do not cache this
+across backend/pipeline changes or claim it certifies resolve shaders, depth,
+external motion, target creation or GPU completion.
+
+Renderer startup records selected bgfx vendor/device identity directly through the logger in DIST. Requested or enumerated adapters are separate observations and never substitute for the active device; unknown/no-capability identity remains unavailable. The startup record is bounded and never emitted per frame. GPU Engine LUID attribution and memory ownership still require actual native evidence.
+
+Volumetric fog render/composite own their bgfx view labels after admission, so per-view GPU diagnostics retain the pass identity without changing reserved view IDs, render order, parameters or quality.
+
+View names persist in the backend until another name is submitted. Splash owns
+view0 as Renderer/Splash only during startup; each admitted normal begin-frame
+restores Renderer/Main before its ordinary clear/touch. Admitted offscreen
+texture composites label their supplied view Renderer/OffscreenComposite. In
+the Game View this includes PostFX fold-back at120+51=171;170 is only the PostFX
+chain tail and its active meter/present paths label themselves. These labels
+use the pinned C99 INT32_MAX NUL sentinel and do not change IDs, order or quality.
+The F9 recorder instead uses ImGui250 plus1/2 (251/252): its resolve is already
+UI/Recording; staging-blit naming remains separate, and a generic shared
+readback label must not overwrite UI/ImGui250 used by screenshot capture.
+Provider ViewStats names can trail CPU submissions with the corresponding
+source frame. A correct label is attribution metadata, never GPU completion.
+
+
+
+Native Windows D3D11/D3D12 Auto startup first considers the hardware adapter
+ranked by DXGI high-performance preference. Its exact LUID must map to the
+pinned classic bgfx first vendor/device key and fit Caps::gpu. If unavailable
+or not representable, use the existing window display adapter and driver
+fallback. If the preferred device's init or API admission fails, retire that
+attempt and retry its backend once with the legacy selection. Explicit
+vendor/device requests, non-D3D and headless retain their prior policy.
+Window observation also runs for explicit D3D requests, preserving the original
+init keys, effective request and applied=false. Its result remains diagnostic;
+Auto-only selection limits never rewrite that explicit-request observation.
+Non-D3D attempts do not query the window display.
+The private per-create state queries each needed platform observation at most
+once across the backend fallback chain. The startup log and trace distinguish
+the preferred render request from the observed display owner and selected
+caps. No process-global adapter cache or device migration is introduced. A candidate beyond the actual pinned bgfx Caps::gpu array is
+refused. Inexact or unavailable matching retains the previous fallback. The
+existing adapter parser/enumeration code is included by the same renderer TU
+from `jce_renderer_adapter.inc.h`; this is not a second device owner. Startup
+records observed key/LUID, effective requested key, selected caps key, refusal
+reason and exact-match flag once through the DIST logger and common trace.
+Trace-off has no ring work; selection mismatch is WARN rather than silent.
+`test_jce_renderer_display_adapter` consumes the exact private policy, extracted
+actual init prefix and actual startup diagnostic body. The old-device and
+missing-wire mutants, plus the old-explicit-observation whole-owner control,
+must fail ordinary assertions after compiling. These CPU
+fixtures do not certify native adapter selection or prove lower Copy traffic.
+The process NvOptimus/AmdPower exports and vendor aliases remain unchanged.
+
+Cooked texture rejection diagnostics belong to `jce_texture.c` and its private
+`jce_texture_diagnostics_internal.h`, using the existing logger and trace ring.
+The opaque CPU decode object carries authored path hash and cooked source hash
+to API-thread upload; decoder workers never query GPU capabilities. Header,
+chunk, metadata, pixel decode, layout, format, capability, allocation and create
+refusals keep distinct stages. Missing caps are unavailable, not observed zero.
+Short metadata and size truncation refuse before copying or allocating upload
+memory. Successful handle zero remains valid; upload success is API acceptance,
+not GPU completion. The direct public cooked upload has unknown asset identity.
+Identity hashes are correlation metadata, not authentication or collision-proof
+content authority. One warning is emitted per rejected decode/upload request;
+existing scene/UI failure caches govern retries and invalidation, with no new
+registry or per-frame diagnostic scan. Repeated explicit public requests remain
+separate attempts. Existing Pak lookup and raw image errors retain their owners.
+
+Web API version admission lives in `jce_renderer_web_api_internal.h`, sharing
+the existing `jce_renderer_caps.c` API authority and one private context identity.
+The real post-bgfx-init decision refuses missing/unknown/mixed-epoch/below-floor
+API or GLSL observations before accepting the backend and uses existing
+shutdown/join/context-release cleanup. Parse the actual embedded OpenGL ES
+version rather than WebGL's leading version namespace. Native missing-version
+policy and actual feature/format caps remain unchanged. Public API info, running
+backend name and begin-frame observe that admitted epoch; changes clear verified
+flags and require actual renderer recreation before new admission. Cache reset
+also detaches the current platform listeners. The private frame-admission gate
+consumes that same status in Begin/View/End and central submission; rejected
+work cannot call bgfx_frame or advance submission/retirement/instance ordinals.
+Private implementations return real results to the trace adapter while public
+void ABI remains unchanged. Non-null refusal is FAILED, not pointer-only success;
+null calls remain cancelled and Noop/fallback retain their existing policies.
+Engine failure stops callback/asset/draw work through its existing cleanup owner.
+No automatic context recovery, resource reconstruction or GPU completion is certified.
+The 11-case CPU provider fixture consumes this exact owner, real version
+authority and the actual post-init decision/cleanup tail; four ordinary failing
+controls cover wrong namespace, missing publication, stale epoch and missing
+init wire. Real Web context-loss/recreation remains separate acceptance.
+
+## Public GPU timing observations
+
+`jce_gpu_caps.c` owns the independent size-bounded
+`jce_renderer_get_gpu_timing_observation` API. Existing `JceGpuStats` layout and
+active getter values remain unchanged. The legacy `jce_renderer_get_gpu_stats`
+also uses the existing active-context bridge before querying bgfx: before bind,
+after unbind, invalid generation/payload or Web context loss returns zeroed
+unavailable output without touching the backend. Bound Noop/headless statistics
+remain valid even when timers are zero/unavailable; no GPU completion or release
+is inferred from either result. The private renderer-device bridge reads the
+existing active payload generation and CPU-side host frame; unbind or Web
+context invalidation refuses backend access. No allocation, query, frame advance
+or additional device registry lives in that bridge.
+The API copies signed raw timer frequency/begin/end and bgfx's GPU sample frame,
+with explicit context/backend/frequency/nonforward-interval unavailable reasons.
+Negative or equal/reversed ticks are not a zero-ms performance observation.
+Read-time context/host-frame identity does not join the possibly older GPU sample
+or prove GPU completion, presentation or resource retirement.
+
+## Complete camera value clones
+
+`jce_camera_clone` lives with camera allocation and state in `jce_camera.c`. It
+allocates an independent tracked CPU object and copies the entire private value
+state, including rolled/pole pose, FPS control basis and both orthographic
+extent modes. NULL source and OOM return NULL; neither mutates the source nor
+requires a renderer. Consumers must destroy each owned camera independently.
+Do not reconstruct a complete clone from partial public getters.
+
+GPU annotation package capability is published through the existing bgfx
+attempt log and same-scope trace counters bgfx.gpu.annotation.request/option/
+compiled. These are generated package metadata, not native marker observations:
+request -1 means auto, while option/compiled -1 mean unknown. Missing or invalid
+macros remain unknown; CPU callbacks and runtime debug flags cannot infer them.
+The upstream build enables Debug even with option OFF and excludes WindowsStore.
+No new per-frame logging, callback API, device query or GPU acknowledgement is
+introduced. Actual D3D/Vulkan/GL marker availability requires backend captures.
+
+Startup shader-root ownership lives in jce_renderer_shader_dev.inc.h, included
+after the opaque Renderer definition. The existing device state borrows its
+actual instance at the same two successful metrics bindings. A Renderer owns an
+optional copied root plus a distinct startup-bound fact; empty/unset binds no
+allocation. API-owner, current device, instance identity and Web-context
+admission precede binding or root access. Repeated or foreign bindings preserve
+the snapshot. Destruction detaches the matching device instance before freeing
+the root. Failed copies publish nothing, and failed boot uses normal teardown.
+The private named loader delegates unbound/empty state to the unchanged explicit
+PAK loader; configured state delegates to the existing per-stage overlay owner.
+Caller PAK, independent VS/FS names, invalid-present-stage refusal and program
+creator reference ownership remain unchanged. There is no extra environment
+read, per-frame root polling, global registry or shader-manager lease. The
+existing initialized-backend/API-owner precondition still applies to unbound
+PAK delegation. Noop controls are CPU evidence; Web loss refuses this private
+load. This startup snapshot does not update valid Scene caches on Reload.
+
+## PostFX output target allocation contract
+
+`jce_postfx_get_output_target` is a versioned owner-thread CPU query. Exact
+size/version mismatch does not write; unavailable output is cleared. Empty
+chains report borrowed input with unknown extent/format and no writable FBO.
+Owned output requires the current apply slot's complete texture/FBO pair and
+allocation-time uint16 extent/format; handle zero is valid. Ping-pong allocation
+keeps the FBO attachment reference and releases the caller texture reference
+on success or failure. Metadata publishes only after both handles succeed and
+clears before retirement, on resize and partial failure. This is no GPU
+completion, context-generation or residency guarantee. Borrowed handles expire
+at the next apply/resize/destruction. Color-only overlay consumers must clear
+NONE, require no depth/stencil, and submit before that expiration.
+
+The private encoder preparation owner retires an unresolved deferred program's
+already recorded draw state with BGFX_DISCARD_ALL against its captured explicit
+encoder or implicit recording. Implicit-only routes pass NULL independently of
+unrelated TLS. Successful program, depth and flags retain existing behavior;
+a rejected submission is not counted. All three existing submit routes share
+this tail. Complete-header CPU controls and the ordinary missing-abort mutant
+cover owner routing and clean next-draw reuse, not GPU acceptance/completion or
+the cause of any specific application failure.
+
+The private lighting camera binder reuses the existing named camera uniform
+and its initialization/retirement owner. It publishes the caller's actual
+position once without changing the light environment or uploading other lights.
+
+Foliage model LOD resolves the effective material per actual band. A missing
+material table or out-of-range material index binds the ordinary default inside
+that band before the existing frame callback; present authored materials retain
+their behavior. The scene adapter does not prebind another default material.
+Exact-owner model controls check both missing-material cases and preserve the
+existing comparison-PCF routing assertions.
+
+## Cookie texture compatibility and ownership
+
+`jce_light_cookie_internal.h` owns the per-device cookie texture create, typed
+bind and idempotent destroy used by `jce_lighting_system.c`'s existing `s_lu`.
+The shared shader-profile predicate excludes cookie arrays on compatibility
+GL/ES even if the actual driver advertises arrays. Missing array/layer support
+also performs no cookie allocation or stage-13 bind. Authoring descriptors stay
+intact; the unavailable effect is diagnosed once per lighting lifetime.
+Array-capable modern paths retain the 16-layer 256-square white atlas and
+per-light sampling. Disabled/unavailable atlases use two initialized white
+layers: bgfx treats one layer as 2D, which cannot satisfy the array sampler.
+NULL allocation never reaches texture creation; failed handles never bind or
+destroy, and a legitimate handle zero is owned and destroyed exactly once.
+The IES texture remains a separate 2D owner. Counted CPU controls establish
+ownership and calls only, not graphics execution, pixels or performance.
+
+## Composite LUT resource ownership
+
+`jce_postfx_grade_internal.h` owns the composite's uniforms and initialized
+3D placeholder inside each private pipeline; its LUT/size/strength are borrowed
+authoring state. Compatibility GL/ES uses the shared shader-profile predicate
+and performs no LUT resource creation or stage-2 bind. A requested unavailable
+3D LUT warns once per pipeline; the default neutral state is quiet. There is
+no 2D LUT conversion in this compatibility path. Modern grade params, tonemap
+gating and placeholder sampler type remain unchanged. Failed acquisition
+releases valid partial resources; NULL memory never reaches texture creation.
+Handle zero is valid; release is idempotent and never owns the authored LUT.
+CPU owner controls and GLSL payload compilation do not certify driver output.
+
+Decal pool creation uses the shared renderer shader-profile predicate before
+any allocation, suffix lookup or shader acquire. Compatibility GL/ES refuses
+with an unsupported WARN on the actual create attempt; scene authoring data
+remains intact. Allocation/link/sampler failures return NULL with error
+diagnostics and valid partial resources are released. Program linking retains
+bgfx destroyShaders ownership; zero is a valid program/uniform handle. The
+scene's per-owner retry latch and explicit reset define retry frequency.
+
+Explicit bgfx trace mirroring remains opt-in through the process-latched
+`JCE_GFX_DEBUG` selector. Its callback sink uses direct public INFO writes so
+DIST does not erase the requested diagnostics; ordinary runtime log-level
+policy remains authoritative. API-version lines still feed metadata while
+mirroring is off. A prefix marks the callback's own 1024-byte formatting
+truncation; the canonical logger independently marks any further truncation.
+Source basenames use comparisons only within the same non-NULL path string.
+This sink cannot restore a compiled-out upstream BX_TRACE producer and never
+classifies arbitrary driver text as fatal or mutates device-error state.
+
+Underwater absorption samples the active scene depth and writes the existing
+HDR color with two RGB blends in one sequential view. A managed offscreen
+destination acquires a lazy color-only framebuffer alias when its attached
+depth is the sample source. The alias owns one reference to the existing
+color texture. It creates no texture or copy and shares the parent allocation
+generation and bounded retirement slot. Submit alias destruction before parent
+destruction. Allocation refusal preserves the parent and the next eligible
+submission may retry. The alias and draw scopes describe CPU calls. Verify
+actual SRV, RTV and DSV bindings separately. For a caller-owned framebuffer
+outside this bridge, the caller supplies a depth texture independent of the
+output attachments.
+
+
+Cloud density uses world metres on all three noise axes and an independent
+height envelope. Cellular F1 is a distance: the Perlin remap uses F1-1 so
+billow potential increases toward cell seeds, not toward their walls. The
+12-cell base frequency describes approximately 341-metre primary billows in
+the 4096-metre tile. Coverage carves potential without multiplying surviving
+optical density; extinction and coverage remain separate controls. Split
+shape/detail combination is identical to canonical CPU density and ground
+shadow density. The authored coverage number is a control, not a measured
+screen-space cloud fraction; authored scenes need visual calibration after
+morphology changes. Keep period, deterministic, erosion, precipitation and
+split-vs-combined property tests when changing this field.

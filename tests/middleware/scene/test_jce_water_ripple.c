@@ -13,6 +13,7 @@
 #include "unity.h"
 
 #include <jce/middleware/scene/jce_water_ripple.h>
+#include "jce_water_ripple_internal.h"
 
 #include <math.h>
 #include <string.h>
@@ -655,6 +656,29 @@ static void test_a_sloping_bed_turns_the_wavefront(void)
     jce_water_ripple_destroy(r);
 }
 
+static void test_drive_velocity_is_bounded_and_dt_consistent(void)
+{
+    JceWaterRippleDesc d = jce_water_ripple_default_desc();
+    JceWaterRipple *a = jce_water_ripple_create(&d), *b = jce_water_ripple_create(&d);
+    TEST_ASSERT_NOT_NULL(a); TEST_ASSERT_NOT_NULL(b);
+    jce_water_ripple_impulse(a, 0, 0, 2, 3);
+    jce_water_ripple_impulse(b, 0, 0, 2, 3);
+    const float initial = jce_water_ripple_energy(a);
+    jce_water_ripple_drive_velocity(a, 0, 0, 2, 0, 0.1f);
+    jce_water_ripple_drive_velocity(b, 0, 0, 2, 0, 0.05f);
+    jce_water_ripple_drive_velocity(b, 0, 0, 2, 0, 0.05f);
+    const float energy = jce_water_ripple_energy(a);
+    TEST_ASSERT_TRUE(energy > 0 && energy < initial);
+    TEST_ASSERT_FLOAT_WITHIN(initial * 1e-6f, energy, jce_water_ripple_energy(b));
+    jce_water_ripple_drive_velocity(a, 0, 0, 2, 100, 0);
+    jce_water_ripple_drive_velocity(a, 0, 0, 2, 100, -1);
+    jce_water_ripple_drive_velocity(a, 0, 0, 2, 100, NAN);
+    TEST_ASSERT_EQUAL_FLOAT(energy, jce_water_ripple_energy(a));
+    jce_water_ripple_step(a, 0.00001f);
+    TEST_ASSERT_TRUE(jce_water_ripple_height(a, 0, 0) < 0);
+    jce_water_ripple_destroy(a); jce_water_ripple_destroy(b);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -675,5 +699,6 @@ int main(void)
     RUN_TEST(test_substep_cap_advances_exactly_the_capped_amount);
     RUN_TEST(test_water_that_becomes_land_drains);
     RUN_TEST(test_a_sloping_bed_turns_the_wavefront);
+    RUN_TEST(test_drive_velocity_is_bounded_and_dt_consistent);
     return UNITY_END();
 }

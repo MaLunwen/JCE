@@ -142,10 +142,12 @@ JCE_API bool jce_config_load(JceConfig *cfg, const char *path);
    gfx_valid is set).  Returns false on a write error. */
 JCE_API bool jce_config_save(const JceConfig *cfg, const char *path);
 
-/* Process-global accessors for the boot-only performance knobs.  jce_engine
- * publishes the loaded values right after jce_config_load so the renderer /
- * jobs layers (which never receive the JceConfig) can read them.  Return the
- * defaults (auto / 0) until published. */
+/* Process-global accessors for the authored boot-only performance knobs.
+ * jce_engine publishes after resolving its low-memory policy, before lazy
+ * scheduler creation. These accessors retain the loaded machine class and
+ * job_workers; only the private shared worker budget receives effective LOW.
+ * Explicit job_workers keeps its override policy. Return auto / 0 until
+ * published. Classification does not certify a process-wide thread limit. */
 JCE_API JceMachineClass jce_config_machine_class(void);
 JCE_API int             jce_config_job_workers(void);
 JCE_API void            jce_config_publish_perf(int machine_class, int job_workers);

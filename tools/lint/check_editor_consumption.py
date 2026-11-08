@@ -189,6 +189,51 @@ def public_symbols(owner):
     return out
 
 
+
+def _include_source_without_comments(source):
+    """Remove comment tokens only for include discovery, preserving line breaks.
+
+    Ordinary quoted text is retained so // or /* in a string/header spelling
+    cannot erase a later directive. This is not a preprocessor: conditional
+    compilation and macro-expanded includes remain unknown.
+    """
+    tokens = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//(?:\\\r?\n|[^\r\n])*|/\*.*?(?:\*/|\Z)', re.S)
+    def replace(match):
+        token = match.group(0)
+        if token.startswith(("//", "/*")):
+            return re.sub(r"[^\r\n]", " ", token)
+        return token
+    return tokens.sub(replace, source)
+
+def included_implementation_identifiers(source, public_root=PUBLIC_ROOT):
+    """Follow explicit opt-in implementation includes, never API declarations.
+
+    Hosts share runtime policy through .inc.h/.inc definitions. Direct source
+    token scanning loses their genuine call sites when a host moves that code
+    into the shared include. Ordinary public headers stay excluded: including
+    api.h cannot count all its function declarations as editor consumption.
+    Include discovery excludes comments but does not evaluate #if conditions:
+    presence remains a weak name signal, not a compiled/runtime call witness.
+    """
+    root = public_root.resolve()
+    pending = list(INCLUDE_RE.findall(_include_source_without_comments(source)))
+    visited, names = set(), set()
+    while pending:
+        relative = pending.pop()
+        if not relative.endswith((".inc.h", ".inc")):
+            continue
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root) or path in visited or not path.is_file():
+            continue
+        visited.add(path)
+        text = read(path)
+        pending.extend(INCLUDE_RE.findall(_include_source_without_comments(text)))
+        # A declaration in an implementation include is still not a call.
+        text = re.sub(r"\bJCE_API\b[^;{}]*;", "", text)
+        names.update(IDENT_RE.findall(text))
+    return names
+
+
 def consumer_identifiers():
     """Every jce_* identifier that appears anywhere in the consumer trees.
 
@@ -201,7 +246,9 @@ def consumer_identifiers():
             continue
         for path in root.rglob("*"):
             if path.suffix.lower() in SOURCE_SUFFIXES and path.is_file():
-                seen.update(IDENT_RE.findall(read(path)))
+                text = read(path)
+                seen.update(IDENT_RE.findall(text))
+                seen.update(included_implementation_identifiers(text))
     return seen
 
 

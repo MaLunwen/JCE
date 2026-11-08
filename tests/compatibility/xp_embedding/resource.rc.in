@@ -1,0 +1,2 @@
+#include <windows.h>
+101 RCDATA "@JCE_XP_EMBED_PAYLOAD_RC@"

@@ -29,8 +29,9 @@ extern "C" {
 void jce_editor_build_profile_snapshot(void);
 
 /* Overlay the (now-current) project's saved build/run profile onto the
- * global JceEditorConfig, or seed the project store from the current
- * global values on first sight.  Call AFTER the project store follows the
+ * global JceEditorConfig. A fresh ordinary project uses neutral run/build
+ * paths, simulation mode and its manifest target; a fresh engine workspace
+ * retains the existing global migration. Call AFTER the project store follows the
  * new root.  No-op when no project store is active. */
 void jce_editor_build_profile_restore(void);
 

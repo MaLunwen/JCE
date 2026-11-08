@@ -26,7 +26,7 @@ working half hides its broken half.
 
 WHAT IS CHECKED
   1. Every `vs_*shadow*.sc` under engine/shaders includes shadow_pancake.sh
-     AND calls jce_shadow_pancake(.
+     AND calls jce_shadow_pancake(, directly or through a local quoted include.
   2. There is at least one such file, and at least as many as the day this was
      written -- a glob that silently matches nothing is a gate that cannot
      fail, and this repository has had those too.
@@ -55,7 +55,7 @@ HEADER = SHADERS / "pbr" / "shadow_pancake.sh"
 MIN_SHADOW_VS = 5
 
 CALL = "jce_shadow_pancake("
-INCLUDE = "shadow_pancake.sh"
+QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]+"([^"\n]+)"', re.MULTILINE)
 
 
 def shadow_vertex_shaders():
@@ -75,13 +75,35 @@ def shadow_vertex_shaders():
     return out
 
 
+def strip_comments(source):
+    # Keep line boundaries and prevent comments from joining adjacent tokens.
+    return re.sub(r"/\*.*?\*/|//[^\n]*",
+                  lambda match: " " + "\n" * match[0].count("\n"),
+                  source, flags=re.S)
+
+
+def local_shader_sources(path, visited):
+    """Yield uncommented sources from the shader's quoted include closure."""
+    path = path.resolve()
+    if path in visited:
+        return
+    visited.add(path)
+    code = strip_comments(path.read_text(encoding="utf-8"))
+    yield path, code
+    for name in QUOTED_INCLUDE.findall(code):
+        included = (path.parent / name).resolve()
+        if included.is_relative_to(SHADERS) and included.is_file():
+            yield from local_shader_sources(included, visited)
+
+
 def main():
     failures = []
 
     if not HEADER.is_file():
         print("FAIL: %s is missing" % HEADER.relative_to(ROOT))
         return 1
-    header = HEADER.read_text(encoding="utf-8")
+    header = strip_comments(HEADER.read_text(encoding="utf-8"))
+    header_path = HEADER.resolve()
 
     # Rule 3, first: if the header has lost its branch, every call site below is
     # calling something that clamps against the wrong plane on half the
@@ -110,21 +132,13 @@ def main():
             % (len(files), SHADERS.relative_to(ROOT), MIN_SHADOW_VS))
 
     for p in files:
-        src = p.read_text(encoding="utf-8")
+        sources = dict(local_shader_sources(p, set()))
         rel = p.relative_to(ROOT).as_posix()
-        # Strip block and line comments before looking for anything, so that
-        # NAMING the header or the function cannot stand in for using it.
-        # This is not hypothetical: the first version of this check tested the
-        # include against the raw text, and the mutation that deletes the
-        # `#include` line passed green -- because each of these shaders carries
-        # a comment that says "see shadow_pancake.sh", and `in src` cannot tell
-        # a reference from a use.  The same shape this repository has recorded
-        # twice: a gate satisfied by prose about the thing it guards.
-        code = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-        code = re.sub(r"//[^\n]*", "", code)
-        if not re.search(r'#\s*include\s+"%s"' % re.escape(INCLUDE), code):
-            failures.append("%s does not include %s" % (rel, INCLUDE))
-        if CALL not in code:
+        if header_path not in sources:
+            failures.append("%s does not include %s" % (rel, HEADER.name))
+        # The convention header defines the function. Only a source using it
+        # outside that header proves the caster wires the clamp.
+        if not any(CALL in code for path, code in sources.items() if path != header_path):
             failures.append(
                 "%s writes gl_Position without %s -- a caster further up-sun "
                 "than the cascade box reaches is clipped away on this path, "

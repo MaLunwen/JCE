@@ -170,28 +170,20 @@ JCE_API void       jce_texture_destroy(JceTexture tex);
  *                            Low/Mid/High → floor matrix),
  * clamped so the smallest 4x4 mip-tail is always resident.
  *
- * Whether the desire is *physically realised* depends on having a CPU copy
- * of the texture's mip-0 to re-upload from:
+ * Runtime requests currently record intent without replacing the resident
+ * texture, including textures with retained source pixels. JceTexture is a
+ * raw backend handle borrowed by value by materials, scene components and UI
+ * consumers; replacing it cannot safely update those existing copies. The
+ * original handle and source ownership remain intact, and size/resident-mip
+ * queries continue to describe the actual resident resource. No memory
+ * reclamation or successful dynamic resize is claimed. Unsupported changes
+ * are diagnosed once per texture and traced once per capture.
  *
- *   - Source-backed textures (a retained RGBA8 mip-0): an effective top-mip
- *     change destroys and recreates the GPU texture at the smaller size, so
- *     VRAM is genuinely reclaimed and jce_texture_get_size /
- *     jce_texture_get_resident_top_mip report the new, smaller resident level.
- *
- *   - Default textures (NO retained copy): to honour the low-memory baseline
- *     (single-core, 512 MB, no discrete GPU) the engine does NOT keep a
- *     redundant CPU mirror of every texture.  For these, a bias/residency
- *     request is recorded as intent but the resident GPU texture is left
- *     unchanged — and crucially the queries keep reporting the TRUE resident
- *     level/size.  They never claim a shrink that did not happen (audit F29;
- *     the previous build silently advanced the reported size while leaving the
- *     GPU at full resolution, corrupting size-derived math and the streaming
- *     memory accounting).
- *
- * Roadmap: full streaming for default textures will arrive with an asset
- * format that stores the explicit mip chain on disk, so high mips can be
- * streamed in/out from the PAK on demand instead of from a RAM mirror —
- * keeping the reclaim path zero-extra-RAM, as the baseline requires.
+ * Initial loads still apply supported quality/size choices and build their
+ * mip chains before publishing the handle. Runtime residency replacement
+ * requires a future stable-handle/binding contract; keeping a CPU source copy
+ * alone does not provide one. Default textures avoid retaining a redundant
+ * CPU mirror unless the existing streaming upload policy opts them in.
  *
  * Per-texture mip bias.  0 = full quality, +1 = drop top mip, +2 = drop two
  * top mips, etc.  Negative values are clamped to 0.
@@ -201,9 +193,10 @@ JCE_API int8_t jce_texture_get_mip_bias(JceTextureId tex);
 
 /*
  * Request a given top-mip residency (e.g. top_mip = 0 to upload the full
- * chain).  Honored on the next streaming tick; may be denied / clamped
- * upward under HARD streaming pressure or by the caps floor.  See the
- * CONTRACT note above: only source-backed textures are physically resized.
+ * chain). Records clamped intent; dynamic replacement is currently unsupported
+ * for the raw by-value handle contract. See the contract above; resident size
+ * and mip queries remain unchanged until a supported reload creates a new
+ * explicitly owned handle.
  */
 JCE_API void    jce_texture_request_mip_residency(JceTextureId tex, uint8_t top_mip);
 JCE_API uint8_t jce_texture_get_resident_top_mip(JceTextureId tex);
@@ -243,8 +236,9 @@ JCE_API int    jce_texture_colour_space(void);
  * Arm/disarm "streaming uploads".  While armed, NEW uncompressed-RGBA8 texture
  * uploads (the streamed-texture path: PAK PNG/JPG and cooked RGBA8) retain a CPU
  * mip-0 copy AND opt into streaming_tracked, so the streaming-pressure global
- * mip-bias hook can PHYSICALLY shrink them under memory pressure (without a
- * retained source the demote is a truthful no-op — see the CONTRACT above).
+ * request policy can retain intent and source ownership. Published raw
+ * handles are not dynamically replaced; this does not reclaim GPU memory
+ * (see the contract above).
  * Off by default so editor/UI/one-off textures pay zero extra RAM.  The runtime
  * scene renderer arms it around streamed model/texture uploads.  Render-thread
  * only (uploads run there).

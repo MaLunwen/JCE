@@ -10,6 +10,8 @@
 #include "scene/jce_editor_viewport_common.h"    /* plumbing shared with Scene View */
 #include "gizmo/jce_gizmo_compound_collider.h"   /* draw fitted compound colliders */
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_viewport_trace.h"
+#include "core/jce_editor_frame_observation.h"
 
 #include "jce_scene_content_context.h"   /* project content roots (C++ linkage) */
 #include "core/jce_editor_project.h"
@@ -42,7 +44,6 @@ extern "C" {
 #include <jce/os/platform/jce_input.h>
 #include <jce/runtime/jce_game_module.h>
 #include <jce/application/jce_runtime.h>  /* UI widget → script dispatch in Play */
-extern void jce_game_module_set_active_scene(JceScene *scene);
 }
 
 #include <cmath>
@@ -59,7 +60,8 @@ struct GameRenderState {
     JceRenderer           *renderer          = nullptr;
     JceWindow             *window            = nullptr;
     JceOffscreenTarget    *bridge            = nullptr;
-    JceCamera             *camera            = nullptr;
+    JceCamera             *camera            = nullptr;  /* stopped preview */
+    JceCamera             *play_camera       = nullptr;  /* Play-owned; never aliases preview */
     JcePostFXPipeline     *postfx            = nullptr;  /* game-view own pipeline */
     uint16_t               postfx_output_tex = UINT16_MAX;
     uint16_t               render_width      = 0;
@@ -76,6 +78,7 @@ struct GameRenderState {
      * "was this written for the frame we are capturing" can. */
     uint32_t               extent_frame      = 0u;
     bool                   extent_written    = false;
+    bool                   stats_frame_completed = false; /* CPU-only HUD freshness. */
 
     /* GPU-query occlusion culler (Play / game-view).  The game view shares the
      * ENGINE scene renderer with the scene view but renders in its own pass with
@@ -95,12 +98,7 @@ struct GameRenderState {
     jce_mat4               taa_prev_view     = {};
     jce_mat4               taa_prev_proj     = {};
     bool                   taa_prev_valid    = false;
-
-    /* Active game module + lifecycle bookkeeping. */
-    const JceGameModule   *module            = nullptr;
-    bool                   module_inited     = false;
-    int                    last_play_state   = 0;  /* JcePlayState */
-    JceServices            svc               = {};
+    bool                   camera_cut_pending = true;
 
     /* ECS-UI (Canvas) renderer — draws Canvas/UIImage/UIText/UIButton on
      * top of the game view and hit-tests the pointer. */
@@ -118,6 +116,7 @@ struct GameRenderState {
 };
 
 GameRenderState g;
+JceEditorFrameObservation s_game_frame_observation;
 
 /* Use a view ID well above the editor scene + shadow + post FX range.
  * Engine scene renderer expects shadow views at base+10..+13 and post
@@ -127,13 +126,32 @@ GameRenderState g;
  * Scene View's, so the view-id spacing assertions can see both. */
 constexpr uint16_t GAME_VIEW_BASE = JCE_EDITOR_GAME_VIEW_BASE;
 
+JceCameraDesc game_default_camera_desc_internal(void)
+{
+    JceCameraDesc desc = {};
+    desc.mode       = JCE_CAMERA_PERSPECTIVE;
+    desc.position   = jce_v3(0.0f, 1.7f, 6.0f);
+    desc.target     = jce_v3(0.0f, 1.5f, 0.0f);
+    desc.up         = jce_v3(0.0f, 1.0f, 0.0f);
+    desc.fov_deg    = 60.0f;
+    desc.near_plane = 0.05f;
+    desc.far_plane  = 1000.0f;
+    return desc;
+}
+
+JceCamera *game_display_camera_internal(void)
+{
+    return g.play_camera ? g.play_camera : g.camera;
+}
+
 void game_reset_camera_internal(void)
 {
-    if (!g.camera) return;
-    jce_camera_set_position(g.camera, jce_v3(0.0f, 1.7f, 6.0f));
-    jce_camera_set_target  (g.camera, jce_v3(0.0f, 1.5f, 0.0f));
-    jce_camera_set_fov     (g.camera, 60.0f);
-    jce_camera_set_near_far(g.camera, 0.05f, 1000.0f);
+    JceCamera *camera = game_display_camera_internal();
+    if (!camera) return;
+    jce_camera_set_position(camera, jce_v3(0.0f, 1.7f, 6.0f));
+    jce_camera_set_target  (camera, jce_v3(0.0f, 1.5f, 0.0f));
+    jce_camera_set_fov     (camera, 60.0f);
+    jce_camera_set_near_far(camera, 0.05f, 1000.0f);
 }
 
 } /* anon namespace */
@@ -159,7 +177,7 @@ extern "C" {
 static bool JCE_CALL game_view_auto_capture(void *user, const char *path)
 {
     (void)user;
-    return jce_editor_game_render_screenshot(path);
+    return jce_editor_game_render_screenshot(path, nullptr);
 }
 }
 
@@ -167,6 +185,7 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
                                  const JcePakArchive *pak)
 {
     if (g.initialized) return true;
+    g.stats_frame_completed = false;
     if (!renderer) return false;
 
     g.renderer = renderer;
@@ -174,14 +193,7 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
     JceGfxCaps caps = jce_gfx_caps();
     g.homogeneous_depth = caps.homogeneous_depth;
 
-    JceCameraDesc desc = {};
-    desc.mode       = JCE_CAMERA_PERSPECTIVE;
-    desc.position   = jce_v3(0.0f, 1.7f, 6.0f);
-    desc.target     = jce_v3(0.0f, 1.5f, 0.0f);
-    desc.up         = jce_v3(0.0f, 1.0f, 0.0f);
-    desc.fov_deg    = 60.0f;
-    desc.near_plane = 0.05f;
-    desc.far_plane  = 1000.0f;
+    const JceCameraDesc desc = game_default_camera_desc_internal();
     g.camera = jce_camera_create(&desc);
     if (!g.camera) {
         LOG_WARN(LOG_TAG, "[init] failed to create game-view camera");
@@ -284,6 +296,7 @@ void jce_editor_game_render_reset_occlusion(void)
 
 void jce_editor_game_render_shutdown(void)
 {
+    g.stats_frame_completed = false;
     if (g.window) {
         jce_window_set_mouse_rect(g.window, 0, 0, 0, 0);
     }
@@ -307,6 +320,8 @@ void jce_editor_game_render_shutdown(void)
     }
     if (g.ui_canvas) { jce_ui_canvas_destroy(g.ui_canvas); g.ui_canvas = nullptr; }
     if (g.bridge) { jce_offscreen_target_destroy(g.bridge); g.bridge = nullptr; }
+    jce_editor_game_render_end_play_camera();
+    g.play_runtime = nullptr;
     if (g.camera) { jce_camera_destroy(g.camera); g.camera = nullptr; }
     if (g.postfx) { jce_postfx_destroy(g.postfx); g.postfx = nullptr; }
     g.postfx_output_tex = UINT16_MAX;
@@ -327,7 +342,17 @@ static uint32_t s_captured_mouse_buttons = 0;
 
 bool jce_editor_game_render_set_mouse_capture(bool capture)
 {
+    if (!capture) s_captured_mouse_buttons = 0; /* idempotent Stop release */
     if (!g.window) { g.mouse_captured = false; return false; }
+    if (capture) {
+        uint32_t flags = 0;
+        /* Dock focus does not imply host input focus. Recheck even when the
+         * previous frame captured, so a hidden or inactive host releases it. */
+        capture = jce_window_get_flags(g.window, &flags) &&
+                  (flags & JCE_WINDOW_INPUT_FOCUS) != 0 &&
+                  (flags & (JCE_WINDOW_HIDDEN | JCE_WINDOW_MINIMIZED |
+                            JCE_WINDOW_NOT_FOCUSABLE)) == 0;
+    }
     if (capture == g.mouse_captured) return g.mouse_captured;
     jce_window_set_relative_mouse_mode(g.window, capture);
     /* Hard-grab so the cursor cannot escape the editor window even if the
@@ -350,6 +375,35 @@ void jce_editor_game_render_set_ui_pointer(float x, float y,
     g.ui_pointer.y     = y;
     g.ui_pointer.down  = down;
     g.ui_pointer.valid = valid;
+}
+
+/* Camera allocation participates in Play admission, independently of whether
+ * the Game panel draws. Keeping the preview object untouched preserves its
+ * complete projection, orthographic extent and rolled pose without a partial
+ * snapshot built from getters. All calls run on the Editor owner thread. */
+bool jce_editor_game_render_begin_play_camera(void)
+{
+    if (g.play_camera) return true;
+    const JceCameraDesc desc = game_default_camera_desc_internal();
+    JceCamera *camera = g.camera ? jce_camera_clone(g.camera)
+                                 : jce_camera_create(&desc);
+    if (!camera) {
+        LOG_ERROR(LOG_TAG, "failed to create Play camera");
+        return false;
+    }
+    g.play_camera = camera;
+    g.taa_prev_valid = false;
+    g.camera_cut_pending = true;
+    return true;
+}
+
+void jce_editor_game_render_end_play_camera(void)
+{
+    JceCamera *camera = g.play_camera;
+    g.play_camera = nullptr;
+    if (camera) jce_camera_destroy(camera);
+    g.taa_prev_valid = false;
+    g.camera_cut_pending = true;
 }
 
 /* Hand the game renderer the live Play-mode runtime (or NULL to detach on
@@ -441,7 +495,7 @@ bool jce_editor_game_render_mouse_button(int btn)
 
 JceCamera *jce_editor_game_render_get_camera(void)
 {
-    return g.camera;
+    return game_display_camera_internal();
 }
 
 void jce_editor_game_render_reset_camera(void)
@@ -498,7 +552,8 @@ uint16_t jce_editor_game_render_get_texture(void)
  * separates one frame of pipeline from a dead panel by orders of magnitude. */
 #define JCE_EDITOR_GAME_VIEW_EXTENT_MAX_AGE 1
 
-bool jce_editor_game_render_screenshot(const char *path)
+bool jce_editor_game_render_screenshot(
+    const char *path, JceEditorGameScreenshotFrame *frame)
 {
     if (!g.initialized || !g.bridge || !path || !path[0] ||
         g.render_width == 0 || g.render_height == 0) {
@@ -552,34 +607,108 @@ bool jce_editor_game_render_screenshot(const char *path)
         return false;
     }
 
-    return jce_editor_viewport_screenshot_submit(
-        g.bridge, jce_offscreen_target_get_view_id(g.bridge),
-        g.postfx_output_tex, g.render_width, g.render_height, path);
+    if (!jce_editor_viewport_screenshot_submit(
+            g.bridge, jce_offscreen_target_get_view_id(g.bridge),
+            g.postfx_output_tex, g.render_width, g.render_height, path,
+            JCE_EDITOR_SCREENSHOT_GAME))
+        return false;
+    if (frame) {
+        frame->source_frame = g.extent_frame;
+        frame->submit_frame = now;
+    }
+    return true;
 }
 
 int jce_editor_game_render_capture_poll(void)
 {
-    return jce_renderer_readback_capture_poll();
+    return jce_editor_viewport_capture_poll(JCE_EDITOR_SCREENSHOT_GAME);
 }
 
-/* `width`/`height` are the PANEL's size -- the rectangle the finished image
- * is stretched into.  Everything that touches the offscreen chain uses
- * render_w/render_h instead (computed at the top of this function): the
- * bridge, the postfx chain, TAA's jitter, the fullscreen effects and the
- * composite all have to agree on one size, and the panel is not it.
- *
- * They agreed by accident while render_scale reached nothing.  The first time
- * the two differed, four of the five stages kept using the panel size and the
- * scene came out in the top-left corner of a black frame. */
+/* Dimensions are resolved by the shared pipeline extent owner before this
+ * function. The panel maps ImGui points into these Canvas/FBO pixels and
+ * publishes the same extent to Play before input or first script startup.
+ * Never apply render_scale a second time here. */
+void jce_editor_game_render_observation_begin(bool enabled)
+{
+    s_game_frame_observation.begin(enabled);
+}
+
+void jce_editor_game_render_observation_policy(uint32_t reason)
+{
+    s_game_frame_observation.policy(static_cast<JceEditorViewportPolicyReason>(reason));
+}
+
+void jce_editor_game_render_observation_request(uint32_t width, uint32_t height)
+{
+    s_game_frame_observation.request(width, height);
+}
+
+void jce_editor_game_render_observation_image(uint16_t texture)
+{
+    if (!s_game_frame_observation.enabled() || texture == UINT16_MAX) return;
+    uint32_t allocated_width = 0, allocated_height = 0;
+    const bool bridge_extent = jce_offscreen_target_get_extent(
+        g.bridge, &allocated_width, &allocated_height);
+    uint32_t display_width = 0, display_height = 0;
+    if (texture == jce_offscreen_target_get_color_texture(g.bridge)) {
+        if (bridge_extent) {
+            display_width = allocated_width;
+            display_height = allocated_height;
+        }
+    } else if (g.postfx && texture == g.postfx_output_tex) {
+        JcePostFXOutputTarget output{};
+        output.struct_size = sizeof(output);
+        output.version = JCE_POSTFX_OUTPUT_TARGET_VERSION;
+        if (jce_postfx_get_output_target(g.postfx, &output) &&
+            output.kind == JCE_POSTFX_OUTPUT_OWNED && output.texture.idx == texture) {
+            display_width = output.width;
+            display_height = output.height;
+        }
+    }
+    s_game_frame_observation.image(texture, allocated_width, allocated_height,
+                                   display_width, display_height);
+}
+
+bool jce_editor_game_render_observation_copy(JceFrameViewportObservation *out)
+{
+    return s_game_frame_observation.copy(out);
+}
+
+bool jce_editor_game_render_get_committed_extent(uint32_t *width, uint32_t *height)
+{
+    if (width) *width = 0;
+    if (height) *height = 0;
+    if (!width || !height || !g.initialized || !g.renderer || !g.bridge ||
+        !g.stats_frame_completed || !g.extent_written ||
+        g.extent_frame != jce_renderer_get_frame_index(g.renderer))
+        return false;
+    return jce_offscreen_target_get_extent(g.bridge, width, height);
+}
+
+void jce_editor_game_render_resolve_extent(uint32_t width, uint32_t height,
+                                          uint32_t *out_w, uint32_t *out_h)
+{
+    jce_render_pipeline_scene_extent(width, height, out_w, out_h);
+}
+
 void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 {
-    if (!g.initialized || !g.renderer) return;
-    if (width == 0 || height == 0) return;
+    g.stats_frame_completed = false;
+    s_game_frame_observation.render_begin(width, height);
+    JceEditorViewportRenderTrace render_trace("editor.game.render", "editor.game.render.reason",
+        "editor.game.render.admitted");
+    if (!g.initialized || !g.renderer) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::Unavailable);
+        render_trace.reason(JceEditorViewportRenderReason::Unavailable); return;
+    }
+    if (width == 0 || height == 0) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::EmptyExtent);
+        render_trace.reason(JceEditorViewportRenderReason::EmptyExtent); return;
+    }
 
     /* THE size of the offscreen chain, asked once.  See the note above the
      * function: the panel size is for the ImGui image and nothing else. */
-    uint32_t render_w = width, render_h = height;
-    jce_render_pipeline_scene_extent(width, height, &render_w, &render_h);
+    const uint32_t render_w = width, render_h = height;
 
     /* A modal impostor bake owns the frame's view ids (127..227), which is
      * inside this viewport's range under any base that fits in 256 views.
@@ -591,72 +720,34 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      *
      * The bake is driven from the Inspector / the QA harness, not from here,
      * so skipping this render does not stall it. */
-    if (jce_impostor_bake_in_flight()) return;
+    if (jce_impostor_bake_in_flight()) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::ImpostorBusy);
+        render_trace.reason(JceEditorViewportRenderReason::ImpostorBusy); return;
+    }
     /* ...and to a probe capture, for the same reason: it renders the scene
-     * from a viewport base id while it runs.  The Scene View drives it; this
-     * viewport only steps aside. */
-    if (jce_scene_probe_capture_in_flight()) return;
+     * from a viewport base id while it runs. The admitted host pump drives it;
+     * this viewport also yields on the pump's completion/failure frame. */
+    if (jce_editor_scene_render_probe_busy()) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::ProbeBusy);
+        render_trace.reason(JceEditorViewportRenderReason::ProbeBusy); return;
+    }
 
     JceSceneRenderer *engine_sr = jce_editor_get_scene_renderer();
     JceScene         *scene     = jce_state_get_scene();
-    if (!engine_sr || !scene || !g.camera || !g.bridge) return;
-
-    /* ── Game module lifecycle (drive on Play state edges) ──────── */
-    int play_state = (int)jce_state_get_play_state();
-    const JceGameModule *mod = g.module ? g.module : jce_game_module_default();
-
-    bool play_active = (play_state == 1 /*PLAYING*/ ||
-                        play_state == 2 /*PAUSED */);
-    bool was_active  = (g.last_play_state == 1 || g.last_play_state == 2);
-
-    if (play_active && !was_active) {
-        /* Rising edge — init module. */
-        g.svc.window   = g.window;
-        g.svc.renderer = g.renderer;
-        jce_game_module_set_active_scene(scene);
-        if (mod && mod->init) {
-            if (!mod->init(&g.svc, mod->user_data)) {
-                LOG_WARN(LOG_TAG, "[play] module '%s' init failed",
-                         mod->name ? mod->name : "?");
-            } else {
-                g.module_inited = true;
-                LOG_INFO(LOG_TAG, "[play] module '%s' started",
-                         mod->name ? mod->name : "?");
-            }
-        } else {
-            g.module_inited = true;
-        }
-    } else if (!play_active && was_active) {
-        /* Falling edge — exit module. */
-        if (mod && mod->exit && g.module_inited)
-            mod->exit(mod->user_data);
-        g.module_inited = false;
-        jce_game_module_set_active_scene(NULL);
+    const int play_state = (int)jce_state_get_play_state();
+    const bool play_active = play_state == 1 || play_state == 2;
+    JceCamera *camera = game_display_camera_internal();
+    /* A failed/missing Play admission must never fall back to mutating preview. */
+    if (!engine_sr || !scene || !camera || !g.bridge ||
+        (play_active && !g.play_camera)) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::MissingSceneOwner);
+        render_trace.reason(JceEditorViewportRenderReason::MissingSceneOwner); return;
     }
-    g.last_play_state = play_state;
-
-    /* Compute real frame dt (jce_time_perf_counter) so the engine scene
-     * renderer can advance skeletal animation, particles, and other
-     * time-based components in PLAY mode (Game View). */
-    static uint64_t s_last_tp = jce_time_perf_counter();
-    uint64_t now_tp  = jce_time_perf_counter();
-    float    frame_dt = (float)jce_time_perf_to_seconds(s_last_tp, now_tp);
-    s_last_tp = now_tp;
-    if (frame_dt < 0.0f || frame_dt > 0.25f) frame_dt = 1.0f / 60.0f;
-
-    /* Per-frame tick (only when actually PLAYING, not PAUSED). */
-    if (play_state == 1 /*PLAYING*/ && g.module_inited && mod) {
-        /* Re-point the module at the CURRENT scene every frame.  The active
-         * scene was pinned at module-init (rising edge above); if the editor
-         * scene has since been swapped or recreated (scene load / project
-         * switch mid-Play), that pinned pointer now dangles and mod->draw ->
-         * jce_scene_update would dereference freed memory (ACCESS_VIOLATION at
-         * jce_scene.c scene_drop_world_cache_frame).  `scene` is this frame's
-         * jce_state_get_scene(), already null-checked above, so it is valid. */
-        jce_game_module_set_active_scene(scene);
-        if (mod->update) mod->update(frame_dt, mod->user_data);
-        if (mod->draw)   mod->draw(&g.svc, mod->user_data);
-    }
+    render_trace.admitted();
+    const float frame_dt = jce_editor_play_render_delta();
+    /* Module drawing is view work; init/update/exit belong to Play, which
+     * continues when this viewport is hidden or clipped. */
+    jce_editor_play_draw_module();
 
     /* WYSIWYG with the standalone runtime: during Play, if the scene has a
      * playable character (CharacterController → runtime player position), drive
@@ -667,7 +758,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     if (play_active && g.play_runtime) {
         jce_vec3 player_pos;
         if (jce_runtime_get_player_position(g.play_runtime, &player_pos))
-            jce_camera_third_person_follow(g.camera, player_pos);
+            jce_camera_third_person_follow(camera, player_pos);
     }
 
     /* Resolve the authored scene camera after the Play runtime has stepped and
@@ -694,7 +785,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
          * runtime: authored pose first, virtual camera on top of it. */
         JceSceneCameraPose cpose;
         const JceSceneCameraResolveResult cres =
-            jce_scene_camera_apply_primary(scene, g.camera, &cpose);
+            jce_scene_camera_apply_primary(scene, camera, &cpose);
         /* Say it ONCE when the scene cannot supply a camera.  Silently
          * keeping the default is how this whole defect stayed invisible:
          * Play renders something plausible from a camera nobody authored,
@@ -727,20 +818,20 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         jce_vcam_system_evaluate(scene, frame_dt, &output, &has_vcam);
         if (has_vcam) {
             jce_camera_set_position(
-                g.camera, jce_v3(output.position[0], output.position[1],
+                camera, jce_v3(output.position[0], output.position[1],
                                  output.position[2]));
             jce_camera_look_at(
-                g.camera, jce_v3(output.target[0], output.target[1],
+                camera, jce_v3(output.target[0], output.target[1],
                                  output.target[2]));
-            jce_camera_set_fov(g.camera, output.fov_deg);
+            jce_camera_set_fov(camera, output.fov_deg);
         }
     } else {
         jce_vcam_system_reset();
     }
 
     float aspect = (float)width / (float)height;
-    jce_mat4 view = jce_camera_view(g.camera);
-    jce_mat4 proj = jce_camera_proj(g.camera, aspect, g.homogeneous_depth);
+    jce_mat4 view = jce_camera_view(camera);
+    jce_mat4 proj = jce_camera_proj(camera, aspect, g.homogeneous_depth);
 
     /* Camera.clearFlags, resolved ONCE here because both halves of the answer
      * are needed and they are needed at different moments: what the target
@@ -781,8 +872,9 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * the pin is gone.  examples/snake_seven/parity.py asserts the two hosts
      * agree about it, so a future divergence is a named FAIL and not a pixel
      * count. */
-    static const JceCvar *s_cv_taa = jce_cvar_find("r.taa");
-    bool game_taa_on = s_cv_taa ? jce_cvar_get_bool(s_cv_taa) : false;
+    const bool game_taa_on =
+        jce_scene_renderer_taa_requested(engine_sr) &&
+        jce_postfx_taa_supported();
     jce_mat4 color_proj = proj;
     if (game_taa_on && g.postfx) {
         jce_taa_advance(&g.taa_state, render_w, render_h);
@@ -804,7 +896,10 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                 if (rs->taa_motion_clamp > 0.0f) taa_mc = rs->taa_motion_clamp;
             }
         }
-        jce_postfx_set_taa(g.postfx, true, taa_fb, taa_lc, taa_mc);
+        /* A camera cut must not blend the previous camera's colour history.
+         * Keep this pending across hidden/skipped views until an actual apply. */
+        jce_postfx_set_taa(g.postfx, true,
+            g.camera_cut_pending ? 0.0f : taa_fb, taa_lc, taa_mc);
         /* Request the shared renderer write a per-object/per-bone velocity
          * buffer this frame (the game view is the sole renderer when the Scene
          * tab is hidden; when both are visible the scene path's prev-state is
@@ -843,7 +938,14 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             0x000000FFu,
             base_keep_color, base_keep_depth,
             "EditorGame")) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::TargetRefused);
+        render_trace.reason(JceEditorViewportRenderReason::TargetRefused);
         return;
+    }
+    if (s_game_frame_observation.enabled()) {
+        uint32_t allocated_w = 0, allocated_h = 0;
+        (void)jce_offscreen_target_get_extent(g.bridge, &allocated_w, &allocated_h);
+        s_game_frame_observation.prepared(allocated_w, allocated_h);
     }
     g.render_width = static_cast<uint16_t>(render_w);
     g.render_height = static_cast<uint16_t>(render_h);
@@ -858,6 +960,10 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * Game View visible showed missing meshes/textures until you clicked the
      * Scene tab once. */
     jce_editor_scene_asset_cache_finalize();
+    if (!jce_scene_renderer_prepare_resources(engine_sr, scene)) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::ResourcesRefused);
+        render_trace.reason(JceEditorViewportRenderReason::ResourcesRefused); return;
+    }
 
     /* Same story, one step further along: the particle-descriptor and canvas
      * font roots are process-wide statics that only the Scene View was
@@ -874,7 +980,8 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                 isolated,
                 proj ? proj->project_root : nullptr,
                 proj ? proj->source_assets : nullptr,
-                proj ? proj->cooked_assets : nullptr);
+                proj ? proj->cooked_assets : nullptr,
+                jce_editor_scene_content_root());
         const char *root = paths.particle_asset_root.empty()
                                ? nullptr
                                : paths.particle_asset_root.c_str();
@@ -973,7 +1080,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * what keeps a full-loaded big world playable in the Game View / Play.
      * Focus = the play (free-fly/FPS) camera position. */
     {
-        jce_vec3 cam_pos = jce_camera_get_position(g.camera);
+        jce_vec3 cam_pos = jce_camera_get_position(camera);
         cfg.cull_focus_enabled = true;
         cfg.cull_focus_x = cam_pos.x;
         cfg.cull_focus_y = cam_pos.y;
@@ -986,7 +1093,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * should freeze animation, matching Unity's Game View semantics. */
     float render_dt = (play_state == 1) ? frame_dt : 0.0f;
     /* Before the main render -- see the note in the Scene View. */
-    jce_scene_renderer_render_planar_reflection(engine_sr, scene, g.camera,
+    jce_scene_renderer_render_planar_reflection(engine_sr, scene, camera,
                                                  render_dt);
     /* THE OVERLAY CAMERAS, SUBMITTED FIRST.  They are DRAWN last -- bgfx runs
      * views in the order the view-order pass set, and base+64..66 sit after the
@@ -1026,7 +1133,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         }
     }
 
-    jce_scene_renderer_render(engine_sr, scene, g.camera, base,
+    jce_scene_renderer_render(engine_sr, scene, camera, base,
                               render_dt, &cfg);
 
     /* Forensic occlusion KPI (JCE_KPI_OCCLUSION_LOG=1) for the GAME-view
@@ -1055,7 +1162,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     jce_editor_viewport_composite_fog_ssr(engine_sr, g.bridge, base,
                                           cfg.fog_enabled);
     jce_editor_viewport_apply_fullscreen_effects(
-        engine_sr, scene, g.camera, g.bridge, base, 0,
+        engine_sr, scene, camera, g.bridge, base, 0,
         render_w, render_h, render_dt);
 
     /* ── PostFX ─────────────────────────────────────────────────────
@@ -1120,6 +1227,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                 game_depth.idx = jce_offscreen_target_get_depth_texture(g.bridge);
                 if (jce_gfx_texture_valid(game_color)) {
                     jce_postfx_apply(g.postfx, game_color, game_depth);
+                    g.camera_cut_pending = false;
                     JceTextureHandle out = jce_postfx_get_output(g.postfx);
                     if (jce_gfx_texture_valid(out))
                         g.postfx_output_tex = out.idx;
@@ -1134,24 +1242,30 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     /* Same declaration as the Scene View -- see the comment there. */
     jce_editor_viewport_claim_view_band("editor-game-view", GAME_VIEW_BASE);
 
-    const bool postfx_composited = jce_editor_viewport_composite_postfx(
-        g.bridge, GAME_VIEW_BASE, g.postfx_output_tex, render_w, render_h);
+    uint16_t postfx_ui_fb = UINT16_MAX;
+    const bool postfx_overlay = g.ui_canvas && jce_editor_game_postfx_overlay_target(
+        g.bridge, g.postfx, g.postfx_output_tex, render_w, render_h,
+        g.renderer, scene, jce_state_get_show_physics_debug(), &postfx_ui_fb);
+    const bool postfx_composited = !postfx_overlay && jce_editor_viewport_composite_postfx(
+        g.bridge, GAME_VIEW_BASE, g.postfx_output_tex, render_w, render_h,
+        g.renderer, scene, g.ui_canvas != nullptr, jce_state_get_show_physics_debug());
     if (postfx_composited)
         g.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
 
     /* ── ECS-UI (Canvas) overlay ────────────────────────────────────
      * Draw Canvas/UIImage/UIText/UIButton on top of the rendered game
-     * view, into the offscreen target's framebuffer.  With PostFX active
+     * view, into the admitted current PostFX FBO or the bridge. With PostFX active
      * the overlay draws after the composite pass above (crisp, un-tonemapped
      * UI, matching the runtime); without PostFX it draws right after the
      * scene color (base) and fog composite (base+16). */
     if (g.ui_canvas && scene) {
         uint16_t ui_view = jce_editor_viewport_ui_overlay_view(GAME_VIEW_BASE,
                                                                postfx_composited);
-        uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(g.bridge);
+        uint16_t ui_fb = postfx_overlay ? postfx_ui_fb
+            : jce_offscreen_target_get_frame_buffer(g.bridge);
         const JceUIPointer *ptr = g.ui_pointer.valid ? &g.ui_pointer : nullptr;
         /* render_w/render_h, not the panel size: the canvas is rasterised
-         * INTO the bridge, so its logical extent has to be the bridge's or the
+         * INTO the admitted full-size target, so its logical extent must match or the
          * whole UI lands in a corner of a scaled target.
          *
          * This is the one place the Game view cannot match the shipped
@@ -1197,7 +1311,7 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             uint32_t id = jce_state_get_entity_id_by_index(i);
             if (id == 0 || !jce_state_entity_exists(id)) continue;
             if (!jce_state_entity_enabled(id)) continue;
-            JceEntity e = (JceEntity)id;
+            JceEntity e = jce_state_to_ecs_entity(id);
             JceTransform *t = jce_scene_get_transform(scene, e);
             if (!t) continue;
             jce_quat q = t->rotation;
@@ -1277,19 +1391,16 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     /* Clear the shared renderer's velocity request so it isn't reused by a
      * later scene/pick render this frame. */
     jce_scene_renderer_set_taa_velocity_enabled(engine_sr, false);
+    s_game_frame_observation.completed();
+    g.stats_frame_completed = true;
 }
 
 void jce_editor_game_render_set_module(const JceGameModule *mod)
 {
-    if (g.module == mod) return;
-    /* If a module is currently inited, tear it down first. */
-    if (g.module_inited && g.module && g.module->exit)
-        g.module->exit(g.module->user_data);
-    g.module_inited = false;
-    g.module = mod;
+    jce_editor_play_set_module(mod);
 }
 
 const JceGameModule *jce_editor_game_render_get_module(void)
 {
-    return g.module ? g.module : jce_game_module_default();
+    return jce_editor_play_get_module();
 }

@@ -1,5 +1,20 @@
 # engine/include/jce/renderer/ — Renderer Public API
 
+The public `JCE_GRAPHICS_API_TIER_COMPATIBILITY` policy is appended at value 4.
+Stable, modern, current and the legacy COUNT sentinel retain values 0/1/2/3.
+COUNT remains invalid for name and floor lookup. `JceRendererApiInfo` retains
+its layout and reports the public policy value.
+This explicit GL 2.1 / GLES 2.0 floor is separate from GPU quality tiers and does
+not imply every stock shader, extension, render target or Editor feature works.
+The version snapshot continues to distinguish observed values from unverified
+fallbacks. Vulkan 1.0 is policy data, not a new compiled-backend certificate.
+
+The pure C99 inline `jce_graphics_api_is_compatibility_gl_es` shares explicit
+API-tier/backend policy without exporting a new symbol or changing ABI layout.
+It is a policy predicate, not hardware capability or shader availability. The
+private renderer adapter still maps the actual backend before consuming it;
+middleware uses the public API snapshot and keeps custom loaders unrestricted.
+
 ## Identity
 - **Layer**: L3 (Renderer). Pure C99 headers; consumers must not include
   bgfx headers directly.
@@ -17,6 +32,20 @@
    `api_graphics.h`.
 5. **Symmetric C/C++** — every header wraps declarations in
    `JCE_EXTERN_C_BEGIN / _END`.
+
+The offscreen target's get_extent observes its current live allocation and
+owner-admitted size without allocation or backend queries. Failure clears
+supplied outputs. A successful query cannot establish current-frame content,
+render submission, GPU completion or presentation. Editor bridge readbacks use
+this extent; PostFX output dimensions remain a separate source authority.
+
+The additive `jce_scene_renderer_render_linear` symbol preserves the existing
+render signature and unversioned `JceSceneRenderConfig` layout. It scopes a
+private per-renderer PBR output override around the ordinary render and
+restores both output flags after all returns. It skips PBR display gamma and
+dither, while other passes still follow config and callers own composition.
+Reflection-probe capture consumes this entry with reduced-pass config; enabling
+authored PostFX is not a substitute for choosing a linear capture output.
 
 ## Caps tiering (`jce_renderer_caps.h`)
 
@@ -93,3 +122,51 @@ Spot lights ship end-to-end (cookie texture + IES LM-63 photometric LUT) via new
 ## P3-E.5b — Directional cookie projection + cookie atlas
 
 `<jce/renderer/jce_lighting_system.h>` exposes `JCE_COOKIE_ATLAS_CAPACITY` (16) and `jce_light_env_register_cookie(env, JceTexture) -> int slot`. Slot 0 is reserved for the white "no cookie" default; slots 1..15 are LRU-managed (smallest `last_used` counter evicted). The per-light atlas slot is uploaded inside `u_dirLights[i*2+1].w` and `u_spotLights[i*4+3].y`, ready to drive `SAMPLER2DARRAY` sampling once `s_cookie` is promoted. v1 keeps the single-bind path from P3-E.5 (one cookie per draw on sampler 13) — spot cookies win the bind, directional cookies fall back when no spot cookie is present. Directional VP is a **world-aligned ortho box** (±50 m, near 0.1 m, far 200 m) centred on the camera position, aimed along the chosen directional light's forward — see `engine/src/renderer/AGENTS.md` "P3-E.5b" for the v2 CSM-cascade-0-fit path.
+
+## Typed readback and impostor shutdown ownership
+
+`jce_render_readback_*` is an asynchronous renderer-owner-thread contract.
+The queue owns its staging texture and CPU transfer destination. Cancel/release
+can return true while that storage remains borrowed by the backend; repeated
+calls do not imply immediate reclamation. Observe actual completion through
+poll and `ready_frame`, then release the ticket. Destroy queues while their
+renderer is still alive: destruction drains submitted completion frames and
+releases owned storage. Layout validation and CPU ownership controls are not
+proof of successful GPU transfer or correct source pixels.
+
+`jce_impostor_shutdown` is renderer lifecycle cleanup, not a public completion
+fence. It retires GPU resources before backend shutdown and closes the pending
+bake's admission. The renderer's private post-join hook releases any already
+submitted CPU destination and resets the single bake slot for a later session.
+An application must not restart rendering between these shutdown boundaries or
+call the private hook itself. Public API/ABI and the one-bake policy are unchanged.
+
+JceSceneRendererCallbacks.load_model transfers an independently owned successful
+result to the calling scene/pick cache. It must not return a shared borrowed
+model. The current callback-mode VRAM accounting/eviction exclusion is a policy
+limitation, not a borrowing contract; explicit invalidation and teardown destroy
+callback models. Attached pick passes borrow scene-renderer results only for the
+current ID render and resolve again on the next request.
+
+## Scene preparation API
+
+`jce_scene_renderer_prepare_resources(sr, scene)` is an additive SDK render-thread
+resource stage. Its bool reports device/context admission, not asset readiness.
+It permits existing uploads/retirements, submits no scene colour/shadow/compute
+and takes no dt. Backend CPU frame/context facts are preparation identity, never
+a GPU fence or simulation clock. Legacy rendering keeps its automatic fallback;
+this API is not full scene maintenance or permission to stop time-dependent
+render calls. No public render-config struct layout changes for this slice.
+
+## Camera clone ownership
+
+The public camera clone returns an independent CPU value object, preserving
+pose/roll, perspective and fixed-width or aspect-derived orthographic state.
+NULL source or allocation failure returns NULL. A clone borrows nothing from
+its source and remains valid after source destruction; callers release it with
+`jce_camera_destroy`. No camera layout or renderer-private type is exposed.
+
+`jce_graphics_api_is_compatibility_gl_es` is a pure C99 static-inline policy
+helper over existing public enums. It adds no exported symbol or ABI field and
+certifies no hardware capability. Middleware consumes observed ApiInfo; the
+private renderer adapter delegates after mapping its actual bgfx backend.

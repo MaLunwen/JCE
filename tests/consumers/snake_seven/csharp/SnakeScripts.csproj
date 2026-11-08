@@ -11,7 +11,9 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="Hud.cs" />
+    <!-- Active source is the same address selected by the scene/packer.
+         csharp/Hud.cs is preserved inactive authoring history. -->
+    <Compile Include="../resources/scripts/Hud.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- The SDK ships the built bridge assembly; referencing it (rather than

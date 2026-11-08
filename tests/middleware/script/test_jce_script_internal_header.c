@@ -18,12 +18,12 @@
  *      address: two tokens swapped consistently pass the equality test, and
  *      a reader pointed at a private token passes the address test.
  *
- *   3. The one creator installs an 81-key `jce` table.  This assertion has
+ *   3. The one creator installs a 118-key `jce` table.  This assertion has
  *      been through three shapes, and the current one is the only shape left:
  *      it first asserted the generated set was REFUSED (honest while the
  *      generated installer was not linked), then that BOTH sets built the
  *      same-sized table, and now -- with the hand-written 71 and the seam
- *      that selected them deleted -- that the sole creator installs 81 keys.
+ *      that selected them deleted -- that the sole creator installs 118 keys.
  *      It is deliberately COARSE, and it is not the key list: that is
  *      test_jce_script_table_shape.c, hand-authored, read with pairs() from
  *      inside a script.  This one counts the same keys from C through a TU
@@ -112,10 +112,10 @@ static void test_the_one_binding_set_builds_the_whole_jce_table(void)
     lua_pop(g->L, 1);
     jce_script_destroy(g);
 
-    /* 117: the 108 generated bindings + 8 hand-written + json_null.  A count and
+    /* 118: the 109 generated bindings + 8 hand-written + json_null.  A count and
      * not a list here on purpose -- test_jce_script_table_shape.c owns the
      * list, and two copies of it is two things to update. */
-    TEST_ASSERT_EQUAL_INT(117, keys);
+    TEST_ASSERT_EQUAL_INT(118, keys);
 }
 
 int main(void)

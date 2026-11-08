@@ -14,15 +14,25 @@
 #include <jce/os/core/jce_thread.h>   /* JceMutex — PhysFS is process-global + NOT thread-safe */
 
 #include "jce_memory.h"
+#include "jce_trace_scope_internal.h"
+#include "jce_filesystem_read_internal.h"
+#include "jce_filesystem_pak_internal.h"
 
 #include <physfs.h>
 #include <string.h>
 
 #define LOG_TAG "jce_fs"
 
-/* PAK read provider, registered by the resource layer at boot (dependency
- * inversion — os/core no longer includes resource/jce_pak_loader.h). */
-static const JceFsPakProvider *s_pak_provider = NULL;
+/* One serial owner for the active PAK provider and its registered native
+ * admission tuple. Dependency inversion keeps native Pak details out of core;
+ * exact tuple restoration retains the resource-owned predicate without an
+ * opaque archive registry or a change to the public three-callback layout. */
+static struct {
+    const JceFsPakProvider *current_provider;
+    JceFsPakProvider registered_provider;
+    JceFsPakMountAllowedInternal registered_mount_allowed;
+    JceFsPakMountAllowedInternal current_mount_allowed;
+} s_pak_service;
 
 /* PhysFS has process-global state (mount search path, open-handle list, error
  * code) and is explicitly NOT thread-safe.  The async world streamer + asset
@@ -42,12 +52,26 @@ static inline void fs_unlock(void) { if (s_fs_mutex) jce_mutex_unlock(s_fs_mutex
 
 void JCE_CALL jce_fs_set_pak_provider(const JceFsPakProvider *provider)
 {
-    s_pak_provider = provider;
+    s_pak_service.current_provider = provider;
+    s_pak_service.current_mount_allowed = provider && s_pak_service.registered_mount_allowed &&
+        provider->find == s_pak_service.registered_provider.find &&
+        provider->asset_size == s_pak_service.registered_provider.asset_size &&
+        provider->decompress == s_pak_service.registered_provider.decompress
+            ? s_pak_service.registered_mount_allowed : NULL;
+}
+
+void JCE_CALL jce_fs_register_pak_provider_internal(
+    const JceFsPakProvider *provider, JceFsPakMountAllowedInternal mount_allowed)
+{
+    if (!provider || !mount_allowed) return;
+    s_pak_service.registered_provider = *provider;
+    s_pak_service.registered_mount_allowed = mount_allowed;
+    jce_fs_set_pak_provider(provider);
 }
 
 const JceFsPakProvider *JCE_CALL jce_fs_get_pak_provider(void)
 {
-    return s_pak_provider;
+    return s_pak_service.current_provider;
 }
 
 /* ================================================================== */
@@ -125,7 +149,7 @@ static bool fs_physfs_init(void)
 #endif
 }
 
-JceFileSystem *jce_fs_create(void)
+static JceFileSystem *jce_fs_create_impl(void)
 {
     JceFileSystem *fs = JCE_NEW(JceFileSystem);
     if (!fs) return NULL;
@@ -133,6 +157,10 @@ JceFileSystem *jce_fs_create(void)
     /* Create the global VFS lock once, here on the main thread, before any
      * streamer/asset worker can call into PhysFS. */
     if (!s_fs_mutex) s_fs_mutex = jce_mutex_create();
+    if (!s_fs_mutex) {
+        JCE_FREE(fs);
+        return NULL; /* Never run PhysFS or mutate users without its lock. */
+    }
 
     fs_lock();
     bool init_failed = false;
@@ -166,7 +194,7 @@ JceFileSystem *jce_fs_create(void)
     return fs;
 }
 
-void jce_fs_destroy(JceFileSystem *fs)
+static void jce_fs_destroy_impl(JceFileSystem *fs)
 {
     if (!fs) return;
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
@@ -191,9 +219,11 @@ void jce_fs_destroy(JceFileSystem *fs)
 /* Mount points                                                        */
 /* ================================================================== */
 
-bool jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
+static bool jce_fs_mount_pak_impl(JceFileSystem *fs, JcePakArchive *pak)
 {
     if (!fs || !pak) return false;
+    if (!s_pak_service.current_provider) return false;
+    if (s_pak_service.current_mount_allowed && !s_pak_service.current_mount_allowed(pak)) return false;
 
     /* Replace the legacy unnamed slot if present; otherwise append. */
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
@@ -217,10 +247,12 @@ bool jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
     return true;
 }
 
-bool jce_fs_mount_pak_named(JceFileSystem *fs, const char *name,
+static bool jce_fs_mount_pak_named_impl(JceFileSystem *fs, const char *name,
                             JcePakArchive *pak)
 {
     if (!fs || !pak || !name) return false;
+    if (!s_pak_service.current_provider) return false;
+    if (s_pak_service.current_mount_allowed && !s_pak_service.current_mount_allowed(pak)) return false;
 
     /* Reject duplicate names so refcounting in higher layers stays sane. */
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
@@ -254,7 +286,7 @@ bool jce_fs_mount_pak_named(JceFileSystem *fs, const char *name,
     return true;
 }
 
-bool jce_fs_unmount_pak_named(JceFileSystem *fs, const char *name)
+static bool jce_fs_unmount_pak_named_impl(JceFileSystem *fs, const char *name)
 {
     if (!fs || !name) return false;
 
@@ -282,7 +314,7 @@ uint32_t jce_fs_mounted_pak_count(const JceFileSystem *fs)
     return fs ? fs->pak_count : 0;
 }
 
-bool jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
+static bool jce_fs_mount_dir_impl(JceFileSystem *fs, const char *prefix,
                       const char *directory)
 {
     if (!fs || !directory) return false;
@@ -328,10 +360,11 @@ static JceFile *try_open_physfs(const char *vpath)
 
 /* Try to open a virtual path from any mounted PAK archive.
    Walks the priority list (front → back) and returns the first hit. */
-static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
+static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath,
+                             uint64_t max_bytes, uint64_t *out_size)
 {
     if (!fs || fs->pak_count == 0) return NULL;
-    const JceFsPakProvider *prov = s_pak_provider;
+    const JceFsPakProvider *prov = s_pak_service.current_provider;
     if (!prov || !prov->find) return NULL;   /* no resource provider installed */
 
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
@@ -342,6 +375,10 @@ static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
         if (!asset) continue;
 
         uint64_t orig = prov->asset_size(asset);
+        if (out_size) *out_size = orig;
+        /* PAK open eagerly decompresses; enforce a bound before allocation. */
+        if (max_bytes && (orig > max_bytes || orig >= (uint64_t)SIZE_MAX))
+            return NULL;
         if (orig > (uint64_t)SIZE_MAX) {
             LOG_ERROR(LOG_TAG, "asset too large for address space: %s", vpath);
             return NULL;
@@ -351,6 +388,10 @@ static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
         if (!buf) return NULL;
 
         size_t decompressed = prov->decompress(asset, buf, (size_t)orig);
+        if (max_bytes && decompressed != (size_t)orig) {
+            JCE_FREE(buf);
+            return NULL;
+        }
         if (decompressed == 0) {
             JCE_FREE(buf);
             continue; /* try next pak — corrupt entry shouldn't kill lookup */
@@ -372,7 +413,7 @@ static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
 /* File operations                                                     */
 /* ================================================================== */
 
-JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path)
+static JceFile *jce_fs_open_impl(const JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return NULL;
 
@@ -382,12 +423,12 @@ JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path)
      * streamer/asset worker threads. */
     fs_lock();
     JceFile *f = try_open_physfs(virtual_path);
-    if (!f) f = try_open_pak(fs, virtual_path);
+    if (!f) f = try_open_pak(fs, virtual_path, 0, NULL);
     fs_unlock();
     return f;
 }
 
-void jce_fs_close(JceFile *file)
+static void jce_fs_close_impl(JceFile *file)
 {
     if (!file) return;
     if (file->kind == JCE_FILE_PHYSFS) {
@@ -429,32 +470,100 @@ uint64_t jce_fs_size(const JceFile *file)
     return file->u.pak.size;
 }
 
-void *jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
+static void *jce_fs_read_all_impl(const JceFileSystem *fs, const char *virtual_path,
                       uint64_t *out_size)
 {
     if (out_size) *out_size = 0;
-    JceFile *f = jce_fs_open(fs, virtual_path);
-    if (!f) return NULL;
+    uint64_t observed = 0;
+    /* One bounded whole-asset owner: reject lengths without representable
+     * sentinel headroom before PAK eager allocation or PhysFS allocation.
+     * Preserve public failure out_size=0; the internal reader independently
+     * retains an observed total on rejection. Returned PAK data is binary,
+     * without a general NUL-termination promise. */
+    void *result = jce_fs_read_all_bounded_internal(fs, virtual_path,
+                                                   (uint64_t)SIZE_MAX - 1u, &observed);
+    if (result && out_size) *out_size = observed;
+    return result;
+}
 
-    uint64_t sz = jce_fs_size(f);
-    if (sz == 0) {
-        jce_fs_close(f);
-        return NULL;
+JceFsPakReadResult JCE_CALL jce_fs_read_pak_bounded(
+    const JceFileSystem *fs, const char *key, uint64_t max_bytes,
+    void **out_data, uint64_t *out_size)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.read_pak_bounded");
+    JceFsPakReadResult result = JCE_FS_PAK_READ_FAILED;
+    if (out_data) *out_data = NULL;
+    if (out_size) *out_size = 0;
+    if (!fs || !key || !key[0] || !max_bytes) goto done;
+    fs_lock();
+    const JceFsPakProvider *provider = s_pak_service.current_provider;
+    if (fs->pak_count == 0) { result = JCE_FS_PAK_READ_ABSENT; goto unlock; }
+    if (!provider || !provider->find || !provider->asset_size ||
+        !provider->decompress) goto unlock;
+    result = JCE_FS_PAK_READ_ABSENT;
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        if (!fs->paks[i].pak) continue;
+        const void *asset = provider->find(fs->paks[i].pak, key);
+        if (!asset) continue;
+        const uint64_t size = provider->asset_size(asset);
+        result = JCE_FS_PAK_READ_OVER_LIMIT;
+        if (size > max_bytes || size >= (uint64_t)SIZE_MAX) break;
+        result = JCE_FS_PAK_READ_FAILED;
+        if (out_data) {
+            void *data = JCE_MALLOC((size_t)size + 1u);
+            if (!data) break;
+            if (provider->decompress(asset, data, (size_t)size) != (size_t)size) {
+                JCE_FREE(data);
+                break;
+            }
+            ((char *)data)[size] = '\0';
+            *out_data = data;
+        }
+        if (out_size) *out_size = size;
+        result = JCE_FS_PAK_READ_OK;
+        break;
     }
+unlock:
+    fs_unlock();
+done:
+    jce_trace_scope_end(scope, result == JCE_FS_PAK_READ_OK ? JCE_TRACE_TASK_SUCCEEDED :
+        result == JCE_FS_PAK_READ_ABSENT ? JCE_TRACE_TASK_CANCELLED : JCE_TRACE_TASK_FAILED);
+    return result;
+}
 
-    void *buf = JCE_MALLOC(sz);
-    if (!buf) { jce_fs_close(f); return NULL; }
-
-    uint64_t nread = jce_fs_read(f, buf, sz);
-    jce_fs_close(f);
-
-    if (nread != sz) {
-        JCE_FREE(buf);
-        return NULL;
+void *jce_fs_read_all_bounded_internal(const JceFileSystem *fs,
+    const char *path, uint64_t max_bytes, uint64_t *out_size)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.read_all_bounded");
+    void *buffer = NULL;
+    JceFile *file = NULL;
+    uint64_t total = 0;
+    if (out_size) *out_size = 0;
+    if (!fs || !path || !path[0] || !max_bytes) goto done;
+    fs_lock();
+    file = try_open_physfs(path);
+    if (!file) file = try_open_pak(fs, path, max_bytes, &total);
+    fs_unlock();
+    if (!file) goto done;
+    total = jce_fs_size(file);
+    if (!total || total > max_bytes || total >= (uint64_t)SIZE_MAX) goto done;
+    if (file->kind == JCE_FILE_PAK) {
+        /* Transfer the eagerly decoded file buffer, avoiding a second copy. */
+        buffer = file->u.pak.data;
+        file->u.pak.data = NULL;
+    } else {
+        buffer = JCE_MALLOC((size_t)total + 1u);
+        if (buffer && jce_fs_read(file, buffer, total) != total) {
+            JCE_FREE(buffer);
+            buffer = NULL;
+        }
+        if (buffer) ((char *)buffer)[total] = '\0';
     }
-
-    if (out_size) *out_size = nread;
-    return buf;
+done:
+    if (file) jce_fs_close(file);
+    if (out_size) *out_size = total;
+    jce_trace_scope_end(scope, buffer ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return buffer;
 }
 
 bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
@@ -465,7 +574,7 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
     /* Check PhysFS search path, then every mounted PAK (via the provider). */
     bool found = PHYSFS_isInit() && PHYSFS_exists(virtual_path);
     if (!found) {
-        const JceFsPakProvider *prov = s_pak_provider;
+        const JceFsPakProvider *prov = s_pak_service.current_provider;
         if (prov && prov->find) {
             for (uint32_t i = 0; i < fs->pak_count; ++i) {
                 if (fs->paks[i].pak &&
@@ -480,11 +589,54 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
     return found;
 }
 
+static void fs_probe_search_path_internal(void *data, const char *path)
+{
+    (void)path;
+    *(bool *)data = true;
+}
+
+/* Metadata only, preserving the same PhysFS-before-PAK priority as reads.
+ * An uncertain higher-priority source never becomes a fallback absence. */
+static JceFsPresence fs_probe_vfs_internal(const JceFileSystem *fs, const char *path)
+{
+    if (!fs || !path || !path[0] || !s_fs_mutex) return JCE_FS_PRESENCE_UNKNOWN;
+    JceFsPresence presence = JCE_FS_PRESENCE_ABSENT;
+    fs_lock();
+    if (PHYSFS_isInit()) {
+        bool has_search_path = false;
+        PHYSFS_getSearchPathCallback(fs_probe_search_path_internal, &has_search_path);
+        /* Stat on an empty search path returns zero without setting an error.
+         * Classify only this call, never an unrelated prior TLS error. */
+        (void)PHYSFS_getLastErrorCode();
+        PHYSFS_Stat info;
+        if (PHYSFS_stat(path, &info)) {
+            presence = info.filetype == PHYSFS_FILETYPE_REGULAR
+                ? JCE_FS_PRESENCE_PRESENT : JCE_FS_PRESENCE_UNKNOWN;
+        } else {
+            const PHYSFS_ErrorCode error = PHYSFS_getLastErrorCode();
+            if (error != PHYSFS_ERR_NOT_FOUND &&
+                !(error == PHYSFS_ERR_OK && !has_search_path))
+                presence = JCE_FS_PRESENCE_UNKNOWN;
+        }
+    }
+    if (presence == JCE_FS_PRESENCE_ABSENT && fs->pak_count) {
+        const JceFsPakProvider *provider = s_pak_service.current_provider;
+        if (!provider || !provider->find || !provider->asset_size || !provider->decompress)
+            presence = JCE_FS_PRESENCE_UNKNOWN;
+        else for (uint32_t n = 0; n < fs->pak_count; ++n) {
+            if (!fs->paks[n].pak) { presence = JCE_FS_PRESENCE_UNKNOWN; break; }
+            if (provider->find(fs->paks[n].pak, path)) { presence = JCE_FS_PRESENCE_PRESENT; break; }
+        }
+    }
+    fs_unlock();
+    return presence;
+}
+
 /* ================================================================== */
 /* Write support                                                       */
 /* ================================================================== */
 
-bool jce_fs_set_write_dir(JceFileSystem *fs, const char *directory)
+static bool jce_fs_set_write_dir_impl(JceFileSystem *fs, const char *directory)
 {
     if (!fs) return false;
 
@@ -514,7 +666,7 @@ bool jce_fs_set_write_dir(JceFileSystem *fs, const char *directory)
     return true;
 }
 
-JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path)
+static JceFile *jce_fs_open_write_impl(JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return NULL;
 
@@ -563,7 +715,7 @@ uint64_t jce_fs_write(JceFile *file, const void *buf, uint64_t size)
     return (n > 0) ? (uint64_t)n : 0;
 }
 
-bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
+static bool jce_fs_write_all_impl(JceFileSystem *fs, const char *virtual_path,
                       const void *data, uint64_t size)
 {
     if (!fs || !virtual_path || !data) return false;
@@ -601,7 +753,6 @@ bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
 /* (so consumers that link only that TU still get a working stub).      */
 /* ================================================================== */
 
-void jce__fs_store_active(JceFileSystem *fs);
 void jce__fs_store_active_policy(JceFsActivePolicy policy);
 
 void jce_fs_set_active(JceFileSystem *fs)
@@ -615,6 +766,119 @@ void jce_fs_set_active_policy(JceFileSystem *fs, JceFsActivePolicy policy)
         policy = JCE_FS_ACTIVE_OVERLAY;
     jce_fs_set_active_reader(fs ? jce_fs_read_all : NULL);
     /* Store the handle and fallback policy through host-side helpers. */
-    jce__fs_store_active(fs);
+    jce__fs_store_active(fs, fs ? fs_probe_vfs_internal : NULL);
     jce__fs_store_active_policy(fs ? policy : JCE_FS_ACTIVE_OVERLAY);
+}
+
+/* Trace adapters keep IO behavior in the existing implementation owner.
+ * Read/query APIs with ambiguous zero/EOF results are not labelled successful
+ * here. Capture-owned host IO is suppressed only on its consumer thread. */
+JceFileSystem *jce_fs_create(void)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.create");
+    JceFileSystem *result = jce_fs_create_impl();
+    jce_trace_scope_end(scope, (result != NULL) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+void jce_fs_destroy(JceFileSystem *fs)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.destroy");
+    jce_fs_destroy_impl(fs);
+    jce_trace_scope_end(scope, fs ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_CANCELLED);
+}
+
+bool jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.mount_pak");
+    bool result = jce_fs_mount_pak_impl(fs, pak);
+    jce_trace_scope_end(scope, (result) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+bool jce_fs_mount_pak_named(JceFileSystem *fs, const char *name,
+                            JcePakArchive *pak)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.mount_pak_named");
+    bool result = jce_fs_mount_pak_named_impl(fs, name, pak);
+    jce_trace_scope_end(scope, (result) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+bool jce_fs_unmount_pak_named(JceFileSystem *fs, const char *name)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.unmount_pak_named");
+    bool result = jce_fs_unmount_pak_named_impl(fs, name);
+    jce_trace_scope_end(scope, (result) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+bool jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
+                      const char *directory)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.mount_dir");
+    bool result = jce_fs_mount_dir_impl(fs, prefix, directory);
+    jce_trace_scope_end(scope, (result) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.open");
+    JceFile *result = jce_fs_open_impl(fs, virtual_path);
+    jce_trace_scope_end(scope, (result != NULL) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+void jce_fs_close(JceFile *file)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.close");
+    jce_fs_close_impl(file);
+    jce_trace_scope_end(scope, file ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_CANCELLED);
+}
+
+void *jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
+                      uint64_t *out_size)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.read_all");
+    void *result = jce_fs_read_all_impl(fs, virtual_path, out_size);
+    jce_trace_scope_end(scope, (result != NULL) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+bool jce_fs_set_write_dir(JceFileSystem *fs, const char *directory)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.set_write_dir");
+    bool result = jce_fs_set_write_dir_impl(fs, directory);
+    jce_trace_scope_end(scope, (result) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.open_write");
+    JceFile *result = jce_fs_open_write_impl(fs, virtual_path);
+    jce_trace_scope_end(scope, (result != NULL) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
+                      const void *data, uint64_t size)
+{
+    JceTraceScope scope = jce_trace_scope_begin("fs.write_all");
+    bool result = jce_fs_write_all_impl(fs, virtual_path, data, size);
+    jce_trace_scope_end(scope, (result) ? JCE_TRACE_TASK_SUCCEEDED
+                         : JCE_TRACE_TASK_FAILED);
+    return result;
 }

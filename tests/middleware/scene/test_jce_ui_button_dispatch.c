@@ -184,6 +184,220 @@ static void test_press_inside_release_outside_no_click(void)
     jce_scene_destroy(s);
 }
 
+/* A held camera/scene drag cannot acquire a button after the press began. */
+static void test_press_outside_drag_inside_release_does_not_click(void)
+{
+    JceEntity button = 0;
+    JceScene *s = make_scene_with_button(&button);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, OUT_X, OUT_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, OUT_X, OUT_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    /* The rejected gesture must not poison a later ordinary click. */
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(button, step(uc, s, IN_X, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+/* Crossing from A to B while held must neither transfer the press nor click B. */
+static void test_press_a_drag_b_release_does_not_transfer_click(void)
+{
+    JceEntity a = 0;
+    JceScene *s = make_scene_with_button(&a);
+    JceEntity b = jce_scene_create_entity(s, "SecondButton");
+    JceUIImageComponent image = *jce_scene_get_ui_image(s, a);
+    JceUIButtonComponent button = *jce_scene_get_ui_button(s, a);
+    image.rect.anchored_position[0] = 110.0f;
+    jce_scene_set_parent(s, b, jce_scene_get_parent(s, a));
+    jce_scene_set_ui_image(s, b, &image);
+    jce_scene_set_ui_button(s, b, &button);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, 130.0f, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, 130.0f, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, 130.0f, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(b, step(uc, s, 130.0f, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+/* Losing pointer validity cancels the old press, including held re-entry. */
+static void test_pointer_loss_and_held_reentry_do_not_rearm_button(void)
+{
+    JceEntity button = 0;
+    JceScene *s = make_scene_with_button(&button);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, false));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(button, step(uc, s, IN_X, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+/* A disabled interval ends the gesture; becoming interactable is not a press. */
+static void test_noninteractable_interval_cancels_held_gesture(void)
+{
+    JceEntity button = 0;
+    JceScene *s = make_scene_with_button(&button);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    jce_scene_get_ui_button(s, button)->interactable = false;
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    jce_scene_get_ui_button(s, button)->interactable = true;
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(button, step(uc, s, IN_X, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+/* A hidden button cannot retain a press and replay it when made visible. */
+static void test_hidden_interval_cancels_held_gesture(void)
+{
+    JceEntity button = 0;
+    JceScene *s = make_scene_with_button(&button);
+    JceCanvasGroupComponent group;
+    memset(&group, 0, sizeof group);
+    group.alpha = 1.0f;
+    group.interactable = true;
+    group.blocks_raycasts = true;
+    jce_scene_set_canvas_group(s, button, &group);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    jce_scene_get_canvas_group(s, button)->alpha = 0.0f;
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    jce_scene_get_canvas_group(s, button)->alpha = 1.0f;
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(button, step(uc, s, IN_X, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+/* Skipping a whole disabled Canvas cannot preserve a press across the gap. */
+static void test_disabled_canvas_interval_cancels_held_gesture(void)
+{
+    JceEntity button = 0;
+    JceScene *s = make_scene_with_button(&button);
+    JceEntity canvas = jce_scene_get_parent(s, button);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    jce_scene_set_component_enabled(s, canvas, JCE_COMP_FLAG_CANVAS, false);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    jce_scene_set_component_enabled(s, canvas, JCE_COMP_FLAG_CANVAS, true);
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+    TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+    TEST_ASSERT_EQUAL_UINT64(button, step(uc, s, IN_X, IN_Y, false, true));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+/* Seed actual render-owned outputs, then cross the public frame boundary.
+ * No private Canvas fields are accessed. Each boundary retains both its real
+ * button click and real slider value-change producer observations. */
+static void assert_render_boundary_clears_output(unsigned boundary, bool value_change)
+{
+    JceEntity button = 0;
+    JceScene *s = make_scene_with_button(&button);
+    JceEntity root = jce_scene_get_parent(s, button);
+    JceUICanvas *uc = jce_ui_canvas_create(NULL, NULL);
+    TEST_ASSERT_NOT_NULL(uc);
+    if (value_change) {
+        JceEntity slider = jce_scene_create_entity(s, "OutputSlider");
+        JceUISliderComponent sl;
+        memset(&sl, 0, sizeof sl);
+        sl.rect = jce_scene_get_ui_image(s, button)->rect;
+        sl.rect.anchored_position[0] = 110.0f;
+        sl.min_value = 0.0f;
+        sl.max_value = 1.0f;
+        sl.interactable = true;
+        sl.bg_color[3] = sl.fill_color[3] = sl.handle_color[3] = 1.0f;
+        jce_scene_set_parent(s, slider, root);
+        jce_scene_set_ui_slider(s, slider, &sl);
+        TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, 140.0f, IN_Y, false, true));
+        TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, 140.0f, IN_Y, true, true));
+        TEST_ASSERT_FLOAT_WITHIN(0.01f, 0.5f,
+                                jce_scene_get_ui_slider(s, slider)->value);
+        /* These are polling channels, not clear-on-read events. */
+        TEST_ASSERT_EQUAL_UINT64(slider, jce_ui_canvas_last_value_changed(uc));
+        TEST_ASSERT_EQUAL_UINT64(slider, jce_ui_canvas_last_value_changed(uc));
+    } else {
+        TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, false, true));
+        TEST_ASSERT_EQUAL_UINT64(0, step(uc, s, IN_X, IN_Y, true, true));
+        TEST_ASSERT_EQUAL_UINT64(button, step(uc, s, IN_X, IN_Y, false, true));
+        TEST_ASSERT_EQUAL_UINT64(button, jce_ui_canvas_last_clicked(uc));
+        TEST_ASSERT_EQUAL_UINT64(button, jce_ui_canvas_last_clicked(uc));
+    }
+    JceUIPointer up = {OUT_X, OUT_Y, false, true};
+    switch (boundary) {
+    case 0: /* Rejected width is still a new public render attempt. */
+        jce_ui_canvas_render(uc, s, 0, 0, 0, SCREEN_H, &up, 1.0f / 60.0f);
+        break;
+    case 1:
+        jce_ui_canvas_render(uc, s, 0, 0, SCREEN_W, 0, &up, 1.0f / 60.0f);
+        break;
+    case 2:
+        jce_ui_canvas_render(uc, NULL, 0, 0, SCREEN_W, SCREEN_H, &up, 1.0f / 60.0f);
+        break;
+    case 3: /* Preserve the old widget entities, remove only the Canvas. */
+        jce_scene_remove_canvas(s, root);
+        jce_ui_canvas_render(uc, s, 0, 0, SCREEN_W, SCREEN_H, &up, 1.0f / 60.0f);
+        break;
+    default: /* Ordinary no-interaction frame is the existing positive control. */
+        jce_ui_canvas_render(uc, s, 0, 0, SCREEN_W, SCREEN_H, &up, 1.0f / 60.0f);
+        break;
+    }
+    TEST_ASSERT_EQUAL_UINT64(0, jce_ui_canvas_last_clicked(uc));
+    TEST_ASSERT_EQUAL_UINT64(0, jce_ui_canvas_last_value_changed(uc));
+    jce_ui_canvas_destroy(uc);
+    jce_scene_destroy(s);
+}
+
+static void test_zero_width_frame_clears_render_owned_outputs(void)
+{
+    assert_render_boundary_clears_output(0u, false);
+    assert_render_boundary_clears_output(0u, true);
+}
+static void test_zero_height_frame_clears_render_owned_outputs(void)
+{
+    assert_render_boundary_clears_output(1u, false);
+    assert_render_boundary_clears_output(1u, true);
+}
+static void test_missing_scene_frame_clears_render_owned_outputs(void)
+{
+    assert_render_boundary_clears_output(2u, false);
+    assert_render_boundary_clears_output(2u, true);
+}
+static void test_zero_canvas_frame_clears_render_owned_outputs(void)
+{
+    assert_render_boundary_clears_output(3u, false);
+    assert_render_boundary_clears_output(3u, true);
+}
+static void test_ordinary_empty_frame_clears_render_owned_outputs(void)
+{
+    assert_render_boundary_clears_output(4u, false);
+    assert_render_boundary_clears_output(4u, true);
+}
+
 /* A non-interactable button is driven to the disabled state and never clicks,
  * even on a clean press+release inside. */
 static void test_non_interactable_button_never_clicks(void)
@@ -317,6 +531,17 @@ int main(void)
     RUN_TEST(test_press_release_inside_clicks_on_release);
     RUN_TEST(test_press_release_outside_never_clicks);
     RUN_TEST(test_press_inside_release_outside_no_click);
+    RUN_TEST(test_press_outside_drag_inside_release_does_not_click);
+    RUN_TEST(test_press_a_drag_b_release_does_not_transfer_click);
+    RUN_TEST(test_pointer_loss_and_held_reentry_do_not_rearm_button);
+    RUN_TEST(test_noninteractable_interval_cancels_held_gesture);
+    RUN_TEST(test_hidden_interval_cancels_held_gesture);
+    RUN_TEST(test_disabled_canvas_interval_cancels_held_gesture);
+    RUN_TEST(test_zero_width_frame_clears_render_owned_outputs);
+    RUN_TEST(test_zero_height_frame_clears_render_owned_outputs);
+    RUN_TEST(test_missing_scene_frame_clears_render_owned_outputs);
+    RUN_TEST(test_zero_canvas_frame_clears_render_owned_outputs);
+    RUN_TEST(test_ordinary_empty_frame_clears_render_owned_outputs);
     RUN_TEST(test_non_interactable_button_never_clicks);
     RUN_TEST(test_call_named_fires_handler_once);
     RUN_TEST(test_call_named_missing_handler_is_noop);

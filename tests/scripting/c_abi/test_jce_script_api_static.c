@@ -95,9 +95,29 @@ static void test_invalid_handshake_and_missing_callbacks_fail_closed(void)
     jce_script_api_close(api);
 }
 
+static void observed_viewport(void *user, float out[2])
+{
+    int *calls = user; ++*calls; out[0]=909; out[1]=650;
+}
+static void test_current_viewport_tail_respects_sized_host(void)
+{
+    int calls=0;float size[2]={77,88};JceScriptHost host={0};
+    host.user=&calls;host.viewport_size=observed_viewport;
+    JceScriptApi *api=jce_script_api_open(&host,sizeof host,JCE_SCRIPT_API_VERSION);
+    TEST_ASSERT_NOT_NULL(api);jce_script_api_get_viewport_size(api,size);
+    TEST_ASSERT_EQUAL_FLOAT(909,size[0]);TEST_ASSERT_EQUAL_FLOAT(650,size[1]);
+    TEST_ASSERT_EQUAL_INT(1,calls);jce_script_api_close(api);
+    api=jce_script_api_open(&host,offsetof(JceScriptHost,viewport_size),JCE_SCRIPT_API_VERSION);
+    TEST_ASSERT_NOT_NULL(api);size[0]=77;size[1]=88;
+    jce_script_api_get_viewport_size(api,size);
+    TEST_ASSERT_EQUAL_FLOAT(0,size[0]);TEST_ASSERT_EQUAL_FLOAT(0,size[1]);
+    TEST_ASSERT_EQUAL_INT(1,calls);jce_script_api_close(api);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_current_viewport_tail_respects_sized_host);
     RUN_TEST(test_static_forwarders_use_copied_host_and_user);
     RUN_TEST(test_short_host_excludes_real_tail_callback);
     RUN_TEST(test_invalid_handshake_and_missing_callbacks_fail_closed);

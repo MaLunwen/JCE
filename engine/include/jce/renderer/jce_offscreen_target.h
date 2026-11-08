@@ -85,6 +85,15 @@ JCE_API uint16_t jce_offscreen_target_get_depth_texture(
     const JceOffscreenTarget *bridge);
 JCE_API uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge);
 
+/* Query the current allocated target's admitted pixel dimensions, including
+ * the owner's size clamps. Both output pointers are required; false clears
+ * any supplied output to zero when arguments or the live target are absent.
+ * Owner-thread read only: no allocation, backend query or renderer mutation.
+ * A retained target may contain older content. Success does not establish
+ * preparation in this frame, draw submission, GPU completion or presentation. */
+JCE_API bool jce_offscreen_target_get_extent(const JceOffscreenTarget *bridge,
+                                             uint32_t *width, uint32_t *height);
+
 /* Raw frame-buffer handle index of the offscreen target (or UINT16_MAX
  * when no target has been allocated yet). Used by post-passes that need
  * to bind the same destination FBO from a different view-id (e.g. the

@@ -37,6 +37,7 @@ bool jce_cloud_shadow_bake_rows(const JceCloudShadowDesc *d, float *out,
      * vertical component is what makes a low sun cast LONGER shadows through
      * more cloud -- using the slab thickness directly would make the shadow
      * identical at noon and at sunset, which is exactly backwards. */
+    const float ray_entry = d->layer_bottom_m / ny;
     const float ray_len  = thickness / ny;
     const float step_len = ray_len / (float)JCE_CLOUD_SHADOW_STEPS;
 
@@ -70,17 +71,19 @@ bool jce_cloud_shadow_bake_rows(const JceCloudShadowDesc *d, float *out,
             float tau = 0.0f;
             for (int s = 0; s < JCE_CLOUD_SHADOW_STEPS; ++s) {
                 const float t = ((float)s + 0.5f) * step_len;
-                const float px = wx + nx * t;
+                const float px = wx + nx * (ray_entry + t);
                 const float py = d->layer_bottom_m + ny * t;
-                const float pz = wz + nz * t;
+                const float pz = wz + nz * (ray_entry + t);
 
                 float h01 = (py - d->layer_bottom_m) * inv_thick;
                 if (h01 < 0.0f) h01 = 0.0f;
                 if (h01 > 1.0f) h01 = 1.0f;
 
-                /* Weather-driven, exactly as the sky atlas samples it. */
+                /* The atlas bakes a layer-local Y coordinate, independent of
+                 * its world altitude. Absolute py would change the density
+                 * phase when the entire cloud layer is raised. */
                 const float den = jce_cloud_density_weather_prepared(
-                                      &sp, px, py, pz, h01);
+                                      &sp, px, h01 * sp.period_y, pz, h01);
                 tau += den * sigma * step_len;
             }
 

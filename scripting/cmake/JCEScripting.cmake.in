@@ -72,6 +72,11 @@ set(_jce_s_share "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATAROOTDIR@/jce/scriptin
 set(_jce_s_cmake "${CMAKE_CURRENT_LIST_DIR}")
 set(_jce_s_backends "${CMAKE_CURRENT_LIST_DIR}/backends")
 
+# Producer-owned declaration, independent of files left on disk. Lua remains
+# built into the engine; these sets describe the additional language rosters.
+set(JCE_SCRIPT_AVAILABILITY_SCHEMA 1)
+set(JCE_SCRIPT_CATALOG_LANGUAGES "@JCE_SDK_SCRIPT_CATALOG_LANGUAGES@")
+set(JCE_SCRIPT_COMPILED_LANGUAGES "@JCE_SDK_SCRIPT_COMPILED_LANGUAGES@")
 set(JCE_SCRIPT_API_STATIC @JCE_SDK_SCRIPT_API_STATIC@)
 set(JCE_SCRIPTING_FOUND TRUE)
 set(JCE_SCRIPT_LANGUAGES "")
@@ -589,15 +594,31 @@ function(jce_script_stage_runtime TARGET_NAME)
 			"jce_script_stage_runtime(${TARGET_NAME}): no such target.")
 	endif()
 
-	# ROSTER-DRIVEN, not a hand-written list.  It used to name JCE::ScriptApi
-	# and JCE::ScriptJava, which was correct for exactly the languages that
-	# existed when it was written: a backend added later staged nothing, with
-	# no error -- measured, the C# backend's nethost.dll and managed assembly
-	# were both missed and the consumer's process died with
-	# 0xC0000135 (DLL not found) before printing anything.
-	#
-	# Reading the installed rosters means a seventh language stages itself by
-	# existing, which is the same property jce_script_enable() has in-tree.
+	# Catalog presence is not compiled availability. Missing/malformed authority
+	# stays observable and retains legacy discovery, never an empty obligation.
+	set(_unfulfilled "")
+	set(_authority_valid TRUE)
+	if(NOT JCE_SCRIPT_AVAILABILITY_SCHEMA STREQUAL "1" OR
+	   NOT DEFINED JCE_SCRIPT_COMPILED_LANGUAGES OR
+	   NOT DEFINED JCE_SCRIPT_CATALOG_LANGUAGES)
+		set(_authority_valid FALSE)
+	else()
+		set(_compiled "${JCE_SCRIPT_COMPILED_LANGUAGES}")
+		set(_compiled_unique "${_compiled}")
+		list(REMOVE_DUPLICATES _compiled_unique)
+		if(NOT _compiled_unique STREQUAL _compiled)
+			set(_authority_valid FALSE)
+		endif()
+		foreach(_lang IN LISTS _compiled)
+			if(NOT _lang IN_LIST JCE_SCRIPT_CATALOG_LANGUAGES)
+				set(_authority_valid FALSE)
+			endif()
+		endforeach()
+	endif()
+	if(NOT _authority_valid)
+		list(APPEND _unfulfilled "compiled roster authority is missing or malformed")
+	endif()
+
 	set(_stage "")
 	set(_stage_files "")
 	if(TARGET JCE::ScriptApi)
@@ -606,14 +627,31 @@ function(jce_script_stage_runtime TARGET_NAME)
 			list(APPEND _stage jce_script_api)
 		endif()
 	endif()
+	set(_seen_compiled "")
 	file(GLOB _rosters "${_jce_s_cmake}/backends/*/jce_backend.cmake")
 	foreach(_r IN LISTS _rosters)
+		set(JCE_BACKEND_LANGUAGE "")
 		set(JCE_BACKEND_STAGE_TARGETS "")
 		set(JCE_BACKEND_STAGE_FILES "")
 		include("${_r}")
+		if(_authority_valid)
+			if(NOT JCE_BACKEND_LANGUAGE IN_LIST _compiled)
+				continue()
+			endif()
+			list(APPEND _seen_compiled "${JCE_BACKEND_LANGUAGE}")
+		endif()
 		list(APPEND _stage ${JCE_BACKEND_STAGE_TARGETS})
-		list(APPEND _stage_files ${JCE_BACKEND_STAGE_FILES})
+		if(NOT JCE_BACKEND_STAGE_FILES STREQUAL "")
+			list(APPEND _stage_files "${JCE_BACKEND_STAGE_FILES}")
+		endif()
 	endforeach()
+	if(_authority_valid)
+		foreach(_lang IN LISTS _compiled)
+			if(NOT _lang IN_LIST _seen_compiled)
+				list(APPEND _unfulfilled "missing compiled roster ${_lang}")
+			endif()
+		endforeach()
+	endif()
 	if(_stage)
 		list(REMOVE_DUPLICATES _stage)
 	endif()
@@ -622,35 +660,60 @@ function(jce_script_stage_runtime TARGET_NAME)
 	endif()
 
 	set(_staged 0)
+	set(_static_only TRUE)
 	foreach(_t IN LISTS _stage)
-		if(TARGET ${_t})
-			get_target_property(_stage_type ${_t} TYPE)
-			if(_stage_type STREQUAL "STATIC_LIBRARY" OR
-			   _stage_type STREQUAL "INTERFACE_LIBRARY")
-				continue()
-			endif()
-			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
-				COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-					"$<TARGET_FILE:${_t}>" "$<TARGET_FILE_DIR:${TARGET_NAME}>"
-				VERBATIM)
-			math(EXPR _staged "${_staged}+1")
+		if(NOT TARGET ${_t})
+			set(_static_only FALSE)
+			list(APPEND _unfulfilled "missing target ${_t}")
+			continue()
 		endif()
+		get_target_property(_stage_type ${_t} TYPE)
+		if(_stage_type STREQUAL "STATIC_LIBRARY" OR
+		   _stage_type STREQUAL "INTERFACE_LIBRARY")
+			continue()
+		endif()
+		set(_static_only FALSE)
+		if(NOT _stage_type STREQUAL "SHARED_LIBRARY" AND
+		   NOT _stage_type STREQUAL "MODULE_LIBRARY" AND
+		   NOT _stage_type STREQUAL "EXECUTABLE")
+			list(APPEND _unfulfilled "target ${_t} has no stageable file (${_stage_type})")
+			continue()
+		endif()
+		add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+			COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+				"$<TARGET_FILE:${_t}>" "$<TARGET_FILE_DIR:${TARGET_NAME}>"
+			VERBATIM)
+		math(EXPR _staged "${_staged}+1")
 	endforeach()
 	foreach(_f IN LISTS _stage_files)
-		if(_f AND EXISTS "${_f}")
+		if(_f AND EXISTS "${_f}" AND NOT IS_DIRECTORY "${_f}")
 			add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
 				COMMAND "${CMAKE_COMMAND}" -E copy_if_different
 					"${_f}" "$<TARGET_FILE_DIR:${TARGET_NAME}>"
 				VERBATIM)
 			math(EXPR _staged "${_staged}+1")
+		else()
+			list(APPEND _unfulfilled "missing runtime file ${_f}")
 		endif()
 	endforeach()
 
-	if(_staged EQUAL 0 AND NOT EMSCRIPTEN)
-		message(WARNING
-			"jce_script_stage_runtime(${TARGET_NAME}): this SDK ships no "
-			"script runtime library to stage. Nothing was added, and the "
-			"call is a no-op rather than a guarantee.")
+	if(NOT EMSCRIPTEN)
+		if(_unfulfilled)
+			message(WARNING
+				"jce_script_stage_runtime(${TARGET_NAME}): unfulfilled runtime "
+				"staging obligations: ${_unfulfilled}. Staging is not a guarantee.")
+		elseif(_staged EQUAL 0)
+			if(JCE_SCRIPT_API_STATIC AND _static_only AND NOT _stage_files)
+				message(STATUS
+					"jce_script_stage_runtime(${TARGET_NAME}): static SDK roster "
+					"declares no external script runtime to stage.")
+			else()
+				message(WARNING
+					"jce_script_stage_runtime(${TARGET_NAME}): this SDK ships no "
+					"script runtime library to stage. Nothing was added, and the "
+					"call is a no-op rather than a guarantee.")
+			endif()
+		endif()
 	endif()
 endfunction()
 

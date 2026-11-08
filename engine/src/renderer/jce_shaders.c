@@ -7,11 +7,19 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_trace.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_renderer.h>
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
+#include "os/core/jce_trace_capture_internal.h"
+#include "os/core/jce_sha256_internal.h"
+#include "jce_renderer_lifecycle_internal.h"
 #include "jce_shader_deferred.h"
+#include "jce_shader_set_owned_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <stdio.h>
@@ -96,6 +104,180 @@ static void deferred_source_free(JceDeferredSource *src)
     memset(src, 0, sizeof *src);
 }
 
+/* bgfx may reject an interface mismatch before its destroyShaders handling.
+ * Each successful create_shader owns a creator reference; program references
+ * are independent. Release creators explicitly on both link outcomes. */
+static bgfx_program_handle_t link_program_owned(bgfx_shader_handle_t vsh,
+                                                bgfx_shader_handle_t fsh)
+{
+    JceTraceScope scope = jce_trace_scope_begin("renderer.shader.link");
+    bgfx_program_handle_t program = { UINT16_MAX };
+    unsigned released = 0;
+    const bool stages_valid = vsh.idx != UINT16_MAX && fsh.idx != UINT16_MAX;
+    if (stages_valid) program = bgfx_create_program(vsh, fsh, false);
+    if (vsh.idx != UINT16_MAX) { bgfx_destroy_shader(vsh); ++released; }
+    if (fsh.idx != UINT16_MAX) { bgfx_destroy_shader(fsh); ++released; }
+    const bool succeeded = program.idx != UINT16_MAX;
+    if (scope.id) {
+#define LINK_COUNTER(name, value) jce_trace_counter_scoped_internal( \
+    JCE_TRACE_CATEGORY_RENDER, name, (int64_t)(value), scope.id, scope.parent)
+        LINK_COUNTER("shader.link.vs", vsh.idx);
+        LINK_COUNTER("shader.link.fs", fsh.idx);
+        LINK_COUNTER("shader.link.program", program.idx);
+        LINK_COUNTER("shader.link.creator_releases", released);
+        LINK_COUNTER("shader.link.success", succeeded);
+        LINK_COUNTER("shader.link.rejection", succeeded ? 0 : stages_valid ? 2 : 1);
+#undef LINK_COUNTER
+    }
+    jce_trace_scope_end(scope, succeeded ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return program;
+}
+
+/* Synchronous eager-load evidence only. Stack receipts describe individual
+ * API acquisitions, never a global handle incarnation or GPU execution. The
+ * existing Web deferred owner continues to use link_program_owned unchanged. */
+typedef struct JceShaderAcquireEvidence {
+    uint64_t create_id;
+    uint64_t context_generation;
+    uint32_t capture_generation;
+    uint16_t handle;
+    bool context_known;
+} JceShaderAcquireEvidence;
+
+static JceTraceScope shader_provenance_begin(const char *name)
+{
+    if (!jce_renderer_shader_provenance_policy_internal())
+        return (JceTraceScope){0};
+    return jce_trace_scope_begin(name);
+}
+
+static void shader_provenance_counter(JceTraceScope scope, const char *name,
+                                      uint32_t value)
+{
+    jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_RENDER, name, value,
+                                    scope.id, scope.parent);
+}
+
+static bgfx_shader_handle_t create_shader_evidenced(const bgfx_memory_t *mem,
+    JceShaderAcquireEvidence *evidence)
+{
+    if (evidence) *evidence = (JceShaderAcquireEvidence){0};
+    const JceTraceScope scope = shader_provenance_begin("renderer.shader.create");
+    if (!scope.id) return bgfx_create_shader(mem);
+
+    const uint32_t generation = jce_trace_capture_generation();
+    uint64_t context = 0;
+    uint32_t host_frame = 0;
+    const bool context_known = jce_renderer_gpu_observation_context_internal(&context, &host_frame);
+    const bool payload_known = mem && mem->data && mem->size;
+    const uint32_t size = mem ? mem->size : 0;
+    uint8_t digest[32] = {0};
+    /* Hash the exact container before bgfx consumes/releases its Memory. */
+    if (payload_known) jce_sha256_internal(mem->data, size, digest);
+    const bgfx_shader_handle_t shader = bgfx_create_shader(mem);
+    /* Capture changes require producer quiescence. Never stamp old evidence
+     * into a new capture if a caller violates that contract during the API. */
+    if (!jce_trace_enabled() || generation != jce_trace_capture_generation()) {
+        jce_trace_task_restore_id(scope.restore);
+        return shader;
+    }
+    shader_provenance_counter(scope, "shader.create.capture", generation);
+    shader_provenance_counter(scope, "shader.create.context_known", context_known);
+    shader_provenance_counter(scope, "shader.create.context_hi", (uint32_t)(context >> 32));
+    shader_provenance_counter(scope, "shader.create.context_lo", (uint32_t)context);
+    shader_provenance_counter(scope, "shader.create.bytes", size);
+    shader_provenance_counter(scope, "shader.create.payload_known", payload_known);
+    static const char *const words[8] = {
+        "shader.create.sha256.0", "shader.create.sha256.1", "shader.create.sha256.2", "shader.create.sha256.3",
+        "shader.create.sha256.4", "shader.create.sha256.5", "shader.create.sha256.6", "shader.create.sha256.7"
+    };
+    for (unsigned i = 0; i < 8; ++i) {
+        const uint8_t *p = digest + 4*i;
+        const uint32_t word = (uint32_t)p[0]<<24 | (uint32_t)p[1]<<16 |
+                              (uint32_t)p[2]<<8 | p[3];
+        shader_provenance_counter(scope, words[i], word); /* Digest-order big endian. */
+    }
+    shader_provenance_counter(scope, "shader.create.handle", shader.idx);
+    shader_provenance_counter(scope, "shader.create.cpu_returned", 1);
+    if (evidence && payload_known) {
+        evidence->create_id = scope.id;
+        evidence->capture_generation = generation;
+        evidence->context_generation = context;
+        evidence->context_known = context_known;
+        evidence->handle = shader.idx;
+    }
+    jce_trace_scope_end(scope, shader.idx != UINT16_MAX ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return shader;
+}
+
+/* 0 available, 1 absent, 2 capture changed, 3 wrong returned handle,
+ * 4 unavailable/changed device context. These are CPU evidence qualifiers. */
+static unsigned shader_evidence_reason(const JceShaderAcquireEvidence *evidence,
+                                        bgfx_shader_handle_t shader)
+{
+    if (!evidence || !evidence->create_id) return 1;
+    if (evidence->capture_generation != jce_trace_capture_generation()) return 2;
+    if (evidence->handle != shader.idx) return 3;
+    uint64_t context = 0;
+    uint32_t frame = 0;
+    if (!evidence->context_known ||
+        !jce_renderer_gpu_observation_context_internal(&context, &frame) ||
+        context != evidence->context_generation) return 4;
+    return 0;
+}
+
+static bgfx_program_handle_t link_program_evidenced(bgfx_shader_handle_t vsh,
+    bgfx_shader_handle_t fsh, const JceShaderAcquireEvidence *vs,
+    const JceShaderAcquireEvidence *fs)
+{
+    const JceTraceScope scope = shader_provenance_begin("renderer.shader.load_link");
+    if (!scope.id) return link_program_owned(vsh, fsh);
+    const uint32_t generation = jce_trace_capture_generation();
+    const bgfx_program_handle_t program = link_program_owned(vsh, fsh);
+    if (!jce_trace_enabled() || generation != jce_trace_capture_generation()) {
+        jce_trace_task_restore_id(scope.restore);
+        return program;
+    }
+    /* The unchanged child owner records the actual program return and both
+     * explicit creator-release calls. No inferred implicit releases here. */
+    const unsigned vs_reason = shader_evidence_reason(vs, vsh);
+    const unsigned fs_reason = shader_evidence_reason(fs, fsh);
+    const uint64_t vs_id = vs_reason ? 0 : vs->create_id;
+    const uint64_t fs_id = fs_reason ? 0 : fs->create_id;
+    shader_provenance_counter(scope, "shader.owner.capture", generation);
+    shader_provenance_counter(scope, "shader.owner.vs_create_hi", (uint32_t)(vs_id >> 32));
+    shader_provenance_counter(scope, "shader.owner.vs_create_lo", (uint32_t)vs_id);
+    shader_provenance_counter(scope, "shader.owner.fs_create_hi", (uint32_t)(fs_id >> 32));
+    shader_provenance_counter(scope, "shader.owner.fs_create_lo", (uint32_t)fs_id);
+    shader_provenance_counter(scope, "shader.owner.vs_reason", vs_reason);
+    shader_provenance_counter(scope, "shader.owner.fs_reason", fs_reason);
+    shader_provenance_counter(scope, "shader.owner.cpu_returned", 1);
+    jce_trace_scope_end(scope, program.idx != UINT16_MAX ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return program;
+}
+
+static void release_shader_evidenced(bgfx_shader_handle_t shader,
+                                      const JceShaderAcquireEvidence *evidence)
+{
+    const JceTraceScope scope = shader_provenance_begin("renderer.shader.creator_release");
+    const uint32_t generation = scope.id ? jce_trace_capture_generation() : 0;
+    bgfx_destroy_shader(shader);
+    if (!scope.id) return;
+    if (!jce_trace_enabled() || generation != jce_trace_capture_generation()) {
+        jce_trace_task_restore_id(scope.restore);
+        return;
+    }
+    const unsigned reason = shader_evidence_reason(evidence, shader);
+    const uint64_t create_id = reason ? 0 : evidence->create_id;
+    shader_provenance_counter(scope, "shader.release.capture", generation);
+    shader_provenance_counter(scope, "shader.release.create_hi", (uint32_t)(create_id >> 32));
+    shader_provenance_counter(scope, "shader.release.create_lo", (uint32_t)create_id);
+    shader_provenance_counter(scope, "shader.release.reason", reason);
+    shader_provenance_counter(scope, "shader.release.handle", shader.idx);
+    shader_provenance_counter(scope, "shader.release.cpu_returned", 1);
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
+}
+
 static JceDeferredSource deferred_source_read(const JcePakArchive *pak,
     const char *dev, const char *stage, const char *base, bool strict_fs)
 {
@@ -156,6 +338,9 @@ static JceShaderHandle defer_program(const JcePakArchive *pak, const char *dev,
             return JCE_INVALID_SHADER;
         }
         p->used = true; p->program = UINT16_MAX;
+        LOG_DEBUG(LOG_TAG, "program prepared: token=%u vs=%s fs=%s backend=%s",
+            JCE_DEFERRED_FIRST + i, vs, fs,
+            bgfx_get_renderer_name(bgfx_get_renderer_type()));
         return (JceShaderHandle){ (uint16_t)(JCE_DEFERRED_FIRST + i) };
     }
     return JCE_INVALID_SHADER;
@@ -181,14 +366,23 @@ uint16_t jce_shader_deferred_resolve(uint16_t idx)
     if (!p->used) return UINT16_MAX;
     if (!p->attempted) {
         p->attempted = true;
-        bgfx_shader_handle_t vs = bgfx_create_shader(bgfx_copy(p->vs.data, p->vs.size));
+        const bgfx_memory_t *vs_mem = bgfx_copy(p->vs.data, p->vs.size);
+        bgfx_shader_handle_t vs = { UINT16_MAX };
         bgfx_shader_handle_t fs = { UINT16_MAX };
-        if (vs.idx != UINT16_MAX)
-            fs = bgfx_create_shader(bgfx_copy(p->fs.data, p->fs.size));
+        if (vs_mem) vs = bgfx_create_shader(vs_mem);
+        if (vs.idx != UINT16_MAX) {
+            const bgfx_memory_t *fs_mem = bgfx_copy(p->fs.data, p->fs.size);
+            if (fs_mem) fs = bgfx_create_shader(fs_mem);
+        }
         if (vs.idx != UINT16_MAX && fs.idx != UINT16_MAX)
-            p->program = bgfx_create_program(vs, fs, true).idx;
+            p->program = link_program_owned(vs, fs).idx;
         else if (vs.idx != UINT16_MAX)
             bgfx_destroy_shader(vs);
+        if (p->program == UINT16_MAX)
+            LOG_ERROR(LOG_TAG,
+                "program realization failed: token=%u backend=%s vs_bytes=%u fs_bytes=%u vs_handle=%u fs_handle=%u",
+                idx, bgfx_get_renderer_name(bgfx_get_renderer_type()),
+                p->vs.size, p->fs.size, vs.idx, fs.idx);
         deferred_source_free(&p->vs);
         deferred_source_free(&p->fs);
     }
@@ -207,7 +401,8 @@ void jce_shader_deferred_shutdown(void)
 /* Load one shader (.bin) from the PAK, return a bgfx handle.
    Falls back to the engine-embedded shader pak when the caller-supplied
    pak is NULL or the path is missing. */
-static bgfx_shader_handle_t load_single(const JcePakArchive *pak, const char *path)
+static bgfx_shader_handle_t load_single(const JcePakArchive *pak, const char *path,
+                                        JceShaderAcquireEvidence *evidence)
 {
     bgfx_shader_handle_t invalid;
     invalid.idx = UINT16_MAX;
@@ -225,12 +420,22 @@ static bgfx_shader_handle_t load_single(const JcePakArchive *pak, const char *pa
         return invalid;
     }
 
+    if (!asset->original_size || asset->original_size > UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "shader size unsupported: key=%s bytes=%llu", path,
+            (unsigned long long)asset->original_size);
+        return invalid;
+    }
     void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return invalid;
+    if (!buf) {
+        LOG_ERROR(LOG_TAG, "shader source allocation failed: key=%s bytes=%llu",
+            path, (unsigned long long)asset->original_size);
+        return invalid;
+    }
 
     size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) {
-        LOG_ERROR(LOG_TAG, "decompression failed: %s", path);
+    if (n != (size_t)asset->original_size) {
+        LOG_ERROR(LOG_TAG, "shader decompression failed: key=%s expected=%llu actual=%zu",
+            path, (unsigned long long)asset->original_size, n);
         JCE_FREE(buf);
         return invalid;
     }
@@ -240,8 +445,17 @@ static bgfx_shader_handle_t load_single(const JcePakArchive *pak, const char *pa
         bgfx_copy(buf, (uint32_t)asset->original_size);
     JCE_FREE(buf);
 
-    return bgfx_create_shader(mem);
+    if (!mem) {
+        LOG_ERROR(LOG_TAG, "shader upload allocation failed: key=%s", path);
+        return invalid;
+    }
+    bgfx_shader_handle_t shader = create_shader_evidenced(mem, evidence);
+    if (shader.idx == UINT16_MAX)
+        LOG_ERROR(LOG_TAG, "shader creation failed: key=%s backend=%s", path,
+            bgfx_get_renderer_name(bgfx_get_renderer_type()));
+    return shader;
 }
+
 
 /* Internal: load a program with explicit VS and FS base names.
    Skinned programs share the fragment shader with their non-skinned
@@ -264,16 +478,20 @@ static JceShaderHandle load_program_named(const JcePakArchive *pak,
     snprintf(vs_path, sizeof(vs_path), "shaders/vs_%s_%s.bin", vs_base, sfx);
     snprintf(fs_path, sizeof(fs_path), "shaders/fs_%s_%s.bin", fs_base, sfx);
 
-    bgfx_shader_handle_t vsh = load_single(pak, vs_path);
+    JceShaderAcquireEvidence vs_evidence = {0}, fs_evidence = {0};
+    bgfx_shader_handle_t vsh = load_single(pak, vs_path, &vs_evidence);
     if (vsh.idx == UINT16_MAX) return JCE_INVALID_SHADER;
 
-    bgfx_shader_handle_t fsh = load_single(pak, fs_path);
+    bgfx_shader_handle_t fsh = load_single(pak, fs_path, &fs_evidence);
     if (fsh.idx == UINT16_MAX) {
-        bgfx_destroy_shader(vsh);
+        release_shader_evidenced(vsh, &vs_evidence);
         return JCE_INVALID_SHADER;
     }
 
-    bgfx_program_handle_t prog = bgfx_create_program(vsh, fsh, true);
+    bgfx_program_handle_t prog = link_program_evidenced(vsh, fsh, &vs_evidence, &fs_evidence);
+    if (prog.idx == UINT16_MAX)
+        LOG_ERROR(LOG_TAG, "program link failed: vs=%s fs=%s backend=%s",
+            vs_path, fs_path, bgfx_get_renderer_name(bgfx_get_renderer_type()));
     return (JceShaderHandle){ prog.idx };
 }
 
@@ -297,6 +515,33 @@ JceShaderHandle shader_load_program_named(const JcePakArchive *pak,
                                           const char *fs_base)
 {
     return load_program_named(pak, vs_base, fs_base);
+}
+
+JceShaderHandle jce_renderer_create_program_from_blobs(
+    const void *vs_blob, size_t vs_size,
+    const void *fs_blob, size_t fs_size)
+{
+    const JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!vs_blob || !vs_size || vs_size > UINT32_MAX ||
+        !fs_blob || !fs_size || fs_size > UINT32_MAX)
+        return invalid;
+
+    /* Consume each copied buffer before allocating the next stage. */
+    const bgfx_memory_t *memory = bgfx_copy(vs_blob, (uint32_t)vs_size);
+    if (!memory) return invalid;
+    const bgfx_shader_handle_t vs = bgfx_create_shader(memory);
+    if (!BGFX_HANDLE_IS_VALID(vs)) return invalid;
+
+    memory = bgfx_copy(fs_blob, (uint32_t)fs_size);
+    const bgfx_shader_handle_t fs = memory
+        ? bgfx_create_shader(memory) : (bgfx_shader_handle_t){UINT16_MAX};
+    return (JceShaderHandle){link_program_owned(vs, fs).idx};
+}
+
+void jce_renderer_destroy_program(JceShaderHandle prog)
+{
+    if (prog.idx == UINT16_MAX) return;
+    jce_shader_program_destroy((JceShaderHandle){ ((bgfx_program_handle_t){ prog.idx }).idx });
 }
 
 void jce_shader_program_destroy(JceShaderHandle prog)
@@ -329,7 +574,8 @@ const char *jce_shaders_backend_suffix(void)
 /* Filesystem overlay (hot-reload support)                            */
 /* ================================================================== */
 
-static bgfx_shader_handle_t load_single_fs(const char *full_path)
+static bgfx_shader_handle_t load_single_fs(const char *full_path,
+                                           JceShaderAcquireEvidence *evidence)
 {
     bgfx_shader_handle_t invalid;
     invalid.idx = UINT16_MAX;
@@ -345,15 +591,24 @@ static bgfx_shader_handle_t load_single_fs(const char *full_path)
         return invalid;
     }
 
-    if (sz == 0) {
+    if (sz == 0 || sz > UINT32_MAX) {
         jce_fs_buffer_free(buf);
-        LOG_ERROR(LOG_TAG, "fs empty: %s", full_path);
+        LOG_ERROR(LOG_TAG, "shader size unsupported: key=%s bytes=%llu",
+            full_path, (unsigned long long)sz);
         return invalid;
     }
 
     const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)sz);
     jce_fs_buffer_free(buf);
-    return bgfx_create_shader(mem);
+    if (!mem) {
+        LOG_ERROR(LOG_TAG, "shader upload allocation failed: key=%s", full_path);
+        return invalid;
+    }
+    bgfx_shader_handle_t shader = create_shader_evidenced(mem, evidence);
+    if (shader.idx == UINT16_MAX)
+        LOG_ERROR(LOG_TAG, "shader creation failed: key=%s backend=%s", full_path,
+            bgfx_get_renderer_name(bgfx_get_renderer_type()));
+    return shader;
 }
 
 static JceShaderHandle load_program_fs_named(const char *dev_dir,
@@ -373,16 +628,20 @@ static JceShaderHandle load_program_fs_named(const char *dev_dir,
     snprintf(fs_path, sizeof(fs_path),
              "%s/shaders/fs_%s_%s.bin", dev_dir, fs_base, sfx);
 
-    bgfx_shader_handle_t vsh = load_single_fs(vs_path);
+    JceShaderAcquireEvidence vs_evidence = {0}, fs_evidence = {0};
+    bgfx_shader_handle_t vsh = load_single_fs(vs_path, &vs_evidence);
     if (vsh.idx == UINT16_MAX) return JCE_INVALID_SHADER;
 
-    bgfx_shader_handle_t fsh = load_single_fs(fs_path);
+    bgfx_shader_handle_t fsh = load_single_fs(fs_path, &fs_evidence);
     if (fsh.idx == UINT16_MAX) {
-        bgfx_destroy_shader(vsh);
+        release_shader_evidenced(vsh, &vs_evidence);
         return JCE_INVALID_SHADER;
     }
 
-    bgfx_program_handle_t prog = bgfx_create_program(vsh, fsh, true);
+    bgfx_program_handle_t prog = link_program_evidenced(vsh, fsh, &vs_evidence, &fs_evidence);
+    if (prog.idx == UINT16_MAX)
+        LOG_ERROR(LOG_TAG, "program link failed: vs=%s fs=%s backend=%s",
+            vs_path, fs_path, bgfx_get_renderer_name(bgfx_get_renderer_type()));
     return (JceShaderHandle){ prog.idx };
 }
 
@@ -403,6 +662,7 @@ JceShaderHandle shader_load_program_overlay_named(
     const char *vs_base, const char *fs_base)
 {
     bgfx_shader_handle_t vsh, fsh;
+    JceShaderAcquireEvidence vs_evidence = {0}, fs_evidence = {0};
     bgfx_program_handle_t program;
     const char *sfx;
     char vs_path[512], fs_path[512];
@@ -423,32 +683,35 @@ JceShaderHandle shader_load_program_overlay_named(
     vs_overlay = dev_dir && dev_dir[0] && jce_fs_host_exists_file(vs_path);
     fs_overlay = dev_dir && dev_dir[0] && jce_fs_host_exists_file(fs_path);
 
-    vsh = vs_overlay ? load_single_fs(vs_path) : (bgfx_shader_handle_t){ UINT16_MAX };
+    vsh = vs_overlay ? load_single_fs(vs_path, &vs_evidence) : (bgfx_shader_handle_t){ UINT16_MAX };
     if (!vs_overlay) {
         char pak_path[256];
         snprintf(pak_path, sizeof(pak_path),
                  "shaders/vs_%s_%s.bin", vs_base, sfx);
-        vsh = load_single(pak, pak_path);
+        vsh = load_single(pak, pak_path, &vs_evidence);
     }
     if (vsh.idx == UINT16_MAX) return JCE_INVALID_SHADER;
 
-    fsh = fs_overlay ? load_single_fs(fs_path) : (bgfx_shader_handle_t){ UINT16_MAX };
+    fsh = fs_overlay ? load_single_fs(fs_path, &fs_evidence) : (bgfx_shader_handle_t){ UINT16_MAX };
     if (!fs_overlay) {
         char pak_path[256];
         snprintf(pak_path, sizeof(pak_path),
                  "shaders/fs_%s_%s.bin", fs_base, sfx);
-        fsh = load_single(pak, pak_path);
+        fsh = load_single(pak, pak_path, &fs_evidence);
     }
     if (fsh.idx == UINT16_MAX) {
-        bgfx_destroy_shader(vsh);
+        release_shader_evidenced(vsh, &vs_evidence);
         return JCE_INVALID_SHADER;
     }
 
-    program = bgfx_create_program(vsh, fsh, true);
+    program = link_program_evidenced(vsh, fsh, &vs_evidence, &fs_evidence);
+    if (program.idx == UINT16_MAX)
+        LOG_ERROR(LOG_TAG, "overlay program link failed: vs=%s fs=%s backend=%s",
+            vs_base, fs_base, bgfx_get_renderer_name(bgfx_get_renderer_type()));
     return (JceShaderHandle){ program.idx };
 }
 
-#include "renderer/jce_shader_variants_table.inc"
+#include "jce_shader_stock_table_internal.h"
 
 /* Defined below, beside the other overlay loaders: the table loader has
  * to sit above jce_shaders_load_all and load_overlay below it, and one
@@ -458,95 +721,44 @@ static JceShaderHandle load_overlay(const char *dev_dir,
                                     const char *vs_base,
                                     const char *fs_base);
 
-/* LOAD THE WHOLE PBR PROGRAM TABLE, deduplicated by (vs, fs).
- *
- * Six vertex variants times four keyword keys is 24 cells, but far fewer
- * distinct programs: three variants share the base fragment family, and a
- * family that does not carry an axis maps the same name for both states of
- * that bit.  Creating a bgfx program per duplicate would pay for every one of
- * them at load and hold them all until shutdown, so identical pairs share a
- * handle -- and the destroy side already frees by handle, not by cell.
- *
- * `dev_dir` NULL is the shipped path (pak only); non-NULL is the editor's
- * Reload Shaders, which prefers files on disk.  ONE implementation for both,
- * because a table that is right in the editor and stale in the build is the
- * defect this whole file exists to prevent. */
-static void load_variant_table(const char *dev_dir, const JcePakArchive *pak,
-                               JceShaderSet *set)
-{
-    struct { const char *vs, *fs; JceShaderHandle h; } seen[
-        JCE_SHADER_VARIANT_COUNT * JCE_SHADER_KEY_COUNT];
-    int nseen = 0;
+typedef struct JceShaderStockContext {
+    const char *dev_dir;
+    const JcePakArchive *pak;
+} JceShaderStockContext;
 
-    for (int v = 0; v < JCE_SHADER_VARIANT_COUNT; v++) {
-        const char *vs = jce_shader_vv_name[v];
-        for (int k = 0; k < JCE_SHADER_KEY_COUNT; k++) {
-            const char *fs = jce_shader_fs_for[v][k];
-            JceShaderHandle h = JCE_INVALID_SHADER;
-            int hit = -1;
-            for (int i = 0; i < nseen; i++)
-                if (strcmp(seen[i].vs, vs) == 0 && strcmp(seen[i].fs, fs) == 0) {
-                    hit = i; break;
-                }
-            if (hit >= 0) {
-                h = seen[hit].h;
-            } else {
-                h = load_overlay(dev_dir, pak, vs, fs);
-                seen[nseen].vs = vs;
-                seen[nseen].fs = fs;
-                seen[nseen].h = h;
-                nseen++;
-            }
-            set->variant[v][k] = h;
-        }
-    }
+static JceShaderHandle load_stock_pair(void *user, const char *vs, const char *fs)
+{
+    const JceShaderStockContext *context = user;
+    return load_overlay(context->dev_dir, context->pak, vs, fs);
+}
+
+static JceShaderStockProfile load_stock_table(const char *dev_dir,
+    const JcePakArchive *pak, JceShaderSet *set, JceShaderStockAcquires *batch)
+{
+    JceShaderStockContext context = {dev_dir, pak};
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    const JceShaderStockProfile profile = jce_shader_stock_profile_for_api(
+        &api, bgfx_get_renderer_type());
+    jce_shader_stock_load(set, batch, load_stock_pair, &context, profile);
+    if (profile == JCE_SHADER_STOCK_PROFILE_COMPATIBILITY)
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+            "stock shader profile=compatibility backend=%s acquired=%u; "
+            "instanced/skinned/array/Forward+ families excluded",
+            jce_renderer_backend_name(api.backend), (unsigned)batch->count);
+    return profile;
 }
 
 JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
 {
     JCE_PROFILE_ZONE_N("Shaders::LoadAll");
     JceShaderSet set;
-    memset(&set, 0, sizeof set);
-    load_variant_table(NULL, pak, &set);
-    set.color    = shader_load_program(pak, "color");
-    set.textured = shader_load_program(pak, "textured");
-    /* vs_textured + fs_text_sdf: same vertex stage, different edge. */
-    set.text_sdf = load_program_named(pak, "textured", "text_sdf");
-    set.mesh     = shader_load_program(pak, "mesh");
-    set.pbr            = shader_load_program(pak, "pbr");
-    /* Instanced PBR variant: vs_pbr_inst + fs_pbr (fragment unchanged). */
-    set.pbr_inst       = load_program_named(pak, "pbr_inst",       "pbr");
-    /* Per-instance-tint instanced variant (large-world-opt P1 #7):
-       vs_pbr_inst_tint + fs_pbr_tint.  Optional; absent in older paks. */
-    set.pbr_inst_tint  = load_program_named(pak, "pbr_inst_tint",  "pbr_tint");
-    /* Texture-diverse instanced variant (texture-array batcher):
-       vs_pbr_inst_tex_array + fs_pbr_inst_tex_array.  Optional; absent in older
-       paks and on essl1/GLES2 (excluded from the array-sampler allowlist). */
-    set.pbr_inst_tex_array = load_program_named(pak, "pbr_inst_tex_array", "pbr_inst_tex_array");
-    /* LOD cross-fade instanced variant (千万 ②): vs_pbr_inst_fade smuggles the
-       band-transition coverage in i_data3.w → fs_pbr_fade screen-door dithers.
-       Optional; absent → the LOD-in-cull draw falls back to pbr_inst (hard
-       band switches, still correct). */
-    set.pbr_inst_fade  = load_program_named(pak, "pbr_inst_fade",  "pbr_fade");
-    /* Skinned variants share the fragment shader with their non-skinned
-       counterpart: vs_pbr_skinned + fs_pbr, vs_shadow_skinned + fs_shadow. */
-    set.pbr_skinned    = load_program_named(pak, "pbr_skinned",    "pbr");
-    /* Forward+ fragment variant (vs_pbr* + fs_pbr_fwdplus).  Same vertex
-     * shaders; only the fragment program differs.  Optional: a pak built
-     * before the variant existed simply won't have the bins → the handle stays
-     * invalid and the renderer falls back to the non-variant program. */
-    set.pbr_fwdplus         = load_program_named(pak, "pbr",         "pbr_fwdplus");
-    set.pbr_inst_fwdplus    = load_program_named(pak, "pbr_inst",    "pbr_fwdplus");
-    set.pbr_skinned_fwdplus = load_program_named(pak, "pbr_skinned", "pbr_fwdplus");
-    /* Toon character (stylized-slice §5.6): vs_pbr_skinned + fs_pbr_toon. */
-    set.pbr_toon       = load_program_named(pak, "pbr_skinned", "pbr_toon");
-    /* Inverted-hull skinned outline: vs_pbr_skinned_outline + fs_outline. */
-    set.outline_skinned = load_program_named(pak, "pbr_skinned_outline", "outline");
-    set.shadow         = shader_load_program(pak, "shadow");
-    /* Instanced shadow variant: vs_shadow_inst + fs_shadow (fragment unchanged). */
-    set.shadow_inst    = load_program_named(pak, "shadow_inst",    "shadow");
-    set.shadow_skinned = load_program_named(pak, "shadow_skinned", "shadow");
-    set.terrain        = shader_load_program(pak, "terrain");
+    JceShaderStockAcquires acquires = {0};
+    const JceShaderStockProfile profile = load_stock_table(NULL, pak, &set, &acquires);
+    unsigned duplicate_refs = jce_shader_set_normalize_stock_acquires(&acquires);
+    jce_shader_set_alias_stock(&set);
+    if (jce_trace_enabled())
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                          "renderer.stock_duplicate_acquires", duplicate_refs);
 
     if (!jce_shader_valid(set.color))
         LOG_ERROR(LOG_TAG, "failed to load 'color' shader");
@@ -556,29 +768,29 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
         LOG_WARN(LOG_TAG, "'mesh' shader unavailable");
     if (!jce_shader_valid(set.pbr))
         LOG_WARN(LOG_TAG, "'pbr' shader unavailable");
-    if (!jce_shader_valid(set.pbr_inst))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_inst))
         LOG_WARN(LOG_TAG, "'pbr_inst' shader unavailable (GPU instancing disabled)");
-    if (!jce_shader_valid(set.pbr_inst_tint))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_inst_tint))
         LOG_WARN(LOG_TAG, "'pbr_inst_tint' shader unavailable (per-instance tint batching disabled)");
-    if (!jce_shader_valid(set.pbr_inst_tex_array))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_inst_tex_array))
         LOG_WARN(LOG_TAG, "'pbr_inst_tex_array' shader unavailable (texture-diverse instancing disabled)");
-    if (!jce_shader_valid(set.pbr_inst_fade))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_inst_fade))
         LOG_WARN(LOG_TAG, "'pbr_inst_fade' shader unavailable (LOD cross-fade dither disabled)");
-    if (!jce_shader_valid(set.pbr_skinned))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_skinned))
         LOG_WARN(LOG_TAG, "'pbr_skinned' shader unavailable");
-    if (!jce_shader_valid(set.pbr_fwdplus))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_fwdplus))
         LOG_WARN(LOG_TAG, "'pbr_fwdplus' shader unavailable (Forward+ disabled)");
-    if (!jce_shader_valid(set.pbr_toon))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.pbr_toon))
         LOG_WARN(LOG_TAG, "'pbr_toon' shader unavailable (toon character disabled)");
-    if (!jce_shader_valid(set.outline_skinned))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.outline_skinned))
         LOG_WARN(LOG_TAG, "'outline_skinned' shader unavailable (character outline disabled)");
     if (!jce_shader_valid(set.shadow))
         LOG_WARN(LOG_TAG, "'shadow' shader unavailable");
-    if (!jce_shader_valid(set.shadow_inst))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.shadow_inst))
         LOG_WARN(LOG_TAG, "'shadow_inst' shader unavailable (shadow instancing disabled)");
-    if (!jce_shader_valid(set.shadow_skinned))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.shadow_skinned))
         LOG_WARN(LOG_TAG, "'shadow_skinned' shader unavailable");
-    if (!jce_shader_valid(set.terrain))
+    if (profile == JCE_SHADER_STOCK_PROFILE_FULL && !jce_shader_valid(set.terrain))
         LOG_WARN(LOG_TAG, "'terrain' shader unavailable");
 
     JCE_PROFILE_ZONE_END;
@@ -589,20 +801,12 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
 /* FS-overlay variant of jce_shaders_load_all                         */
 /* ================================================================== */
 
-/* Try FS first, fall back to PAK on a per-shader basis. */
+/* Stock and project overlays share stage selection and failure ownership. */
 static JceShaderHandle load_overlay(const char *dev_dir,
                                     const JcePakArchive *pak,
                                     const char *vs, const char *fs)
 {
-    JceShaderHandle pending = defer_stock(pak, dev_dir, vs, fs, false);
-    if (jce_shader_valid(pending)) return pending;
-
-    JceShaderHandle h = JCE_INVALID_SHADER;
-    if (dev_dir && dev_dir[0])
-        h = load_program_fs_named(dev_dir, vs, fs);
-    if (!jce_shader_valid(h))
-        h = load_program_named(pak, vs, fs);
-    return h;
+    return shader_load_program_overlay_named(dev_dir, pak, vs, fs);
 }
 
 JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
@@ -610,27 +814,13 @@ JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
 {
     JCE_PROFILE_ZONE_N("Shaders::LoadAllFS");
     JceShaderSet set;
-    memset(&set, 0, sizeof set);
-    load_variant_table(dev_dir, pak, &set);
-    set.color          = load_overlay(dev_dir, pak, "color",          "color");
-    set.textured       = load_overlay(dev_dir, pak, "textured",       "textured");
-    set.text_sdf       = load_overlay(dev_dir, pak, "textured",       "text_sdf");
-    set.mesh           = load_overlay(dev_dir, pak, "mesh",           "mesh");
-    set.pbr            = load_overlay(dev_dir, pak, "pbr",            "pbr");
-    set.pbr_inst       = load_overlay(dev_dir, pak, "pbr_inst",       "pbr");
-    set.pbr_inst_tint  = load_overlay(dev_dir, pak, "pbr_inst_tint",  "pbr_tint");
-    set.pbr_inst_tex_array = load_overlay(dev_dir, pak, "pbr_inst_tex_array", "pbr_inst_tex_array");
-    set.pbr_inst_fade  = load_overlay(dev_dir, pak, "pbr_inst_fade",  "pbr_fade");
-    set.pbr_skinned    = load_overlay(dev_dir, pak, "pbr_skinned",    "pbr");
-    set.pbr_fwdplus         = load_overlay(dev_dir, pak, "pbr",         "pbr_fwdplus");
-    set.pbr_inst_fwdplus    = load_overlay(dev_dir, pak, "pbr_inst",    "pbr_fwdplus");
-    set.pbr_skinned_fwdplus = load_overlay(dev_dir, pak, "pbr_skinned", "pbr_fwdplus");
-    set.pbr_toon        = load_overlay(dev_dir, pak, "pbr_skinned",         "pbr_toon");
-    set.outline_skinned = load_overlay(dev_dir, pak, "pbr_skinned_outline", "outline");
-    set.shadow         = load_overlay(dev_dir, pak, "shadow",         "shadow");
-    set.shadow_inst    = load_overlay(dev_dir, pak, "shadow_inst",    "shadow");
-    set.shadow_skinned = load_overlay(dev_dir, pak, "shadow_skinned", "shadow");
-    set.terrain        = load_overlay(dev_dir, pak, "terrain",        "terrain");
+    JceShaderStockAcquires acquires = {0};
+    (void)load_stock_table(dev_dir, pak, &set, &acquires);
+    unsigned duplicate_refs = jce_shader_set_normalize_stock_acquires(&acquires);
+    jce_shader_set_alias_stock(&set);
+    if (jce_trace_enabled())
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                          "renderer.stock_duplicate_acquires", duplicate_refs);
     JCE_PROFILE_ZONE_END;
     return set;
 }

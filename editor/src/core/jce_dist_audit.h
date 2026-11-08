@@ -16,7 +16,12 @@ struct JceDistAuditInput {
     const char *report_path = nullptr;
     const char *package_dir = nullptr;
     const char *expected_exe_name = nullptr;
+    /* Nonzero binds Windows delivery to the requested target and checks both
+     * import tables against the shared CLI OS-only dependency policy. */
+    uint16_t expected_pe_machine = 0;
     const char *graph_snapshot_path = nullptr;
+    /* Explicit confidential names: any occurrence outside the project PAK fails.
+     * Independent of the required encryption/authentication of all payloads. */
     const char *const *protected_paths = nullptr;
     size_t protected_path_count = 0;
     const uint8_t *key = nullptr; /* 32 bytes when require_secure */
@@ -32,6 +37,9 @@ struct JceDistAuditResult {
     bool passed = false;
     bool pe_valid = false;
     uint16_t pe_subsystem = 0;
+    uint16_t pe_machine = 0;
+    uint32_t pe_import_count = 0;
+    bool pe_imports_verified = false;
     bool pak_embedded_exactly_once = false;
     size_t pak_offset = SIZE_MAX;
     uint32_t archive_entries = 0;
@@ -42,6 +50,7 @@ struct JceDistAuditResult {
     uint32_t graph_verified = 0;
     uint32_t graph_mismatch_count = 0;
     uint32_t leaked_path_count = 0;
+    uint32_t observed_address_literal_count = 0;
     uint32_t package_file_count = 0;
     char error[512] = {0};
 };

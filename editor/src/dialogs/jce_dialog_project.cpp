@@ -19,6 +19,9 @@
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
+#include "core/jce_editor_scene_route.h"
+#include "core/jce_editor_project_context.h"
+#include "core/jce_editor_new_project.h"
 #include "core/jce_editor_script_backends.h"
 #include "core/jce_editor_project_render_pipeline.h"
 #include "core/jce_editor_project_state.h"
@@ -53,8 +56,10 @@ static void last_browse_folder_load_once(void)
                                  sizeof(s_last_browse_folder), "");
 }
 
-void set_current_project_root(const char *path)
+bool jce_editor_prepare_project_switch(const char *next_root)
 {
+    const char *current = jce_editor_current_project_root();
+    if (jce_editor_project_path_equal(current, next_root)) return true;
     /* Snapshot the OUTGOING project's machine-local overlays (build/run
      * profile + favourites) while the project root still names it (the
      * project store follows the root lazily, so this must run before we
@@ -63,24 +68,22 @@ void set_current_project_root(const char *path)
         jce_editor_build_profile_snapshot();
         jce_editor_favorites_snapshot();
     }
+    if (!jce_editor_pstate_flush_now()) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Project switch refused: outgoing editor state could not be saved");
+        return false;
+    }
+    return true;
+}
 
-    if (!path || path[0] == '\0') {
-        jce_editor_current_project_root_set(nullptr);
-        jce_project_settings_set_root(nullptr);
-        jce_assetdb_set_root("");
-        jce_editor_project_set_root(nullptr);
-        /* Drop the outgoing project's C++ script modules.  A module is a
-         * shared object THIS process has mapped and whose function pointers
-         * the script VM holds; leaving it loaded past its project would let
-         * the next project's scene resolve a class out of the previous
-         * project's binary. */
-        jce_editor_script_modules_reload(nullptr);
-        jce_editor_gl10n_unload();
-        jce_pak_key_install_process("");  /* clear the process key */
-        JceRenderPipelineDesc pipeline{};
-        jce_render_pipeline_preset_for_current_tier(&pipeline);
-        jce_render_pipeline_apply(&pipeline);
-        return;
+bool set_current_project_root(const char *path)
+{
+    char buf[512];
+    const int copied = snprintf(buf, sizeof(buf), "%s", path ? path : "");
+    if (copied < 0 || (size_t)copied >= sizeof(buf)) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Project switch refused: input path exceeds editor root capacity");
+        return false;
     }
 
     /* Normalize: callers occasionally hand us a path to jce_project.json
@@ -89,8 +92,6 @@ void set_current_project_root(const char *path)
      * Also unify backslashes and drop a trailing separator so all
      * downstream string-concat code (build profiles, asset DB, etc.)
      * sees a canonical form. */
-    char buf[512];
-    snprintf(buf, sizeof(buf), "%s", path);
     for (char *q = buf; *q; ++q)
         if (*q == '\\') *q = '/';
     size_t L = strlen(buf);
@@ -107,7 +108,41 @@ void set_current_project_root(const char *path)
     while (L > 1 && (buf[L - 1] == '/' || buf[L - 1] == '\\'))
         buf[--L] = '\0';
 
-    jce_editor_current_project_root_set(buf);
+    if (!jce_editor_prepare_project_switch(buf)) return false;
+    if (jce_editor_project_path_equal(jce_editor_current_project_root(), buf)) return true;
+
+    if (!buf[0]) {
+        /* Retire while the outgoing root still owns Play/modules. Restoring
+         * a Bundle's saved RP after the new root publishes would overwrite it. */
+        if (!jce_state_close_bundle_preview()) return false;
+        if (!jce_editor_current_project_root_set(nullptr)) {
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "Project close refused: outgoing editor state could not be saved");
+            return false;
+        }
+        jce_project_settings_set_root(nullptr);
+        jce_assetdb_set_root("");
+        jce_editor_project_set_root(nullptr);
+        /* Drop the outgoing project's C++ script modules.  A module is a
+         * shared object THIS process has mapped and whose function pointers
+         * the script VM holds; leaving it loaded past its project would let
+         * the next project's scene resolve a class out of the previous
+         * project's binary. */
+        jce_editor_script_modules_reload(nullptr);
+        jce_editor_gl10n_unload();
+        jce_pak_key_install_process("");  /* clear the process key */
+        JceRenderPipelineDesc pipeline{};
+        jce_render_pipeline_preset_for_current_tier(&pipeline);
+        jce_render_pipeline_apply(&pipeline);
+        return true;
+    }
+
+    if (!jce_state_close_bundle_preview()) return false;
+    if (!jce_editor_current_project_root_set(buf)) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Project switch refused: outgoing editor state could not be saved");
+        return false;
+    }
     const char *root = jce_editor_current_project_root();
     jce_project_settings_set_root(root);
     jce_assetdb_set_root(root);
@@ -188,6 +223,38 @@ void set_current_project_root(const char *path)
     jce_editor_build_profile_restore();
     jce_editor_favorites_restore();
     jce_state_apply_project_view_settings();
+    return true;
+}
+
+/* JCE_PROJECT_SCENE_ROUTE_V2: project manifest owns the Asset Browser base.
+ * Selecting a project cannot silently show the previous project's files. */
+static void route_project_asset_browser(const char *root)
+{
+    const JceProject *manifest = jce_editor_project_get();
+    const char *source =
+        (manifest && manifest->source_assets && manifest->source_assets[0])
+            ? manifest->source_assets : "assets";
+    const std::string base = jce_editor_scene_route::asset_root(
+        root ? root : "", source);
+    if (!base.empty() && jce_fs_host_exists_dir(base.c_str())) {
+        jce_editor_assets_set_project(base.c_str());
+    } else {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "Project source_assets not found ('%s'); using project root: %s",
+            source, root ? root : "(none)");
+        jce_editor_assets_set_project(root);
+    }
+}
+
+static bool activate_new_project(const char *root)
+{
+    /* Stop while the outgoing project still owns its script modules/source.
+       Reload must see no live instances from A when B becomes active. */
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED)
+        jce_state_stop();
+    if (!set_current_project_root(root)) return false;
+    route_project_asset_browser(root);
+    return jce_editor_project_get() != nullptr;
 }
 
 bool is_valid_project_dir(const char *path)
@@ -482,11 +549,15 @@ void open_file_dialog_async(const char *title,
 
     last_browse_folder_load_once();
     const char *initial = NULL;
-    if (default_path && default_path[0] != '\0')
+    const auto valid_initial = [](const char *path) {
+        return path && path[0] &&
+            (jce_fs_host_exists_file(path) || jce_fs_host_exists_dir(path));
+    };
+    if (valid_initial(default_path))
         initial = default_path;
-    else if (s_last_browse_folder[0] != '\0')
+    else if (valid_initial(s_last_browse_folder))
         initial = s_last_browse_folder;
-    else if (primary_out[0] != '\0')
+    else if (valid_initial(primary_out))
         initial = primary_out;
 
     jce_host_dialog_pick_file(title, initial, filters,
@@ -646,100 +717,35 @@ void jce_editor_dialog_new_project(bool *p_open)
             snprintf(s_new_project.error_msg, sizeof(s_new_project.error_msg), "%s",
                      jce_editor_i18n("newProject.errorLocationEmpty"));
         } else {
-            /* Create the project directory structure. */
             char project_dir[1024];
-            jce_path_join(project_dir, sizeof(project_dir),
-                         s_new_project.project_location,
-                         s_new_project.project_name);
-            
-            /* Check if exists and not empty */
-            bool dir_exists = jce_fs_host_exists_dir(project_dir);
-            bool has_files = false;
-            if (dir_exists) {
-                struct CheckCtx { bool has_any; };
-                CheckCtx chk = { false };
-                auto cb = [](const char *, bool, void *ud) -> bool {
-                    static_cast<CheckCtx*>(ud)->has_any = true;
-                    return false;
-                };
-                jce_fs_host_list_dir(project_dir, cb, &chk);
-                has_files = chk.has_any;
-            }
-            
-            if (dir_exists && has_files) {
-                snprintf(s_new_project.error_msg, sizeof(s_new_project.error_msg), "%s",
-                         jce_editor_i18n("newProject.errorExists"));
+            const JceProjectTemplate type = s_new_project.project_type == 1
+                ? JCE_PROJECT_TEMPLATE_BASIC_2D : JCE_PROJECT_TEMPLATE_BASIC_3D;
+            const JceEditorNewProjectPorts ports = {
+                activate_new_project, jce_state_new_default_scene_for_project,
+                jce_state_save_scene_file, jce_editor_project_update_field
+            };
+            if (!jce_path_join(project_dir, sizeof(project_dir),
+                               s_new_project.project_location, s_new_project.project_name)) {
+                snprintf(s_new_project.error_msg, sizeof(s_new_project.error_msg),
+                         "Project path is too long");
+            } else if (!jce_editor_new_project_create(project_dir,
+                           s_new_project.project_name, type, ports,
+                           s_new_project.error_msg, sizeof(s_new_project.error_msg))) {
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR, "%s",
+                                            s_new_project.error_msg);
             } else {
-                /* Use the engine's template generator: lays down
-                 * jce_project.json + CMakeLists.txt + src/main.c +
-                 * assets/.gitkeep so the project is buildable out of
-                 * the box.  (Engine API — works the same in headless
-                 * tooling later.) */
-                JceProjectTemplate tpl = (s_new_project.project_type == 1)
-                    ? JCE_PROJECT_TEMPLATE_BASIC_2D
-                    : JCE_PROJECT_TEMPLATE_BASIC_3D;
-                char tpl_err[256] = {0};
-                if (!jce_project_create_from_template(project_dir,
-                                                     s_new_project.project_name,
-                                                     tpl,
-                                                     tpl_err, sizeof tpl_err)) {
-                    snprintf(s_new_project.error_msg,
-                             sizeof(s_new_project.error_msg),
-                             "%s", tpl_err[0] ? tpl_err
-                                  : jce_editor_i18n("newProject.errorExists"));
-                } else {
-                    /* Optional asset sub-trees that are convenient to
-                     * pre-create for the inspector / asset browser. */
-                    char sub_path[1024];
-                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scenes");
-                    jce_fs_host_create_directory(sub_path);
-                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/textures");
-                    jce_fs_host_create_directory(sub_path);
-                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/models");
-                    jce_fs_host_create_directory(sub_path);
-                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/audio");
-                    jce_fs_host_create_directory(sub_path);
-                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scripts");
-                    jce_fs_host_create_directory(sub_path);
-                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "build");
-                    jce_fs_host_create_directory(sub_path);
-
-                    /* Write Settings/RenderPipeline.rp.json with MID preset so
-                     * the built exe doesn't auto-detect HIGH tier and enable
-                     * SSR/volfog/TAA at full resolution.  The file is user-editable
-                     * and deployed next to the exe by the CMake POST_BUILD step. */
-                    {
-                        char settings_dir[1024];
-                        char rp_path[1024];
-                        jce_path_join(settings_dir, sizeof(settings_dir), project_dir, "Settings");
-                        jce_fs_host_create_directory(settings_dir);
-                        jce_path_join(rp_path, sizeof(rp_path), settings_dir, "RenderPipeline.rp.json");
-                        JceRenderPipelineDesc rp_desc;
-                        jce_render_pipeline_preset_mid(&rp_desc);
-                        jce_render_pipeline_save(rp_path, &rp_desc);
-                    }
-
-                    /* Add to recent projects and record it as the last
-                     * opened project (consumed by has_known_startup_project
-                     * and the asset-browser root resolution at next boot). */
-                    JceEditorConfig ecfg;
-                    jce_editor_config_load(&ecfg);
-                    jce_editor_config_add_recent(&ecfg, project_dir);
-                    snprintf(ecfg.last_project, sizeof(ecfg.last_project),
-                             "%s", project_dir);
-                    jce_editor_config_save(&ecfg);
-
-                    /* Set the asset browser root to the new project. */
-                    jce_editor_assets_set_project(project_dir);
-                    set_current_project_root(project_dir);
-                    jce_editor_layout_request_focus_scene_view();
-
-                    jce_editor_console_log("Created project: %s at %s",
-                                           s_new_project.project_name,
-                                           project_dir);
-                    ImGui::CloseCurrentPopup();
-                    *p_open = false;
-                }
+                /* Record only a complete project: its fresh default scene is
+                   saved and its manifest declares the matching startup asset. */
+                JceEditorConfig ecfg;
+                jce_editor_config_load(&ecfg);
+                jce_editor_config_add_recent(&ecfg, project_dir);
+                snprintf(ecfg.last_project, sizeof(ecfg.last_project), "%s", project_dir);
+                jce_editor_config_save(&ecfg);
+                jce_editor_layout_request_focus_scene_view();
+                jce_editor_console_log("Created project: %s at %s",
+                                       s_new_project.project_name, project_dir);
+                ImGui::CloseCurrentPopup();
+                *p_open = false;
             }
         }
     }
@@ -1055,7 +1061,11 @@ void jce_editor_dialog_open_project(bool *p_open)
             s_open_project.error_msg[0] = '\0';
             if (strlen(path) > 0) {
                 std::string project_root;
-                if (resolve_project_root_path(path, &project_root)) {
+                const bool resolved = resolve_project_root_path(path, &project_root);
+                /* Retire Play before swapping the project-owned script modules. */
+                if (resolved && jce_state_get_play_state() != JCE_PLAY_STOPPED)
+                    jce_state_stop();
+                if (resolved && set_current_project_root(project_root.c_str())) {
                     if (!s_open_project.cfg_loaded)
                         jce_editor_config_load(&s_open_project.cfg);
                     jce_editor_config_add_recent(&s_open_project.cfg, project_root.c_str());
@@ -1067,31 +1077,87 @@ void jce_editor_dialog_open_project(bool *p_open)
                              "%s", project_root.c_str());
                     jce_editor_config_save(&s_open_project.cfg);
 
-                    /* Set the asset browser root to the project directory. */
-                    jce_editor_assets_set_project(project_root.c_str());
-                    set_current_project_root(project_root.c_str());
+                    /* Bind manifest source_assets, not the enclosing directory. */
+                    route_project_asset_browser(project_root.c_str());
                     snprintf(s_open_project.manual_path,
                              sizeof(s_open_project.manual_path), "%s",
                              project_root.c_str());
                     jce_editor_layout_request_focus_scene_view();
 
-                    /* Resume THIS project's last-open scene (each project
-                     * remembers its own; the global last_scene only drives
-                     * cold-boot restore).  Skip when absent or the file is
-                     * gone — the user lands on whatever is already open. */
+                    /* JCE_PROJECT_SCENE_ROUTE_V2: a project open is a scene
+                     * transition. The old project's scene may NOT keep running
+                     * under the new project manifest or source-assets root.
+                     * Try owned last_scene, then authored startup_scene. */
                     {
-                        char last_scene[512];
+                        bool scene_loaded = false;
+                        const JceProject *manifest = jce_editor_project_get();
+                        /* Copy manifest fields before a scene load: a project
+                         * transition can replace the manifest's storage. */
+                        const std::string source =
+                            (manifest && manifest->source_assets && manifest->source_assets[0])
+                                ? manifest->source_assets : "assets";
+                        const std::string startup_declared =
+                            (manifest && manifest->startup_scene && manifest->startup_scene[0])
+                                ? manifest->startup_scene : "";
+                        char last_scene[512] = {};
                         if (jce_editor_pstate_get_str("last_scene", last_scene,
                                                       sizeof(last_scene)) &&
-                            last_scene[0] &&
-                            jce_fs_host_exists_file(last_scene))
-                            jce_state_load_scene_file_async(last_scene);
+                            last_scene[0]) {
+                            if (!jce_editor_scene_route::project_scene(
+                                    project_root, source, last_scene)) {
+                                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                                    "Open Project: ignored foreign last_scene: %s",
+                                    last_scene);
+                            } else if (!jce_fs_host_exists_file(last_scene)) {
+                                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                                    "Open Project: last_scene missing: %s", last_scene);
+                            } else {
+                                scene_loaded = jce_state_load_scene_file_async(last_scene);
+                                if (!scene_loaded)
+                                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                                        "Open Project: last_scene load failed: %s",
+                                        last_scene);
+                            }
+                        }
+                        if (!scene_loaded && !startup_declared.empty()) {
+                            const std::string startup =
+                                jce_editor_scene_route::startup_scene_path(
+                                    project_root, source, startup_declared);
+                            if (!startup.empty() &&
+                                jce_fs_host_exists_file(startup.c_str())) {
+                                scene_loaded = jce_state_load_scene_file_async(
+                                    startup.c_str());
+                                if (scene_loaded)
+                                    jce_editor_console_log(
+                                        "Open Project: loaded startup_scene %s",
+                                        startup.c_str());
+                            }
+                            if (!scene_loaded)
+                                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                    "Open Project: startup_scene is unavailable or invalid: %s",
+                                    startup_declared.c_str());
+                        }
+                        if (!scene_loaded) {
+                            /* The UI's project-open action uses the unsaved
+                             * scene confirmation gate. Do not leave an old
+                             * project's entities attached to the new root. */
+                            if (jce_state_new_default_scene())
+                                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                                    "Open Project: no loadable scene; opened a new default scene");
+                            else
+                                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                    "Open Project: default scene initialization failed");
+                        }
                     }
 
                     jce_editor_console_log("Opened project: %s", project_root.c_str());
                     *p_open = false;
                 } else {
-                    if (!jce_fs_host_exists_file(path) && !jce_fs_host_exists_dir(path)) {
+                    if (resolved) {
+                        snprintf(s_open_project.error_msg,
+                                 sizeof(s_open_project.error_msg), "%s",
+                                 jce_editor_i18n("preferences.status.saveFailed"));
+                    } else if (!jce_fs_host_exists_file(path) && !jce_fs_host_exists_dir(path)) {
                         snprintf(s_open_project.error_msg,
                                  sizeof(s_open_project.error_msg), "%s",
                                  jce_editor_i18n("openProject.errorNotExist"));

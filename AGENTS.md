@@ -63,7 +63,7 @@ CPU submission records never substitute for GPU execution or presentation.
 1. Search public headers, implementation and adjacent modules before adding code.
 2. Keep public headers self-contained C99; add APIs to their proper umbrella.
 3. Preserve LF for owned text; BAT/CMD use CRLF on disk and LF in Git. Preserve
-   binary and original upstream bytes. .editorconfig and .gitattributes agree.
+   binary and original upstream bytes. Use .gitattributes for Git line endings.
 4. Update affected AGENTS.md and the module map when ownership or paths change.
 5. Run python scripts/jce.py lint (both lint and architecture suites) and the
    appropriate python scripts/jce.py test checks. A missing/private suite is
@@ -93,7 +93,12 @@ CPU submission records never substitute for GPU execution or presentation.
   Reject a project requiring an unavailable backend before packaging; never
   silently omit gameplay scripts. A declared architecture, language or preset
   is a goal/catalog entry, not proof that it runs.
-- Compatibility comes first: desktop Windows 7+, macOS 10.13+, glibc 2.28+;
+- Compatibility comes first: Windows XP+ is an explicit legacy target goal
+  through LLVM-MinGW-XP GNU/MSVCRT (x86 NT 5.1, x64 NT 5.2); the default desktop
+  lane remains Windows 7+ with MSVC. Both keep C99 engine/runtime and C++20
+  Editor. Full XP Editor/GPU acceptance is work in progress; core, OS and
+  resource probes do not certify it. See [Windows targets](contracts/windows-targets.md).
+  Other floors remain macOS 10.13+, glibc 2.28+;
   Android 21+, iOS 12+ and wasm32 are capability targets. Console builds need
   their licensed toolchains and device validation. Record actual compiler,
   OS/runtime and graphics floors; do not silently turn a recipe's higher floor

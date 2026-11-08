@@ -5,10 +5,14 @@
 
 #include <cstdlib>   /* getenv for the QA autowalk hook below */
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_renderer_startup.h"
+#include "core/jce_editor_viewport_work.h"
 #include "core/jce_editor_game_input_bridge.h"
+#include "core/jce_editor_play_input_owner.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_kpi_game_capture.h"
 #include "core/jce_editor_project_state.h"
+#include "jce_game_view_focus_policy.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_state.h"
@@ -18,7 +22,6 @@
 
 extern "C" {
 #include <jce/os/core/jce_defs.h>
-#include <jce/os/core/jce_str.h>   /* jce_strcasecmp for the Auto check */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/renderer/jce_camera.h>
@@ -29,6 +32,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/os/platform/jce_keys.h>
+#include <jce/os/platform/jce_input.h>  /* physical Alt level */
 #include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_window_event.h>  /* JCE_KMOD_* */
 #include <ctype.h>
@@ -42,6 +46,29 @@ extern "C" {
 /* Renderer backend list comes from jce_editor_panels.cpp via the
    editor's public accessor (populated lazily from
    jce_renderer_caps_list_backends()). */
+
+/* Keep persisted aliases consistent with the startup resolver. An unknown or
+ * unavailable choice retains its configured preview instead of becoming Auto. */
+static int gv_renderer_choice_index(const char *requested,
+                                    const char *const *names, int count)
+{
+    const int backend = jce_editor_renderer_backend_from_name(requested);
+    if (backend < 0 || !names) return -1;
+    for (int i = 0; i < count; ++i) {
+        if (names[i] &&
+            jce_editor_renderer_backend_from_name(names[i]) == backend)
+            return i;
+    }
+    return -1;
+}
+
+static bool gv_renderer_restart_required(const char *requested,
+                                         JceRendererBackend live)
+{
+    const int backend = jce_editor_renderer_backend_from_name(requested);
+    return backend > JCE_BACKEND_AUTO && live != JCE_BACKEND_AUTO &&
+           backend != (int)live;
+}
 
 /* ── Game View state ──────────────────────────────────────────────── */
 
@@ -59,6 +86,11 @@ static bool s_third_person = false;   /* play camera: false=first-person, true=b
  * so in-game keys (WASD, Ctrl+S, …) never leak into editor commands during
  * Play.  Set on click-in, cleared on ESC / Stop. */
 static bool s_user_wants_capture = false;
+static bool s_alt_held_previous_frame = false;
+/* Explicit, per-project opt-in. Auto keeps UI/strategy games pointer-driven. */
+static bool s_script_mouse_look = false;
+static bool s_script_mouse_look_scope_valid = false;
+static char s_script_mouse_look_root[512] = {0};
 static bool s_runtime_pointer_camera = false;
 static const float kTpBoomLen = 4.5f; /* third-person orbit distance */
 static float s_tp_dist = 4.5f;        /* smoothed boom length (collision-shortened) */
@@ -270,12 +302,53 @@ static void forward_text_input_to_canvas(void)
  * The editor shortcut gate consults this (gated by Play state) so editor
  * hotkeys (Ctrl+S / Ctrl+A / …) do not mis-fire while the user is playing in
  * the Game View — Play-consistent, not just the strict mouse-captured case. */
+/* A level-triggered Alt sample, never a key-down edge/toggle. The engine
+ * input owns physical key state even while ImGui stops receiving pointer
+ * events in SDL relative mode. The ImGui fallback covers an absent host. */
+static bool gv_alt_held_now()
+{
+    const JceInput *input = jce_editor_engine_input();
+    if (input)
+        return jce_input_key_down(input, JCE_KEY_LALT) ||
+               jce_input_key_down(input, JCE_KEY_RALT);
+    return ImGui::GetCurrentContext() &&
+           (ImGui::IsKeyDown(ImGuiKey_LeftAlt) ||
+            ImGui::IsKeyDown(ImGuiKey_RightAlt));
+}
+
 bool jce_editor_game_view_is_input_active(void)
 {
+    /* Alt temporarily releases the cursor for editor UI: do not keep
+     * claiming shortcuts that now belong to another editor panel. */
+    if (ImGui::GetCurrentContext()) {
+        const ImGuiIO &io = ImGui::GetIO();
+        if (io.AppFocusLost || gv_alt_held_now())
+            return false;
+    }
     return s_user_wants_capture ||
            jce_editor_game_render_is_mouse_captured() ||
            (s_runtime_pointer_camera &&
             ImGui::IsMouseDown(ImGuiMouseButton_Left));
+}
+
+void jce_editor_game_view_release_play_input(void)
+{
+    /* Stop is a lifecycle transition, not a UI-paint event. When Game View is
+     * clipped/hidden its existing Stop-edge does not run. Retire all three
+     * owners now, then synthesize button-up for any gameplay-captured press
+     * that ImGui never received. It is safe if the physical release arrives
+     * later: AddMouseButtonEvent is an edge queue and duplicate up is inert. */
+    const bool had_owner = s_user_wants_capture ||
+                           jce_editor_game_render_is_mouse_captured();
+    s_user_wants_capture = false;
+    s_alt_held_previous_frame = false;
+    s_runtime_pointer_camera = false;
+    jce_editor_game_render_set_mouse_capture(false);
+    if (had_owner && ImGui::GetCurrentContext()) {
+        ImGuiIO &io = ImGui::GetIO();
+        for (int button = 0; button < 5; ++button)
+            io.AddMouseButtonEvent(button, false);
+    }
 }
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -320,6 +393,30 @@ void jce_editor_panel_game_view_content(void)
         }
     }
 
+    /* Mouse Look is project-scoped. Unlike the older once-per-session viewport
+     * preferences, reread this on EVERY project-root switch so a pointer UI
+     * game never inherits the previous project's FPS lock preference. */
+    if (jce_editor_pstate_active()) {
+        const char *root = jce_editor_current_project_root();
+        if (root && root[0] &&
+            (!s_script_mouse_look_scope_valid ||
+             strcmp(s_script_mouse_look_root, root) != 0)) {
+            snprintf(s_script_mouse_look_root, sizeof(s_script_mouse_look_root),
+                     "%s", root);
+            s_script_mouse_look_scope_valid = true;
+            s_script_mouse_look =
+                jce_editor_pstate_get_int("gameview.script_mouse_look", 0) != 0;
+            s_user_wants_capture = false;
+            jce_editor_game_render_set_mouse_capture(false);
+        }
+    } else if (s_script_mouse_look_scope_valid) {
+        s_script_mouse_look_scope_valid = false;
+        s_script_mouse_look_root[0] = '\0';
+        s_script_mouse_look = false;
+        s_user_wants_capture = false;
+        jce_editor_game_render_set_mouse_capture(false);
+    }
+
     /* Toolbar row */
     const char *aspects[] = { jce_editor_i18n("gameView.aspect.free"), "16:9", "16:10", "4:3", "21:9", "1:1" };
     ImGui::PushItemWidth(80);
@@ -360,45 +457,41 @@ void jce_editor_panel_game_view_content(void)
     const char *const *renderer_names = nullptr;
     int renderer_count = jce_editor_renderer_backends(&renderer_names);
     JceRendererBackend live_bk = jce_renderer_get_backend(NULL);
-    const char *live_name = jce_renderer_backend_name(live_bk);
 
     JceEditorConfig ren_cfg;
     jce_editor_config_load(&ren_cfg);
-    int renderer_idx = 0;
-    for (int i = 0; i < renderer_count; ++i) {
-        if (renderer_names[i] && ren_cfg.renderer[0]
-                && strcmp(renderer_names[i], ren_cfg.renderer) == 0) {
-            renderer_idx = i;
-            break;
-        }
-    }
+    int renderer_idx = gv_renderer_choice_index(ren_cfg.renderer,
+                                               renderer_names, renderer_count);
+    const char *renderer_preview = renderer_idx >= 0
+        ? renderer_names[renderer_idx] : ren_cfg.renderer;
     ImGui::PushItemWidth(110);
-    if (ImGui::Combo("##renderer", &renderer_idx,
-                     renderer_names, renderer_count)
-            && renderer_idx >= 0 && renderer_idx < renderer_count) {
-        const char *picked = renderer_names[renderer_idx];
-        if (picked && strcmp(ren_cfg.renderer, picked) != 0) {
-            snprintf(ren_cfg.renderer, sizeof(ren_cfg.renderer), "%s",
-                     picked);
-            jce_editor_config_save(&ren_cfg);
-            LOG_INFO("editor.game_view",
-                "renderer backend selection changed to '%s' — "
-                "restart the editor to apply", picked);
+    if (ImGui::BeginCombo("##renderer", renderer_preview)) {
+        for (int i = 0; i < renderer_count; ++i) {
+            const char *picked = renderer_names[i];
+            if (!picked) continue;
+            const bool selected = (i == renderer_idx);
+            if (ImGui::Selectable(picked, selected)) {
+                const int picked_backend =
+                    jce_editor_renderer_backend_from_name(picked);
+                if (picked_backend >= 0 && picked_backend !=
+                    jce_editor_renderer_backend_from_name(ren_cfg.renderer)) {
+                    snprintf(ren_cfg.renderer, sizeof(ren_cfg.renderer), "%s",
+                             picked);
+                    jce_editor_config_save(&ren_cfg);
+                    LOG_INFO("editor.game_view",
+                        "renderer backend selection saved: '%s' restart_required=%d",
+                        picked, gv_renderer_restart_required(ren_cfg.renderer, live_bk));
+                }
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
         }
+        ImGui::EndCombo();
     }
     ImGui::PopItemWidth();
 
-    /* Inline hint: shown whenever the persisted choice differs from
-     * the actually-running bgfx backend.  Disappears as soon as the
-     * user picks the live backend again (or restarts the editor). */
-    /* "Auto" is not a backend, it is "whichever the chain picks", so it can
-     * never equal the live backend name and this banner used to be permanent
-     * for every user on the default macOS/Linux setting -- telling them to
-     * restart to apply something that was already applied. */
-    const bool ren_is_auto =
-        (jce_strcasecmp(ren_cfg.renderer, "Auto") == 0);
-    if (ren_cfg.renderer[0] && live_name && !ren_is_auto
-            && strcmp(ren_cfg.renderer, live_name) != 0) {
+    /* Auto accepts the live backend; unknown requests have no applicable
+     * backend. Only a valid different request requires the next launch. */
+    if (gv_renderer_restart_required(ren_cfg.renderer, live_bk)) {
         ImGui::SameLine();
         char buf[160];
         snprintf(buf, sizeof(buf),
@@ -414,6 +507,22 @@ void jce_editor_panel_game_view_content(void)
         if (ImGui::Checkbox(_lbl, &s_show_stats))
             jce_editor_ui_state_save_int("gameview.stats", s_show_stats ? 1 : 0);
     }
+
+    ImGui::SameLine();
+    char mouse_look_label[128];
+    snprintf(mouse_look_label, sizeof(mouse_look_label), "%s##gameview_script_pointer_lock",
+             jce_editor_i18n_or("gameView.input.mouseLook", "Mouse Look"));
+    if (ImGui::Checkbox(mouse_look_label,
+                        &s_script_mouse_look)) {
+        jce_editor_pstate_set_int("gameview.script_mouse_look",
+                                  s_script_mouse_look ? 1 : 0);
+        /* Toggling via toolbar does not instantly trap the cursor under
+         * the button: click back into the image to take control. */
+        s_user_wants_capture = false;
+        jce_editor_game_render_set_mouse_capture(false);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("gameView.input.mouseLookHint"));
 
     ImGui::SameLine();
     ImGui::TextUnformatted("|");
@@ -530,8 +639,17 @@ void jce_editor_panel_game_view_content(void)
     /* ── Embedded game viewport ──────────────────────────────────── */
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (avail.x < 16.0f) avail.x = 16.0f;
-    if (avail.y < 16.0f) avail.y = 16.0f;
+    if (avail.x <= 0.0f || avail.y <= 0.0f) {
+        jce_editor_game_render_observation_policy(
+            static_cast<uint32_t>(JceEditorViewportPolicyReason::InvalidLayout));
+        jce_editor_viewport_policy_trace("editor.game.policy", JceEditorViewportPolicyReason::InvalidLayout);
+        s_user_wants_capture = false;
+        s_runtime_pointer_camera = false;
+        (void)jce_editor_game_render_set_mouse_capture(false);
+        jce_editor_game_render_set_ui_pointer(0.0f, 0.0f, false, false);
+        jce_editor_game_input_bridge_publish(jce_editor_game_input_bridge_shared(), nullptr);
+        return;
+    }
 
     /* Apply optional aspect-ratio letterboxing. */
     static const float aspect_ratios[] = {
@@ -576,6 +694,16 @@ void jce_editor_panel_game_view_content(void)
         render_vh = qa_height;
     }
 
+    const bool viewport_work = jce_editor_viewport_wants_render(region_start, view_size,
+        jce_editor_viewport_capture_requested(jce_editor_kpi_game_capture_global_active()),
+        "editor.game.policy");
+    /* Suppress GPU work, while still running the existing input/focus/Stop
+     * lifecycle below: a clipped panel must release previous held inputs. */
+
+    if (viewport_work) jce_editor_play_publish_viewport(render_vw, render_vh);
+    uint32_t canvas_w = 0, canvas_h = 0;
+    jce_editor_game_render_resolve_extent(render_vw, render_vh, &canvas_w, &canvas_h);
+
     /* Feed the ECS-UI (Canvas) graphic raycaster the panel-local pointer,
      * mapped from the displayed image rect into rendered (FBO) pixels.  Only
      * valid while the cursor is over the viewport, we are NOT in FPS capture
@@ -600,33 +728,57 @@ void jce_editor_panel_game_view_content(void)
         bool fps = jce_editor_game_render_is_mouse_captured();
         float lx = io.MousePos.x - region_start.x;
         float ly = io.MousePos.y - region_start.y;
-        bool inside = playing && !fps && view_size.x > 0 && view_size.y > 0 &&
+        const bool native_inside = viewport_work && playing && !fps && view_size.x > 0 && view_size.y > 0 &&
                       lx >= 0 && ly >= 0 &&
                       lx < view_size.x && ly < view_size.y;
-        float ui_x = inside ? lx / view_size.x * (float)render_vw : 0.0f;
-        float ui_y = inside ? ly / view_size.y * (float)render_vh : 0.0f;
+        bool inside = native_inside;
+        float ui_x = inside ? lx / view_size.x * (float)canvas_w : 0.0f;
+        float ui_y = inside ? ly / view_size.y * (float)canvas_h : 0.0f;
         bool down = inside && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        /* Explicit virtual Game input must reach the same Canvas raycaster as
+         * the Runtime. Peeking does not drain the next update's input sample;
+         * the actual current geometry rejects a stale or covered viewport. */
+        JceEditorGameInputViewport ui_viewport{};
+        ui_viewport.x = region_start.x; ui_viewport.y = region_start.y;
+        ui_viewport.width = view_size.x; ui_viewport.height = view_size.y;
+        ui_viewport.render_width = (float)canvas_w;
+        ui_viewport.render_height = (float)canvas_h;
+        ui_viewport.visible = viewport_work && playing;
+        ui_viewport.owner = playing ? JCE_EDITOR_GAME_INPUT_RUNTIME : JCE_EDITOR_GAME_INPUT_NONE;
+        JceEditorGameInputSample virtual_pointer{};
+        if (jce_editor_game_input_bridge_peek_virtual(
+                jce_editor_game_input_bridge_shared(), &ui_viewport, &virtual_pointer)) {
+            ui_x = virtual_pointer.x; ui_y = virtual_pointer.y;
+            down = (virtual_pointer.buttons & 1u) != 0;
+            inside = true;
+        }
         jce_editor_game_render_set_ui_pointer(ui_x, ui_y, down, inside);
 
         /* Forward keyboard / text into the focused ECS-UI InputField while the
          * Game View is hovered (and not in FPS capture) during Play.  The
          * canvas API is fire-and-forget (no-op when nothing focused) and does
          * not consume the events — ImGui still sees them. */
-        if (inside)
+        if (native_inside)
             forward_text_input_to_canvas();
     }
 
-    jce_editor_game_render_frame(render_vw, render_vh);
+    jce_editor_game_render_observation_request(canvas_w, canvas_h);
+    if (!viewport_work) {
+        const auto reason = ImGui::GetIO().AppFocusLost
+            ? JceEditorViewportPolicyReason::FocusLost : JceEditorViewportPolicyReason::Clipped;
+        jce_editor_game_render_observation_policy(static_cast<uint32_t>(reason));
+    }
+    if (viewport_work) jce_editor_game_render_frame(canvas_w, canvas_h);
 
-    uint16_t tex_idx = jce_editor_game_render_get_texture();
+    uint16_t tex_idx = viewport_work ? jce_editor_game_render_get_texture() : UINT16_MAX;
     if (tex_idx != UINT16_MAX) {
         jce_editor_kpi_game_capture_global_note_rendered();
         if (const char *capture_path =
                 jce_editor_kpi_game_capture_global_due_path()) {
-            if (jce_editor_game_render_screenshot(capture_path)) {
-                (void)jce_editor_kpi_game_capture_global_mark_submitted();
-                LOG_INFO("editor.game_view",
-                         "Game View capture submitted: %s", capture_path);
+            JceEditorGameScreenshotFrame frame{};
+            if (jce_editor_game_render_screenshot(capture_path, &frame)) {
+                jce_editor_kpi_game_capture_global_mark_submitted(
+                    frame.source_frame, frame.submit_frame);
             }
         }
         /* +1: encode bgfx idx so a valid idx 0 != ImTextureID_Invalid(0)
@@ -638,6 +790,7 @@ void jce_editor_panel_game_view_content(void)
             uv1 = ImVec2(1.0f, 0.0f);
         }
         ImGui::Image(tid, view_size, uv0, uv1);
+        jce_editor_game_render_observation_image(tex_idx);
     } else {
         ImGui::Dummy(view_size);
     }
@@ -670,8 +823,10 @@ void jce_editor_panel_game_view_content(void)
         jce_editor_play_get_player_position(&player_x, &player_y, &player_z);
     s_runtime_pointer_camera =
         play_active && !has_player_controller;
-    // Playing a pointer-driven scene must not opt into the editor fly camera.
-    const bool capture_allowed = !play_active || has_player_controller;
+    /* Auto: lock for native CharacterController. Explicit Mouse Look: allow
+     * script-driven cameras like CK even with no CharacterController. */
+    const bool capture_allowed = !play_active || has_player_controller ||
+                                 s_script_mouse_look;
 
     /* ── ScrollView wheel channel ───────────────────────────────────────
      * Forward ImGui's mouse-wheel (vertical io.MouseWheel = +up, horizontal
@@ -701,17 +856,16 @@ void jce_editor_panel_game_view_content(void)
      * cursor (Unity-parity behavior).  Without this, s_user_wants_capture
      * stays true and the Game View keeps the cursor locked even though
      * play has ended, blocking the user from clicking other panels. */
-    if (play_state == JCE_PLAY_STOPPED &&
-        s_prev_play_state != JCE_PLAY_STOPPED) {
-        s_user_wants_capture = false;
-    }
-    /* Play rising edge (STOPPED -> PLAYING): orient the game-view camera to the
-     * player's forward once (after the first player-snap below) so the user
-     * starts looking where the character faces — e.g. at enemies ahead. */
+    const bool play_just_stopped = play_state == JCE_PLAY_STOPPED &&
+                                   s_prev_play_state != JCE_PLAY_STOPPED;
+    if (play_just_stopped) jce_editor_game_view_release_play_input();
+    /* Play rising edge: give keyboard focus to the Game View. Mouse capture
+     * still requires this window to own input and an allowed pointer policy. */
     static bool s_orient_to_player_forward = false;
-    if (play_state != JCE_PLAY_STOPPED && s_prev_play_state == JCE_PLAY_STOPPED) {
+    const bool play_just_started =
+        play_state != JCE_PLAY_STOPPED && s_prev_play_state == JCE_PLAY_STOPPED;
+    if (play_just_started) {
         s_orient_to_player_forward = true;
-        s_user_wants_capture = true;
         ImGui::SetWindowFocus();
     }
     s_prev_play_state = play_state;
@@ -720,37 +874,49 @@ void jce_editor_panel_game_view_content(void)
         const ImGuiIO &io = ImGui::GetIO();
         float dt = io.DeltaTime > 0.0f ? io.DeltaTime : (1.0f / 60.0f);
 
-        bool alt_held =
-            ImGui::IsKeyDown(ImGuiKey_LeftAlt) ||
-            ImGui::IsKeyDown(ImGuiKey_RightAlt);
+        const bool alt_held = gv_alt_held_now();
+        const bool alt_just_released =
+            s_alt_held_previous_frame && !alt_held;
+        s_alt_held_previous_frame = alt_held;
+        const bool view_focused =
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        const bool any_click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        const bool click_inside = hovered && any_click && !alt_held;
+        const bool click_elsewhere = any_click && !hovered;
+        if (click_inside) ImGui::SetWindowFocus();
 
-        /* Fly capture is available outside Play or for a player controller.
-         * Pointer-driven games (including scenes without a VCam) keep their
-         * cursor for UI. Losing app focus cancels the intent as well as the
-         * OS capture, so returning to the editor cannot silently re-lock. */
-        if (io.AppFocusLost)
-            s_user_wants_capture = false;
-
-        if (!io.AppFocusLost && hovered &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-            !alt_held) {
-            s_user_wants_capture = true;
-            ImGui::SetWindowFocus();
+        const bool was_captured = jce_editor_game_render_is_mouse_captured();
+        const JceGameViewFocusInput focus_in = {
+            s_user_wants_capture, play_just_started, play_just_stopped,
+            viewport_work, !io.AppFocusLost,
+            view_focused || click_inside, was_captured,
+            click_inside, click_elsewhere, alt_held,
+            ImGui::IsKeyPressed(ImGuiKey_Escape, false), capture_allowed,
+            alt_just_released
+        };
+        const JceGameViewFocusOutput focus =
+            jce_game_view_focus_decide(focus_in);
+        s_user_wants_capture = focus.wanted;
+        /* The capture wrapper checks host-window focus before setting
+         * relative mode. Use its returned state, not an unchecked request. */
+        bool effective_capture =
+            jce_editor_game_render_set_mouse_capture(focus.request_capture);
+        const bool game_keyboard = focus.keyboard_owned;
+        if (play_active && was_captured != effective_capture) {
+            LOG_INFO("editor.game_view",
+                     "Game View pointer lock: %s mode=%s alt=%d focus=%d "
+                     "viewport=%d keyboard=%d",
+                     effective_capture ? "ACQUIRED" : "RELEASED",
+                     s_script_mouse_look ? "script_mouse_look" : "auto",
+                     alt_held ? 1 : 0, view_focused ? 1 : 0,
+                     viewport_work ? 1 : 0, game_keyboard ? 1 : 0);
         }
-        if (s_user_wants_capture && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            s_user_wants_capture = false;
-        }
-
-        const bool game_keyboard = s_user_wants_capture && !alt_held;
-        bool effective_capture = game_keyboard && capture_allowed;
-        bool was_captured = jce_editor_game_render_is_mouse_captured();
         if (!was_captured && effective_capture) {
-            // The acquiring click's release belongs to the game, not ImGui.
-            // Clear it now so Alt cannot resume an old window drag.
+            /* Capture-acquire click's release may be swallowed by SDL's
+             * relative mode. Do not leave ImGui thinking MouseLeft is down. */
             for (int button = 0; button < 5; ++button)
                 ImGui::GetIO().AddMouseButtonEvent(button, false);
         }
-        jce_editor_game_render_set_mouse_capture(effective_capture);
 
         /* Sample the pad once per frame from the engine's hardware-fed map. */
         const JceInputActions *pad_map =
@@ -829,7 +995,7 @@ void jce_editor_panel_game_view_content(void)
 
         if (game_keyboard || pad_drives || s_qa_drives) {
             /* V toggles first/third-person follow camera (Play mode). */
-            if (effective_capture &&
+            if (effective_capture && has_player_controller &&
                 play_active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
                 s_third_person = !s_third_person;
                 jce_editor_pstate_set_int("gameview.third_person",
@@ -881,7 +1047,10 @@ void jce_editor_panel_game_view_content(void)
                 }
                 if (s_al) { yaw += s_aly; pitch += s_alp; }
             }
-            if (yaw != 0.0f || pitch != 0.0f) {
+            /* Script-owned relative camera (CK) consumes pointer delta via
+             * Runtime. Never also rotate the editor's fallback camera. */
+            if (!(play_active && s_script_mouse_look && !has_player_controller) &&
+                (yaw != 0.0f || pitch != 0.0f)) {
                 jce_camera_rotate(cam, yaw, pitch);
             }
 
@@ -1025,7 +1194,7 @@ void jce_editor_panel_game_view_content(void)
                 /* No CharacterController in scene → classic free-fly cam. */
                 float speed = 5.0f * speed_mult;
                 float step  = speed * dt;
-                if (effective_capture) {
+                if (effective_capture && !(play_active && s_script_mouse_look)) {
                     if (ImGui::IsKeyDown(ImGuiKey_W)) jce_camera_move_forward(cam,  step);
                     if (ImGui::IsKeyDown(ImGuiKey_S)) jce_camera_move_forward(cam, -step);
                     if (ImGui::IsKeyDown(ImGuiKey_D)) jce_camera_move_right  (cam,  step);
@@ -1039,8 +1208,10 @@ void jce_editor_panel_game_view_content(void)
                 /* The left stick flies the camera too, so a pad is not dead
                  * in a scene that has no CharacterController.  Analog: the
                  * step is scaled by deflection, not gated on it. */
-                if (pad_fwd   != 0.0f) jce_camera_move_forward(cam, step * pad_fwd);
-                if (pad_right != 0.0f) jce_camera_move_right  (cam, step * pad_right);
+                if (!play_active || !s_script_mouse_look) {
+                    if (pad_fwd   != 0.0f) jce_camera_move_forward(cam, step * pad_fwd);
+                    if (pad_right != 0.0f) jce_camera_move_right  (cam, step * pad_right);
+                }
 
                 /* AND HAND THE RUNTIME A KEYBOARD ANYWAY.
                  *
@@ -1154,20 +1325,25 @@ void jce_editor_panel_game_view_content(void)
     input_viewport.y = image_min.y;
     input_viewport.width = view_size.x;
     input_viewport.height = view_size.y;
-    input_viewport.render_width = (float)render_vw;
-    input_viewport.render_height = (float)render_vh;
-    input_viewport.visible = true;
+    input_viewport.render_width = (float)canvas_w;
+    input_viewport.render_height = (float)canvas_h;
+    input_viewport.visible = viewport_work;
     input_viewport.hovered = hovered;
     input_viewport.captured =
         jce_editor_game_render_is_mouse_captured();
-    if (play_active &&
-        (s_runtime_pointer_camera || has_player_controller)) {
-        input_viewport.owner = JCE_EDITOR_GAME_INPUT_RUNTIME;
-    } else if (play_active) {
-        input_viewport.owner = JCE_EDITOR_GAME_INPUT_RUNTIME;
-    } else {
-        input_viewport.owner = JCE_EDITOR_GAME_INPUT_NONE;
-    }
+    const ImGuiIO &pointer_io = ImGui::GetIO();
+    input_viewport.focused = !pointer_io.AppFocusLost &&
+        (s_user_wants_capture || hovered || input_viewport.captured);
+    input_viewport.pointer_valid = hovered && input_viewport.focused &&
+        !input_viewport.captured;
+    input_viewport.pointer_x = pointer_io.MousePos.x;
+    input_viewport.pointer_y = pointer_io.MousePos.y;
+    /* Mouse Look script mode routes RELATIVE deltas only while the cursor is
+     * genuinely locked. Alt/Esc/focus-loss therefore cannot keep orbiting the
+     * camera. Auto mode retains existing free-pointer UI semantics. */
+    input_viewport.owner = play_active &&
+        (!s_script_mouse_look || input_viewport.captured)
+        ? JCE_EDITOR_GAME_INPUT_RUNTIME : JCE_EDITOR_GAME_INPUT_NONE;
     jce_editor_game_input_bridge_publish(
         jce_editor_game_input_bridge_shared(), &input_viewport);
 
@@ -1186,15 +1362,38 @@ void jce_editor_panel_game_view_content(void)
                     IM_COL32(220, 220, 220, 200),
                     jce_editor_i18n("gameView.hud.clickToFly"));
     }
+    if (play_active && s_script_mouse_look && hovered &&
+        !jce_editor_game_render_is_mouse_captured()) {
+        dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 22.0f),
+                    IM_COL32(220, 240, 255, 220),
+                    "Mouse Look: click to focus | Alt: cursor | Esc: release");
+    }
 
     if (s_show_stats) {
         const char *current = jce_renderer_running_backend_name();
         if (!current || !current[0]) current = "?";
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s: %s | %.1f fps  %ux%u",
-                 jce_editor_i18n("game.renderer"), current,
-                 ImGui::GetIO().Framerate, render_vw, render_vh);
-        dl->AddText(ImVec2(image_min.x + 6.0f, image_max.y - 18.0f),
+        uint32_t target_w = 0, target_h = 0;
+        const bool target_known = viewport_work && render_vw && render_vh &&
+            jce_editor_game_render_get_committed_extent(&target_w, &target_h);
+        char buf[256];
+        if (target_known) {
+            snprintf(buf, sizeof(buf), "%s: %s | %s %.1f | %s %ux%u | %s %ux%u | X %.1f%% Y %.1f%%",
+                     jce_editor_i18n("game.renderer"), current,
+                     jce_editor_i18n("gameView.stats.ui_fps"), ImGui::GetIO().Framerate,
+                     jce_editor_i18n("gameView.stats.content"), render_vw, render_vh,
+                     jce_editor_i18n("gameView.stats.target_3d"), target_w, target_h,
+                     100.0 * target_w / render_vw, 100.0 * target_h / render_vh);
+        } else {
+            snprintf(buf, sizeof(buf), "%s: %s | %s %.1f | %s %ux%u | %s %s",
+                     jce_editor_i18n("game.renderer"), current,
+                     jce_editor_i18n("gameView.stats.ui_fps"), ImGui::GetIO().Framerate,
+                     jce_editor_i18n("gameView.stats.content"), render_vw, render_vh,
+                     jce_editor_i18n("gameView.stats.target_3d"),
+                     jce_editor_i18n("profiler.value.unavailable"));
+        }
+        const float stats_y = fmaxf(image_min.y,
+            image_max.y - ImGui::CalcTextSize(buf).y - 4.0f);
+        dl->AddText(ImVec2(image_min.x + 6.0f, stats_y),
                     IM_COL32(160, 255, 160, 220), buf);
     }
 }
@@ -1204,13 +1403,23 @@ void jce_editor_panel_game_view_content(void)
 void jce_editor_panel_game_view(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW);
-    if (!*vis) return;
+    if (!*vis) {
+        jce_editor_game_render_observation_policy(
+            static_cast<uint32_t>(JceEditorViewportPolicyReason::Hidden));
+        jce_editor_viewport_policy_trace("editor.game.policy", JceEditorViewportPolicyReason::Hidden);
+        return;
+    }
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     char title[256];
     snprintf(title, sizeof(title), "%s###game_view", jce_editor_i18n("Game"));
     if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_game_view_content();
+    else {
+        jce_editor_game_render_observation_policy(
+            static_cast<uint32_t>(JceEditorViewportPolicyReason::Collapsed));
+        jce_editor_viewport_policy_trace("editor.game.policy", JceEditorViewportPolicyReason::Collapsed);
+    }
     ImGui::End();
     ImGui::PopStyleVar();
 }

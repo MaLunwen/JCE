@@ -24,6 +24,15 @@
 extern "C" {
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
+#include <jce/middleware/scene/jce_scene_water_spectrum.h>
+#include <jce/middleware/scene/jce_scene_water_foam.h>
+#include <jce/middleware/scene/jce_scene_water_crest.h>
+#include <jce/middleware/scene/jce_scene_water_caustics.h>
+#include <jce/middleware/scene/jce_scene_water_nearshore.h>
+#include <jce/middleware/scene/jce_scene_water_motion.h>
+#include <jce/middleware/scene/jce_scene_water_optics.h>
+#include <jce/middleware/scene/jce_scene_water_caustic_detail.h>
+#include <jce/middleware/scene/jce_scene_water_normal_detail.h>
 #include <jce/renderer/jce_postfx.h>
 }
 
@@ -1126,6 +1135,60 @@ void adddef_volume(JceScene *scene, JceEntity e)
     jce_scene_set_volume(scene, e, &c);
 }
 
+void adddef_water_caustics(JceScene *scene, JceEntity e)
+{
+    JceWaterCausticsComponent value = jce_scene_water_caustics_default();
+    jce_scene_set_water_caustics(scene, e, &value);
+}
+
+void adddef_water_caustic_detail(JceScene *scene, JceEntity e)
+{
+    const JceWaterCausticDetailComponent value = jce_scene_water_caustic_detail_default();
+    jce_scene_set_water_caustic_detail(scene, e, &value);
+}
+
+void adddef_water_normal_detail(JceScene *scene, JceEntity e)
+{
+    const JceWaterNormalDetailComponent value = jce_scene_water_normal_detail_default();
+    jce_scene_set_water_normal_detail(scene, e, &value);
+}
+
+void adddef_water_optics(JceScene *scene, JceEntity e)
+{
+    const JceWaterOpticsComponent value = jce_scene_water_optics_default();
+    jce_scene_set_water_optics(scene, e, &value);
+}
+
+void adddef_water_motion(JceScene *scene, JceEntity e)
+{
+    const JceWaterMotionComponent value = jce_scene_water_motion_default();
+    jce_scene_set_water_motion(scene, e, &value);
+}
+
+void adddef_water_nearshore(JceScene *scene, JceEntity e)
+{
+    const JceWaterNearshoreComponent value = jce_scene_water_nearshore_default();
+    jce_scene_set_water_nearshore(scene, e, &value);
+}
+
+void adddef_water_crest(JceScene *scene, JceEntity e)
+{
+    JceWaterCrestComponent value = jce_scene_water_crest_default();
+    jce_scene_set_water_crest(scene, e, &value);
+}
+
+void adddef_water_foam(JceScene *scene, JceEntity e)
+{
+    JceWaterFoamComponent value = jce_scene_water_foam_default();
+    jce_scene_set_water_foam(scene, e, &value);
+}
+
+void adddef_water_spectrum(JceScene *scene, JceEntity e)
+{
+    JceWaterSpectrumComponent value = jce_scene_water_spectrum_default();
+    jce_scene_set_water_spectrum(scene, e, &value);
+}
+
 void adddef_fullscreen_effect(JceScene *scene, JceEntity e)
 {
     JceSceneFullscreenEffect c = jce_scene_fullscreen_effect_default();
@@ -1511,6 +1574,15 @@ void jce_editor_component_defaults_ensure_registered(void)
         { "UIDropdown",          adddef_ui_dropdown },
         { "Volume",              adddef_volume },
         { "FullscreenEffect",    adddef_fullscreen_effect },
+        { "WaterSpectrum",       adddef_water_spectrum },
+        { "WaterFoam",           adddef_water_foam },
+        { "WaterCrest",          adddef_water_crest },
+        { "WaterCaustics",       adddef_water_caustics },
+        { "WaterNearshore",      adddef_water_nearshore },
+        { "WaterMotion",         adddef_water_motion },
+        { "WaterOptics",         adddef_water_optics },
+        { "WaterCausticDetail",         adddef_water_caustic_detail },
+        { "WaterNormalDetail",    adddef_water_normal_detail },
         { "OcclusionPortal",     adddef_occlusion_portal },
         { "VideoPlayer",         adddef_video_player },
         { "NavAgent",            adddef_nav_agent },

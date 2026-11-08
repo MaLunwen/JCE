@@ -19,8 +19,15 @@ class StockShaderResolverTests(unittest.TestCase):
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_alloc.h>
+/* Counted allocator boundary required by the actual path owner. Path parsing
+ * and overlap handling are compiled from jce_path.c, never reproduced here. */
+static unsigned path_allocations, path_frees;
+void *jce_malloc(size_t size) { ++path_allocations; return malloc(size); }
+void jce_free(void *data) { if (data) ++path_frees; free(data); }
 static bool jce_fs_host_exists_file(const char *path) {return !strcmp(path,"fixture/stock/fs_test_dx11.bin");}
 ''' + selector + r'''
 int main(void)
@@ -35,6 +42,13 @@ int main(void)
  assert(!resolve_stock_shader("shaders/unknown.bin",out,sizeof(out),"fixture/stock"));
  assert(!resolve_stock_shader("shaders/fs_test_dx11.json",out,sizeof(out),"fixture/stock"));
  assert(!resolve_stock_shader("shaders/fs_test_dx11.bin",out,4,"fixture/stock"));
+ assert(path_allocations==0 && path_frees==0);
+ /* This real forward-overlap branch proves the allocator ports are connected
+  * and owned snapshots are released; ordinary resolver requests remain noheap. */
+ char overlap[64]="shaders/./fs_test_dx11.bin";
+ assert(jce_path_normalize(overlap+1,sizeof(overlap)-1,overlap));
+ assert(!strcmp(overlap+1,"shaders/fs_test_dx11.bin"));
+ assert(path_allocations==1 && path_frees==1);
  puts("Stock shader resolver PASS");return 0;
 }
 '''

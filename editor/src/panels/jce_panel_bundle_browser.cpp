@@ -13,7 +13,11 @@
  */
 
 #include "jce_panel_common.h"
+#include "jce_bundle_inspection_internal.h"
+#include "core/jce_editor_alloc.h"
+#include <new>
 #include "core/jce_project_settings.h"   /* always_included_shaders */
+#include "core/jce_project_prepared_assets.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_assetdb.h"
@@ -38,6 +42,7 @@ extern "C" {
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/resource/jce_bundle_deps.h>
 #include <jce/resource/jce_bundle_format.h>
@@ -426,7 +431,7 @@ struct BuildState {
     char shared_id    [128] {};
     int  shared_threshold = 2;
     int  zstd_level       = 3;
-    bool cook_assets      = true;   /* P0: cook textures/audio/models    */
+    bool cook_assets      = false;  /* Portable bundle unless cooking is requested. */
     int  target_platform  = 0;      /* 0=Win 1=Linux 2=mac 3=Android 4=iOS 5=Web */
     bool encrypt          = false;  /* ChaCha20-encrypt bundle payloads  */
 
@@ -614,6 +619,15 @@ JceAsyncRunResult bundle_pack_worker_main(JceAsyncContext *ctx, void * /*user*/)
         opts.always_included_count = (int)gb.always_included_ptrs_owned.size();
     }
 
+    JceProjectPreparedAssets prepared;
+    std::string prepared_error;
+    if (!jce_project_prepared_assets_bind(gb.project_root_owned, &opts,
+                                          &prepared, &prepared_error)) {
+        gb.last_exit = 1;
+        worker_log_sink(JCE_BUNDLE_PACK_LOG_ERROR, prepared_error.c_str(), &gb);
+        jce_async_context_fail(ctx, gb.last_exit, prepared_error.c_str());
+        return JCE_ASYNC_RUN_FAILED;
+    }
     gb.last_exit = jce_bundle_pack_run(&opts, worker_log_sink, &gb);
     if (jce_async_context_cancel_requested(ctx))
         return JCE_ASYNC_RUN_CANCELLED;
@@ -800,6 +814,9 @@ void draw_cook_options()
         ImGui::TextDisabled("%s", BL("hint.cook_assets",
             "Textures -> GPU block format (.jceasset), models -> GLB+meshopt,\n"
             "audio -> PCM. Reads <asset>.import.json presets."));
+    } else {
+        ImGui::TextDisabled("%s", BL("hint.portable_assets",
+            "Portable bundle (Auto). Target-specific cooking is optional."));
     }
 
     /* ── Secure archive (keyed index + ChaCha20 + HMAC) ─────────────── */
@@ -1096,14 +1113,94 @@ static const char *BL(const char *suffix, const char *en_fallback)
 
 struct OpenBundleState {
     char        path_input[1024] = {0};
+    char        path[1024] = {0};
     bool        is_catalog       = false;
     std::string                 cached_path;
     std::vector<std::string>    bundle_ids;
     std::vector<std::string>    scene_paths;
     int                         selected_idx = -1;
     char                        status_msg[256] = {0};
+    int inspection_target = jce_editor_bundle_inspection_host_target();
+    uint64_t inspection_generation = 0;
+    JceAsyncTask *inspection_task = nullptr;
+    JceEditorBundleInspectionSummary inspection;
+    std::shared_ptr<void> snapshot;
+    size_t snapshot_size = 0;
+    std::string snapshot_path;
+    bool inspection_ready = false, inspection_failed = false;
 };
 OpenBundleState g_ob;
+
+void inspection_cleanup(void *user)
+{
+    auto *request = static_cast<JceEditorBundleInspectionRequest *>(user);
+    request->~JceEditorBundleInspectionRequest();
+    ED_FREE(request);
+}
+void inspection_complete(JceAsyncTask *task, void *user)
+{
+    auto *request = static_cast<JceEditorBundleInspectionRequest *>(user);
+    if (g_ob.inspection_task != task) return;
+    g_ob.inspection_task = nullptr;
+    const char *target = jce_editor_bundle_inspection_target(g_ob.inspection_target);
+    if (jce_editor_bundle_inspection_matches(*request, g_ob.path, target,
+                                             g_ob.inspection_generation)) {
+        g_ob.inspection_ready = request->accepted &&
+            jce_async_task_state(task) == JCE_ASYNC_STATE_SUCCEEDED;
+        g_ob.inspection_failed = !g_ob.inspection_ready;
+        if (g_ob.inspection_failed) {
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "[bundle] inspection refused target=%s source=%s path=%s: %s",
+                request->target.c_str(), request->use_snapshot ? "snapshot" : "file",
+                request->path.c_str(), jce_async_task_error_message(task));
+        }
+        if (g_ob.inspection_ready) {
+            g_ob.inspection = std::move(request->summary);
+            if (request->use_snapshot) {
+                g_ob.snapshot = std::move(request->bytes);
+                g_ob.snapshot_size = request->byte_count;
+                g_ob.snapshot_path = request->path;
+            }
+        }
+    }
+    jce_async_task_release(task);
+}
+void start_inspection(bool snapshot)
+{
+    if (g_ob.inspection_task || g_ob.is_catalog || !g_ob.path[0]) return;
+    const char *target = jce_editor_bundle_inspection_target(g_ob.inspection_target);
+    if (!target) return;
+    void *storage = ED_MALLOC(sizeof(JceEditorBundleInspectionRequest));
+    if (!storage) {
+        g_ob.inspection_failed = true;
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR, "[bundle] inspection request allocation failed");
+        return;
+    }
+    auto *request = new (storage) JceEditorBundleInspectionRequest;
+    request->path = g_ob.path;
+    request->target = target;
+    request->use_snapshot = snapshot;
+    request->generation = ++g_ob.inspection_generation;
+    if (snapshot && g_ob.snapshot_path == request->path) {
+        request->bytes = g_ob.snapshot;
+        request->byte_count = g_ob.snapshot_size;
+    }
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = jce_editor_bundle_inspection_work;
+    desc.complete = inspection_complete;
+    desc.cleanup = inspection_cleanup;
+    desc.user_data = request;
+    desc.debug_name = "editor.bundle.inspect";
+    desc.priority = JCE_ASYNC_PRIORITY_BACKGROUND;
+    g_ob.inspection_ready = g_ob.inspection_failed = false;
+    g_ob.inspection_task = jce_async_submit(jce_async_default_executor(), &desc);
+    if (!g_ob.inspection_task) {
+        inspection_cleanup(request);
+        g_ob.inspection_failed = true;
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR, "[bundle] inspection queue rejected request");
+    }
+}
 
 bool ends_with_ci(const char *s, const char *suf)
 {
@@ -1137,20 +1234,70 @@ bool bundle_path_from_sidecar(const char *sidecar, char *out, size_t outsz)
     return true;
 }
 
+bool bundle_path_space(char ch)
+{
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+void resolve_bundle_input(char *out, size_t size, const char *input)
+{
+    const char *first = input;
+    const char *last = input + strlen(input);
+    /* Preserve a literal existing filename, including significant spaces. */
+    if (!jce_fs_host_exists_file(input) && !jce_fs_host_exists_dir(input)) {
+        while (first != last && bundle_path_space(*first)) ++first;
+        while (first != last && bundle_path_space(last[-1])) --last;
+        if (last - first >= 2 && *first == '"' && last[-1] == '"') {
+            ++first;
+            --last;
+        }
+    }
+    const size_t length = static_cast<size_t>(last - first);
+    if (length >= size) {
+        out[0] = '\0';
+        return;
+    }
+    memcpy(out, first, length);
+    out[length] = '\0';
+}
+
+const char *bundle_browse_directory(const char *path, char *out, size_t size)
+{
+    if (!path[0]) return nullptr;
+    if (jce_fs_host_exists_dir(path)) {
+        const int n = snprintf(out, size, "%s", path);
+        if (n < 0 || static_cast<size_t>(n) >= size) return nullptr;
+    } else if (!jce_path_parent(out, size, path) ||
+               !jce_fs_host_exists_dir(out)) {
+        return nullptr;
+    }
+    const size_t n = strlen(out);
+    if (n == 0) return nullptr;
+    /* SDL's Windows dialog separates a final filename from its directory.
+     * A trailing separator passes a directory with an empty filename. */
+    if (out[n - 1] != '/' && out[n - 1] != '\\') {
+        if (n + 1 >= size) return nullptr;
+        out[n] = '/';
+        out[n + 1] = '\0';
+    }
+    return out;
+}
+
 void open_detect_mode()
 {
-    if (g_ob.path_input[0] && jce_fs_host_exists_dir(g_ob.path_input)) {
+    resolve_bundle_input(g_ob.path, sizeof(g_ob.path), g_ob.path_input);
+    if (g_ob.path[0] && jce_fs_host_exists_dir(g_ob.path)) {
         char candidate[1024];
-        size_t n = strlen(g_ob.path_input);
+        size_t n = strlen(g_ob.path);
         char sep = '/';
         for (size_t i = 0; i < n; ++i)
-            if (g_ob.path_input[i] == '\\') { sep = '\\'; break; }
-        bool has_trail = (n && (g_ob.path_input[n-1] == '/' ||
-                                g_ob.path_input[n-1] == '\\'));
+            if (g_ob.path[i] == '\\') { sep = '\\'; break; }
+        bool has_trail = (n && (g_ob.path[n-1] == '/' ||
+                                g_ob.path[n-1] == '\\'));
         snprintf(candidate, sizeof(candidate), "%s%sbundle_catalog.json",
-                 g_ob.path_input, has_trail ? "" : (sep == '\\' ? "\\" : "/"));
+                 g_ob.path, has_trail ? "" : (sep == '\\' ? "\\" : "/"));
         if (jce_fs_host_exists_file(candidate)) {
-            snprintf(g_ob.path_input, sizeof(g_ob.path_input), "%s", candidate);
+            snprintf(g_ob.path, sizeof(g_ob.path), "%s", candidate);
             snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
                      BL("msg.auto_catalog",
                         "directory detected — auto-selected bundle_catalog.json"));
@@ -1161,10 +1308,10 @@ void open_detect_mode()
         }
     }
     char bundle_path[1024];
-    if (bundle_path_from_sidecar(g_ob.path_input, bundle_path,
+    if (bundle_path_from_sidecar(g_ob.path, bundle_path,
                                  sizeof(bundle_path))) {
         if (jce_fs_host_exists_file(bundle_path)) {
-            snprintf(g_ob.path_input, sizeof(g_ob.path_input), "%s",
+            snprintf(g_ob.path, sizeof(g_ob.path), "%s",
                      bundle_path);
             snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
                      BL("msg.sidecar_bundle",
@@ -1177,7 +1324,7 @@ void open_detect_mode()
             return;
         }
     }
-    g_ob.is_catalog = ends_with_ci(g_ob.path_input, ".json");
+    g_ob.is_catalog = ends_with_ci(g_ob.path, ".json");
 }
 
 void open_refresh_catalog_preview()
@@ -1185,12 +1332,12 @@ void open_refresh_catalog_preview()
     g_ob.bundle_ids.clear();
     g_ob.scene_paths.clear();
     g_ob.selected_idx = -1;
-    g_ob.cached_path = g_ob.path_input;
-    if (!g_ob.is_catalog || g_ob.path_input[0] == '\0') return;
+    g_ob.cached_path = g_ob.path;
+    if (!g_ob.is_catalog || g_ob.path[0] == '\0') return;
 
     JceFileSystem *fs = jce_fs_create();
     if (!fs) return;
-    JceBundleCatalog *cat = jce_bundle_catalog_open(fs, g_ob.path_input);
+    JceBundleCatalog *cat = jce_bundle_catalog_open(fs, g_ob.path);
     if (cat) {
         uint32_t n = jce_bundle_catalog_count(cat);
         for (uint32_t i = 0; i < n; ++i) {
@@ -1210,49 +1357,128 @@ void open_refresh_catalog_preview()
     jce_fs_destroy(fs);
 }
 
+void open_selected_path()
+{
+    bool ok = false;
+    bool attempted = false;
+    if (g_ob.path[0] == '\0') {
+        snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                 BL("msg.empty", "path is empty"));
+    } else if (jce_fs_host_exists_dir(g_ob.path)) {
+        open_detect_mode();
+    } else if (!jce_fs_host_exists_file(g_ob.path)) {
+        snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                 BL("msg.not_found", "file does not exist"));
+    } else if (g_ob.is_catalog) {
+        const char *bid = (g_ob.cached_path == g_ob.path &&
+                           g_ob.selected_idx >= 0 &&
+                           g_ob.selected_idx < (int)g_ob.bundle_ids.size())
+            ? g_ob.bundle_ids[g_ob.selected_idx].c_str()
+            : nullptr;
+        ok = jce_state_load_scene_from_catalog(g_ob.path, bid);
+        attempted = true;
+    } else {
+        ok = jce_state_load_scene_from_jbundle(g_ob.path);
+        attempted = true;
+    }
+    if (attempted) {
+        if (ok) {
+            snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                     BL("msg.opened", "scene loaded"));
+        } else {
+            snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                     BL("msg.failed", "load failed (see Console)"));
+        }
+    }
+}
+
 void draw_open_tab()
 {
     ImGui::TextWrapped("%s", BL("desc",
         "Open a packaged .jbundle (single-scene) or bundle_catalog.json\n"
         "to preview the scene as it would load at runtime.\n"
+        "Open uses the current editor platform. The compatibility check target applies only to inspection.\n"
         "Bundle-loaded scenes are read-only — Save will be ignored."));
     ImGui::Separator();
 
-    bool path_changed = ImGui::InputText(BL("field.path",
-                                            "Bundle / catalog path"),
-                                         g_ob.path_input,
-                                         sizeof(g_ob.path_input));
+    static char browsed_path[1024] = {0};
+    static bool browse_ready = false;
+    static bool browse_cancel = false;
+    static bool browse_pending = false;
+    const bool picked = browse_ready;
+    const bool cancelled = browse_cancel;
+    if (picked || cancelled) {
+        browse_pending = false;
+        browse_ready = browse_cancel = false;
+    }
+    ImGui::TextUnformatted(BL("field.path", "Bundle / catalog path"));
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    const bool picker_busy = browse_pending || picked;
+    ImGui::BeginDisabled(picker_busy);
+    const bool submitted = ImGui::InputText("##bundle_path", g_ob.path_input,
+        sizeof(g_ob.path_input),
+        ImGuiInputTextFlags_AutoSelectAll | ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::EndDisabled();
+    if (picked)
+        snprintf(g_ob.path_input, sizeof(g_ob.path_input), "%s", browsed_path);
+
+    static char last_seen[1024] = {0};
+    if (strcmp(last_seen, g_ob.path_input) != 0) {
+        snprintf(last_seen, sizeof(last_seen), "%s", g_ob.path_input);
+        g_ob.status_msg[0] = '\0';
+        ++g_ob.inspection_generation;
+        g_ob.inspection_ready = g_ob.inspection_failed = false;
+        g_ob.snapshot.reset();
+        g_ob.snapshot_path.clear();
+        g_ob.snapshot_size = 0;
+        open_detect_mode();
+    }
+
+    ImGui::BeginDisabled(picker_busy);
+    const bool browse_clicked = ImGui::Button(BL("btn.browse", "Browse..."));
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button(BL("btn.browse", "Browse..."))) {
-        static bool browse_ready = false, browse_cancel = false;
+
+    const bool can_open = g_ob.path[0] &&
+        (!g_ob.is_catalog || g_ob.selected_idx >= 0 || g_ob.cached_path != g_ob.path);
+    ImGui::BeginDisabled(!can_open || picker_busy);
+    const bool clicked = ImGui::Button(BL("btn.open", "Open"));
+    ImGui::EndDisabled();
+
+    const bool open_requested = (can_open && clicked) || submitted;
+    if (!browse_pending && (browse_clicked ||
+            (open_requested && jce_fs_host_exists_dir(g_ob.path)))) {
+        browse_pending = true;
+        browsed_path[0] = '\0';
+        char directory[1024];
         open_file_dialog_async(BL("title", "Open Bundle"),
-                               g_ob.path_input,
+                               bundle_browse_directory(g_ob.path, directory, sizeof(directory)),
                                jce_editor_i18n_or("fileDialog.filter.bundle",
                                     "Bundle / Catalog (*.jbundle *.json);;"
                                     "Single bundle (*.jbundle);;"
                                     "Bundle catalog (*.json);;"
                                     "All Files (*.*)"),
-                               g_ob.path_input, sizeof(g_ob.path_input),
+                               browsed_path, sizeof(browsed_path),
                                &browse_ready, &browse_cancel);
+    } else if (!browse_pending && (open_requested || (picked && !g_ob.is_catalog))) {
+        open_selected_path();
     }
-    {
-        static char last_seen[1024] = {0};
-        if (strcmp(last_seen, g_ob.path_input) != 0) {
-            snprintf(last_seen, sizeof(last_seen), "%s", g_ob.path_input);
-            if (!path_changed) path_changed = true;
-        }
+
+    if (browse_pending) {
+        ImGui::TextDisabled("%s", BL("msg.browse_pending", "Waiting for the file dialog..."));
+    } else if (cancelled) {
+        snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                 BL("msg.browse_no_file", "No file selected. Paste the absolute path and choose Open."));
     }
-    if (path_changed) {
-        g_ob.status_msg[0] = '\0';
-        open_detect_mode();
-    }
+    if (g_ob.status_msg[0])
+        ImGui::TextWrapped("%s", g_ob.status_msg);
 
     ImGui::TextDisabled("%s: %s", BL("label.detected", "Detected"),
         g_ob.is_catalog ? BL("label.catalog", "bundle catalog (.json)")
                         : BL("label.single",  "single-file (.jbundle)"));
 
     if (g_ob.is_catalog) {
-        if (g_ob.cached_path != g_ob.path_input) {
+        if (g_ob.cached_path != g_ob.path) {
             if (ImGui::Button(BL("btn.scan_catalog", "Scan catalog")))
                 open_refresh_catalog_preview();
         } else if (!g_ob.bundle_ids.empty()) {
@@ -1275,50 +1501,45 @@ void draw_open_tab()
         }
     }
 
-    ImGui::Separator();
-    bool can_open = (g_ob.path_input[0] != '\0') &&
-                    (!g_ob.is_catalog || g_ob.selected_idx >= 0 ||
-                     g_ob.cached_path != g_ob.path_input);
-
-    if (!can_open) ImGui::BeginDisabled();
-    if (ImGui::Button(BL("btn.open", "Open"))) {
-        bool ok = false;
-        bool attempted = false;
-        if (g_ob.path_input[0] == '\0') {
-            snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
-                     BL("msg.empty", "path is empty"));
-        } else if (jce_fs_host_exists_dir(g_ob.path_input)) {
-            open_detect_mode();
-        } else if (!jce_fs_host_exists_file(g_ob.path_input)) {
-            snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
-                     BL("msg.not_found", "file does not exist"));
-        } else if (g_ob.is_catalog) {
-            const char *bid = (g_ob.selected_idx >= 0 &&
-                               g_ob.selected_idx < (int)g_ob.bundle_ids.size())
-                ? g_ob.bundle_ids[g_ob.selected_idx].c_str()
-                : nullptr;
-            ok = jce_state_load_scene_from_catalog(g_ob.path_input, bid);
-            attempted = true;
-        } else {
-            ok = jce_state_load_scene_from_jbundle(g_ob.path_input);
-            attempted = true;
+    if (!g_ob.is_catalog) {
+        ImGui::Separator();
+        const char *const targets[] = {"Windows", "Linux", "macOS", "Android", "iOS", "Web",
+            BL("label.inspect_portable", "Portable (Auto)")};
+        if (ImGui::Combo(BL("field.inspect_target", "Compatibility check target"),
+                &g_ob.inspection_target, targets, 7)) {
+            ++g_ob.inspection_generation;
+            g_ob.inspection_ready = g_ob.inspection_failed = false;
         }
-        if (attempted) {
-            if (ok) {
-                snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
-                         BL("msg.opened", "scene loaded"));
-            } else {
-                snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
-                         BL("msg.failed", "load failed (see Console)"));
+        const bool unavailable = g_ob.inspection_task || !g_ob.path[0];
+        if (unavailable) ImGui::BeginDisabled();
+        if (ImGui::Button(BL("btn.inspect_file", "Inspect package"))) start_inspection(false);
+        ImGui::SameLine();
+        if (ImGui::Button(BL("btn.inspect_snapshot", "Inspect snapshot"))) start_inspection(true);
+        if (unavailable) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", BL("hint.inspect_snapshot",
+            "Capture up to 64 MiB once, then inspect the saved content. Package inspection also checks disk sidecars."));
+        if (g_ob.snapshot) {
+            ImGui::SameLine();
+            if (ImGui::Button(BL("btn.clear_snapshot", "Clear snapshot"))) {
+                ++g_ob.inspection_generation;
+                g_ob.snapshot.reset(); g_ob.snapshot_path.clear(); g_ob.snapshot_size = 0;
+                g_ob.inspection_ready = false;
             }
         }
+        if (g_ob.inspection_task) ImGui::TextDisabled("%s", BL("msg.inspect_running", "Inspecting..."));
+        else if (g_ob.inspection_failed) ImGui::TextWrapped("%s", BL("msg.inspect_failed",
+            "Inspection refused: check target, content, file access and snapshot size (see Console)."));
+        else if (g_ob.inspection_ready) {
+            ImGui::Text("%s: %s", BL("label.inspect_source", "Inspection"),
+                g_ob.inspection.snapshot ? BL("label.inspect_snapshot", "Saved content snapshot")
+                                         : BL("label.inspect_file", "Package and available sidecar"));
+            ImGui::Text("%s: %s", BL("label.inspect_id", "Bundle"), g_ob.inspection.id.c_str());
+            ImGui::Text("%s: %s", BL("label.inspect_kind", "Kind"), g_ob.inspection.kind.c_str());
+            ImGui::Text("%s: %s", BL("label.inspect_scene", "Scene"), g_ob.inspection.scene.c_str());
+            ImGui::Text("%s: %u", BL("label.inspect_entries", "Entries"), g_ob.inspection.entries);
+        }
     }
-    if (!can_open) ImGui::EndDisabled();
 
-    if (g_ob.status_msg[0]) {
-        ImGui::SameLine();
-        ImGui::TextUnformatted(g_ob.status_msg);
-    }
 }
 
 } /* namespace open_ns */
@@ -1493,4 +1714,17 @@ extern "C" bool jce_editor_panel_bundle_browser_request_pack_scene(
     g_pending_single_scene = scene_path;
     jce_editor_panel_bundle_browser_show_build();
     return true;
+}
+
+extern "C" void jce_editor_panel_bundle_browser_shutdown(void)
+{
+    if (open_ns::g_ob.inspection_task) {
+        JceAsyncTask *task = open_ns::g_ob.inspection_task;
+        open_ns::g_ob.inspection_task = nullptr;
+        jce_async_task_discard(task);
+    }
+    open_ns::g_ob.snapshot.reset();
+    open_ns::g_ob.snapshot_path.clear();
+    open_ns::g_ob.inspection = {};
+    open_ns::g_ob.inspection_ready = false;
 }

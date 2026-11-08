@@ -9,8 +9,11 @@
 
 #include <jce/os/core/jce_async.h>
 #include <jce/os/core/jce_thread.h>
+#include "os/core/jce_async_stats_internal.h"
+#include "os/core/jce_async_session_internal.h"
 
 #include <stdint.h>
+#include <string.h>
 
 void setUp(void)    { }
 void tearDown(void) { }
@@ -846,9 +849,15 @@ static void test_process_default_executor_can_shutdown_and_recreate(void)
 
     TEST_ASSERT_TRUE(jce_async_default_shutdown(
         JCE_ASYNC_SHUTDOWN_CANCEL_ALL, JCE_ASYNC_WAIT_INFINITE));
+    memset(&stats,0xa5,sizeof(stats));
+    TEST_ASSERT_FALSE(jce_async_default_stats_internal(NULL));
+    TEST_ASSERT_FALSE(jce_async_default_stats_internal(&stats));
+    TEST_ASSERT_EQUAL_UINT64(0,stats.submitted_tasks);
+    TEST_ASSERT_EQUAL_UINT32(0,stats.live_tasks);
     first = jce_async_default_executor();
     TEST_ASSERT_NOT_NULL(first);
     TEST_ASSERT_TRUE(jce_async_executor_is_owner(first));
+    TEST_ASSERT_TRUE(jce_async_default_stats_internal(&stats));
 
     jce_async_task_desc_init(&desc);
     desc.work = default_no_op_work;
@@ -861,9 +870,14 @@ static void test_process_default_executor_can_shutdown_and_recreate(void)
     TEST_ASSERT_TRUE(jce_async_default_shutdown(
         JCE_ASYNC_SHUTDOWN_DRAIN, JCE_ASYNC_WAIT_INFINITE));
 
+    memset(&stats,0xa5,sizeof(stats));
+    TEST_ASSERT_FALSE(jce_async_default_stats_internal(&stats));
+    TEST_ASSERT_EQUAL_UINT64(0,stats.submitted_tasks);
+    TEST_ASSERT_EQUAL_UINT32(0,stats.live_tasks);
     second = jce_async_default_executor();
     TEST_ASSERT_NOT_NULL(second);
     TEST_ASSERT_TRUE(jce_async_executor_is_owner(second));
+    TEST_ASSERT_TRUE(jce_async_default_stats_internal(&stats));
     jce_async_executor_get_stats(second, &stats);
     TEST_ASSERT_EQUAL_UINT64(0, stats.submitted_tasks);
     TEST_ASSERT_EQUAL_UINT32(0, stats.live_tasks);
@@ -871,9 +885,41 @@ static void test_process_default_executor_can_shutdown_and_recreate(void)
         JCE_ASYNC_SHUTDOWN_CANCEL_ALL, JCE_ASYNC_WAIT_INFINITE));
 }
 
+static void test_engine_session_closes_only_lazy_default_admission(void)
+{
+    jce_async_default_session_open_internal();
+    JceAsyncExecutor *first = jce_async_default_executor();
+    TEST_ASSERT_NOT_NULL(first);
+    jce_async_default_session_close_internal();
+    jce_async_default_session_close_internal();
+    JceAsyncExecutor *retained = jce_async_default_executor();
+    JceAsyncExecutorStats stats;
+    bool observable = jce_async_default_stats_internal(&stats);
+    bool stopped = jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+                                              JCE_ASYNC_WAIT_INFINITE);
+    bool denied = jce_async_default_executor() == NULL;
+    bool empty_stop = jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+                                                JCE_ASYNC_WAIT_INFINITE);
+    bool still_denied = jce_async_default_executor() == NULL;
+    jce_async_default_session_open_internal();
+    JceAsyncExecutor *next = jce_async_default_executor();
+    bool next_ready = next && jce_async_executor_is_owner(next);
+    bool next_stopped = jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_CANCEL_ALL,
+                                                   JCE_ASYNC_WAIT_INFINITE);
+    TEST_ASSERT_EQUAL_PTR(first, retained);
+    TEST_ASSERT_TRUE(observable);
+    TEST_ASSERT_TRUE(stopped);
+    TEST_ASSERT_TRUE(denied);
+    TEST_ASSERT_TRUE(empty_stop);
+    TEST_ASSERT_TRUE(still_denied);
+    TEST_ASSERT_TRUE(next_ready);
+    TEST_ASSERT_TRUE(next_stopped);
+}
+
 typedef struct DefaultShutdownProbe {
     JceSemaphore *release;
     JceAtomicI32 *observed_closing;
+    JceAtomicI32 *stats_hidden;
 } DefaultShutdownProbe;
 
 static void default_shutdown_probe_thread(void *user_data)
@@ -883,6 +929,11 @@ static void default_shutdown_probe_thread(void *user_data)
 
     for (i = 0; i < 500; ++i) {
         if (!jce_async_default_executor()) {
+            JceAsyncExecutorStats stats;
+            memset(&stats,0xa5,sizeof(stats));
+            const bool copied=jce_async_default_stats_internal(&stats);
+            jce_atomic_i32_store(probe->stats_hidden,
+                !copied && stats.live_tasks==0 && stats.submitted_tasks==0 ? 1 : -1);
             jce_atomic_i32_store(probe->observed_closing, 1);
             break;
         }
@@ -909,9 +960,11 @@ static void test_default_executor_is_not_published_while_closing(void)
     blocker.release = jce_semaphore_create(0);
     probe.release = blocker.release;
     probe.observed_closing = jce_atomic_i32_create(0);
+    probe.stats_hidden = jce_atomic_i32_create(0);
     TEST_ASSERT_NOT_NULL(blocker.started);
     TEST_ASSERT_NOT_NULL(blocker.release);
     TEST_ASSERT_NOT_NULL(probe.observed_closing);
+    TEST_ASSERT_NOT_NULL(probe.stats_hidden);
 
     jce_async_task_desc_init(&desc);
     desc.work = blocking_work;
@@ -935,7 +988,10 @@ static void test_default_executor_is_not_published_while_closing(void)
     jce_async_task_release(task);
     jce_semaphore_destroy(blocker.started);
     jce_semaphore_destroy(blocker.release);
+    const int stats_hidden=jce_atomic_i32_load(probe.stats_hidden);
+    jce_atomic_i32_destroy(probe.stats_hidden);
     jce_atomic_i32_destroy(probe.observed_closing);
+    TEST_ASSERT_EQUAL_INT(1,stats_hidden);
 }
 
 typedef struct ProducerFixture {
@@ -1337,6 +1393,7 @@ int main(void)
     RUN_TEST(test_invalid_worker_count_is_rejected);
     RUN_TEST(test_worker_request_obeys_process_budget);
     RUN_TEST(test_process_default_executor_can_shutdown_and_recreate);
+    RUN_TEST(test_engine_session_closes_only_lazy_default_admission);
     RUN_TEST(test_default_executor_is_not_published_while_closing);
     RUN_TEST(test_submission_is_safe_from_concurrent_foreign_threads);
     RUN_TEST(test_worker_wait_on_same_executor_reports_deadlock);

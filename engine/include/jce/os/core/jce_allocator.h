@@ -110,9 +110,12 @@ typedef struct JceMemStats {
     size_t elapsed_ms;      /* process wall time, milliseconds               */
 } JceMemStats;
 
-/* Snapshot the current allocator/process memory stats.  Backed by
- * `mi_process_info()`.  Cheap enough to call once per frame for HUDs.
- * Always populates `*out`; returns false only if `out` is NULL. */
+/* Snapshot the mimalloc provider's memory/process statistics. Native provider
+ * behavior is retained. On Web, current/peak RSS and commit are 0 (unavailable):
+ * its allocator commit estimate is neither OS process RAM nor linear-memory
+ * capacity. Elapsed time and page faults retain provider behavior. A zero memory
+ * field is unavailable, not proof of a zero footprint. Always populates `*out`;
+ * true means copied, not OS availability; false only if `out` is NULL. */
 JCE_API bool jce_mem_stats(JceMemStats *out);
 
 /* Low-memory allocator mode (512MB charter baseline): makes the allocator
@@ -158,9 +161,10 @@ JCE_API bool jce_alloc_hook_sdl(void);
  * allocation counts, bucketed by size class.  Engine memory goes through
  * mimalloc (NOT the CRT heap), so a CRT leak dump and VS native heap
  * snapshots miss it — a rising live-byte total here pinpoints an ENGINE-side
- * leak and the size class it lives in.  Portable: plain native-word counters,
- * no platform-specific libraries.  Compiled out in release (snapshot returns
- * false, dump is a no-op), so zero overhead there.
+ * leak and the size class it lives in. Native-word atomic counters need no
+ * runtime service initialization. Debug live/bucket tracking is compiled out
+ * in release (snapshot returns false, dump is a no-op); the independent
+ * always-on frame counters below remain enabled.
  *
  * SCOPE — one authoritative total, not a per-front-end sample.  COUNTED:
  * jce_allocator_default(), jce_aligned_alloc(), and the engine-internal
@@ -173,8 +177,10 @@ JCE_API bool jce_alloc_hook_sdl(void);
  * anything outside this allocator.  For the process-wide figure that does
  * include the foreign heaps, use jce_mem_stats().
  *
- * NOTE: counters are updated without locks, so values are APPROXIMATE under
- * heavy concurrent allocation (asset worker threads) — fine for a leak TREND.
+ * Each shared counter is atomically updated/read under concurrent allocation.
+ * Reading several counters is not a globally consistent snapshot. Counters
+ * retain native size_t-width wrap before conversion to the public uint64_t
+ * fields; this is not process-wide memory or 64-bit precision on 32-bit hosts.
  */
 #define JCE_ALLOC_TRACK_BUCKETS 28
 
@@ -202,9 +208,10 @@ JCE_API void jce_alloc_track_dump(void);
 
 /* Always-on (release-included) per-frame allocation counter.  Writes the number
  * of allocations and bytes requested SINCE THE LAST CALL into *out_allocs /
- * *out_bytes (either may be NULL).  Cheap (two native-word reads + writes); used
- * by the JCE_PERF_LOG emit to surface allocs/frame so per-frame heap churn is
- * measurable in a profiling build (rank-9).  Same scope as the tracker above:
+ * *out_bytes (either may be NULL). Concurrent producers use native-word atomic
+ * counters; exactly one consumer thread owns the last-call baseline. The pair
+ * of reads is not a globally consistent snapshot and native size_t wrap remains.
+ * Used by JCE_PERF_LOG to surface per-frame heap churn. Same scope as above:
  * every counted front-end contributes, so this is the frame's whole engine-heap
  * churn, not one front-end's share of it. */
 JCE_API void jce_alloc_frame_delta(uint64_t *out_allocs, uint64_t *out_bytes);

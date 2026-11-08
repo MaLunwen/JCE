@@ -8,6 +8,7 @@
  */
 
 #include "jce_project_settings.h"
+#include "jce_editor_project_context.h"
 #include <jce/middleware/scene/jce_scene.h>  /* layer/tag registries */
 #include "jce_editor_alloc.h"
 #include "io/jce_editor_file_util.h"
@@ -67,8 +68,14 @@ const JceProjectSettings *jce_project_settings_current(void)
 
 void jce_project_settings_set_root(const char *project_root)
 {
-    snprintf(s_project_root, sizeof(s_project_root), "%s",
-             project_root ? project_root : "");
+    const char *next_root = project_root ? project_root : "";
+    if (jce_editor_project_path_equal(s_project_root, next_root)) return;
+
+    snprintf(s_project_root, sizeof(s_project_root), "%s", next_root);
+    /* A snapshot belongs to one root; selecting an owner never loads another
+     * file or mutates already-applied runtime state. Same-root edits survive. */
+    s_ps_have = false;
+    memset(&s_ps_current, 0, sizeof(s_ps_current));
 }
 
 /* ── Defaults ─────────────────────────────────────────────────────── */

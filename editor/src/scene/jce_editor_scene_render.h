@@ -33,11 +33,29 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 /* Shut down and free all resources (camera, FBO, meshes). */
 void jce_editor_scene_render_shutdown(void);
 
+/* Once per admitted host UI draw, before panel layout. Not a CPU service:
+ * capture can submit GPU work, subject to the existing focus/capture gate. */
+void jce_editor_scene_render_maintenance(bool viewport_gpu_allowed);
+/* Includes a poll that completed this host frame, to retain modal view ids. */
+bool jce_editor_scene_render_probe_busy(void);
+/* Cancel before destructive scene changes or view teardown. No frame submit. */
+void jce_editor_scene_render_cancel_probe_capture(void);
+/* Editor-only request identity, independent of trace enablement and component
+ * addresses. Zero means refused; both Inspector and batch panel use this owner. */
+uint64_t jce_editor_scene_render_begin_probe_capture(JceScene *scene, JceEntity entity,
+    char *out_path, int capacity);
+bool jce_editor_scene_render_probe_capture_matches(uint64_t request,
+    JceScene *scene, JceEntity entity);
+
 /* Rebind project-relative content after a source-project switch or VFS mount
  * transition.  In isolated Bundle Preview this reads render settings and
  * component assets only from the active bundle.  Call before scene entities
  * are deserialized so particle descriptors resolve in the correct context. */
 void jce_editor_scene_render_refresh_content_context(void);
+
+/* Current scene content base, independent of a build/authoring project root.
+ * Empty for unsaved and virtual Bundle/Catalog scene addresses. */
+const char *jce_editor_scene_content_root(void);
 
 /* Render one frame of the 3D scene to the internal FBO.
  * The FBO is resized automatically when width/height change.
@@ -70,6 +88,16 @@ int jce_editor_scene_render_capture_poll(void);
 bool jce_editor_scene_pick_supported(void);
 bool jce_editor_scene_pick_request(uint32_t x, uint32_t y);
 bool jce_editor_scene_pick_poll(uint32_t *out_entity_id);
+
+/* Synchronous click fallback for the visible Scene View. Direction is unit
+ * length and max_t limits the search to the view's clip segment. */
+typedef struct JceEditorSceneRayPick {
+    uint32_t entity;
+    uint32_t models_tested;
+    bool geometry_hit;
+} JceEditorSceneRayPick;
+JceEditorSceneRayPick jce_editor_scene_pick_ray(
+    JceScene *scene, jce_vec3 origin, jce_vec3 direction, float max_t);
 /* GPU rectangle (marquee) selection: pixel-accurate for any geometry incl.
  * streamed glTF models.  request() with pick-buffer pixel coords; poll_rect()
  * fills out_ids with up to max_ids UNIQUE entity ids + *out_count when ready. */

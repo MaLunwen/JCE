@@ -60,3 +60,17 @@
 
 这个缺陷是靠**第一次运行 `jce_coroutine_self_test()`** 发现的——它已经存在、写得完整正确、
 但全树没有任何调用者。现在由 `tools/lint/check_self_tests_run.py` 守着。
+
+PlayerLoop phase dispatch and each executed callback share core service trace
+spans. Empty phases can be observed as attempted dispatch; disabled/unregistered
+callbacks emit no work. Callback debug names are copied before invocation so
+mutation/reallocation cannot invalidate an active span. Timing getters retain
+callback-only CPU cost; traces additionally expose phase/parent relationships.
+
+Phase dispatch uses a frozen identity ceiling and ordered priority/id cursor,
+allocates no heap snapshot for large phases, and never truncates callbacks on
+snapshot OOM. Shutdown invalidates active dispatch epochs and preserves IDs;
+stale handles cannot remove a callback registered after restart. Cancellation
+is recorded on the phase span while already completed callback spans stay paired.
+
+The active-scene setter/getter are declared by the public game-module header; editor Play consumes that SDK surface without ad-hoc exported declarations. The pointer is borrowed and cleared before scene teardown. Callback simulation belongs to Play lifecycle, independent of Game View visibility.

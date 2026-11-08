@@ -20,6 +20,8 @@
 #include <stdio.h>
 #include <string.h>
 #include "renderer/jce_render_encoder.h"
+#include "jce_pbr_custom_trace_internal.h"
+#include "jce_model_toon_hair_internal.h"
 
 #define LOG_TAG "jce_pbr_material"
 
@@ -52,6 +54,7 @@ static struct {
     bgfx_uniform_handle_t sheen_color;
     bgfx_uniform_handle_t pbr_lobes2;
     bgfx_uniform_handle_t translucency_color;
+    bgfx_uniform_handle_t toon_atlas;
 } s_mu;
 /* Per-draw UV transform override; see the header.  Same shape and lifetime as
  * jce_model.c's s_material_override, and armed by the same code.
@@ -108,6 +111,7 @@ static void ensure_uniforms(void)
     s_mu.sheen_color   = bgfx_create_uniform("u_sheenColor",      BGFX_UNIFORM_TYPE_VEC4, 1);
     s_mu.pbr_lobes2    = bgfx_create_uniform("u_pbrLobes2",       BGFX_UNIFORM_TYPE_VEC4, 1);
     s_mu.translucency_color = bgfx_create_uniform("u_translucencyColor", BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_mu.toon_atlas = bgfx_create_uniform("u_toonAtlas", BGFX_UNIFORM_TYPE_VEC4, 2);
 
     s_albedo      = bgfx_create_uniform("s_albedo",     BGFX_UNIFORM_TYPE_SAMPLER, 1);
     s_metal_rough = bgfx_create_uniform("s_metalRough", BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -503,6 +507,25 @@ uint32_t jce_pbr_material_shader_keys(const JcePbrMaterial *mat)
     return keys;
 }
 
+bool jce_pbr_material_bind_toon_hair_depth(uint16_t texture)
+{
+    if (!BGFX_HANDLE_IS_VALID(s_metal_rough) || texture == UINT16_MAX)
+        return false;
+    jce_enc_set_texture(1, s_metal_rough, (bgfx_texture_handle_t){texture},
+        BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP | BGFX_SAMPLER_POINT);
+    return true;
+}
+
+void jce_pbr_material_bind_toon_atlas(const JceTexture *atlas, const float *basis)
+{
+    ensure_uniforms();
+    if (!BGFX_HANDLE_IS_VALID(s_mu.toon_atlas)) return;
+    jce_enc_set_uniform(s_mu.toon_atlas, basis, 2);
+    if (atlas)
+        jce_enc_set_texture(4, s_emissive_map, (bgfx_texture_handle_t){atlas->idx},
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+}
+
 void jce_pbr_material_bind(const JcePbrMaterial *mat,
                            const JceRenderer *r, uint16_t view_id)
 {
@@ -585,14 +608,19 @@ static void resolve_sibling_path(const JceFileSystem *fs,
  * other caller) return the same handle.  The cache owns the programs and
  * frees them in jce_pbr_material_shutdown(). */
 #define PBR_PROG_CACHE_MAX 64
+/* Entries, admission count and once-warning flag share one cache lifetime.
+ * Shutdown retires the entries and resets the warning for the next device. */
 static struct {
-    char     mat_path[256];
-    char     vs_path[256];
-    char     fs_path[256];
-    uint16_t program;
-    bool     used;
-} s_prog_cache[PBR_PROG_CACHE_MAX];
-static int s_prog_cache_count = 0;
+    struct {
+        char     mat_path[256];
+        char     vs_path[256];
+        char     fs_path[256];
+        uint16_t program;
+        bool     used;
+    } entries[PBR_PROG_CACHE_MAX];
+    int count;
+    bool full_warned;
+} s_prog_cache;
 
 /* Load + link a custom shader program from two compiled bgfx .bin blobs.
  * Returns UINT16_MAX on any failure (missing files, bad blobs, renderer
@@ -625,16 +653,44 @@ static void custom_blob_path(const JceFileSystem *fs, const char *mat_path,
 
 /* The explicit shaders/ namespace can reference shared engine stages. Project
  * VFS bytes win; no arbitrary missing project asset falls back to engine art. */
-static void *custom_blob_read(const JceFileSystem *fs, const char *path, uint64_t *size)
+static void *custom_blob_read(const JceFileSystem *fs, const char *path, uint64_t *size,
+                              JcePbrCustomBlobTrace *detail)
 {
     void *data=fs ? jce_fs_read_all(fs,path,size) : jce_fs_host_read_all(path,size);
+    if (detail) {
+        detail->vfs = fs != NULL;
+        detail->reader_success = data != NULL;
+        detail->fallback_eligible = strncmp(path,"shaders/",8)==0;
+        detail->engine_present = detail->entry_found = detail->entry_admitted = -1;
+        detail->alloc_success = detail->decompress_success = -1;
+        detail->route = data ? (fs ? PBR_CUSTOM_ROUTE_VFS_API : PBR_CUSTOM_ROUTE_HOST_API) : PBR_CUSTOM_ROUTE_NONE;
+        detail->reason = data ? (*size ? PBR_CUSTOM_BLOB_OK : PBR_CUSTOM_BLOB_READER_EMPTY)
+                             : PBR_CUSTOM_BLOB_FALLBACK_FORBIDDEN;
+        if (data) detail->result_bytes = *size;
+    }
     if(data || strncmp(path,"shaders/",8)!=0) return data;
+    if (detail) detail->fallback_attempted = true;
     const JcePakArchive *engine=jce_shaders_embedded_engine_pak();
     const JcePakAsset *asset=engine ? jce_pak_find(engine,path) : NULL;
+    if (detail) {
+        detail->engine_present = engine != NULL;
+        detail->entry_found = engine ? asset != NULL : -1;
+        detail->entry_admitted = asset ? asset->original_size != 0 : -1;
+        detail->reason = !engine ? PBR_CUSTOM_BLOB_NO_ENGINE_PAK : !asset ? PBR_CUSTOM_BLOB_NO_ENTRY : PBR_CUSTOM_BLOB_EMPTY_ENTRY;
+        if (asset) { detail->original_bytes = asset->original_size; detail->stored_bytes = asset->compressed_size; }
+    }
     if(!asset || !asset->original_size) return NULL;
+    if (detail) { detail->alloc_attempted = true; detail->alloc_bytes = (size_t)asset->original_size; }
     data=JCE_MALLOC((size_t)asset->original_size);
+    if (detail) { detail->alloc_success = data != NULL; detail->reason = PBR_CUSTOM_BLOB_ALLOC_FAILED; }
     if(!data) return NULL;
+    if (detail) detail->decompress_attempted = true;
     *size=jce_pak_decompress(asset,data,(size_t)asset->original_size);
+    if (detail) {
+        detail->decompress_success = *size != 0; detail->result_bytes = *size;
+        detail->route = *size ? PBR_CUSTOM_ROUTE_ENGINE_PAK : PBR_CUSTOM_ROUTE_NONE;
+        detail->reason = *size ? PBR_CUSTOM_BLOB_OK : PBR_CUSTOM_BLOB_DECOMPRESS_FAILED;
+    }
     if(!*size) { JCE_FREE(data); return NULL; }
     return data;
 }
@@ -647,15 +703,31 @@ static uint16_t load_custom_program(const JceFileSystem *fs,
         return UINT16_MAX;
 
     /* Cache hit: same material + same blob paths → reuse the linked program. */
-    for (int i = 0; i < s_prog_cache_count; i++) {
-        if (s_prog_cache[i].used &&
-            strncmp(s_prog_cache[i].mat_path, mat_path,
-                    sizeof(s_prog_cache[i].mat_path)) == 0 &&
-            strncmp(s_prog_cache[i].vs_path, vs_rel,
-                    sizeof(s_prog_cache[i].vs_path)) == 0 &&
-            strncmp(s_prog_cache[i].fs_path, fs_rel,
-                    sizeof(s_prog_cache[i].fs_path)) == 0)
-            return s_prog_cache[i].program;
+    for (int i = 0; i < s_prog_cache.count; i++) {
+        if (s_prog_cache.entries[i].used &&
+            strncmp(s_prog_cache.entries[i].mat_path, mat_path,
+                    sizeof(s_prog_cache.entries[i].mat_path)) == 0 &&
+            strncmp(s_prog_cache.entries[i].vs_path, vs_rel,
+                    sizeof(s_prog_cache.entries[i].vs_path)) == 0 &&
+            strncmp(s_prog_cache.entries[i].fs_path, fs_rel,
+                    sizeof(s_prog_cache.entries[i].fs_path)) == 0)
+            return s_prog_cache.entries[i].program;
+    }
+
+    JceTraceScope load_scope = jce_trace_scope_begin("material.custom_program.load");
+    pbr_custom_request_trace(load_scope, mat_path, vs_rel, fs_rel);
+    /* A material only borrows a program. Every successful link must be
+     * admitted to this owner before it can be returned to the caller. */
+    if (s_prog_cache.count >= PBR_PROG_CACHE_MAX) {
+        if (!s_prog_cache.full_warned) {
+            LOG_WARN(LOG_TAG, "custom program phase=cache_admission reason=entry_budget "
+                     "count=%d limit=%d path=%s", s_prog_cache.count,
+                     PBR_PROG_CACHE_MAX, mat_path);
+            s_prog_cache.full_warned = true;
+        }
+        pbr_custom_program_trace_publish(load_scope, false, false, false, PBR_CUSTOM_PROGRAM_CACHE_BUDGET);
+        jce_trace_scope_end(load_scope, JCE_TRACE_TASK_FAILED);
+        return UINT16_MAX;
     }
 
     char vs_path[512], fs_path[512];
@@ -674,11 +746,19 @@ static uint16_t load_custom_program(const JceFileSystem *fs,
      * it. */
     custom_blob_path(fs, mat_path, vs_rel, vs_path, sizeof(vs_path));
     custom_blob_path(fs, mat_path, fs_rel, fs_path, sizeof(fs_path));
-
     uint64_t vs_sz = 0, fs_sz = 0;
-    void *vs_blob = custom_blob_read(fs,vs_path,&vs_sz);
-    void *fs_blob = custom_blob_read(fs,fs_path,&fs_sz);
+    JcePbrCustomBlobTrace vs_detail = {0}, fs_detail = {0};
+    JceTraceScope vs_scope = jce_trace_scope_begin("material.custom_shader.vs");
+    void *vs_blob = custom_blob_read(fs,vs_path,&vs_sz,vs_scope.id ? &vs_detail : NULL);
+    pbr_custom_blob_trace_publish(vs_scope, &vs_detail, vs_rel, vs_path);
+    jce_trace_scope_end(vs_scope, vs_blob && vs_sz ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    JceTraceScope fs_scope = jce_trace_scope_begin("material.custom_shader.fs");
+    void *fs_blob = custom_blob_read(fs,fs_path,&fs_sz,fs_scope.id ? &fs_detail : NULL);
+    pbr_custom_blob_trace_publish(fs_scope, &fs_detail, fs_rel, fs_path);
+    jce_trace_scope_end(fs_scope, fs_blob && fs_sz ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
     uint16_t prog = UINT16_MAX;
+    const bool create_attempted = vs_blob && fs_blob && vs_sz > 0 && fs_sz > 0;
+    bool cache_admitted = false;
     if (vs_blob && fs_blob && vs_sz > 0 && fs_sz > 0) {
         JceShaderHandle h = jce_renderer_create_program_from_blobs(
             vs_blob, (size_t)vs_sz, fs_blob, (size_t)fs_sz);
@@ -692,31 +772,36 @@ static uint16_t load_custom_program(const JceFileSystem *fs,
     JCE_FREE(fs_blob);
 
     /* Cache the result (including failures, so we don't retry a broken blob
-     * every frame).  When the table is full, fall through uncached. */
-    if (s_prog_cache_count < PBR_PROG_CACHE_MAX) {
-        int idx = s_prog_cache_count++;
-        safe_copy(s_prog_cache[idx].mat_path,
-                  sizeof(s_prog_cache[idx].mat_path), mat_path);
-        safe_copy(s_prog_cache[idx].vs_path,
-                  sizeof(s_prog_cache[idx].vs_path), vs_rel);
-        safe_copy(s_prog_cache[idx].fs_path,
-                  sizeof(s_prog_cache[idx].fs_path), fs_rel);
-        s_prog_cache[idx].program = prog;
-        s_prog_cache[idx].used    = true;
+     * every frame). Admission above guarantees one owner for this result. */
+    if (s_prog_cache.count < PBR_PROG_CACHE_MAX) {
+        int idx = s_prog_cache.count++;
+        safe_copy(s_prog_cache.entries[idx].mat_path,
+                  sizeof(s_prog_cache.entries[idx].mat_path), mat_path);
+        safe_copy(s_prog_cache.entries[idx].vs_path,
+                  sizeof(s_prog_cache.entries[idx].vs_path), vs_rel);
+        safe_copy(s_prog_cache.entries[idx].fs_path,
+                  sizeof(s_prog_cache.entries[idx].fs_path), fs_rel);
+        s_prog_cache.entries[idx].program = prog;
+        s_prog_cache.entries[idx].used    = true;
+        cache_admitted = true;
     }
+    pbr_custom_program_trace_publish(load_scope, create_attempted, prog != UINT16_MAX, cache_admitted,
+        prog != UINT16_MAX ? PBR_CUSTOM_PROGRAM_OK : create_attempted ? PBR_CUSTOM_PROGRAM_CREATE_FAILED_UNKNOWN : PBR_CUSTOM_PROGRAM_BLOB_FAILED);
+    jce_trace_scope_end(load_scope, prog != UINT16_MAX ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
     return prog;
 }
 
 void jce_pbr_material_shutdown(void)
 {
-    for (int i = 0; i < s_prog_cache_count; i++) {
-        if (s_prog_cache[i].used && s_prog_cache[i].program != UINT16_MAX) {
-            JceShaderHandle h = { s_prog_cache[i].program };
+    for (int i = 0; i < s_prog_cache.count; i++) {
+        if (s_prog_cache.entries[i].used && s_prog_cache.entries[i].program != UINT16_MAX) {
+            JceShaderHandle h = { s_prog_cache.entries[i].program };
             jce_renderer_destroy_program(h);
         }
-        s_prog_cache[i].used = false;
+        s_prog_cache.entries[i].used = false;
     }
-    s_prog_cache_count = 0;
+    s_prog_cache.count = 0;
+    s_prog_cache.full_warned = false;
     /* These references belong to the lazy material binder, independently of
      * shader reflection. Release them while the renderer device is alive. */
     if (s_uniforms_init) {
@@ -724,6 +809,7 @@ void jce_pbr_material_shutdown(void)
             &s_mu.base_color, &s_mu.pbr_params, &s_mu.emissive,
             &s_mu.normal_scale, &s_mu.uv_transform, &s_mu.pbr_lobes,
             &s_mu.sheen_color, &s_mu.pbr_lobes2, &s_mu.translucency_color,
+            &s_mu.toon_atlas,
             &s_albedo, &s_metal_rough, &s_normal_map, &s_ao_map, &s_emissive_map
         };
         for (size_t i = 0; i < sizeof(uniforms) / sizeof(uniforms[0]); i++) {

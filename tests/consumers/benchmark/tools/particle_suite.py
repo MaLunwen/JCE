@@ -13,8 +13,7 @@ import re
 from gbuffer_asset_suite import difference, image, sha256_file, write
 from postfx_fixture import fixture
 from tools.benchmark_suite import source_identity
-from tools.jce_determinism import assert_backend
-from tools.perf_bench import run
+from particle_process import particle_backend, run_particle_process
 from tools.benchmark_suite import read_frames, frame_summary
 
 
@@ -61,6 +60,18 @@ def validate(images):
     if metrics["emission_delta"] <= .0001 or metrics["material_delta"] <= .0001 \
             or metrics["repeat_delta"] > .0001:
         raise ValueError("particle liveness/repeat/content control failed")
+    # The authored fixture keeps exposure fixed and emitters away from corners.
+    # Typed alive/drawn totals alone cannot detect a skipped postfx pass.
+    background = {}
+    for name in ("active", "changed", "repeat"):
+        delta = max(abs(int(images[name][y, x, channel]) -
+                        int(images["zero"][y, x, channel]))
+                    for y, x in ((0, 0), (0, -1), (-1, 0), (-1, -1))
+                    for channel in range(3))
+        background[name] = delta
+        if delta > 2:
+            raise ValueError("particle fixture background/postfx control changed")
+    metrics["background_corner_max_rgb8_delta"] = background
     return metrics
 
 
@@ -69,7 +80,9 @@ def alive_records(log, emitters, cpu=False):
     name_pattern = r"particles\.cpu_(?:alive|drawn)_total" if cpu else r"particles\.gpu_alive_\d+"
     counts = re.findall(r"benchmark-particle-requests: source_frame=50 count=(\d+)", log)
     rows = re.findall(r"benchmark-particle-alive: source_frame=50 completed_frame=(\d+) ready_engine_frame=(\d+) index=(\d+) name=(" + name_pattern + r") rgba=([0-9a-f]{8}) alive=(\d+)", log)
-    if len(counts) != 1 or int(counts[0]) != expected_targets or len(rows) != expected_targets:
+    if log.count("benchmark-particle-requests:") != 1 or \
+            log.count("benchmark-particle-alive:") != expected_targets or \
+            len(counts) != 1 or int(counts[0]) != expected_targets or len(rows) != expected_targets:
         raise ValueError("missing or incomplete actual particle counts")
     result = []
     for completed, ready, index, name, rgba, alive in rows:
@@ -89,6 +102,26 @@ def alive_records(log, emitters, cpu=False):
             raise ValueError("CPU submitted population differs from simulation")
         return {"records": result, "total_alive": named["particles.cpu_alive_total"]}
     return {"records": result, "total_alive": sum(row["alive"] for row in result)}
+
+
+def validate_burst_records(actual, emitters, particles, active, cpu):
+    expected = particles if active else 0
+    if actual["total_alive"] != expected:
+        raise ValueError("burst actual population is not exact requested count")
+    if not cpu and any(row["alive"] != expected // emitters for row in actual["records"]):
+        raise ValueError("burst GPU per-emitter population differs from fixture")
+
+
+def component_population(log, emitters, cpu):
+    rows = re.findall(r"benchmark-particles: frame=50 components=(\d+) loaded=(\d+) cpu_handles=(\d+) gpu_requested=(\d+)", log)
+    if log.count("benchmark-particles:") != 1 or len(rows) != 1 or int(rows[0][0]) != emitters:
+        raise ValueError("particle component population unavailable or duplicated")
+    marker = tuple(map(int, rows[0]))
+    if marker[3] != (0 if cpu else emitters):
+        raise ValueError("particle requested routing differs from fixture")
+    if cpu and (marker[1] != emitters or marker[2] != emitters):
+        raise ValueError("CPU particle components not ready")
+    return marker
 
 
 def validate_alive_controls(counts, mode="steady", particles=256):
@@ -143,22 +176,20 @@ def main():
                     "JCE_BENCH_ASSET_STILL": "1", "JCE_BENCH_SHOT_FRAME": "50",
                     "JCE_BENCH_PLAY_FRAME": "1", "JCE_BENCH_PARTICLE_STATS": "1",
                     "JCE_BENCH_PLAYER_SHOT": str(directory / "target.png")}
-                process = run(env, directory / "engine.log", frames=200, exe=args.exe.resolve(),
+                process = run_particle_process(env, directory / "engine.log", frames=200, exe=args.exe.resolve(),
                               samples_path=directory / "frames.csv", sample_interval=.02)
                 log = (directory / "engine.log").read_text(encoding="utf-8")
-                assert_backend(process.get("stdout", "") + "\n" + log, args.backend)
-                marker = re.search(r"benchmark-particles: frame=50 components=(\d+) loaded=(\d+) cpu_handles=(\d+) gpu_requested=(\d+)", log)
-                if "] ERROR -" in log or not marker or int(marker[1]) != emitters:
-                    raise ValueError("particle consumer failed or component population unavailable")
-                if args.path == "cpu" and (int(marker[2]) != emitters or int(marker[3]) != emitters):
-                    raise ValueError("CPU particle components not ready")
+                particle_backend(log, args.backend)
+                marker = component_population(log, emitters, args.path == "cpu")
                 actual_counts = alive_records(log, emitters, args.path == "cpu")
-                if actual_counts is not None: counts[label] = actual_counts["total_alive"]
+                if args.emission_mode == "burst":
+                    validate_burst_records(actual_counts, emitters, args.particles, label != "zero", args.path == "cpu")
+                counts[label] = actual_counts["total_alive"]
                 images[label] = image(directory / "target.png")
                 if sha256_file(args.exe) != binary_hash:
                     raise ValueError("executable changed")
                 result["cases"][directory.name] = {"process": process, "environment": env,
-                    "component_marker": list(map(int, marker.groups())),
+                    "component_marker": list(marker),
                     "timing_observer_on": frame_summary(read_frames(directory / "frames.csv", warmup=60, sample_count=None)), "actual_alive": actual_counts,
                     "files": {name: {"path": str(directory / name), "sha256": sha256_file(directory / name)}
                         for name in ("fixture.particles.json", "scene.json", "engine.log", "target.png", "frames.csv")}}

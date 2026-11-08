@@ -40,21 +40,26 @@ extern "C" {
 #include "scene/jce_asset_path_index.h"
 #include "io/jce_editor_prefab_override.h"
 #include "io/jce_editor_mesh_predecode.h"
+#include "io/jce_editor_bundle_render_pipeline.h"
 
 
 
 #include <cmath>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include <jce/os/core/jce_str.h>
 #include "core/jce_editor_project.h"
+#include "core/jce_editor_project_context.h"
+#include "core/jce_editor_scene_route.h"
 
 /* Project-root switch (dialogs/jce_dialog_project.cpp) — reloads the
  * manifest, asset DB root, PAK key, and game string tables. */
-void set_current_project_root(const char *path);
+bool jce_editor_prepare_project_switch(const char *next_root);
+bool set_current_project_root(const char *path);
 
 /* Remember the just-loaded/saved scene as this project's resume target
  * (per-project store), alongside the global last_scene_path that drives
@@ -73,78 +78,113 @@ static void mirror_last_scene_to_project(const char *scene_path)
  * path relativization falls back to absolute paths, the model
  * importer's extracted textures stay CWD-relative, and the bundle
  * packer treats the project's own assets as "external".  Walk up from
- * the scene file to the owning jce_project.json and follow it. */
-static void follow_scene_project_root(const char *scene_path)
+ * the scene file through the public project resolver. A Bundle keeps a valid
+ * explicit authoring context because archive storage is independent of it. */
+static bool prepare_scene_project_switch(const char *content_path,
+                                         bool preserve_current_project = false)
 {
-    char dir[512];
-    if (!jce_path_parent(dir, sizeof(dir), scene_path) || !dir[0])
-        return;
-
-    for (int up = 0; up < 8 && dir[0]; ++up) {
-        char manifest[600];
-        snprintf(manifest, sizeof(manifest), "%s/jce_project.json", dir);
-        if (jce_fs_host_exists_file(manifest)) {
-            char norm[512];
-            if (!jce_path_normalize(norm, sizeof(norm), dir))
-                snprintf(norm, sizeof(norm), "%s", dir);
-            for (char *q = norm; *q; ++q) if (*q == '\\') *q = '/';
-
-            /* Switch manifest-driven subsystems only on a real change. */
-            extern char s_current_project_root[512];
-            if (jce_strcasecmp(s_current_project_root, norm) != 0) {
-                LOG_INFO(LOG_TAG,
-                         "scene belongs to project '%s' — following as "
-                         "current project root", norm);
-                set_current_project_root(norm);
-            }
-
-            /* The canonical asset base (what saved refs are relative to)
-             * is <project>/<source_assets>, not the project dir itself. */
-            const JceProject *jp = jce_editor_project_get();
-            const char *src = (jp && jp->source_assets && jp->source_assets[0])
-                              ? jp->source_assets : "assets";
-            char assets_base[700];
-            snprintf(assets_base, sizeof(assets_base), "%s/%s", norm, src);
-            if (!jce_fs_host_exists_dir(assets_base))
-                snprintf(assets_base, sizeof(assets_base), "%s", norm);
-            const char *cur = jce_editor_assets_get_project();
-            if (!cur || jce_strcasecmp(cur, assets_base) != 0)
-                jce_editor_assets_set_project(assets_base);
-
-            /* Bind render settings and component-relative assets before the
-             * scene starts building lazy renderer/particle state. */
-            jce_editor_scene_render_refresh_content_context();
-
-            /* The project's NATIVE script modules are manifest-driven too.
-             *
-             * jce_editor_script_backends.h states the contract as "every time
-             * the current project changes", and this is such a time -- but
-             * the only callers were the project DIALOG, so following a scene
-             * into its project adopted the root for paths, assets and render
-             * settings and left the script modules belonging to whatever was
-             * open before (usually nothing).
-             *
-             * The cost is not a warning.  A C or C++ script is a CLASS in a
-             * shared object named in jce_project.json, so with no module
-             * loaded every .jcec and .jcecpp component in the scene is
-             * refused by name -- "NO NATIVE SCRIPT MODULE IS LOADED IN THIS
-             * PROCESS" -- while the shipped game, which links the same
-             * modules into its own executable, runs them from the same scene
-             * file.  Measured on a seven-language project: the editor ran
-             * three of the seven languages, and the two native ones failed
-             * here.
-             *
-             * Safe to call repeatedly and with a project that declares no
-             * modules, which the header says explicitly. */
-            jce_editor_script_modules_reload(norm);
-            return;
-        }
-        char parent[512];
-        if (!jce_path_parent(parent, sizeof(parent), dir) ||
-            strcmp(parent, dir) == 0)
-            return;
-        snprintf(dir, sizeof(dir), "%s", parent);
+    char candidate[512];
+    if (!jce_editor_project_context_select(content_path,
+            jce_editor_current_project_root(), preserve_current_project,
+            candidate, sizeof(candidate))) {
+        if (preserve_current_project) return true;
+        return jce_editor_prepare_project_switch(nullptr);
     }
+    return jce_editor_prepare_project_switch(candidate);
+}
+
+static bool scene_document_admitted(const JceJson *root, const char *path)
+{
+    if (!jce_json_is_object(root)) {
+        LOG_WARN(LOG_TAG, "scene load failed (JSON object): %s", path);
+        return false;
+    }
+    int major = (int)JCE_SCENE_CONTRACT_MAJOR;
+    int minor = (int)JCE_SCENE_CONTRACT_MINOR;
+    parse_scene_contract_version(root, &major, &minor);
+    if (!jce_scene_contract_major_compatible((uint32_t)major)) {
+        LOG_WARN(LOG_TAG, "scene load failed: unsupported contract major %d: %s", major, path);
+        return false;
+    }
+    return true;
+}
+
+static bool follow_scene_project_root(const char *scene_path,
+                                      bool preserve_current_project = false)
+{
+    char norm[512];
+    if (!jce_editor_project_context_select(scene_path,
+            jce_editor_current_project_root(), preserve_current_project,
+            norm, sizeof(norm))) {
+        /* An already-opened Bundle owns its temporary mount/pipeline here.
+         * Its absent authoring manifest is not a plain-source project close. */
+        if (preserve_current_project) return true;
+        /* No manifest is a real transition away from an old project. Retire
+         * its modules/settings through the existing transaction, not a string
+         * assignment, while keeping the scene's content base independent. */
+        if (!set_current_project_root(nullptr)) return false;
+        update_scene_dir_from_path(scene_path);
+        jce_editor_assets_set_project(jce_editor_scene_content_root());
+        return true;
+    }
+
+    /* Switch manifest-driven subsystems only on a real change. */
+    extern char s_current_project_root[512];
+    if (!jce_editor_project_path_equal(s_current_project_root, norm)) {
+        LOG_INFO(LOG_TAG,
+                 "scene belongs to project '%s' — following as "
+                 "current project root", norm);
+        if (!set_current_project_root(norm)) return false;
+    }
+
+    /* The canonical asset base (what saved refs are relative to)
+     * is <project>/<source_assets>, not the project dir itself. */
+    const JceProject *jp = jce_editor_project_get();
+    const char *src = (jp && jp->source_assets && jp->source_assets[0])
+                      ? jp->source_assets : "assets";
+    /* JCE_PROJECT_SCENE_ROUTE_V2: source_assets may be absolute; joining
+     * project_root + absolute source silently fabricated a nonexistent path. */
+    std::string assets_base = jce_editor_scene_route::asset_root(norm, src);
+    if (assets_base.empty() || !jce_fs_host_exists_dir(assets_base.c_str())) {
+        LOG_WARN(LOG_TAG,
+                 "Scene project source_assets missing/invalid ('%s'); using %s",
+                 src, norm);
+        assets_base = norm;
+    }
+    const char *cur = jce_editor_assets_get_project();
+    if (!cur || !jce_editor_project_path_equal(cur, assets_base.c_str()))
+        jce_editor_assets_set_project(assets_base.c_str());
+
+    /* Bind render settings and component-relative assets before the
+     * scene starts building lazy renderer/particle state. */
+    if (!preserve_current_project)
+        update_scene_dir_from_path(scene_path);
+    else
+        jce_editor_scene_render_refresh_content_context();
+
+    /* The project's NATIVE script modules are manifest-driven too.
+     *
+     * jce_editor_script_backends.h states the contract as "every time
+     * the current project changes", and this is such a time -- but
+     * the only callers were the project DIALOG, so following a scene
+     * into its project adopted the root for paths, assets and render
+     * settings and left the script modules belonging to whatever was
+     * open before (usually nothing).
+     *
+     * The cost is not a warning.  A C or C++ script is a CLASS in a
+     * shared object named in jce_project.json, so with no module
+     * loaded every .jcec and .jcecpp component in the scene is
+     * refused by name -- "NO NATIVE SCRIPT MODULE IS LOADED IN THIS
+     * PROCESS" -- while the shipped game, which links the same
+     * modules into its own executable, runs them from the same scene
+     * file.  Measured on a seven-language project: the editor ran
+     * three of the seven languages, and the two native ones failed
+     * here.
+     *
+     * Safe to call repeatedly and with a project that declares no
+     * modules, which the header says explicitly. */
+    jce_editor_script_modules_reload(norm);
+    return true;
 }
 
 /* ── Prefab source instantiation (scratch scene, for override diff) ────
@@ -1123,7 +1163,16 @@ const char *jce_state_get_current_scene_path(void)
 
 /* ── Scene file load ─────────────────────────────────────────────── */
 
-namespace { void close_active_bundle_mount(); }   /* fwd */
+namespace {
+void close_active_bundle_mount();
+bool ends_with_ci_local(const char *path, const char *suffix);
+
+bool is_bundle_scene_path(const char *path)
+{
+    return ends_with_ci_local(path, ".jbundle") ||
+           ends_with_ci_local(path, ".jbundle.json");
+}
+}
 
 bool jce_state_load_scene_file(const char *scene_path)
 {
@@ -1136,14 +1185,32 @@ bool jce_state_load_scene_file(const char *scene_path)
 
     /* Opening a scene during Play would swap the JceScene out from under a
      * running runtime — tear the runtime down first. */
-    stop_play_before_scene_swap();
+    if (!stop_play_before_scene_swap()) return false;
 
-    /* The streaming-preview streamer holds entity handles into the old
-     * scene — destroy it BEFORE the entities go away. */
+    if (is_bundle_scene_path(scene_path))
+        return jce_state_load_scene_from_jbundle(scene_path);
+
+    uint64_t input_size = 0;
+    void *input = jce_fs_host_read_all(scene_path, &input_size);
+    if (!input) {
+        LOG_WARN(LOG_TAG, "scene load failed (read): %s", scene_path);
+        return false;
+    }
+    std::unique_ptr<void, decltype(&jce_fs_buffer_free)> input_owner(input, jce_fs_buffer_free);
+    JceJson *document = jce_json_parse((const char *)input, (size_t)input_size);
+    const bool admitted = scene_document_admitted(document, scene_path);
+    jce_json_free(document);
+    if (!admitted) return false;
+    if (!prepare_scene_project_switch(scene_path)) return false;
+
+    /* Admit host bytes and outgoing publication before retiring old content. */
     jce_editor_scene_render_streaming_teardown();
-
-    /* Plain-file load: drop any bundle VFS override from a prior preview. */
     close_active_bundle_mount();
+    if (!follow_scene_project_root(scene_path)) return false;
+    char parser_base[1024];
+    jce_scene_serial_set_base_dir(jce_path_parent(parser_base, sizeof(parser_base), scene_path)
+        ? parser_base : nullptr);
+    jce_scene_serial_set_asset_vfs(nullptr);
 
     bool ok = false;
     {
@@ -1160,7 +1227,7 @@ bool jce_state_load_scene_file(const char *scene_path)
         jce_editor_scene_render_invalidate_model_caches();
         jce_editor_scene_asset_cache_clear_resolve_misses();
 
-        ok = jce_scene_serial_load_file(s.scene, scene_path);
+        ok = jce_scene_serial_load(s.scene, (const char *)input, (size_t)input_size);
         if (ok) {
             /* Deliberately NOT ensure_rendering_settings(): a LOADED scene
              * must render exactly what its file says.  Fabricating defaults
@@ -1171,9 +1238,7 @@ bool jce_state_load_scene_file(const char *scene_path)
              * other half of what ensure() used to do and is still wanted. */
             jce_editor_scene_apply_project_texture_state();
             rebuild_entity_order_from_ecs();
-            update_scene_dir_from_path(scene_path);
             set_current_scene_path_internal(scene_path);
-            follow_scene_project_root(scene_path);
             repair_scene_asset_paths();
             /* Persist as last-opened scene for next editor launch.  Skip the
              * write when nothing actually changed — on the startup
@@ -1225,6 +1290,8 @@ bool jce_state_load_scene_file(const char *scene_path)
          * empty); user can toggle it off in the World Streaming panel. */
         jce_editor_scene_render_streaming_autostart();
     }
+    jce_scene_serial_set_asset_vfs(nullptr);
+    jce_scene_serial_set_base_dir(nullptr);
     return ok;
 }
 
@@ -1273,9 +1340,7 @@ void finalize_deferred_scene_load()
         /* No ensure_rendering_settings() -- see jce_state_load_scene_file(). */
         jce_editor_scene_apply_project_texture_state();
         rebuild_entity_order_from_ecs();
-        update_scene_dir_from_path(path.c_str());
         set_current_scene_path_internal(path.c_str());
-        follow_scene_project_root(path.c_str());
         repair_scene_asset_paths();
 
         /* Persist as last-opened scene for next editor launch (mirrors the
@@ -1342,16 +1407,15 @@ void clear_deferred_scene_load()
 
 } /* anonymous namespace */
 
-namespace { bool ends_with_ci_local(const char *path, const char *suffix); }
-
 bool jce_state_load_scene_file_async(const char *scene_path)
 {
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
+    if (!stop_play_before_scene_swap()) return false;
+
     /* Startup restoration uses the same isolated bundle loader as Open Bundle. */
-    if (ends_with_ci_local(scene_path, ".jbundle") ||
-        ends_with_ci_local(scene_path, ".jbundle.json"))
+    if (is_bundle_scene_path(scene_path))
         return jce_state_load_scene_from_jbundle(scene_path);
 
     /* If a previous async load is somehow still in flight, finish it
@@ -1368,9 +1432,20 @@ bool jce_state_load_scene_file_async(const char *scene_path)
 
     /* Same pre-swap teardown as the synchronous path. */
     jce_panel_sequencer_preview_flush();
-    stop_play_before_scene_swap();
+
+    /* Parse the file (read + cJSON) before touching the live scene, so a
+     * read/parse failure leaves the current scene intact. */
+    JceJson *root = jce_json_parse_file(scene_path);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "scene load failed (parse): %s", scene_path);
+        return false;
+    }
+    std::unique_ptr<JceJson, decltype(&jce_json_free)> root_owner(root, jce_json_free);
+    if (!scene_document_admitted(root, scene_path)) return false;
+    if (!prepare_scene_project_switch(scene_path)) return false;
     jce_editor_scene_render_streaming_teardown();
     close_active_bundle_mount();
+    if (!follow_scene_project_root(scene_path)) return false;
 
     /* Inform the engine parser of the scene's base directory so sibling
      * material backfill resolves (jce_scene_serial_load_file does this; we
@@ -1391,41 +1466,11 @@ bool jce_state_load_scene_file_async(const char *scene_path)
         }
     }
 
-    /* Parse the file (read + cJSON) before touching the live scene, so a
-     * read/parse failure leaves the current scene intact. */
-    JceJson *root = jce_json_parse_file(scene_path);
-    if (!root) {
-        LOG_WARN(LOG_TAG, "scene load failed (parse): %s", scene_path);
-        return false;
-    }
-
-    /* Contract gate (mirrors jce_scene_serial_load). */
-    int cmaj = (int)JCE_SCENE_CONTRACT_MAJOR;
-    int cmin = (int)JCE_SCENE_CONTRACT_MINOR;
-    parse_scene_contract_version(root, &cmaj, &cmin);
-    if (!jce_scene_contract_major_compatible((uint32_t)cmaj)) {
-        LOG_WARN(LOG_TAG,
-                 "scene load failed: unsupported contract major %d (expected %u)",
-                 cmaj, (unsigned)JCE_SCENE_CONTRACT_MAJOR);
-        jce_json_free(root);
-        return false;
-    }
-
-    /* Parse succeeded — now it is safe to drop the old scene. */
+    /* Parse and project admission succeeded — now drop the old scene. */
     {
         HistorySuspendScope suspend;
         clear_scene_entities();
     }
-
-    /* Follow the NEW scene's asset-resolve base + project root BEFORE creating
-     * its entities, so their mesh/material refs resolve against this scene's
-     * roots.  The synchronous load paths already do this; this (async/frame-
-     * sliced) path bypassed jce_scene_serial_load_file and was missing them, so
-     * switching scenes with the editor kept open left the asset-cache scene_dir
-     * + project root pointing at the PREVIOUS scene → the new scene's models
-     * failed to resolve ("模型无法加载") until an editor restart. */
-    update_scene_dir_from_path(scene_path);
-    follow_scene_project_root(scene_path);
 
     /* Scene-switch cache reset (same rationale as the sync path): drop the
      * renderer/pick model caches + the negative resolve-miss cache so stale
@@ -1443,7 +1488,6 @@ bool jce_state_load_scene_file_async(const char *scene_path)
         /* Empty/invalid entity array, or OOM.  Treat like an empty scene:
          * finalize editor state against whatever exists (nothing) so the
          * editor is in a clean, consistent state rather than half-torn. */
-        jce_json_free(root);
         g_dsl.scene_path = scene_path;
         finalize_deferred_scene_load();
         clear_deferred_scene_load();
@@ -1456,7 +1500,6 @@ bool jce_state_load_scene_file_async(const char *scene_path)
     if (total <= kAsyncEntityThreshold) {
         jce_scene_load_stream_step(stream, /*all=*/0);
         jce_scene_load_stream_finalize(stream);
-        jce_json_free(root);
         g_dsl.scene_path = scene_path;
         finalize_deferred_scene_load();
         clear_deferred_scene_load();
@@ -1465,7 +1508,7 @@ bool jce_state_load_scene_file_async(const char *scene_path)
 
     /* Large scene: defer the create across frames. */
     g_dsl.active     = true;
-    g_dsl.root       = root;   /* keep alive until finalize */
+    g_dsl.root       = root_owner.release(); /* keep alive until finalize */
     g_dsl.stream     = stream;
     g_dsl.total      = total;
     g_dsl.scene_path = scene_path;
@@ -1540,6 +1583,7 @@ extern "C" {
 
 namespace {
 struct BundleMount {
+    JceEditorBundlePipeline pipeline;
     JceFileSystem    *fs   = nullptr;   /* private fs for this mount   */
     JceBundleFile    *bf   = nullptr;   /* single-file mode handle     */
     JceBundleCatalog *cat  = nullptr;   /* catalog mode handle         */
@@ -1603,6 +1647,7 @@ void close_active_bundle_mount()
         g_bm.fs = nullptr;
     }
     g_bm.active_bundle_id.clear();
+    jce_editor_bundle_pipeline_close(&g_bm.pipeline);
 
     if (had_bundle)
         jce_editor_scene_render_refresh_content_context();
@@ -1613,7 +1658,7 @@ bool apply_scene_bytes(const char *display_path,
 {
     /* Loading a scene (bundle / memory) during Play would swap the
      * JceScene out from under a running runtime — stop it first. */
-    stop_play_before_scene_swap();
+    if (!stop_play_before_scene_swap()) return false;
 
     /* Streamer holds entity handles into the old scene — destroy first. */
     jce_editor_scene_render_streaming_teardown();
@@ -1656,9 +1701,14 @@ bool apply_scene_bytes(const char *display_path,
 }
 } /* namespace */
 
-void jce_state_close_bundle_preview(void)
+bool jce_state_close_bundle_preview(void)
 {
+    /* A project switch may have no following scene load. Retire borrowers here,
+     * while the outgoing root and Bundle still own their modules/resources. */
+    if (!stop_play_before_scene_swap()) return false;
+    jce_editor_scene_render_streaming_teardown();
     close_active_bundle_mount();
+    return true;
 }
 
 bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
@@ -1678,9 +1728,12 @@ bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
         jbundle_path = sibling_bundle;
     }
 
+    /* A content archive's physical directory is not its authoring context.
+     * Preserve a valid explicitly opened/restored project; only discover the
+     * physical package owner when no valid context exists. */
+    if (!stop_play_before_scene_swap()) return false;
+    if (!prepare_scene_project_switch(jbundle_path, true)) return false;
     close_active_bundle_mount();
-    /* Follow the physical package owner before binding its isolated VFS. */
-    follow_scene_project_root(jbundle_path);
     g_bm.fs = jce_fs_create();
     if (!g_bm.fs) return false;
 
@@ -1691,6 +1744,10 @@ bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
         return false;
     }
     const char *scene_vpath = jce_bundle_file_scene_path(g_bm.bf);
+    if (!jce_editor_bundle_pipeline_prepare(&g_bm.pipeline, g_bm.fs)) {
+        close_active_bundle_mount();
+        return false;
+    }
     if (!scene_vpath || scene_vpath[0] == '\0') {
         LOG_WARN(LOG_TAG, "bundle has no scene path: %s", jbundle_path);
         close_active_bundle_mount();
@@ -1704,10 +1761,23 @@ bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
         close_active_bundle_mount();
         return false;
     }
+    JceJson *document = jce_json_parse((const char *)raw, (size_t)sz);
+    const bool admitted = scene_document_admitted(document, jbundle_path);
+    jce_json_free(document);
+    if (!admitted || !follow_scene_project_root(jbundle_path, true)) {
+        jce_fs_buffer_free(raw);
+        close_active_bundle_mount();
+        return false;
+    }
     char display[1024];
     snprintf(display, sizeof(display), "bundle://%s!%s",
              jbundle_path, scene_vpath);
     jce_fs_set_active_policy(g_bm.fs, JCE_FS_ACTIVE_ISOLATED);
+    if (!jce_editor_bundle_pipeline_apply(&g_bm.pipeline)) {
+        jce_fs_buffer_free(raw);
+        close_active_bundle_mount();
+        return false;
+    }
     jce_editor_scene_render_refresh_content_context();
     bool ok = apply_scene_bytes(display, (const char *)raw, (size_t)sz);
     jce_fs_buffer_free(raw);
@@ -1725,6 +1795,7 @@ bool jce_state_load_scene_from_catalog(const char *catalog_path,
                                  sizeof(sibling_bundle)))
         return jce_state_load_scene_from_jbundle(sibling_bundle);
 
+    if (!stop_play_before_scene_swap()) return false;
     close_active_bundle_mount();
     g_bm.fs = jce_fs_create();
     if (!g_bm.fs) return false;
@@ -1763,6 +1834,10 @@ bool jce_state_load_scene_from_catalog(const char *catalog_path,
         return false;
     }
     g_bm.active_bundle_id = bundle_id;
+    if (!jce_editor_bundle_pipeline_prepare(&g_bm.pipeline, g_bm.fs)) {
+        close_active_bundle_mount();
+        return false;
+    }
 
     const char *scene_vpath = jce_bundle_catalog_scene_path(g_bm.cat, bundle_id);
     if (!scene_vpath || scene_vpath[0] == '\0') {
@@ -1782,6 +1857,11 @@ bool jce_state_load_scene_from_catalog(const char *catalog_path,
     snprintf(display, sizeof(display), "catalog://%s#%s",
              catalog_path, bundle_id);
     jce_fs_set_active_policy(g_bm.fs, JCE_FS_ACTIVE_ISOLATED);
+    if (!jce_editor_bundle_pipeline_apply(&g_bm.pipeline)) {
+        jce_fs_buffer_free(raw);
+        close_active_bundle_mount();
+        return false;
+    }
     jce_editor_scene_render_refresh_content_context();
     bool ok = apply_scene_bytes(display, (const char *)raw, (size_t)sz);
     jce_fs_buffer_free(raw);

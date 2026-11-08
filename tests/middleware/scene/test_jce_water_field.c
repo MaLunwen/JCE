@@ -7,7 +7,10 @@
  * -- the shape is already covered by test_jce_water and test_jce_water_fft.
  */
 
-#include <jce/middleware/scene/jce_water_field.h>
+#include "jce_water_field_internal.h"
+#include "jce_water_nearshore_config.h"
+#include "jce_sr_water_mesh.h"
+#include "jce_water_shore_atlas.h"
 #include <jce/middleware/scene/jce_water.h>
 #include <jce/middleware/scene/jce_water_fft.h>
 
@@ -158,6 +161,41 @@ static void test_same_desc_same_clock_is_bit_exact(void)
  *
  * Inventing a surface off the edge is how a boat gets shoved upward by an
  * ocean it is nowhere near. */
+
+static void test_render_fft_rim_reuses_the_buoyancy_surface(void)
+{
+    JceWaterFieldDesc d = desc_fft();
+    d.size_x = 8.0f;
+    d.size_z = 40.0f;
+    d.cascade_fraction = 0.27f;
+    JceWaterField *bounded = jce_water_field_create(&d);
+    d.size_x = 0.0f;
+    JceWaterField *unbounded = jce_water_field_create(&d);
+    TEST_ASSERT_NOT_NULL(bounded);
+    TEST_ASSERT_NOT_NULL(unbounded);
+    TEST_ASSERT_NOT_NULL(jce_water_field_fft2(bounded));
+
+    jce_water_field_set_time(bounded, 3.25);
+    jce_water_field_set_time(unbounded, 3.25);
+    const uint64_t revision = jce_water_field_revision(bounded);
+    JceWaterSample expected, rendered;
+    /* An ocean ring can extend past the narrow dimension of its rectangle. */
+    TEST_ASSERT_FALSE(jce_water_field_sample(bounded, 14.0f, -3.0f, 0.0f, &rendered));
+    TEST_ASSERT_TRUE(jce_water_field_sample(unbounded, 14.0f, -3.0f, 0.0f, &expected));
+    TEST_ASSERT_TRUE(jce_water_field_sample_render(bounded, 14.0f, -3.0f, &rendered));
+    TEST_ASSERT_EQUAL_FLOAT(14.0f, rendered.position.x);
+    TEST_ASSERT_EQUAL_FLOAT(expected.position.y, rendered.position.y);
+    TEST_ASSERT_EQUAL_FLOAT(-3.0f, rendered.position.z);
+    TEST_ASSERT_EQUAL_FLOAT(expected.normal.x, rendered.normal.x);
+    TEST_ASSERT_EQUAL_FLOAT(expected.normal.y, rendered.normal.y);
+    TEST_ASSERT_EQUAL_FLOAT(expected.normal.z, rendered.normal.z);
+    TEST_ASSERT_EQUAL_FLOAT(expected.jacobian, rendered.jacobian);
+    TEST_ASSERT_EQUAL_UINT64(revision, jce_water_field_revision(bounded));
+    TEST_ASSERT_FALSE(jce_water_field_sample_render(bounded, NAN, -3.0f, &rendered));
+
+    jce_water_field_destroy(unbounded);
+    jce_water_field_destroy(bounded);
+}
 
 static void test_outside_the_body_is_refused(void)
 {
@@ -783,10 +821,501 @@ static void test_outside_the_body_is_not_depth_zero(void)
     jce_water_field_destroy(f);
 }
 
+static void test_versioned_spectrum_shared_owner(void)
+{
+    JceWaterFieldDesc d = desc_fft();
+    JceWaterFftSpectrumDesc config = {0};
+    config.struct_size = sizeof(config);
+    config.version = JCE_WATER_FFT_SPECTRUM_VERSION;
+    config.model = JCE_WATER_FFT_SPECTRUM_PM;
+    config.depth = 20.0f;
+    config.directional_blend = 1.0f;
+    JceWaterFieldSet *set = jce_water_field_set_create();
+    TEST_ASSERT_NOT_NULL(set);
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &d, 3.0));
+    JceWaterField *f = jce_water_field_set_acquire_spectrum(set, 7u, &d, &config);
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_EQUAL_DOUBLE(3.0, jce_water_field_time(f));
+    const uint64_t revision = jce_water_field_revision(f);
+    TEST_ASSERT_EQUAL_PTR(f, jce_water_field_set_acquire_spectrum(set, 7u, &d, &config));
+    TEST_ASSERT_EQUAL_UINT64(revision, jce_water_field_revision(f));
+
+    /* Body wind/seed override the redundant FFT descriptor inputs. */
+    JceWaterFft *reference = jce_water_fft_create(d.fft_resolution, d.fft_patch_size,
+        d.fft_wind_speed, d.fft_wind_dir_x, d.fft_wind_dir_z,
+        d.fft_amplitude, d.fft_seed);
+    TEST_ASSERT_NOT_NULL(reference);
+    config.wind_speed = d.fft_wind_speed;
+    config.seed = d.fft_seed;
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(reference, &config));
+    jce_water_fft_evolve(reference, 3.0f);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(reference),
+        jce_water_fft_height_data(jce_water_field_fft(f)), 32 * 32 * sizeof(float));
+    jce_water_fft_destroy(reference);
+
+    jce_water_field_set_sweep(set);
+    config.model = 999u;
+    TEST_ASSERT_NULL(jce_water_field_set_acquire_spectrum(set, 7u, &d, &config));
+    jce_water_field_set_sweep(set);
+    TEST_ASSERT_EQUAL_PTR(f, jce_water_field_set_find(set, 7u));
+    TEST_ASSERT_EQUAL_UINT64(revision, jce_water_field_revision(f));
+    config.model = JCE_WATER_FFT_SPECTRUM_TMA;
+    config.fetch = 100000.0f;
+    TEST_ASSERT_EQUAL_PTR(f, jce_water_field_set_acquire_spectrum(set, 7u, &d, &config));
+    TEST_ASSERT_TRUE(jce_water_field_revision(f) > revision);
+    TEST_ASSERT_EQUAL_DOUBLE(3.0, jce_water_field_time(f));
+
+    /* Removing the extension restores the exact old Phillips surface. */
+    TEST_ASSERT_EQUAL_PTR(f, jce_water_field_set_acquire_spectrum(set, 7u, &d, NULL));
+    JceWaterField *legacy = jce_water_field_create(&d);
+    TEST_ASSERT_NOT_NULL(legacy);
+    jce_water_field_set_time(legacy, 3.0);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(jce_water_field_fft(legacy)),
+        jce_water_fft_height_data(jce_water_field_fft(f)), 32 * 32 * sizeof(float));
+    jce_water_field_destroy(legacy);
+    jce_water_field_set_destroy(set);
+}
+
+static void assert_motion_phase(const JceWaterField *field,
+                                JceWaterField *reference, double phase)
+{
+    TEST_ASSERT_EQUAL_DOUBLE(phase, jce_water_field_phase(field));
+    jce_water_field_set_time(reference, phase);
+    const JceWaterFft *actual[2] = {jce_water_field_fft(field), jce_water_field_fft2(field)};
+    const JceWaterFft *expected[2] = {jce_water_field_fft(reference), jce_water_field_fft2(reference)};
+    for (int i = 0; i < 2; ++i) {
+        TEST_ASSERT_NOT_NULL(actual[i]);
+        TEST_ASSERT_NOT_NULL(expected[i]);
+        const int n = jce_water_fft_resolution(expected[i]);
+        TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(expected[i]),
+                                 jce_water_fft_height_data(actual[i]),
+                                 (size_t)n * (size_t)n * sizeof(float));
+    }
+}
+
+static void test_motion_rate_preserves_phase_and_real_clock(void)
+{
+    JceWaterFieldDesc desc = desc_fft();
+    desc.cascade_fraction = 0.41f;
+    JceWaterFieldSet *set = jce_water_field_set_create();
+    JceWaterField *reference = jce_water_field_create(&desc);
+    TEST_ASSERT_NOT_NULL(set);
+    TEST_ASSERT_NOT_NULL(reference);
+    const int driver = 0;
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.75));
+
+    JceWaterFieldMotion motion = {1.0f, 1.0f, 0.0f};
+    JceWaterField *field = jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion);
+    JceWaterField *legacy = jce_water_field_set_acquire_spectrum(set, 2, &desc, NULL);
+    TEST_ASSERT_NOT_NULL(field);
+    TEST_ASSERT_NOT_NULL(legacy);
+    assert_motion_phase(field, reference, 0.75);
+    assert_motion_phase(legacy, reference, 0.75);
+
+    motion.phase_rate = 2.0f;
+    const uint64_t first_revision = jce_water_field_revision(field);
+    TEST_ASSERT_EQUAL_PTR(field, jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion));
+    TEST_ASSERT_EQUAL_UINT64(first_revision, jce_water_field_revision(field));
+    assert_motion_phase(field, reference, 0.75);
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.25));
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, jce_water_field_time(field));
+    assert_motion_phase(field, reference, 1.25);
+    assert_motion_phase(legacy, reference, 1.0);
+
+    JceWaterField *late = jce_water_field_set_acquire_motion(set, 3, &desc, NULL, &motion);
+    TEST_ASSERT_NOT_NULL(late);
+    assert_motion_phase(late, reference, 2.0);
+
+    motion.phase_rate = 0.0f;
+    TEST_ASSERT_EQUAL_PTR(field, jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion));
+    const uint64_t frozen_revision = jce_water_field_revision(field);
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.5));
+    TEST_ASSERT_EQUAL_DOUBLE(1.5, jce_water_field_time(field));
+    TEST_ASSERT_EQUAL_UINT64(frozen_revision, jce_water_field_revision(field));
+    assert_motion_phase(field, reference, 1.25);
+
+    motion.phase_rate = 1.0f;
+    TEST_ASSERT_EQUAL_PTR(field, jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion));
+    TEST_ASSERT_EQUAL_UINT64(frozen_revision, jce_water_field_revision(field));
+    assert_motion_phase(field, reference, 1.25);
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, -0.5));
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, jce_water_field_time(field));
+    assert_motion_phase(field, reference, 0.75);
+    assert_motion_phase(legacy, reference, 1.0);
+
+    jce_water_field_destroy(reference);
+    jce_water_field_set_destroy(set);
+}
+
+static void assert_fft_displacement_equal(const JceWaterFft *expected, const JceWaterFft *actual)
+{
+    TEST_ASSERT_NOT_NULL(expected);
+    TEST_ASSERT_NOT_NULL(actual);
+    const int n = jce_water_fft_resolution(expected);
+    TEST_ASSERT_EQUAL_INT(n, jce_water_fft_resolution(actual));
+    const size_t bytes = (size_t)n * (size_t)n * sizeof(float);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(expected), jce_water_fft_height_data(actual), bytes);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_disp_x_data(expected), jce_water_fft_disp_x_data(actual), bytes);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_disp_z_data(expected), jce_water_fft_disp_z_data(actual), bytes);
+}
+
+static void assert_caustic_fraction_rejected(JceWaterField *field, float fraction)
+{
+    uint64_t revision = 42u;
+    TEST_ASSERT_NULL(jce_water_field_caustic_fft(field, fraction, &revision));
+    TEST_ASSERT_EQUAL_UINT64(0u, revision);
+}
+
+static void test_caustic_fft_is_lazy_and_shares_the_geometry_phase(void)
+{
+    JceWaterFieldDesc desc = desc_fft();
+    desc.cascade_fraction = 0.41f;
+    const float fraction = 0.125f;
+    JceWaterFieldSet *set = jce_water_field_set_create();
+    JceWaterField *reference = jce_water_field_create(&desc);
+    TEST_ASSERT_NOT_NULL(set);
+    TEST_ASSERT_NOT_NULL(reference);
+    JceWaterFieldMotion motion = {1.0f, 1.0f, 0.0f};
+    JceWaterField *field = jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion);
+    TEST_ASSERT_NOT_NULL(field);
+
+    const int driver = 0;
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.5));
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.25));
+    jce_water_field_set_time(reference, 0.75);
+    const uint64_t geometry_revision = jce_water_field_revision(field);
+    assert_caustic_fraction_rejected(field, 0.0f);
+    uint64_t revision = 0u;
+    const JceWaterFft *third = jce_water_field_caustic_fft(field, fraction, &revision);
+    TEST_ASSERT_NOT_NULL(third);
+    TEST_ASSERT_TRUE(third != jce_water_field_fft(field) && third != jce_water_field_fft2(field));
+    TEST_ASSERT_EQUAL_UINT64(1u, revision); /* The earlier geometry ticks did not evaluate this source. */
+    TEST_ASSERT_EQUAL_FLOAT(fraction * jce_water_fft_patch_size(jce_water_field_fft(field)),
+                            jce_water_fft_patch_size(third));
+    TEST_ASSERT_TRUE(jce_water_fft_patch_size(third) < jce_water_fft_patch_size(jce_water_field_fft2(field)));
+    TEST_ASSERT_EQUAL_UINT64(geometry_revision, jce_water_field_revision(field));
+    assert_fft_displacement_equal(jce_water_field_fft(reference), jce_water_field_fft(field));
+    assert_fft_displacement_equal(jce_water_field_fft2(reference), jce_water_field_fft2(field));
+
+    float initial_height[32 * 32];
+    TEST_ASSERT_EQUAL_INT(32, jce_water_fft_resolution(third));
+    memcpy(initial_height, jce_water_fft_height_data(third), sizeof(initial_height));
+    assert_caustic_fraction_rejected(field, -0.125f);
+    assert_caustic_fraction_rejected(field, NAN);
+    assert_caustic_fraction_rejected(field, 0.75f); /* Larger period than the second cascade. */
+    uint64_t repeated = 0u;
+    TEST_ASSERT_EQUAL_PTR(third, jce_water_field_caustic_fft(field, fraction, &repeated));
+    TEST_ASSERT_EQUAL_UINT64(revision, repeated);
+
+    motion.phase_rate = 2.0f;
+    TEST_ASSERT_EQUAL_PTR(field, jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion));
+    third = jce_water_field_caustic_fft(field, fraction, &repeated);
+    TEST_ASSERT_NOT_NULL(third);
+    TEST_ASSERT_EQUAL_UINT64(revision, repeated);
+    TEST_ASSERT_EQUAL_MEMORY(initial_height, jce_water_fft_height_data(third), sizeof(initial_height));
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.25));
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, jce_water_field_time(field));
+    uint64_t advanced = 0u;
+    third = jce_water_field_caustic_fft(field, fraction, &advanced);
+    TEST_ASSERT_NOT_NULL(third);
+    TEST_ASSERT_TRUE(advanced > revision);
+    TEST_ASSERT_TRUE(memcmp(initial_height, jce_water_fft_height_data(third), sizeof(initial_height)) != 0);
+    jce_water_field_set_time(reference, 1.25);
+    const JceWaterFft *reference_third = jce_water_field_caustic_fft(reference, fraction, NULL);
+    assert_fft_displacement_equal(reference_third, third);
+
+    motion.phase_rate = 0.0f;
+    TEST_ASSERT_EQUAL_PTR(field, jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion));
+    const uint64_t frozen_geometry = jce_water_field_revision(field);
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.5));
+    TEST_ASSERT_EQUAL_DOUBLE(1.5, jce_water_field_time(field));
+    third = jce_water_field_caustic_fft(field, fraction, &repeated);
+    TEST_ASSERT_EQUAL_UINT64(advanced, repeated);
+    TEST_ASSERT_EQUAL_UINT64(frozen_geometry, jce_water_field_revision(field));
+    assert_fft_displacement_equal(reference_third, third);
+
+    motion.phase_rate = 1.0f;
+    TEST_ASSERT_EQUAL_PTR(field, jce_water_field_set_acquire_motion(set, 1, &desc, NULL, &motion));
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, -0.5));
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, jce_water_field_time(field));
+    uint64_t rewound = 0u;
+    third = jce_water_field_caustic_fft(field, fraction, &rewound);
+    TEST_ASSERT_NOT_NULL(third);
+    TEST_ASSERT_TRUE(rewound > advanced);
+    TEST_ASSERT_EQUAL_MEMORY(initial_height, jce_water_fft_height_data(third), sizeof(initial_height));
+    jce_water_field_set_time(reference, 0.75);
+    reference_third = jce_water_field_caustic_fft(reference, fraction, NULL);
+    assert_fft_displacement_equal(reference_third, third);
+
+    const uint64_t final_geometry = jce_water_field_revision(field);
+    uint64_t released = rewound;
+    TEST_ASSERT_NULL(jce_water_field_caustic_fft(field, 0.0f, &released));
+    TEST_ASSERT_EQUAL_UINT64(0u, released);
+    TEST_ASSERT_EQUAL_UINT64(final_geometry, jce_water_field_revision(field));
+    assert_fft_displacement_equal(jce_water_field_fft(reference), jce_water_field_fft(field));
+    assert_fft_displacement_equal(jce_water_field_fft2(reference), jce_water_field_fft2(field));
+    uint64_t rebuilt = 0u;
+    third = jce_water_field_caustic_fft(field, fraction, &rebuilt);
+    TEST_ASSERT_TRUE(rebuilt > rewound);
+    assert_fft_displacement_equal(reference_third, third);
+    TEST_ASSERT_EQUAL_UINT64(final_geometry, jce_water_field_revision(field));
+    assert_fft_displacement_equal(jce_water_field_fft(reference), jce_water_field_fft(field));
+    assert_fft_displacement_equal(jce_water_field_fft2(reference), jce_water_field_fft2(field));
+
+    jce_water_field_destroy(reference);
+    jce_water_field_set_destroy(set);
+}
+
+/* Model the shader's normalized, linear and repeating texture lookup. */
+static float sample_packed_grid(const JceWaterFft *fft, const float *grid, float x, float z)
+{
+    const int n = jce_water_fft_resolution(fft);
+    const float texels_per_metre = (float)n / jce_water_fft_patch_size(fft);
+    const float gx = x * texels_per_metre - 0.5f;
+    const float gz = z * texels_per_metre - 0.5f;
+    const int ix = (int)floorf(gx), iz = (int)floorf(gz);
+    const int x0 = (ix % n + n) % n, z0 = (iz % n + n) % n;
+    const int x1 = (x0 + 1) % n, z1 = (z0 + 1) % n;
+    const float u = gx - (float)ix, v = gz - (float)iz;
+    const float near = grid[z0*n+x0] + u * (grid[z0*n+x1] - grid[z0*n+x0]);
+    const float far = grid[z1*n+x0] + u * (grid[z1*n+x1] - grid[z1*n+x0]);
+    return near + v * (far - near);
+}
+
+static void test_dual_motion_caps_packed_chop_and_solves_the_combined_surface(void)
+{
+    JceWaterFieldDesc desc = desc_fft();
+    desc.fft_amplitude = 2e-2f;
+    desc.cascade_fraction = 0.41f;
+    JceWaterFieldSet *set = jce_water_field_set_create();
+    TEST_ASSERT_NOT_NULL(set);
+    JceWaterField *legacy = jce_water_field_set_acquire(set, 1, &desc);
+    TEST_ASSERT_NOT_NULL(legacy);
+    const JceWaterFft *original[2] = {jce_water_field_fft(legacy), jce_water_field_fft2(legacy)};
+    float budget = 0.01f;
+    for (int level = 0; level < 2; ++level) {
+        TEST_ASSERT_NOT_NULL(original[level]);
+        const float *dx = jce_water_fft_disp_x_data(original[level]);
+        const float *dz = jce_water_fft_disp_z_data(original[level]);
+        const int n = jce_water_fft_resolution(original[level]);
+        float peak = 0.0f;
+        for (int i = 0; i < n*n; ++i) peak = fmaxf(peak, hypotf(dx[i], dz[i]));
+        TEST_ASSERT_TRUE(peak > 0.0f);
+        budget = fminf(budget, peak * 0.5f);
+    }
+
+    const JceWaterFieldMotion motion = {1.0f, 1.0f, 2.0f * budget};
+    JceWaterField *field = jce_water_field_set_acquire_motion(set, 2, &desc, NULL, &motion);
+    TEST_ASSERT_NOT_NULL(field);
+    const JceWaterFft *levels[2] = {jce_water_field_fft(field), jce_water_field_fft2(field)};
+    for (int level = 0; level < 2; ++level) {
+        const JceWaterFft *fft = levels[level];
+        TEST_ASSERT_NOT_NULL(fft);
+        const int n = jce_water_fft_resolution(fft);
+        TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(original[level]),
+                                 jce_water_fft_height_data(fft), (size_t)n * (size_t)n * sizeof(float));
+        const float *dx = jce_water_fft_disp_x_data(fft);
+        const float *dz = jce_water_fft_disp_z_data(fft);
+        const float *jacobian = jce_water_fft_foam_data(fft);
+        float peak = 0.0f;
+        for (int i = 0; i < n*n; ++i) {
+            peak = fmaxf(peak, hypotf(dx[i], dz[i]));
+            const int x = i % n, z = i / n;
+            const int xm = z*n+(x+n-1)%n, xp = z*n+(x+1)%n;
+            const int zm = ((z+n-1)%n)*n+x, zp = ((z+1)%n)*n+x;
+            const float jxx = 1.0f + 0.5f*(dx[xp]-dx[xm]);
+            const float jzz = 1.0f + 0.5f*(dz[zp]-dz[zm]);
+            const float cross = 0.25f*(dx[zp]-dx[zm])*(dz[xp]-dz[xm]);
+            TEST_ASSERT_FLOAT_WITHIN(1e-6f, jxx*jzz-cross, jacobian[i]);
+        }
+        TEST_ASSERT_FLOAT_WITHIN(budget * 1e-5f, budget, peak);
+    }
+
+    for (int i = 0; i < 12; ++i) {
+        const float x = -8.2f + 1.37f * (float)i, z = 3.1f - 0.97f * (float)i;
+        float dx = 0.0f, dz = 0.0f, h = 0.0f, jacobian = INFINITY;
+        for (int level = 0; level < 2; ++level) {
+            const JceWaterFft *fft = levels[level];
+            dx += sample_packed_grid(fft, jce_water_fft_disp_x_data(fft), x, z);
+            dz += sample_packed_grid(fft, jce_water_fft_disp_z_data(fft), x, z);
+            h += sample_packed_grid(fft, jce_water_fft_height_data(fft), x, z);
+            jacobian = fminf(jacobian, sample_packed_grid(fft, jce_water_fft_foam_data(fft), x, z));
+        }
+        TEST_ASSERT_TRUE(hypotf(dx, dz) <= motion.max_horizontal_displacement * 1.00001f);
+        JceWaterSample sample;
+        TEST_ASSERT_TRUE(jce_water_field_sample_render(field, x + dx, z + dz, &sample));
+        TEST_ASSERT_FLOAT_WITHIN(1e-5f, desc.base_height + h, sample.position.y);
+        TEST_ASSERT_FLOAT_WITHIN(1e-5f, jacobian, sample.jacobian);
+    }
+    jce_water_field_set_destroy(set);
+}
+
+
+static void test_nearshore_cell_budget_and_wide_clock(void)
+{
+    TEST_ASSERT_EQUAL_INT(32, jce_water_nearshore_grid_side(16.0f));
+    TEST_ASSERT_EQUAL_INT(32, jce_water_nearshore_grid_side(28.0f));
+    TEST_ASSERT_EQUAL_INT(64, jce_water_nearshore_grid_side(56.0f));
+    JceWaterFieldSet *set = jce_water_field_set_create();
+    TEST_ASSERT_NOT_NULL(set);
+    const JceWaterFieldDesc desc = desc_fft();
+    JceWaterShoreBinding binding = {0};
+    binding.terrain = 2;
+    binding.terrain_revision = 1;
+    JceWaterShoreStateDesc grid = {
+        .side = 32, .cell_size = 0.875f, .still_y = 0.0f,
+        .max_incoming_height = 1.5f, .max_incoming_speed = 3.0f,
+        .water = {0.25f, 0.02f, 0.8f, 0.03f, 8.0f, 0.15f, 8.0f},
+        .foam = {1.5f, 0.7f, 0.35f, 3.0f, 0.5f},
+    };
+    float bed[4096];
+    for (int i = 0; i < 4096; ++i) bed[i] = -1.0f;
+    for (uint64_t key = 1; key <= 5; ++key) {
+        TEST_ASSERT_NOT_NULL(jce_water_field_set_acquire(set, key, &desc));
+        jce_water_field_set_configure_shore(set, key, &binding, &grid, bed);
+        if (key <= 4) TEST_ASSERT_NOT_NULL(jce_water_field_set_shore(set, key));
+        else TEST_ASSERT_NULL(jce_water_field_set_shore(set, key));
+    }
+    for (uint64_t key = 2; key <= 4; ++key)
+        jce_water_field_set_configure_shore(set, key, NULL, NULL, NULL);
+    grid.side = 64;
+    jce_water_field_set_configure_shore(set, 1, &binding, &grid, bed);
+    const JceWaterShoreState *wide = jce_water_field_set_shore(set, 1);
+    TEST_ASSERT_NOT_NULL(wide);
+    JceWaterShoreSnapshot before, after;
+    TEST_ASSERT_TRUE(jce_water_shore_state_snapshot(wide, &before));
+    grid.side = 32;
+    jce_water_field_set_configure_shore(set, 2, &binding, &grid, bed);
+    TEST_ASSERT_NULL(jce_water_field_set_shore(set, 2));
+    TEST_ASSERT_EQUAL_PTR(wide, jce_water_field_set_shore(set, 1));
+    int driver = 0;
+    TEST_ASSERT_TRUE(jce_water_field_set_advance(set, &driver, 0.05));
+    TEST_ASSERT_EQUAL_PTR(wide, jce_water_field_set_shore(set, 1));
+    TEST_ASSERT_TRUE(jce_water_shore_state_snapshot(wide, &after));
+    TEST_ASSERT_EQUAL_INT(64, after.side);
+    TEST_ASSERT_TRUE(after.revision > before.revision);
+    jce_water_field_set_destroy(set);
+}
+
+static void test_ocean_near_mesh_has_no_radial_spacing_cliff(void)
+{
+    const float extents[] = {0.5f, 100.0f, 10000.0f, 1000000.0f};
+    for (int j = 0; j < 4; ++j) {
+        const float outer = extents[j];
+        const float inner = fminf(0.55f, outer * 0.1f);
+        const float edge = fminf(48.0f, outer * 0.25f);
+        const float growth = sr_water_detail_growth(inner, edge, outer);
+        float previous = 0.0f;
+        for (int ring = 0; ring < SR_WATER_DETAIL_RINGS; ++ring) {
+            const float radius = sr_water_detail_radius(ring, inner, edge, outer, growth);
+            TEST_ASSERT_TRUE(isfinite(radius) && radius > previous);
+            previous = radius;
+        }
+        TEST_ASSERT_FLOAT_WITHIN(outer * 1e-6f, outer, previous);
+        const float pre = edge - sr_water_detail_radius(62, inner, edge, outer, growth);
+        const float post = sr_water_detail_radius(64, inner, edge, outer, growth) - edge;
+        TEST_ASSERT_TRUE(post > 0.0f && post / pre < 1.4f);
+    }
+}
+
+/* Exercise the real topology factory with the renderer's requested budget.
+ * Radius-only tests cannot detect admission returning no ocean mesh. */
+static void test_ocean_detail_topology_factory_admits_renderer_budget(void)
+{
+    const int rings = SR_WATER_DETAIL_RINGS;
+    const int segments = SR_WATER_DETAIL_SEGMENTS;
+    static JceWaterRingVertex vertices[1 + SR_WATER_DETAIL_RINGS * SR_WATER_DETAIL_SEGMENTS];
+    static uint32_t indices[(2 * SR_WATER_DETAIL_RINGS - 1) * SR_WATER_DETAIL_SEGMENTS * 3];
+    uint32_t nv = 0, ni = 0;
+    TEST_ASSERT_TRUE(jce_water_ring_mesh_size(rings, segments, &nv, &ni));
+    TEST_ASSERT_EQUAL_UINT32(sizeof(vertices) / sizeof(vertices[0]), nv);
+    TEST_ASSERT_EQUAL_UINT32(sizeof(indices) / sizeof(indices[0]), ni);
+    TEST_ASSERT_TRUE(nv <= 65535u);
+    TEST_ASSERT_TRUE(jce_water_ring_build(rings, segments, 0.55f, 10000.0f,
+                                         vertices, indices));
+    for (uint32_t i = 0; i < nv; ++i) {
+        TEST_ASSERT_TRUE(isfinite(vertices[i].x) && isfinite(vertices[i].z));
+        TEST_ASSERT_TRUE(isfinite(vertices[i].radius));
+    }
+    for (uint32_t i = 0; i < ni; ++i)
+        TEST_ASSERT_TRUE(indices[i] < nv);
+    for (uint32_t i = 0; i < ni; i += 3) {
+        const JceWaterRingVertex a = vertices[indices[i]];
+        const JceWaterRingVertex b = vertices[indices[i + 1]];
+        const JceWaterRingVertex c = vertices[indices[i + 2]];
+        const float up = (b.z - a.z) * (c.x - a.x) - (b.x - a.x) * (c.z - a.z);
+        TEST_ASSERT_TRUE(isfinite(up) && up > 0.0f);
+    }
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 10000.0f, vertices[nv - 1].radius);
+    TEST_ASSERT_TRUE(jce_water_ring_mesh_size(64, 512, &nv, &ni));
+    TEST_ASSERT_EQUAL_UINT32(32769u, nv);
+    TEST_ASSERT_FALSE(jce_water_ring_mesh_size(129, segments, &nv, &ni));
+    TEST_ASSERT_EQUAL_UINT32(0u, nv);
+    TEST_ASSERT_EQUAL_UINT32(0u, ni);
+    TEST_ASSERT_FALSE(jce_water_ring_mesh_size(rings, 513, &nv, &ni));
+    TEST_ASSERT_FALSE(jce_water_ring_mesh_size(128, 512, &nv, &ni));
+    TEST_ASSERT_EQUAL_UINT32(0u, nv);
+    TEST_ASSERT_EQUAL_UINT32(0u, ni);
+}
+
+static float atlas_test_half(uint16_t h)
+{
+    const int e = (h >> 10) & 31;
+    const float v = e ? ldexpf((float)((h & 1023) + 1024), e - 25)
+                      : ldexpf((float)(h & 1023), -24);
+    return (h & 32768) ? -v : v;
+}
+
+static void test_nearshore_atlas_extends_wet_surface_without_dry_bed_ramps(void)
+{
+    JceWaterShoreCell cells[16] = {0};
+    float bed[16], foam[16] = {0};
+    uint16_t pixels[6 * 12 * 4];
+    for (int z = 0; z < 4; ++z) {
+        for (int x = 0; x < 4; ++x) {
+            const int i = z * 4 + x;
+            bed[i] = x < 2 ? -0.75f : 20.0f + (float)z;
+            cells[i].depth = x < 2 ? 1.0f : 0.0f;
+            cells[i].momentum_x = x < 2 ? 1.25f : 0.0f;
+            foam[i] = x < 2 ? 0.125f : 0.0f;
+        }
+    }
+    const JceWaterShoreSnapshot snapshot = {4, 1, 0, 0, cells, bed, foam, 7, 9};
+    jce_water_shore_pack_atlas(pixels, 6, 12, &snapshot, NULL, 0);
+    for (int z = 0; z < 6; ++z) {
+        for (int x = 1; x <= 3; ++x) {
+            const size_t i = ((size_t)z * 6 + x) * 4;
+            TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.25f, atlas_test_half(pixels[i]));
+        }
+        const size_t wet = ((size_t)z * 6 + 2) * 4;
+        const size_t dry = ((size_t)z * 6 + 3) * 4;
+        const float blended = (atlas_test_half(pixels[wet]) + atlas_test_half(pixels[dry])) * 0.5f;
+        /* Neither an elevated lake nor a negative still plane changes R. */
+        TEST_ASSERT_FLOAT_WITHIN(0.0001f, 23.25f, 23.0f + blended);
+        TEST_ASSERT_FLOAT_WITHIN(0.0001f, -6.75f, -7.0f + blended);
+        TEST_ASSERT_EQUAL_UINT16(0, pixels[dry + 1]);
+        TEST_ASSERT_EQUAL_UINT16(0, pixels[dry + 2]);
+        TEST_ASSERT_FLOAT_WITHIN(0.0001f, 1.0f, atlas_test_half(pixels[wet + 1]));
+        const size_t flow = ((size_t)(z + 6) * 6 + 2) * 4;
+        TEST_ASSERT_FLOAT_WITHIN(0.0001f, 1.25f, atlas_test_half(pixels[flow]));
+        TEST_ASSERT_EQUAL_UINT16(0, pixels[flow + 4]);
+    }
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 20.0f, bed[2]);
+    TEST_ASSERT_FLOAT_WITHIN(0.0001f, 0.0f, cells[2].depth);
+}
+
 int main(void)
 {
     waves_init();
     UNITY_BEGIN();
+    RUN_TEST(test_nearshore_atlas_extends_wet_surface_without_dry_bed_ramps);
+    RUN_TEST(test_ocean_detail_topology_factory_admits_renderer_budget);
+    RUN_TEST(test_nearshore_cell_budget_and_wide_clock);
+    RUN_TEST(test_ocean_near_mesh_has_no_radial_spacing_cliff);
+    RUN_TEST(test_versioned_spectrum_shared_owner);
+    RUN_TEST(test_motion_rate_preserves_phase_and_real_clock);
+    RUN_TEST(test_caustic_fft_is_lazy_and_shares_the_geometry_phase);
+    RUN_TEST(test_dual_motion_caps_packed_chop_and_solves_the_combined_surface);
     RUN_TEST(test_submersion_sign_and_magnitude);
     RUN_TEST(test_submersion_uses_the_displaced_surface);
     RUN_TEST(test_outside_the_body_is_not_depth_zero);
@@ -794,6 +1323,7 @@ int main(void)
     RUN_TEST(test_clock_is_idempotent);
     RUN_TEST(test_same_desc_same_clock_is_bit_exact);
     RUN_TEST(test_outside_the_body_is_refused);
+    RUN_TEST(test_render_fft_rim_reuses_the_buoyancy_surface);
     RUN_TEST(test_band_limit_excludes_short_waves);
     RUN_TEST(test_sync_rebuilds_only_for_spectrum_changes);
     RUN_TEST(test_model_switch_rebuilds);

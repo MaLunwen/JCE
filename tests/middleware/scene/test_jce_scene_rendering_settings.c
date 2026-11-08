@@ -8,6 +8,7 @@
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/middleware/scene/jce_scene_sky_celestial.h>
 #include <jce/os/core/jce_json.h>
 
 #include <stdio.h>
@@ -252,6 +253,147 @@ static void test_additive_json_without_rendering_keeps_prior_settings(void)
     jce_scene_destroy(s);
 }
 
+static void test_celestial_settings_are_optional_and_round_trip(void)
+{
+    JceScene *src = jce_scene_create();
+    JceScene *dst = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(src);
+    TEST_ASSERT_NOT_NULL(dst);
+    TEST_ASSERT_NULL(jce_scene_get_sky_celestial_settings(src));
+
+    JceSceneSkyCelestialSettings celestial = jce_scene_sky_celestial_default();
+    TEST_ASSERT_EQUAL_UINT(sizeof celestial, celestial.struct_size);
+    TEST_ASSERT_EQUAL_UINT(JCE_SCENE_SKY_CELESTIAL_VERSION, celestial.version);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, celestial.star_intensity);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, celestial.moon_intensity);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, celestial.solar_flare_intensity);
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, celestial.moon_phase);
+
+    JceSceneRenderingSettings r = jce_scene_rendering_settings_default();
+    r.sky_mode = JCE_SCENE_SKY_PHYSICAL;
+    jce_scene_set_rendering_settings(src, &r);
+    JceJson *legacy = jce_scene_save_json(src);
+    TEST_ASSERT_NOT_NULL(legacy);
+
+    celestial.star_intensity = 1.25f;
+    celestial.moon_intensity = 0.75f;
+    celestial.solar_flare_intensity = 0.3f;
+    celestial.moon_phase = 0.5f;
+    TEST_ASSERT_TRUE(jce_scene_set_sky_celestial_settings(src, &celestial));
+    celestial.moon_phase = 1.1f;
+    TEST_ASSERT_FALSE(jce_scene_set_sky_celestial_settings(src, &celestial));
+
+    JceJson *root = jce_scene_save_json(src);
+    TEST_ASSERT_NOT_NULL(root);
+    TEST_ASSERT_EQUAL_INT(0, jce_scene_load_json(dst, root));
+    const JceSceneSkyCelestialSettings *saved = jce_scene_get_sky_celestial_settings(dst);
+    TEST_ASSERT_NOT_NULL(saved);
+    TEST_ASSERT_EQUAL_FLOAT(1.25f, saved->star_intensity);
+    TEST_ASSERT_EQUAL_FLOAT(0.75f, saved->moon_intensity);
+    TEST_ASSERT_EQUAL_FLOAT(0.3f, saved->solar_flare_intensity);
+    TEST_ASSERT_EQUAL_FLOAT(0.5f, saved->moon_phase);
+    TEST_ASSERT_EQUAL_INT(JCE_SCENE_SKY_PHYSICAL,
+        jce_scene_get_rendering_settings(dst)->sky_mode);
+
+    TEST_ASSERT_EQUAL_INT(0, jce_scene_load_json(dst, legacy));
+    TEST_ASSERT_NULL(jce_scene_get_sky_celestial_settings(dst));
+    TEST_ASSERT_TRUE(jce_scene_set_sky_celestial_settings(dst,
+        jce_scene_get_sky_celestial_settings(src)));
+    jce_scene_clear_rendering_settings(dst);
+    TEST_ASSERT_NULL(jce_scene_get_sky_celestial_settings(dst));
+
+    jce_json_free(root);
+    jce_json_free(legacy);
+    jce_scene_destroy(src);
+    jce_scene_destroy(dst);
+}
+
+static void test_celestial_night_style_round_trip(void)
+{
+    static const char authored[] = "{\"scene\":{\"entities\":[],\"rendering\":{\"environment\":"
+        "{\"sky\":{\"mode\":4,\"celestial\":{\"moonPhase\":0.8,"
+        "\"moonRadiusDegrees\":2.4,\"nightGradientStrength\":0.86}}}}}}";
+    JceScene *scene = jce_scene_create();
+    JceJson *source = jce_json_parse(authored, sizeof authored - 1);
+    TEST_ASSERT_NOT_NULL(scene);
+    TEST_ASSERT_NOT_NULL(source);
+    TEST_ASSERT_EQUAL_INT(0, jce_scene_load_json(scene, source));
+
+    JceJson *saved = jce_scene_save_json(scene);
+    TEST_ASSERT_NOT_NULL(saved);
+    const JceJson *rendering = jce_json_get(jce_json_get(saved, "scene"), "rendering");
+    const JceJson *sky = jce_json_get(jce_json_get(rendering, "environment"), "sky");
+    const JceJson *celestial = jce_json_get(sky, "celestial");
+    TEST_ASSERT_NOT_NULL(celestial);
+    TEST_ASSERT_EQUAL_FLOAT(2.4f, (float)jce_json_get_number(celestial, "moonRadiusDegrees", -1));
+    TEST_ASSERT_EQUAL_FLOAT(0.86f, (float)jce_json_get_number(celestial, "nightGradientStrength", -1));
+    TEST_ASSERT_EQUAL_FLOAT(0.8f, (float)jce_json_get_number(celestial, "moonPhase", -1));
+    jce_json_free(saved);
+
+    TEST_ASSERT_TRUE(jce_scene_set_sky_celestial_settings(scene, NULL));
+    JceSceneSkyCelestialSettings plain = jce_scene_sky_celestial_default();
+    TEST_ASSERT_TRUE(jce_scene_set_sky_celestial_settings(scene, &plain));
+    saved = jce_scene_save_json(scene);
+    TEST_ASSERT_NOT_NULL(saved);
+    rendering = jce_json_get(jce_json_get(saved, "scene"), "rendering");
+    sky = jce_json_get(jce_json_get(rendering, "environment"), "sky");
+    celestial = jce_json_get(sky, "celestial");
+    TEST_ASSERT_NOT_NULL(celestial);
+    TEST_ASSERT_NULL(jce_json_get(celestial, "moonRadiusDegrees"));
+    TEST_ASSERT_NULL(jce_json_get(celestial, "nightGradientStrength"));
+    jce_json_free(saved);
+    jce_json_free(source);
+    jce_scene_destroy(scene);
+}
+
+static const JceJson *fog_look_json(const JceJson *root)
+{
+    const JceJson *scene = jce_json_get(root, "scene");
+    const JceJson *rendering = jce_json_get(scene, "rendering");
+    return jce_json_get(jce_json_get(rendering, "fog"), "volumeDetail");
+}
+
+static void test_fog_look_round_trip_and_legacy_clear(void)
+{
+    static const char authored[] = "{\"scene\":{\"entities\":[],\"rendering\":{\"fog\":"
+        "{\"enabled\":true,\"mode\":2,\"volumeDetail\":{\"noiseStrength\":0.75,"
+        "\"noiseCellM\":32,\"forwardStrength\":1.25,\"backwardStrength\":0.5,"
+        "\"volumeRadiusM\":105,\"volumeCenterX\":-72,\"volumeCenterY\":-30,\"volumeCenterZ\":-15}}}}}";
+    static const char legacy[] = "{\"scene\":{\"entities\":[],\"rendering\":{\"fog\":"
+        "{\"enabled\":true,\"mode\":2}}}}";
+    JceScene *scene = jce_scene_create();
+    JceJson *source = jce_json_parse(authored, sizeof authored - 1);
+    JceJson *old = jce_json_parse(legacy, sizeof legacy - 1);
+    TEST_ASSERT_NOT_NULL(scene);
+    TEST_ASSERT_NOT_NULL(source);
+    TEST_ASSERT_NOT_NULL(old);
+
+    TEST_ASSERT_EQUAL_INT(0, jce_scene_load_json(scene, source));
+    JceJson *saved = jce_scene_save_json(scene);
+    TEST_ASSERT_NOT_NULL(saved);
+    const JceJson *look = fog_look_json(saved);
+    TEST_ASSERT_NOT_NULL(look);
+    TEST_ASSERT_EQUAL_FLOAT(0.75f, (float)jce_json_get_number(look, "noiseStrength", -1));
+    TEST_ASSERT_EQUAL_FLOAT(32.0f, (float)jce_json_get_number(look, "noiseCellM", -1));
+    TEST_ASSERT_EQUAL_FLOAT(1.25f, (float)jce_json_get_number(look, "forwardStrength", -1));
+    TEST_ASSERT_EQUAL_FLOAT(0.5f, (float)jce_json_get_number(look, "backwardStrength", -1));
+    TEST_ASSERT_EQUAL_FLOAT(105.0f, (float)jce_json_get_number(look, "volumeRadiusM", -1));
+    TEST_ASSERT_EQUAL_FLOAT(-72.0f, (float)jce_json_get_number(look, "volumeCenterX", 0));
+    TEST_ASSERT_EQUAL_FLOAT(-30.0f, (float)jce_json_get_number(look, "volumeCenterY", 0));
+    TEST_ASSERT_EQUAL_FLOAT(-15.0f, (float)jce_json_get_number(look, "volumeCenterZ", 0));
+    jce_json_free(saved);
+
+    TEST_ASSERT_EQUAL_INT(0, jce_scene_load_json(scene, old));
+    saved = jce_scene_save_json(scene);
+    TEST_ASSERT_NOT_NULL(saved);
+    TEST_ASSERT_NULL(fog_look_json(saved));
+
+    jce_json_free(saved);
+    jce_json_free(source);
+    jce_json_free(old);
+    jce_scene_destroy(scene);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -263,5 +405,8 @@ int main(void)
     RUN_TEST(test_scene_json_without_look_keeps_defaults);
     RUN_TEST(test_scene_json_without_rendering_clears_prior_settings);
     RUN_TEST(test_additive_json_without_rendering_keeps_prior_settings);
+    RUN_TEST(test_celestial_settings_are_optional_and_round_trip);
+    RUN_TEST(test_celestial_night_style_round_trip);
+    RUN_TEST(test_fog_look_round_trip_and_legacy_clear);
     return UNITY_END();
 }

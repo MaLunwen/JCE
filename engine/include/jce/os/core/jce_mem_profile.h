@@ -69,7 +69,9 @@ JCE_API void JCE_CALL jce_mem_profile_register_tag_name(JceMemTag tag,
 /* Returns the registered or default tag name, or "?" if out of range. */
 JCE_API const char *JCE_CALL jce_mem_profile_tag_name(JceMemTag tag);
 
-/* Cheap counter bumps. Safe from any thread. */
+/* Cheap voluntary counter bumps. Safe from any thread. Callers must provide
+ * balanced, representable instrumentation events; these counters do not track
+ * allocation identities or repair mismatched frees/overflowing event totals. */
 JCE_API void JCE_CALL jce_mem_profile_record_alloc(JceMemTag tag, size_t bytes);
 JCE_API void JCE_CALL jce_mem_profile_record_free (JceMemTag tag, size_t bytes);
 
@@ -87,12 +89,21 @@ JCE_API void JCE_CALL jce_mem_profile_reset_peaks(void);
 JCE_API void JCE_CALL jce_mem_profile_get_total(uint64_t *current,
                                                 uint64_t *peak);
 
+/* Simultaneous totals for voluntary tagged accounting only, not the complete
+ * allocator heap or process RSS. Peak is the maximum combined current value
+ * since initialization/reset_peaks, unlike get_total's sum of tag peaks.
+ * Either output may be NULL. Thread-safe snapshot under the accounting lock. */
+JCE_API void JCE_CALL jce_mem_profile_get_aggregate_totals(uint64_t *current,
+                                                        uint64_t *peak);
+
 /* Process-level memory snapshot, sourced from mimalloc's mi_process_info
  * (no platform macros, no PSAPI). Always fills *out; returns false only
  * if out is NULL. */
 typedef struct JceProcessMemStats {
     uint64_t process_rss_bytes;
     uint64_t process_committed_bytes;
+    /* Allocator-specific counters: 0 means unavailable, not an empty heap.
+     * Never substitute process commit or voluntary tagged allocations. */
     uint64_t mimalloc_reserved_bytes;
     uint64_t mimalloc_committed_bytes;
 } JceProcessMemStats;

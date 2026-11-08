@@ -19,6 +19,7 @@
 #include <jce/os/core/jce_defs.h>
 
 #include <stdint.h>
+#include <stdbool.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -55,6 +56,12 @@ JCE_EXTERN_C_BEGIN
  * tests do. */
 uint64_t jce_engine_frame_cap_advance(uint64_t now, uint64_t budget,
                                       uint64_t *deadline);
+/* One Engine-owned opt-in session, no registry. End restores latest request. */
+/* Observation phase: 1 bind, 2 changed request, 3 post-app-init,
+ * 4 before-destroy, 5 released/restored (outside the overridden workload). */
+bool jce_engine_launch_fps_begin(const void *owner, bool present, int fps);
+void jce_engine_launch_fps_observe(const void *owner, int phase);
+void jce_engine_launch_fps_end(const void *owner);
 
 JCE_EXTERN_C_END
 

@@ -3,13 +3,13 @@
 import argparse
 import json
 from pathlib import Path
-import re
 from PIL import Image, ImageDraw
 from particle_capacity_suite import CASES, asset_for, validate_counts
-from particle_suite import scene
+from particle_suite import scene, component_population
 from gbuffer_asset_suite import image, sha256_file, write
 from report_lights import BACKENDS, checked
-from tools.jce_determinism import assert_backend
+from particle_process import validate_particle_execution
+from tools.perf_bench import read_execution_log
 
 
 def load(path):
@@ -23,7 +23,7 @@ def load(path):
     for label, config in CASES.items():
         row = value["cases"][label]
         files = row["files"]
-        if set(files) != {"fixture.particles.json", "scene.json", "engine.log", "target.png"}:
+        if set(files) != {"fixture.particles.json", "scene.json", "engine.log", "target.png", "frames.csv"}:
             raise ValueError("missing raw capacity evidence")
         for raw in files.values(): checked(Path(raw["path"]), raw["sha256"])
         asset = Path(files["fixture.particles.json"]["path"])
@@ -31,14 +31,17 @@ def load(path):
                 json.loads(Path(files["scene.json"]["path"]).read_text()) != scene(asset, config[0], True):
             raise ValueError("capacity fixture differs")
         process = row["process"]
-        log = Path(files["engine.log"]["path"]).read_text(encoding="utf-8")
-        if process["process"].get("returncode") != 0 or process["process"].get("timed_out") or "] ERROR -" in log:
-            raise ValueError("capacity consumer failed")
-        if assert_backend(process.get("stdout", "")+"\n"+log, value["backend"]) != process.get("backend_actual"):
+        captured = dict(process["process"])
+        for stream in ("stdout", "stderr"):
+            if stream in process:
+                captured[stream] = process[stream]
+        log_path = Path(files["engine.log"]["path"])
+        actual = validate_particle_execution(captured, log_path,
+            Path(files["frames.csv"]["path"]), 200, value["backend"])
+        if actual != process.get("backend_actual"):
             raise ValueError("actual backend differs")
-        marker = re.findall(r"benchmark-particles: frame=50 components=(\d+) loaded=(\d+) cpu_handles=(\d+) gpu_requested=(\d+)", log)
-        if len(marker) != 1 or int(marker[0][0]) != config[0] or int(marker[0][3]) != config[0]:
-            raise ValueError("component routing differs")
+        log = read_execution_log(log_path, captured)
+        component_population(log, config[0], False)
         expected = {"JCE_BACKEND": value["backend"], "JCE_GPU_TIER": "high",
             "JCE_SCENE": files["scene.json"]["path"], "JCE_BENCH_PARTICLE_OBSERVE": "1",
             "JCE_GPU_PARTICLES_FORCE": "1", "JCE_BENCH_ASSET_STILL": "1",

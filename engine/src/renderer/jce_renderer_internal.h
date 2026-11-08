@@ -129,4 +129,7 @@ const bgfx_memory_t *jce_zero_init_mem(unsigned int size_bytes);
 }
 #endif
 
+/* Toon-only stage-4 override; a null atlas retains the material's own bind. */
+void jce_pbr_material_bind_toon_atlas(const JceTexture *atlas, const float *basis);
+
 #endif /* JCE_RENDERER_INTERNAL_H */

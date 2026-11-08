@@ -126,9 +126,26 @@ static bool tc_find_on_path(const char *exe_base,
     return false;
 }
 
-/* Run `exe arg` with stdout captured, wait for completion, and return
- * the first non-empty line in `out` (truncated to cap).  Returns false
- * on spawn failure.  Empty arg means "no args".  `timeout_ms` is a
+/* Drain both nonblocking pipes, retaining only the bounded stdout prefix.
+ * Stderr is diagnostic output, never a tool path or version authority. */
+static bool tc_drain_query(JceProcess *p, char *buf, size_t cap, size_t *total)
+{
+    char discard[256];
+    size_t got;
+    if (*total < cap - 1) {
+        got = jce_process_read_stdout(p, buf + *total, cap - 1 - *total);
+        *total += got;
+    } else {
+        got = jce_process_read_stdout(p, discard, sizeof discard);
+    }
+    size_t stderr_got = jce_process_read_stderr(p, discard, sizeof discard);
+    return got != 0 || stderr_got != 0;
+}
+
+/* Run `exe arg` with both streams captured, wait for successful completion,
+ * and return the first non-empty stdout line in `out` (truncated to cap).
+ * Returns false on spawn, timeout, exit or empty-output failure. Empty arg
+ * means "no args". `timeout_ms` is a
  * cooperative cap — children that take longer get force-killed. */
 static bool tc_capture_first_line(const char *exe, const char *arg,
                                   int timeout_ms,
@@ -141,7 +158,7 @@ static bool tc_capture_first_line(const char *exe, const char *arg,
     cfg.executable_path  = exe;
     cfg.arguments        = (arg && arg[0]) ? arg : NULL;
     cfg.capture_stdout   = true;
-    cfg.capture_stderr   = false;
+    cfg.capture_stderr   = true;
 
     JceProcess *p = jce_process_spawn(&cfg);
     if (!p) return false;
@@ -149,40 +166,36 @@ static bool tc_capture_first_line(const char *exe, const char *arg,
     char buf[1024];
     size_t total   = 0;
     const Uint64 t0 = SDL_GetTicks();
-    const Uint64 deadline = t0 + (timeout_ms > 0 ? (Uint64)timeout_ms : 2000);
+    const Uint64 budget = timeout_ms > 0 ? (Uint64)timeout_ms : 2000;
     int exit_code = 0;
     bool exited   = false;
     while (!exited) {
-        if (total < sizeof buf - 1) {
-            size_t got = jce_process_read_stdout(p, buf + total,
-                                                 sizeof buf - 1 - total);
-            total += got;
-        }
+        (void)tc_drain_query(p, buf, sizeof buf, &total);
         if (jce_process_poll_exit(p, &exit_code)) {
             exited = true;
             break;
         }
-        if (SDL_GetTicks() >= deadline) {
+        if (SDL_GetTicks() - t0 >= budget) {
             jce_process_force_kill(p);
             break;
         }
         SDL_Delay(5);
     }
-    /* Drain any tail bytes left in the stdout pipe after exit. */
-    if (exited && total < sizeof buf - 1) {
+    /* An exited child can still have queued bytes in either pipe. Continue
+     * discarding beyond the stdout prefix so neither stream blocks progress. */
+    bool drained = false;
+    if (exited) {
         for (;;) {
-            size_t got = jce_process_read_stdout(p, buf + total,
-                                                 sizeof buf - 1 - total);
-            if (got == 0) break;
-            total += got;
-            if (total >= sizeof buf - 1) break;
+            if (!tc_drain_query(p, buf, sizeof buf, &total)) {
+                drained = true;
+                break;
+            }
+            if (SDL_GetTicks() - t0 >= budget) break;
         }
     }
     jce_process_destroy(p);
     buf[total] = 0;
-    (void)exit_code;
-
-    if (total == 0) return false;
+    if (!exited || !drained || exit_code != 0 || total == 0) return false;
     /* First non-empty line. */
     char *line = buf;
     while (*line) {
@@ -197,7 +210,7 @@ static bool tc_capture_first_line(const char *exe, const char *arg,
         if (!nl) break;
         line = nl + 1;
     }
-    return true;
+    return false;
 }
 
 /* Extract a "1.2.3"-style version token from an arbitrary line.  Picks
@@ -290,9 +303,10 @@ static bool try_install_dir(JceToolchain *out, const char *dir,
 {
     if (!dir || !dir[0] || !exe_base) return false;
     char exe[JCE_TOOLCHAIN_PATH_MAX];
-    SDL_snprintf(exe, sizeof exe, "%s%c%s%s",
-                 dir, TC_NATIVE_DIR_SEP, exe_base, TC_EXE_SUFFIX);
-    if (!jce_fs_host_exists_file(exe)) return false;
+    char file_name[256];
+    SDL_snprintf(file_name, sizeof file_name, "%s%s", exe_base, TC_EXE_SUFFIX);
+    if (!jce_path_join(exe, sizeof exe, dir, file_name)
+        || !jce_fs_host_exists_file(exe)) return false;
 
     str_copy(out->path, sizeof out->path, dir);
     char first[256];
@@ -405,6 +419,20 @@ static void probe_ninja(JceToolchain *out) { probe_with_fallbacks(out, "ninja", 
 static void probe_gcc  (JceToolchain *out) { probe_with_fallbacks(out, "gcc",   k_gcc_dirs);   }
 static void probe_clang(JceToolchain *out) { probe_with_fallbacks(out, "clang", k_clang_dirs); }
 
+/* Marker validation is shared by automatic and explicit VS roots.
+ * It proves plausible discovery, not a usable compiler/SDK/ABI closure. */
+static bool try_msvc_root(JceToolchain *out, const char *root)
+{
+    char marker[JCE_TOOLCHAIN_PATH_MAX];
+    if (!root || !root[0]
+        || !jce_path_join(marker, sizeof marker, root,
+                          "VC/Auxiliary/Build/vcvarsall.bat")
+        || !jce_fs_host_exists_file(marker)) return false;
+    str_copy(out->path, sizeof out->path, root);
+    out->present = true;
+    return true;
+}
+
 static void probe_msvc(JceToolchain *out)
 {
 #if JCE_PLATFORM_WINDOWS
@@ -425,9 +453,7 @@ static void probe_msvc(JceToolchain *out)
             3000, line, sizeof line)) {
         return;
     }
-    if (!line[0]) return;
-
-    str_copy(out->path, sizeof out->path, line);
+    if (!try_msvc_root(out, line)) return;
 
     /* Read tools version too — best effort. */
     char ver_line[128];
@@ -450,9 +476,8 @@ static bool try_ndk_root(JceToolchain *out, const char *root)
     if (!root || !root[0]) return false;
     char marker[JCE_TOOLCHAIN_PATH_MAX];
     /* source.properties is present in every NDK r10e+. */
-    SDL_snprintf(marker, sizeof marker, "%s%csource.properties",
-                 root, TC_NATIVE_DIR_SEP);
-    if (!jce_fs_host_exists_file(marker)) return false;
+    if (!jce_path_join(marker, sizeof marker, root, "source.properties")
+        || !jce_fs_host_exists_file(marker)) return false;
 
     str_copy(out->path, sizeof out->path, root);
 
@@ -502,18 +527,16 @@ static void probe_ndk(JceToolchain *out)
     }
 }
 
-static void probe_emsdk(JceToolchain *out)
+static bool try_emsdk_root(JceToolchain *out, const char *root)
 {
-    const char *root = tc_getenv("EMSDK");
-    if (!root) return;
+    if (!root || !root[0]) return false;
     char marker[JCE_TOOLCHAIN_PATH_MAX];
-    SDL_snprintf(marker, sizeof marker, "%s%cemsdk%s",
-                 root, TC_NATIVE_DIR_SEP, TC_EXE_SUFFIX[0] ? ".bat" : "");
+    if (!jce_path_join(marker, sizeof marker, root,
+                       TC_EXE_SUFFIX[0] ? "emsdk.bat" : "emsdk")) return false;
     /* Fall back to the python entry point. */
     if (!jce_fs_host_exists_file(marker)) {
-        SDL_snprintf(marker, sizeof marker, "%s%cemsdk.py",
-                     root, TC_NATIVE_DIR_SEP);
-        if (!jce_fs_host_exists_file(marker)) return;
+        if (!jce_path_join(marker, sizeof marker, root, "emsdk.py")
+            || !jce_fs_host_exists_file(marker)) return false;
     }
     str_copy(out->path, sizeof out->path, root);
 
@@ -540,6 +563,25 @@ static void probe_emsdk(JceToolchain *out)
         }
     }
     out->present = true;
+    return true;
+}
+
+static void probe_emsdk(JceToolchain *out)
+{
+    (void)try_emsdk_root(out, tc_getenv("EMSDK"));
+}
+
+/* Both full Xcode and Command Line Tools Developer roots contain clang.
+ * This marker is not proof of an iOS SDK, signing or target execution. */
+static bool try_xcode_root(JceToolchain *out, const char *root)
+{
+    char marker[JCE_TOOLCHAIN_PATH_MAX];
+    if (!root || !root[0]
+        || !jce_path_join(marker, sizeof marker, root, "usr/bin/clang")
+        || !jce_fs_host_exists_file(marker)) return false;
+    str_copy(out->path, sizeof out->path, root);
+    out->present = true;
+    return true;
 }
 
 static void probe_xcode(JceToolchain *out)
@@ -550,8 +592,7 @@ static void probe_xcode(JceToolchain *out)
                                2000, line, sizeof line)) {
         return;
     }
-    if (!line[0] || !jce_fs_host_exists_dir(line)) return;
-    str_copy(out->path, sizeof out->path, line);
+    if (!try_xcode_root(out, line)) return;
 
     char ver[128];
     if (tc_capture_first_line("/usr/bin/xcodebuild", "-version",
@@ -568,48 +609,89 @@ static void probe_xcode(JceToolchain *out)
 /*  Override probing                                                  */
 /* ------------------------------------------------------------------ */
 
+static bool tc_basename_matches(const char *path, const char *expected)
+{
+    char name[256];
+    if (!jce_path_basename(name, sizeof name, path)) return false;
+#if JCE_PLATFORM_WINDOWS
+    return jce_strcasecmp(name, expected) == 0;
+#else
+    return strcmp(name, expected) == 0;
+#endif
+}
+
 static void probe_override(JceToolchainKind kind, const char *path,
                            JceToolchain *out)
 {
-    /* The override is interpreted as the install root.  We accept it
-     * as "present" if either:
-     *   - the path is a directory and contains a kind-specific marker
-     *   - or the path itself is an existing file (user pointed straight
-     *     at cmake.exe or similar — we then store the parent dir). */
-    if (!path || !path[0]) return;
-
+    if ((int)kind < 0 || (int)kind >= JCE_TOOLCHAIN_COUNT
+        || !path || !path[0]) return;
     char root[JCE_TOOLCHAIN_PATH_MAX];
+    if (strlen(path) >= sizeof root) return;
     str_copy(root, sizeof root, path);
 
-    if (jce_fs_host_exists_file(root) && !jce_fs_host_exists_dir(root)) {
-        char parent[JCE_TOOLCHAIN_PATH_MAX];
-        if (jce_path_parent(parent, sizeof parent, root)) {
-            str_copy(root, sizeof root, parent);
+    const char *exe_base = NULL;
+    switch (kind) {
+    case JCE_TOOLCHAIN_CMAKE:
+    case JCE_TOOLCHAIN_NINJA:
+    case JCE_TOOLCHAIN_GCC:
+    case JCE_TOOLCHAIN_CLANG:
+        exe_base = k_kind_names[kind];
+        break;
+    default:
+        break;
+    }
+
+    /* Only the expected executable or vcvarsall entry may be supplied
+     * directly. An arbitrary sibling file is not an install-root override. */
+    if (jce_fs_host_exists_file(root)) {
+        if (exe_base) {
+            char file_name[256];
+            SDL_snprintf(file_name, sizeof file_name, "%s%s",
+                         exe_base, TC_EXE_SUFFIX);
+            if (!tc_basename_matches(root, file_name)
+                || !jce_path_parent(root, sizeof root, root)) return;
+        } else if (kind == JCE_TOOLCHAIN_MSVC) {
+            const char *parents[] = {"Build", "Auxiliary", "VC"};
+            /* Keep normalization output separate from the borrowed input. */
+            if (!jce_path_normalize(root, sizeof root, path)
+                || !tc_basename_matches(root, "vcvarsall.bat")) return;
+            for (size_t i = 0; i < sizeof parents / sizeof parents[0]; ++i) {
+                if (!jce_path_parent(root, sizeof root, root)
+                    || !tc_basename_matches(root, parents[i])) return;
+            }
+            if (!jce_path_parent(root, sizeof root, root)) return;
+        } else {
+            /* SDK inputs retain their documented root-directory contract. */
+            return;
         }
     }
     if (!jce_fs_host_exists_dir(root)) return;
 
-    out->present = true;
-    out->from_override = true;
-    str_copy(out->path, sizeof out->path, root);
-
-    /* Best-effort version when we know how to derive it. */
+    /* Use the same marker/executable helpers as automatic discovery.
+     * Invalid overrides retain the existing public refresh auto fallback. */
     switch (kind) {
-    case JCE_TOOLCHAIN_NDK: {
-        char marker[JCE_TOOLCHAIN_PATH_MAX];
-        SDL_snprintf(marker, sizeof marker, "%s%csource.properties",
-                     root, TC_NATIVE_DIR_SEP);
-        char buf[2048];
-        if (tc_read_small_file(marker, buf, sizeof buf)) {
-            tc_props_get(buf, "Pkg.Revision",
-                         out->version, sizeof out->version);
-        }
+    case JCE_TOOLCHAIN_CMAKE:
+    case JCE_TOOLCHAIN_NINJA:
+    case JCE_TOOLCHAIN_GCC:
+    case JCE_TOOLCHAIN_CLANG:
+        (void)try_install_dir(out, root, exe_base);
         break;
-    }
+    case JCE_TOOLCHAIN_MSVC:
+        (void)try_msvc_root(out, root);
+        break;
+    case JCE_TOOLCHAIN_NDK:
+        (void)try_ndk_root(out, root);
+        break;
+    case JCE_TOOLCHAIN_EMSDK:
+        (void)try_emsdk_root(out, root);
+        break;
+    case JCE_TOOLCHAIN_XCODE:
+        (void)try_xcode_root(out, root);
+        break;
     default:
-        out->version[0] = 0;
         break;
     }
+    if (out->present) out->from_override = true;
 }
 
 /* ------------------------------------------------------------------ */

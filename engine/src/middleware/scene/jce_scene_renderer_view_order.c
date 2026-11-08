@@ -57,6 +57,27 @@ JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_CAMERA_OVERLAY_OFFSET),
 JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_CAMERA_OVERLAY_OFFSET +
                                            JCE_VIEW_SR_CAMERA_OVERLAY_MAX - 1u),
                camera_overlay_hi_is_frozen);
+JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_WATER_CAUSTIC_OFFSET),
+               caustic_atlas_is_frozen);
+JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_WATER_TRACE_OFFSET) &&
+               JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_TRANSPARENCY_OFFSET),
+               water_optics_views_are_frozen);
+JCE_VO_SASSERT(JCE_VIEW_SR_WATER_TRACE_OFFSET < JCE_VIEW_SR_TRANSPARENCY_OFFSET &&
+               JCE_VIEW_SR_TRANSPARENCY_OFFSET < JCE_VIEW_SR_POINT_CUBE_OFFSET,
+               water_optics_band_is_bounded);
+JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_TOON_HAIR_OFFSET),
+               toon_hair_depth_is_frozen);
+JCE_VO_SASSERT(JCE_VIEW_SR_TOON_HAIR_OFFSET > JCE_VIEW_SR_SCREEN_SHAFTS_OFFSET &&
+               JCE_VIEW_SR_TOON_HAIR_OFFSET < JCE_VIEW_SR_POINT_CUBE_OFFSET,
+               toon_hair_depth_is_bounded);
+JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_CLOUD_TEMPORAL_OFFSET) &&
+               JCE_VIEW_SR_CLOUD_TEMPORAL_OFFSET < JCE_VIEW_SR_POINT_CUBE_OFFSET,
+               cloud_temporal_view_is_frozen_and_bounded);
+JCE_VO_SASSERT(JCE_VIEW_SR_OFFSET_RESERVED(JCE_VIEW_SR_CLOUD_OPAQUE_OFFSET) &&
+               JCE_VIEW_SR_CLOUD_OPAQUE_OFFSET < JCE_VIEW_SR_POINT_CUBE_OFFSET,
+               cloud_opaque_view_is_frozen_and_bounded);
+JCE_VO_SASSERT(JCE_VIEW_RUNTIME_GAME + JCE_VIEW_SR_WATER_TRACE_OFFSET > 120u,
+               water_trace_after_runtime_postfx_ids);
 
 /* And the frozen set may only ever GROW.  A narrowed range hands ids the
  * renderer once named back to whoever asks for them first, which is how the
@@ -74,6 +95,10 @@ JCE_VO_SASSERT(JCE_VIEW_SR_FROZEN_4_LO <=  26u && JCE_VIEW_SR_FROZEN_4_HI >=  27
                frozen_range_4_never_narrows);
 JCE_VO_SASSERT(JCE_VIEW_SR_FROZEN_5_LO <=  64u && JCE_VIEW_SR_FROZEN_5_HI >=  66u,
                frozen_range_5_never_narrows);
+JCE_VO_SASSERT(JCE_VIEW_SR_FROZEN_6_LO <=  69u && JCE_VIEW_SR_FROZEN_6_HI >=  69u,
+               frozen_range_6_never_narrows);
+JCE_VO_SASSERT(JCE_VIEW_SR_FROZEN_7_LO <= 94u && JCE_VIEW_SR_FROZEN_7_HI >= 95u,
+               frozen_range_7_never_narrows);
 
 static bool order_contains(const JceSceneRendererViewOrder *out,
                            uint16_t view_id)
@@ -87,6 +112,8 @@ static bool order_contains(const JceSceneRendererViewOrder *out,
 
 static bool order_push(JceSceneRendererViewOrder *out, uint16_t view_id)
 {
+    if (view_id >= JCE_SCENE_RENDERER_VIEW_ID_LIMIT)
+        return false;
     if (out->count >= JCE_SCENE_RENDERER_VIEW_ORDER_MAX)
         return false;
     if (order_contains(out, view_id))
@@ -95,28 +122,52 @@ static bool order_push(JceSceneRendererViewOrder *out, uint16_t view_id)
     return true;
 }
 
-bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
-                                         bool include_shadow_views,
-                                         uint8_t csm_cascade_count,
-                                         bool include_fog_views,
-                                         bool include_gpu_particle_view,
-                                         bool include_gpu_cull_view,
-                                         bool include_point_cube_views,
-                                         bool include_dyn_csm_views,
-                                         bool include_underwater_view,
-                                         uint8_t camera_overlay_count,
-                                         JceSceneRendererViewOrder *out)
+bool jce_scene_renderer_view_order_build_with_cloud_temporal(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            bool include_screen_shafts,
+                                            bool include_toon_hair,
+                                            bool include_cloud_temporal,
+                                            JceSceneRendererViewOrder *out)
 {
     if (!out)
         return false;
 
     memset(out, 0, sizeof(*out));
     out->first = view_id_base;
+    if (view_id_base >= JCE_SCENE_RENDERER_VIEW_ID_LIMIT - 1u)
+        return false;
+    if (include_water_caustics &&
+        (unsigned)view_id_base + JCE_VIEW_SR_WATER_CAUSTIC_OFFSET >= JCE_SCENE_RENDERER_VIEW_ID_LIMIT)
+        return false;
+    if (include_water_optics &&
+        (unsigned)view_id_base + JCE_VIEW_SR_TRANSPARENCY_OFFSET >=
+            JCE_SCENE_RENDERER_VIEW_ID_LIMIT)
+        return false;
+    if (include_screen_shafts && (!include_fog_views ||
+        (unsigned)view_id_base + JCE_VIEW_SR_SCREEN_SHAFTS_OFFSET >= JCE_SCENE_RENDERER_VIEW_ID_LIMIT))
+        return false;
+    if ((include_toon_hair || include_cloud_temporal) && (view_id_base != JCE_VIEW_EDITOR_SCENE &&
+        view_id_base != JCE_VIEW_EDITOR_GAME && view_id_base != JCE_VIEW_RUNTIME_GAME))
+        return false;
 
     if (csm_cascade_count > JCE_CSM_MAX_CASCADES)
         csm_cascade_count = JCE_CSM_MAX_CASCADES;
 
-    uint16_t max_view = view_id_base;
+    /* The shared camera-depth producer can be submitted for the pipeline's
+     * depth_prepass alone, without any of the optional view flags below.
+     * Always reserve its existing core slot; an empty reservation costs no
+     * touch, draw or dispatch. */
+    uint16_t max_view = (uint16_t)(view_id_base + 1u);
     if (include_shadow_views) {
         uint16_t shadow_max = (uint16_t)(view_id_base + 10u);
         if (csm_cascade_count > 0)
@@ -156,7 +207,8 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
        [base, max_view] — only affects ordering, not the range. */
 
     uint32_t range_count = (uint32_t)max_view - (uint32_t)view_id_base + 1u;
-    if (range_count > JCE_SCENE_RENDERER_VIEW_ORDER_MAX)
+    if (max_view >= JCE_SCENE_RENDERER_VIEW_ID_LIMIT ||
+        range_count > JCE_SCENE_RENDERER_VIEW_ORDER_MAX)
         return false;
 
     /* GPU-driven CULL views FIRST — before the shadow producer views — but ONLY
@@ -249,7 +301,38 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
             return false;
     }
 
+    /* Water absorption and soft particles read the shared camera depth
+     * while drawing base+0.  Submit order cannot establish that dependency:
+     * bgfx sorts views by this remap, so base+1 must lead its color readers.
+     * SSR/SSGI and SSAO retain their existing post-color slots below. */
+    if (!order_push(out, (uint16_t)(view_id_base + 1u)))
+        return false;
+    if (include_water_caustics &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_WATER_CAUSTIC_OFFSET)))
+        return false;
+    if (include_toon_hair &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_TOON_HAIR_OFFSET)))
+        return false;
+    if (include_cloud_temporal &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_CLOUD_TEMPORAL_OFFSET)))
+        return false;
     if (!order_push(out, view_id_base))
+        return false;
+
+    // Water optics must read the original opaque radiance. The subsequent
+    // cloud composite writes into that same target before transparency resumes.
+    if (include_water_optics &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_WATER_TRACE_OFFSET)))
+        return false;
+    if (include_cloud_temporal &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_CLOUD_OPAQUE_OFFSET)))
+        return false;
+    if ((include_water_optics || include_cloud_temporal) &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_TRANSPARENCY_OFFSET)))
+        return false;
+
+    if (include_screen_shafts &&
+        !order_push(out, (uint16_t)(view_id_base + JCE_VIEW_SR_SCREEN_SHAFTS_OFFSET)))
         return false;
 
     for (uint16_t view_id = (uint16_t)(view_id_base + 1u);
@@ -327,4 +410,144 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
     /* Permutation check: count must span first..highest exactly once each.
      * order_push dedups, so a correct build has one entry per id. */
     return out->count == (uint32_t)(highest - out->first + 1u);
+}
+
+bool jce_scene_renderer_view_order_build_with_toon_hair(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            bool include_screen_shafts,
+                                            bool include_toon_hair,
+                                            JceSceneRendererViewOrder *out)
+{
+    return jce_scene_renderer_view_order_build_with_cloud_temporal(view_id_base,
+        include_shadow_views, csm_cascade_count, include_fog_views,
+        include_gpu_particle_view, include_gpu_cull_view, include_point_cube_views,
+        include_dyn_csm_views, include_underwater_view, camera_overlay_count,
+        include_water_caustics, include_water_optics,
+        include_screen_shafts, include_toon_hair, false, out);
+}
+
+bool jce_scene_renderer_view_order_build_with_shafts(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            bool include_screen_shafts,
+                                            JceSceneRendererViewOrder *out)
+{
+    return jce_scene_renderer_view_order_build_with_toon_hair(view_id_base,
+        include_shadow_views, csm_cascade_count, include_fog_views,
+        include_gpu_particle_view, include_gpu_cull_view, include_point_cube_views,
+        include_dyn_csm_views, include_underwater_view, camera_overlay_count,
+        include_water_caustics, include_water_optics,
+        include_screen_shafts, false, out);
+}
+
+bool jce_scene_renderer_view_order_build_with_optics(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            JceSceneRendererViewOrder *out)
+{
+    return jce_scene_renderer_view_order_build_with_shafts(view_id_base,
+        include_shadow_views, csm_cascade_count, include_fog_views,
+        include_gpu_particle_view, include_gpu_cull_view, include_point_cube_views,
+        include_dyn_csm_views, include_underwater_view, camera_overlay_count,
+        include_water_caustics, include_water_optics,
+        false, out);
+}
+
+JceSceneRendererViewOrderTail jce_scene_renderer_view_order_tail_reset(
+    const JceSceneRendererViewOrder *order, uint16_t previous_count)
+{
+    if (!order || !order->count || previous_count <= order->count ||
+        previous_count > JCE_SCENE_RENDERER_VIEW_ORDER_MAX ||
+        (unsigned)order->first + previous_count > JCE_SCENE_RENDERER_VIEW_ID_LIMIT)
+        return (JceSceneRendererViewOrderTail){0};
+
+    return (JceSceneRendererViewOrderTail){
+        (uint16_t)(order->first + order->count),
+        (uint16_t)(previous_count - order->count)
+    };
+}
+
+bool jce_scene_renderer_view_order_build_with_caustic(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            JceSceneRendererViewOrder *out)
+{
+    return jce_scene_renderer_view_order_build_with_optics(view_id_base,
+        include_shadow_views, csm_cascade_count, include_fog_views,
+        include_gpu_particle_view, include_gpu_cull_view, include_point_cube_views,
+        include_dyn_csm_views, include_underwater_view, camera_overlay_count,
+        include_water_caustics, false, out);
+}
+
+bool jce_scene_renderer_view_order_build_ex(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            JceSceneRendererViewOrder *out)
+{
+    return jce_scene_renderer_view_order_build_with_caustic(view_id_base,
+        include_shadow_views, csm_cascade_count, include_fog_views,
+        include_gpu_particle_view, include_gpu_cull_view, include_point_cube_views,
+        include_dyn_csm_views, include_underwater_view, camera_overlay_count,
+        false, out);
+}
+
+bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
+                                         bool include_shadow_views,
+                                         uint8_t csm_cascade_count,
+                                         bool include_fog_views,
+                                         bool include_gpu_particle_view,
+                                         bool include_gpu_cull_view,
+                                         bool include_point_cube_views,
+                                         bool include_dyn_csm_views,
+                                         bool include_underwater_view,
+                                         uint8_t camera_overlay_count,
+                                         JceSceneRendererViewOrder *out)
+{
+    return jce_scene_renderer_view_order_build_ex(view_id_base,
+        include_shadow_views, csm_cascade_count, include_fog_views,
+        include_gpu_particle_view, include_gpu_cull_view, include_point_cube_views,
+        include_dyn_csm_views, include_underwater_view, camera_overlay_count, out);
 }

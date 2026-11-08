@@ -9,6 +9,7 @@
  */
 
 #include "jce_scene_components_internal.h"
+#include "jce_scene_line_colors_internal.h"
 
 void parse_dir_light(JceScene *s, JceEntity e, const cJSON *c)
 {
@@ -293,14 +294,7 @@ void parse_line_renderer(JceScene *s, JceEntity e, const cJSON *c)
     snprintf(l.material_path, sizeof(l.material_path), "%s", mp ? mp : "");
     l.width_start    = (float)j_num(c, "widthStart", 0.1);
     l.width_end      = (float)j_num(c, "widthEnd",   0.1);
-    l.color_start[0] = (float)j_num(c, "colorStartR", 1.0);
-    l.color_start[1] = (float)j_num(c, "colorStartG", 1.0);
-    l.color_start[2] = (float)j_num(c, "colorStartB", 1.0);
-    l.color_start[3] = (float)j_num(c, "colorStartA", 1.0);
-    l.color_end[0]   = (float)j_num(c, "colorEndR", 1.0);
-    l.color_end[1]   = (float)j_num(c, "colorEndG", 1.0);
-    l.color_end[2]   = (float)j_num(c, "colorEndB", 1.0);
-    l.color_end[3]   = (float)j_num(c, "colorEndA", 1.0);
+    scene_line_parse_colors(&l, c, false);
     l.use_world_space = j_bool(c, "useWorldSpace", true);
     l.loop            = j_bool(c, "loop", false);
     int n = (int)j_num(c, "positionCount", 0);

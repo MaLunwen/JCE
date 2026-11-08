@@ -149,8 +149,9 @@ JCE_API void JCE_CALL jce_log_write_v(JceLogLevel level, const char *tag,
  * (producer burst) never reach the sink, the same way they never reach stderr.
  *
  * Threading: on threaded platforms the sink runs on the log backend thread,
- * never on the thread that called LOG_*; before jce_log_init() and after
- * jce_log_shutdown() it runs on the calling thread.  It must therefore be
+ * while the backend is active. During the Engine's final diagnostic retirement,
+ * before jce_log_init(), and after jce_log_shutdown(), it runs on the calling
+ * thread. It must therefore be
  * thread-safe, must not block for long (it stalls log IO), must not call any
  * jce_log_* function (jce_log_write would recurse forever, jce_log_set_sink
  * would deadlock), and must copy anything it keeps — every pointer in the

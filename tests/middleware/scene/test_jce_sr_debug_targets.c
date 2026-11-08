@@ -20,7 +20,6 @@
  */
 
 #include "middleware/scene/jce_sr_debug_targets.h"
-#include "middleware/scene/jce_sr_particle_batch_plan.h"
 
 #include "unity.h"
 
@@ -406,43 +405,9 @@ static void test_cpu_count_zero_overflow_and_current_target(void)
     TEST_ASSERT_EQUAL_INT(0, jce_sr_debug_targets_build(&st, rows, CAP));
 }
 
-static void test_cpu_particle_arena_bounded_offsets_and_failure(void)
-{
-    uint32_t capacity = 9, offset = 9;
-    const uint32_t million = 1048576;
-    TEST_ASSERT_TRUE(sr_particle_arena_plan(0, 0, million, 2 * million, &capacity, &offset));
-    TEST_ASSERT_EQUAL_UINT32(million, capacity);
-    TEST_ASSERT_EQUAL_UINT32(0, offset);
-    TEST_ASSERT_TRUE(sr_particle_arena_plan(million, million, million, 2 * million, &capacity, &offset));
-    TEST_ASSERT_EQUAL_UINT32(2 * million, capacity);
-    TEST_ASSERT_EQUAL_UINT32(million, offset);
-    capacity = 9; offset = 9;
-    TEST_ASSERT_FALSE(sr_particle_arena_plan(2 * million, 2 * million, 1, 2 * million, &capacity, &offset));
-    TEST_ASSERT_EQUAL_UINT32(9, capacity);
-    TEST_ASSERT_EQUAL_UINT32(9, offset);
-    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 1, UINT32_MAX, &capacity, &offset));
-    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 0, million, &capacity, &offset));
-    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 1, million, NULL, &offset));
-    TEST_ASSERT_FALSE(sr_particle_arena_plan(0, 0, 1, million, &capacity, NULL));
-    TEST_ASSERT_EQUAL_UINT32(9, capacity);
-    TEST_ASSERT_EQUAL_UINT32(9, offset);
-    TEST_ASSERT_TRUE(sr_particle_arena_trim_needed(million, 0, true));
-    TEST_ASSERT_TRUE(sr_particle_arena_trim_needed(million, million / 2, true));
-    TEST_ASSERT_FALSE(sr_particle_arena_trim_needed(million, 0, false));
-    TEST_ASSERT_FALSE(sr_particle_arena_trim_needed(million, million, true));
-    TEST_ASSERT_FALSE(sr_particle_arena_plan(64, 65, 1, 128, &capacity, &offset));
-    TEST_ASSERT_TRUE(sr_particle_arena_plan(64, 16, 32, 64, &capacity, &offset));
-    TEST_ASSERT_EQUAL_UINT32(64, capacity);
-    TEST_ASSERT_EQUAL_UINT32(16, offset);
-    TEST_ASSERT_TRUE(sr_particle_arena_plan(64, 0, 65, 100, &capacity, &offset));
-    TEST_ASSERT_EQUAL_UINT32(100, capacity);
-    TEST_ASSERT_EQUAL_UINT32(0, offset);
-}
-
 int main(void)
 {
     UNITY_BEGIN();
-    RUN_TEST(test_cpu_particle_arena_bounded_offsets_and_failure);
     RUN_TEST(test_cpu_count_zero_overflow_and_current_target);
     RUN_TEST(test_gpu_alive_targets_require_current_frame_and_valid_handles);
     RUN_TEST(test_the_full_table_is_exactly_this);

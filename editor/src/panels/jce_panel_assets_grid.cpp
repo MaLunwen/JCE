@@ -40,10 +40,6 @@ static void open_asset_entry(const FileEntry &fe)
 
     if (jce_assetdb_get_kind(fe.path.c_str()) == JCE_ASSET_KIND_SCENE) {
         jce_state_load_scene_file(fe.path.c_str());
-        std::string dir = fe.path;
-        size_t sep = dir.find_last_of("/\\");
-        if (sep != std::string::npos) dir.resize(sep);
-        jce_editor_scene_set_scene_dir(dir.c_str());
     } else {
         open_asset_in_file_viewer(fe.path.c_str());
     }
@@ -991,7 +987,7 @@ void draw_asset_empty_area_menu(void)
         }
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.refresh"))) {
-            s_assets.needs_refresh = true;
+            request_asset_resource_refresh();
         }
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.setAsProjectRoot"),
                             NULL, false,

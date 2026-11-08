@@ -4,6 +4,32 @@
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	cmake_minimum_required(VERSION 3.20)
+endif()
+
+# Both entries share authoring sources and resource bytes. Only the explicit
+# SDK capability fixture requires the external/native language closure.
+option(ES_MULTILANG "Build the five-language ES SDK capability fixture" OFF)
+if(ES_MULTILANG)
+	set(_es_manifest_path "${CMAKE_CURRENT_SOURCE_DIR}/jce_project.multilang.json")
+else()
+	set(_es_manifest_path "${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json")
+endif()
+
+# The default executable is the public stock app body over serialized Lua.
+# Native capability extensions remain in the explicit multilang fixture.
+set(_es_app_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/main_portable.c")
+if(ES_MULTILANG)
+	set(_es_app_sources
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_camera.c"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_perf.c"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_scene_orchestrator.c"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_aid_mood.c"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_script_langs.c"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_script_probe.c")
+endif()
+
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	project(ElementalSerenity C CXX)
 	if(NOT DEFINED JCE_BUILD_VARIANT)
 		set(JCE_BUILD_VARIANT release CACHE STRING
@@ -12,43 +38,19 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 
 	find_package(JCE REQUIRED)
 
-	add_executable(ElementalSerenity
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/main.c"
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_camera.c"
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_perf.c"
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_scene_orchestrator.c"
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_aid_mood.c"
-		# main.c calls es_script_langs_register() and the es_script_probe_*
-		# trio unconditionally; this branch's list had drifted behind the
-		# in-tree branch's (line ~298) and the SDK build failed to link.
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_script_langs.c"
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/es_script_probe.c")
+	add_executable(ElementalSerenity ${_es_app_sources})
 	set_target_properties(ElementalSerenity PROPERTIES OUTPUT_NAME elemental_serenity)
 
-	# ---------------------------------------------------------------- #
-	#  EVERY LANGUAGE THIS SDK HAS, in one line.                        #
-	#                                                                   #
-	#  What used to be here was nothing at all: the ~190 lines that     #
-	#  link the backends, bake their runtime paths and call their       #
-	#  register()s live in the IN-TREE branch below, which this branch  #
-	#  returns before reaching.  So `scripts/jce.py app` -- the way     #
-	#  this project actually ships -- produced an executable that ran   #
-	#  Lua and nothing else, while the editor ran four languages, and   #
-	#  nothing errored at build time.  The probe said "1 of 5 languages #
-	#  live" and had been right for some time.                          #
-	#                                                                   #
-	#  jce_script_enable() (scripting/cmake/JCEScriptEnable.cmake, in   #
-	#  the SDK) does all four steps and generates the registration      #
-	#  shim; es_script_langs.c calls into it.                           #
-	# ---------------------------------------------------------------- #
-	if(COMMAND jce_script_enable)
-		# The two NATIVE MODULES stay project code -- the classes are this
-		# project's.  Their sources are added here; publishing them is the
-		# callback es_script_langs.c hands the shim.
+	# The selected scene and registration closure are one product choice.
+	# The public generated shim remains the sole SDK-app publisher.
+	if(NOT COMMAND jce_script_enable)
+		message(FATAL_ERROR
+			"elemental_serenity: the installed SDK must provide jce_script_enable().")
+	endif()
+	if(ES_MULTILANG)
 		if(TARGET jce_script_vm_cpp)
 			target_sources(ElementalSerenity PRIVATE
 				"${CMAKE_CURRENT_SOURCE_DIR}/src/es_flower_sway.cpp")
-
 		endif()
 		if(TARGET jce_script_vm_c)
 			target_sources(ElementalSerenity PRIVATE
@@ -57,36 +59,36 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 				"${CMAKE_CURRENT_SOURCE_DIR}/src/es_prop_surface.c"
 				PROPERTIES LANGUAGE C)
 		endif()
-		jce_script_enable(ElementalSerenity)
-		target_compile_definitions(ElementalSerenity PRIVATE
-			ES_SCRIPT_ENABLE_SHIM=1)
-	else()
-		message(WARNING
-			"elemental_serenity: this SDK predates jce_script_enable() — "
-			"the exe will run Lua only, exactly as it did before that "
-			"function existed. Rebuild the SDK.")
-	endif()
-	# Editor Play uses the project's native classes through the public SDK ABI.
-	# Modules link the call-down interface, never a second host registry.
-	foreach(_es_native IN ITEMS cpp c)
-		if(TARGET jce_script_${_es_native}_module)
-			if(_es_native STREQUAL "cpp")
-				set(_es_module es_scripts)
-				set(_es_module_source src/es_flower_sway.cpp)
-			else()
-				set(_es_module es_scripts_c)
-				set(_es_module_source src/es_prop_surface.c)
+		jce_script_enable(ElementalSerenity
+			LANGUAGES lua python java cpp c REQUIRED
+			NATIVE_FACTORIES es_flower_sway_module es_prop_surface_module)
+		target_compile_definitions(ElementalSerenity PRIVATE ES_SCRIPT_ENABLE_SHIM=1)
+		# Editor modules belong only to the selected capability fixture.
+		# They link the public call-down ABI, never a second host registry.
+		foreach(_es_native IN ITEMS cpp c)
+			if(TARGET jce_script_${_es_native}_module)
+				if(_es_native STREQUAL "cpp")
+					set(_es_module es_scripts)
+					set(_es_module_source src/es_flower_sway.cpp)
+				else()
+					set(_es_module es_scripts_c)
+					set(_es_module_source src/es_prop_surface.c)
+				endif()
+				add_library(${_es_module} MODULE "${_es_module_source}")
+				target_link_libraries(${_es_module} PRIVATE jce_script_${_es_native}_module)
+				target_compile_definitions(${_es_module} PRIVATE ES_SCRIPT_MODULE_SHARED=1)
+				set_target_properties(${_es_module} PROPERTIES
+					C_STANDARD 99 CXX_STANDARD 20 PREFIX ""
+					RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/native/bin"
+					LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/native/bin")
+				add_dependencies(ElementalSerenity ${_es_module})
 			endif()
-			add_library(${_es_module} MODULE "${_es_module_source}")
-			target_link_libraries(${_es_module} PRIVATE jce_script_${_es_native}_module)
-			target_compile_definitions(${_es_module} PRIVATE ES_SCRIPT_MODULE_SHARED=1)
-			set_target_properties(${_es_module} PROPERTIES
-				C_STANDARD 99 CXX_STANDARD 20 PREFIX ""
-				RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/native/bin"
-				LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/native/bin")
-			add_dependencies(ElementalSerenity ${_es_module})
-		endif()
-	endforeach()
+		endforeach()
+	else()
+		jce_script_enable(ElementalSerenity LANGUAGES lua REQUIRED)
+	endif()
+	target_compile_definitions(ElementalSerenity PRIVATE
+		ES_MULTILANG=$<BOOL:${ES_MULTILANG}>)
 
 	jce_configure_application_target(ElementalSerenity)
 
@@ -267,8 +269,12 @@ document.addEventListener('click',function r(){
 		set(JCE_PROJECT_STAGE_LOOSE_ASSETS ON)
 	endif()
 	if(JCE_PROJECT_STAGE_LOOSE_ASSETS)
-		file(READ "${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json" _es_manifest)
-		string(JSON _es_manifest REMOVE "${_es_manifest}" script_modules)
+		file(READ "${_es_manifest_path}" _es_manifest)
+		string(JSON _es_modules_type ERROR_VARIABLE _es_modules_error
+			TYPE "${_es_manifest}" script_modules)
+		if(NOT _es_modules_error)
+			string(JSON _es_manifest REMOVE "${_es_manifest}" script_modules)
+		endif()
 		file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/es_runtime_project.json"
 			CONTENT "${_es_manifest}\n")
 
@@ -340,20 +346,14 @@ endif()
 
 set(_es_src "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
-add_executable(ElementalSerenity
-	"${_es_src}/main.c"
-	"${_es_src}/es_camera.c"
-	"${_es_src}/es_perf.c"
-	"${_es_src}/es_scene_orchestrator.c"
-	"${_es_src}/es_aid_mood.c"
-	"${_es_src}/es_script_langs.c"
-	"${_es_src}/es_script_probe.c")
+add_executable(ElementalSerenity ${_es_app_sources})
 
 set_target_properties(ElementalSerenity PROPERTIES
 	OUTPUT_NAME elemental_serenity
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
 
-target_compile_definitions(ElementalSerenity PRIVATE SDL_MAIN_USE_CALLBACKS=1)
+target_compile_definitions(ElementalSerenity PRIVATE
+	SDL_MAIN_USE_CALLBACKS=1 ES_MULTILANG=$<BOOL:${ES_MULTILANG}>)
 target_include_directories(ElementalSerenity PRIVATE "${_es_src}")
 target_link_libraries(ElementalSerenity PRIVATE JCE)
 
@@ -455,6 +455,14 @@ endif()
 #  language.                                                          #
 # ------------------------------------------------------------------ #
 set(_es_langs "lua")
+
+if(ES_MULTILANG)
+	foreach(_es_required IN ITEMS python java cpp c)
+		if(NOT TARGET jce_script_vm_${_es_required})
+			message(FATAL_ERROR
+				"elemental_serenity: ES_MULTILANG requires jce_script_vm_${_es_required}.")
+		endif()
+	endforeach()
 
 # ---- Python ------------------------------------------------------- #
 if(TARGET jce_script_vm_python)
@@ -717,11 +725,13 @@ foreach(_es_lib jce_script_api jce_script_java)
 	endif()
 endforeach()
 
+endif() # ES_MULTILANG: no external VM or native module staging in portable mode.
+
 # The project manifest, beside the exe, so a run from the output directory
 # finds its own startup_scene.
 add_custom_command(TARGET ElementalSerenity POST_BUILD
 	COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-		"${CMAKE_CURRENT_SOURCE_DIR}/jce_project.json"
+		"${_es_manifest_path}"
 		"$<TARGET_FILE_DIR:ElementalSerenity>/jce_project.json"
 	VERBATIM)
 

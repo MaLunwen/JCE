@@ -158,7 +158,7 @@ def _owned(fn, args, what: str):
         f"{OWNED_STRING_MAX_ATTEMPTS} attempts")
 
 SCRIPT_API_VERSION = 1
-ENTRY_COUNT = 108
+ENTRY_COUNT = 109
 
 ENTRY_NAMES = (
     "get_position",
@@ -269,6 +269,7 @@ ENTRY_NAMES = (
     "stat_set",
     "stat_get",
     "stat_flush",
+    "get_viewport_size",
 )
 
 # Every Lua table key this module deliberately does not carry, with the
@@ -433,6 +434,7 @@ class _Entries:
         "stat_set",
         "stat_get",
         "stat_flush",
+        "get_viewport_size",
     )
 
     def __init__(self, lib: ctypes.CDLL) -> None:
@@ -764,6 +766,9 @@ class _Entries:
         self.stat_flush = _decl(
             lib, "jce_script_api_stat_flush", ctypes.c_bool,
             [ctypes.c_void_p])
+        self.get_viewport_size = _decl(
+            lib, "jce_script_api_get_viewport_size", None,
+            [ctypes.c_void_p, ctypes.c_float * 2])
 
 
 class Api:
@@ -1116,9 +1121,10 @@ class Api:
     def get_pointer_position(self) -> tuple[float, float, float, float]:
         """jce.get_pointer_position — shape: void_out_array, since 1.
 
-        Viewport-local logical pixel x, y, width, height; zero dimensions
-        indicate unavailable input. The sample is frame-transient and shared by
-        Editor Game View and standalone runtime.
+        Viewport-local Canvas pixel x, y, width, height (native drawable or
+        Editor GameView FBO after render_scale); zero dimensions indicate
+        unavailable input. The sample is frame-transient and shared by Editor
+        Game View and standalone runtime.
         """
         out_xywh = (ctypes.c_float * 4)()
         self._f.get_pointer_position(self._h, out_xywh)
@@ -1681,3 +1687,16 @@ class Api:
         """jce.stat_flush — shape: value_return, since 1.
         """
         return self._f.stat_flush(self._h)
+
+    def get_viewport_size(self) -> tuple[float, float]:
+        """jce.get_viewport_size — shape: void_out_array, since 1.
+
+        Host presentation width and height in Canvas pixels (native drawable or
+        Editor GameView FBO after render_scale), independent of pointer
+        availability, focus or hover. Persistent until the host replaces or
+        clears it; unavailable or absent sized-host callbacks return zero,
+        zero.
+        """
+        out_wh = (ctypes.c_float * 2)()
+        self._f.get_viewport_size(self._h, out_wh)
+        return (out_wh[0], out_wh[1],)

@@ -10,7 +10,7 @@
  * else for them to disagree about.
  */
 
-#include <jce/middleware/world/jce_environment.h>
+#include "jce_environment_internal.h"
 
 #include <math.h>
 #include <string.h>
@@ -173,7 +173,8 @@ void JCE_CALL jce_environment_sanitize(JceEnvironmentState *s)
  * snowfall leaves nothing lying. */
 #define ENV_SNOW_SETTLE_C 1.0f
 
-void JCE_CALL jce_environment_advance(JceEnvironmentState *s, float dt_seconds)
+void jce_environment_advance_with_surface_times(JceEnvironmentState *s, float dt_seconds,
+                                                float wetting_seconds, float snowfall_seconds)
 {
     if (!s) return;
     /* Positive test: rejects NaN and negative dt alike.  A no-op, never a
@@ -202,7 +203,7 @@ void JCE_CALL jce_environment_advance(JceEnvironmentState *s, float dt_seconds)
 
     if (raining) {
         s->global_wetness = env_approach(s->global_wetness, s->precipitation_rate,
-                                         ENV_TAU_WETTING, dt_seconds);
+                                         wetting_seconds > 0.0f ? wetting_seconds : ENV_TAU_WETTING, dt_seconds);
     } else {
         s->global_wetness = env_approach(s->global_wetness, 0.0f,
                                          ENV_TAU_DRYING, dt_seconds);
@@ -213,7 +214,7 @@ void JCE_CALL jce_environment_advance(JceEnvironmentState *s, float dt_seconds)
      * which is how a snowfield disappears over a warm afternoon. */
     if (snowing && s->temperature_c <= ENV_SNOW_SETTLE_C) {
         s->snow_amount = env_approach(s->snow_amount, s->precipitation_rate,
-                                      ENV_TAU_SNOWFALL, dt_seconds);
+                                      snowfall_seconds > 0.0f ? snowfall_seconds : ENV_TAU_SNOWFALL, dt_seconds);
     } else if (s->temperature_c > ENV_SNOW_SETTLE_C) {
         s->snow_amount = env_approach(s->snow_amount, 0.0f,
                                       ENV_TAU_MELT, dt_seconds);
@@ -222,6 +223,11 @@ void JCE_CALL jce_environment_advance(JceEnvironmentState *s, float dt_seconds)
 
     s->global_wetness = env_clamp01(s->global_wetness);
     s->snow_amount    = env_clamp01(s->snow_amount);
+}
+
+void JCE_CALL jce_environment_advance(JceEnvironmentState *s, float dt_seconds)
+{
+    jce_environment_advance_with_surface_times(s, dt_seconds, 0.0f, 0.0f);
 }
 
 /* ── weather-implied wind ────────────────────────────────────────────  */

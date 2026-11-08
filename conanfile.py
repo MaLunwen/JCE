@@ -11,6 +11,7 @@
 """
 
 from conan import ConanFile
+from conan.errors import ConanInvalidConfiguration
 from conan.tools.build import cross_building
 from conan.tools.cmake import CMakeDeps, CMakeToolchain, cmake_layout
 
@@ -131,8 +132,29 @@ class JCEConan(ConanFile):
         "libtiff/*:lzma": False,
     }
 
+    def _windows_xp_profile(self):
+        enabled = self.conf.get("user.jce:windows_xp", default=False, check_type=bool)
+        if not enabled:
+            return False
+        if (str(self.settings.os) != "Windows" or str(self.settings.compiler) != "clang"
+                or str(self.settings.compiler.get_safe("libcxx")) != "libc++"
+                or str(self.settings.arch) not in ("x86", "x86_64")
+                or any(self.settings.compiler.get_safe(key) is not None for key in
+                       ("runtime", "runtime_type", "runtime_version"))):
+            raise ConanInvalidConfiguration("XP requires the isolated LLVM-MinGW-XP GNU/libc++ target profile")
+        if self.conf.get("user.jce:ai_dispatch", default=False, check_type=bool):
+            raise ConanInvalidConfiguration("XP does not support the optional private AI dispatch dependency graph")
+        return True
+
     def configure(self):
-        if self.settings.os == "Windows":
+        xp = self._windows_xp_profile()
+        if xp:
+            self.options["bgfx/*"].tools = False
+            # The XP shipment disables profiling; do not compile its unused client.
+            self.options["tracy/*"].enable = False
+            self.options["zstd/*"].build_programs = False
+            self.options["zstd/*"].threading = False
+        if self.settings.os == "Windows" and not xp:
             # libcurl: native TLS (schannel) keeps the dependency closure
             # small — no OpenSSL build for the ai_dispatch transport.
             self.options["libcurl/*"].with_ssl = "schannel"
@@ -168,7 +190,7 @@ class JCEConan(ConanFile):
         self.requires("harfbuzz/12.3.0")
         self.requires("freetype/2.14.3", force=True)
 
-        self.requires("miniaudio/0.11.22")
+        self.requires("miniaudio/0.11.25")
         self.requires("opus/1.5.2")
         self.requires("ogg/1.3.5")
         self.requires("dav1d/1.5.3")
@@ -191,7 +213,9 @@ class JCEConan(ConanFile):
         self.requires("box2d/3.1.1")
         self.requires("bullet3/3.25")
 
-        self.requires("quickjs-ng/0.16.2")
+        # The official legacy provider avoids native Vista synchronization APIs.
+        # Modern targets keep their existing runtime version.
+        self.requires("quickjs-ng/0.4.1" if self._windows_xp_profile() else "quickjs-ng/0.16.2")
         self.requires("lua/5.4.8")
         self.requires("rmlui/6.2")
 
@@ -202,13 +226,21 @@ class JCEConan(ConanFile):
         self.requires("mimalloc/3.3.2")
         self.requires("enkits/1.11")
 
-        self.requires("libcurl/8.21.0")
+        # The current CURL floor is Vista. XP ships the separately maintained
+        # private extension disabled; ordinary public Editor modules do not
+        # link CURL. Modern dependency graphs retain their existing identity.
+        if not self._windows_xp_profile():
+            self.requires("libcurl/8.21.0")
         self.requires("enet/1.3.18")
         self.requires("protobuf/7.35.0")
 
         self.requires("tracy/0.13.1")
 
         # ── Transitive overrides (resolve version conflicts) ─────────
+        if self._windows_xp_profile():
+            # Verified required Protobuf APIs; the older optional ICU path is gated.
+            self.requires("abseil/20250814.2", override=True)
+
         if self.settings.os == "Linux":
             # bgfx pins wayland/1.23.92 while SDL & others pull 1.24.0
             self.requires("wayland/1.24.0", override=True)
@@ -268,6 +300,17 @@ class JCEConan(ConanFile):
                 build_context=True,
             )
         deps.generate()
+        # Keep shader command identity aligned with the compiled renderer floor.
+        # FORCE both directions: ordinary toolchain cache defaults retain an old
+        # value when reconfiguring an existing object tree for another tier.
+        tier = self.conf.get("user.jce:bgfx_graphics_tier", default="stable", check_type=str)
+        key = "tools.cmake.cmaketoolchain:extra_variables"
+        variables = dict(self.conf.get(key, default={}, check_type=dict))
+        variables["JCE_SHADER_COMPATIBILITY"] = {
+            "value": "ON" if tier.strip().lower() == "compatibility" else "OFF",
+            "cache": True, "type": "BOOL", "force": True,
+        }
+        self.conf.define(key, variables)
         tc = CMakeToolchain(self)
         # Independent target graphs must not race on a shared source-root preset.
         tc.user_presets_path = None

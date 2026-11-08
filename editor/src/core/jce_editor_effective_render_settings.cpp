@@ -5,6 +5,48 @@
 
 #include "core/jce_project_settings.h"
 #include "scene/jce_scene_content_context.h"
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_alloc.h>
+
+namespace {
+
+bool editor_load_isolated_render_settings(const std::string &path,
+                                          JceRenderSettings *out)
+{
+    /* This content address belongs to the currently admitted isolated VFS.
+     * The host convenience reader also supports alternate reader callbacks;
+     * an absent callback must never turn an isolated miss into a CWD read. */
+    JceFileSystem *fs = jce_fs_get_active();
+    if (!fs || jce_fs_get_active_policy() != JCE_FS_ACTIVE_ISOLATED)
+        return false;
+    JceFile *file = jce_fs_open(fs, path.c_str());
+    if (!file)
+        return false;
+    const uint64_t size = jce_fs_size(file);
+    if (!size || size > (1u << 20)) {
+        jce_fs_close(file);
+        return false;
+    }
+    /* Bound this caller's copy before allocation/read. A PAK-backed open
+     * already eagerly decoded its entry; this is not a total VFS memory cap. */
+    char *bytes = static_cast<char *>(jce_malloc(static_cast<size_t>(size)));
+    const bool read = bytes && jce_fs_read(file, bytes, size) == size;
+    jce_fs_close(file);
+    const bool loaded = read &&
+        jce_render_settings_load_json_mem(bytes, static_cast<size_t>(size), out);
+    jce_free(bytes);
+    return loaded;
+}
+
+bool editor_load_render_settings(bool isolated, const std::string &path,
+                                  JceRenderSettings *out)
+{
+    if (isolated)
+        return editor_load_isolated_render_settings(path, out);
+    return jce_render_settings_load_json(path.c_str(), out);
+}
+
+} // namespace
 
 int jce_editor_quality_msaa(int level_anti_aliasing, int project_default_msaa)
 {
@@ -23,25 +65,28 @@ int jce_editor_quality_msaa(int level_anti_aliasing, int project_default_msaa)
 bool jce_editor_effective_render_settings(bool isolated,
                                           const char *project_root,
                                           JceRenderSettings *out,
-                                          std::string *out_source_path)
+                                          std::string *out_source_path,
+                                          const char *source_assets,
+                                          const char *cooked_assets,
+                                          const char *loose_asset_root)
 {
     if (!out)
         return false;
 
     const JceEditorSceneContentPaths paths =
-        jce_editor_scene_content_paths(isolated, project_root, nullptr,
-                                       nullptr);
+        jce_editor_scene_content_paths(isolated, project_root, source_assets,
+                                       cooked_assets, loose_asset_root);
 
     /* 1. The authored file carries the Look Profile and the grass gate. */
     std::string used;
     bool loaded = false;
     if (!paths.render_settings_primary.empty()) {
         used = paths.render_settings_primary;
-        loaded = jce_render_settings_load_json(used.c_str(), out);
+        loaded = editor_load_render_settings(isolated, used, out);
     }
     if (!loaded && !paths.render_settings_fallback.empty()) {
         used = paths.render_settings_fallback;
-        loaded = jce_render_settings_load_json(used.c_str(), out);
+        loaded = editor_load_render_settings(isolated, used, out);
     }
     if (!loaded)
         used.clear();
@@ -50,9 +95,13 @@ bool jce_editor_effective_render_settings(bool isolated,
      *    the half the viewport was missing: the packager applied it, the
      *    editor did not, so a designer only saw their quality level after a
      *    build. */
+    const bool loose = !isolated && (!project_root || !project_root[0]) &&
+                       loose_asset_root && loose_asset_root[0];
     JceProjectSettings ps_local;
-    const JceProjectSettings *ps = jce_project_settings_current();
-    if (!ps && jce_project_settings_load(&ps_local))
+    /* A standalone scene has no project quality owner. Do not overwrite its
+     * authored settings with the previous project's cache or CWD defaults. */
+    const JceProjectSettings *ps = loose ? nullptr : jce_project_settings_current();
+    if (!loose && !ps && jce_project_settings_load(&ps_local))
         ps = &ps_local;
     if (ps) {
         int ql = ps->quality.current_level;

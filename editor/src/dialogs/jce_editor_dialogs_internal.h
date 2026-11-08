@@ -28,7 +28,9 @@
 /* Shared project root tracking. */
 extern char s_current_project_root[512];
 
-void set_current_project_root(const char *path);
+/* Canonical candidate identity; nullptr closes. Same identity keeps pending state. */
+bool jce_editor_prepare_project_switch(const char *next_root);
+bool set_current_project_root(const char *path);
 bool is_valid_project_dir(const char *path);
 bool sanitize_recent_projects(JceEditorConfig *cfg);
 

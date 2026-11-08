@@ -188,7 +188,8 @@ typedef struct {
     uint32_t commands_in;     /* draw commands fed into flush */
     uint32_t submits_out;     /* actual bgfx_submit calls issued */
     uint32_t batches_merged;  /* number of auto-merged instance batches */
-    uint32_t instances_total; /* total instances across merged batches */
+    uint32_t instances_total; /* instance payloads submitted by auto or authored batches;
+                               * ordinary single draws and GPU invocation counts excluded */
 } JceRenderQueueStats;
 
 JCE_API void jce_rq_last_stats(const JceRenderQueue *rq,

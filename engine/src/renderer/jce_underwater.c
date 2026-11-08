@@ -6,6 +6,7 @@
 
 #include "os/core/jce_memory.h"
 #include "renderer/jce_shader_load.h"
+#include "renderer/jce_offscreen_target_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>
@@ -23,6 +24,7 @@ struct JceUnderwater {
     bgfx_uniform_handle_t      u_tint;
     bgfx_uniform_handle_t      u_params;
     bgfx_uniform_handle_t      s_depth;
+    bool destination_refusal_logged;
 };
 
 JceUnderwater *jce_underwater_create(const JcePakArchive *pak)
@@ -84,7 +86,7 @@ void jce_underwater_destroy(JceUnderwater *u)
     JCE_FREE(u);
 }
 
-void jce_underwater_render(JceUnderwater *u,
+void jce_underwater_render(JceUnderwater *u, const JceRenderer *renderer,
                            uint16_t depth_tex_handle,
                            uint16_t dst_fb_idx,
                            uint16_t width, uint16_t height,
@@ -98,10 +100,24 @@ void jce_underwater_render(JceUnderwater *u,
      * say; drawing two fullscreen quads to multiply by exactly 1 is pure cost. */
     if (!(p->sigma[0] > 0.0f || p->sigma[1] > 0.0f || p->sigma[2] > 0.0f)) return;
 
+    JceTraceScope scope = jce_trace_scope_begin("renderer.underwater.submit");
+    uint16_t destination;
+    if (!jce_offscreen_target_depth_read_destination(renderer, dst_fb_idx,
+            depth_tex_handle, &destination)) {
+        destination = dst_fb_idx;
+    } else if (destination == UINT16_MAX) {
+        if (!u->destination_refusal_logged) {
+            LOG_WARN(LOG_TAG, "scene depth sampling requires a live color-only destination");
+            u->destination_refusal_logged = true;
+        }
+        jce_trace_scope_end(scope, JCE_TRACE_TASK_FAILED);
+        return;
+    }
     JCE_PROFILE_ZONE_N("Renderer::Underwater");
 
-    bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
+    bgfx_frame_buffer_handle_t dst = { destination };
     bgfx_set_view_frame_buffer(view_id, dst);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
     bgfx_set_view_rect(view_id, 0, 0, width, height);
     /* SEQUENTIAL is load-bearing: both submits share this view, and the
      * multiply MUST land before the add.  Sorted order would let bgfx reorder
@@ -140,4 +156,17 @@ void jce_underwater_render(JceUnderwater *u,
         bgfx_submit(view_id, u->prog, 0, BGFX_DISCARD_ALL);
     }
     JCE_PROFILE_ZONE_END;
+    if (scope.id) {
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+            "underwater.view", view_id, scope.id, scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+            "underwater.scene_fbo", dst_fb_idx, scope.id, scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+            "underwater.depth_read", depth_tex_handle, scope.id, scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+            "underwater.color_fbo", destination, scope.id, scope.id);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+            "underwater.cpu_draw_submits", 2, scope.id, scope.id);
+    }
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
 }

@@ -23,7 +23,7 @@ cmake_minimum_required(VERSION 3.20)
 #  half could not exist), puts editor/src on the include path, and labels #
 #  its tests "editor" — none of which is true here.  The pieces the       #
 #  helper provides that MATTER are reproduced explicitly below:           #
-#  add_dependencies(jce_tests ...) (check_jce_tests_closure.py enforces   #
+#  jce_test_build_dependencies(...) (check_jce_tests_closure.py enforces   #
 #  it for raw add_test), the link job pool, the runtime output directory, #
 #  the 60 s timeout and JCE_TEST_ENVIRONMENT.                             #
 # ----------------------------------------------------------------------- #
@@ -39,7 +39,8 @@ if(NOT TARGET jce_script_cpp)
 endif()
 
 function(jce_add_scripting_cpp_test NAME STD)
-    cmake_parse_arguments(ARG "" "" "SOURCES;LINK" ${ARGN})
+    jce_register_test_directory()
+    cmake_parse_arguments(ARG "" "KIND" "SOURCES;LINK" ${ARGN})
 
     add_executable(${NAME} ${ARG_SOURCES})
     set_target_properties(${NAME} PROPERTIES
@@ -63,13 +64,17 @@ function(jce_add_scripting_cpp_test NAME STD)
                 "$<TARGET_FILE_DIR:${NAME}>"
         COMMENT "Staging jce_script_api beside ${NAME}")
 
-    add_dependencies(jce_tests ${NAME})
+    jce_test_build_dependencies(${NAME})
 
     add_test(NAME ${NAME} COMMAND ${NAME})
     set_tests_properties(${NAME} PROPERTIES
         TIMEOUT 60
         LABELS  "unit"
         ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
+    if(NOT ARG_KIND)
+        set(ARG_KIND unit)
+    endif()
+    jce_set_test_kind("${NAME}" "${ARG_KIND}")
     set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV ${NAME})
 endfunction()
 
@@ -77,6 +82,7 @@ endfunction()
 # lua::lua PRIVATE, so the public jce_script API is all that is linked here —
 # the same link set tests/middleware/script uses.
 jce_add_scripting_cpp_test(test_jce_script_cpp_differential 20
+    KIND integration
     SOURCES test_jce_script_cpp_differential.gen.cpp
             test_jce_script_cpp_contract.cpp
     LINK    jce_core jce_script)
@@ -84,6 +90,7 @@ jce_add_scripting_cpp_test(test_jce_script_cpp_differential 20
 # The floor test links NO engine layer.  It exercises the wrapper over the C
 # ABI alone, which is exactly the shape an SDK consumer on C++17 has.
 jce_add_scripting_cpp_test(test_jce_script_cpp17_floor 17
+    KIND contract
     SOURCES test_jce_script_cpp17_floor.cpp)
 
 # ── The floor test must actually be at the floor ─────────────────────────
@@ -155,6 +162,7 @@ target_link_libraries(jce_cpp_testplugin_v2 PRIVATE jce_script_cpp_module)
 jce_configure_test_link_pool(jce_cpp_testplugin_v2)
 
 jce_add_scripting_cpp_test(test_jce_script_vm_cpp 17
+    KIND integration
     SOURCES test_jce_script_vm_cpp_lifecycle.cpp
             test_jce_script_vm_cpp_modules.cpp
     LINK    jce_core jce_script jce_script_vm_cpp)

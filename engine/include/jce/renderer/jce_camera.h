@@ -40,6 +40,12 @@ typedef struct {
 /* Create a camera from a descriptor. Returns NULL on failure. */
 JCE_API JceCamera *jce_camera_create(const JceCameraDesc *desc);
 
+/* Clone complete CPU value state into an independently owned camera, including
+ * exact pose/roll, FPS control basis and perspective/orthographic projection.
+ * Source remains unchanged. NULL source or allocation failure returns NULL.
+ * The caller destroys the result; no renderer/context is required. */
+JCE_API JceCamera *jce_camera_clone(const JceCamera *source);
+
 /* Destroy a camera. */
 JCE_API void jce_camera_destroy(JceCamera *cam);
 

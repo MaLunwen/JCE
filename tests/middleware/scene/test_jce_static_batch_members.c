@@ -21,6 +21,8 @@
 #include <jce/resource/jce_mesh_merge.h>
 #include <jce/resource/jce_glb_write.h>
 #include <jce/resource/jce_static_batch.h>
+#include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_filesystem.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -322,10 +324,129 @@ static void test_the_bake_writes_a_table_the_loader_reads_back(void)
     remove("jce_sb_grp_0.batch.json");
 }
 
+/* Output formatting failure must leave no batch and no caller-owned spans.
+ * Reuses the real quad/GLB fixture above; no merge or allocator mock. */
+static const char *k_sb_path_out = "jce_sb_path_boundary_out";
+static const char *k_sb_path_a = "jce_sb_path_boundary_in_a.glb";
+static const char *k_sb_path_b = "jce_sb_path_boundary_in_b.glb";
+
+typedef struct {
+    JceStaticBatchInstance instances[2];
+    JceStaticBatchDesc desc;
+    char prefix[1025];
+} SbPathBoundaryFixture;
+
+static bool sb_path_boundary_count_entry(const char *name, bool is_dir,
+                                         void *user)
+{
+    (void)name;
+    (void)is_dir;
+    ++*(uint32_t *)user;
+    return true;
+}
+
+static void sb_path_boundary_assert_no_output(void)
+{
+    uint32_t entries = 0;
+    TEST_ASSERT_TRUE(jce_fs_host_list_dir(k_sb_path_out,
+                                         sb_path_boundary_count_entry,
+                                         &entries));
+    TEST_ASSERT_EQUAL_UINT32(0, entries);
+}
+
+static void sb_path_boundary_setup(SbPathBoundaryFixture *f)
+{
+    const float color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    /* Refuse stale or unrelated fixture paths before writing anything. */
+    TEST_ASSERT_FALSE(jce_fs_host_exists_dir(k_sb_path_out));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_file(k_sb_path_out));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_file(k_sb_path_a));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_file(k_sb_path_b));
+    TEST_ASSERT_TRUE(jce_fs_host_create_directory(k_sb_path_out));
+    sb_path_boundary_assert_no_output();
+    TEST_ASSERT_TRUE(jce_glb_write_mesh_uv(k_sb_path_a, k_pos, k_nrm, NULL,
+                                          4, k_idx, 6, color));
+    TEST_ASSERT_TRUE(jce_glb_write_mesh_uv(k_sb_path_b, k_pos, k_nrm, NULL,
+                                          4, k_idx, 6, color));
+    memset(f, 0, sizeof *f);
+    f->instances[0].mesh_host_path = k_sb_path_a;
+    f->instances[1].mesh_host_path = k_sb_path_b;
+    translated(f->instances[0].world, 0.0f, 0.0f, 0.0f);
+    translated(f->instances[1].world, 10.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 2; ++i) {
+        f->instances[i].material_key = 7u;
+        for (int c = 0; c < 4; ++c)
+            f->instances[i].base_color[c] = 1.0f;
+    }
+    memset(f->prefix, 'p', 1024);
+    f->prefix[1024] = '\0';
+}
+
+static void sb_path_boundary_cleanup(void)
+{
+    /* The directory was created by this fixture and must still be empty. */
+    sb_path_boundary_assert_no_output();
+    TEST_ASSERT_TRUE(jce_fs_host_remove_file(k_sb_path_a));
+    TEST_ASSERT_TRUE(jce_fs_host_remove_file(k_sb_path_b));
+    TEST_ASSERT_TRUE(jce_fs_host_remove_recursive(k_sb_path_out));
+}
+
+static void test_overlong_group_path_has_no_outputs_or_assignments(void)
+{
+    SbPathBoundaryFixture f;
+    sb_path_boundary_setup(&f);
+    int32_t groups[2] = {-1, -1};
+    JceStaticBatchStats stats;
+    TEST_ASSERT_FALSE(jce_static_batch_bake(f.instances, 2, &f.desc,
+                                            k_sb_path_out, f.prefix,
+                                            groups, &stats));
+    TEST_ASSERT_EQUAL_INT32(-1, groups[0]);
+    TEST_ASSERT_EQUAL_INT32(-1, groups[1]);
+    TEST_ASSERT_EQUAL_UINT32(0, stats.groups_written);
+    TEST_ASSERT_EQUAL_UINT32(0, stats.instances_merged);
+    sb_path_boundary_assert_no_output();
+    sb_path_boundary_cleanup();
+}
+
+static void test_repeated_overlong_group_path_balances_tracked_allocations(void)
+{
+    SbPathBoundaryFixture f;
+    sb_path_boundary_setup(&f);
+    /* Warm importer/logger first. Even a leaking BEFORE call is outside the
+     * measured interval; repeated AFTER calls must not grow its live baseline. */
+    TEST_ASSERT_FALSE(jce_static_batch_bake(f.instances, 2, &f.desc,
+                                            k_sb_path_out, f.prefix, NULL, NULL));
+    sb_path_boundary_assert_no_output();
+    JceAllocTrack before, after;
+    if (!jce_alloc_track_snapshot(&before)) {
+        sb_path_boundary_cleanup();
+        TEST_IGNORE_MESSAGE("Allocation tracking unavailable; leak balance unverified");
+    }
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        int32_t groups[2] = {-1, -1};
+        JceStaticBatchStats stats;
+        TEST_ASSERT_FALSE(jce_static_batch_bake(f.instances, 2, &f.desc,
+                                                k_sb_path_out, f.prefix,
+                                                groups, &stats));
+        TEST_ASSERT_EQUAL_INT32(-1, groups[0]);
+        TEST_ASSERT_EQUAL_INT32(-1, groups[1]);
+        TEST_ASSERT_EQUAL_UINT32(0, stats.groups_written);
+        TEST_ASSERT_EQUAL_UINT32(0, stats.instances_merged);
+    }
+    const bool tracked_after = jce_alloc_track_snapshot(&after);
+    sb_path_boundary_assert_no_output();
+    sb_path_boundary_cleanup();
+    TEST_ASSERT_TRUE(tracked_after);
+    TEST_ASSERT_EQUAL_UINT64(before.live_count, after.live_count);
+    TEST_ASSERT_EQUAL_UINT64(before.live_bytes, after.live_bytes);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_the_bake_writes_a_table_the_loader_reads_back);
+    RUN_TEST(test_overlong_group_path_has_no_outputs_or_assignments);
+    RUN_TEST(test_repeated_overlong_group_path_balances_tracked_allocations);
     RUN_TEST(test_each_input_reports_where_it_landed);
     RUN_TEST(test_a_skipped_input_keeps_its_slot);
     RUN_TEST(test_merge_without_spans_is_the_same_merge);

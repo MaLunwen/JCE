@@ -16,60 +16,26 @@
  * the array must be a permutation of [first, highest], so the point-light cube
  * band (base+100..116) alone needs 117 entries. */
 #define JCE_SCENE_RENDERER_VIEW_ORDER_MAX 128u
+/* Native product bgfx configuration: valid view IDs are 0..255.  A remap
+ * window must not exceed this domain even when its own array still fits. */
+#define JCE_SCENE_RENDERER_VIEW_ID_LIMIT 256u
 
-/* Dual shadow-map DYNAMIC atlas band: base+120 (full-atlas depth clear) and
- * base+121..124 (one tile per cascade).  Declared HERE, in the header both the
- * order builder and the shadow pass already include, so the band has exactly
- * one definition — two copies of a view-id constant is how the previous one
- * drifted.
+/* Dynamic CSM uses the public reservation: offset 52..56, with its depth
+ * clear and four cascade tiles. Keep this alias single-sourced with the
+ * actual shadow pass; view order cannot repair framebuffer-slot collisions.
  *
- * 120 puts it in the free 72..231 window, above the cube-shadow band
- * (base+100..116).  The previous band, base+21..25, was documented in-source as
- * free because it sits above the fog composite at base+16.  It is not: postfx
- * re-bases to base+20 (jce_editor_scene_render.cpp) and spans ~21 views, so
- * those five ids WERE PostFX/TAA_Resolve, TAA_HistoryCopy and Composite.  bgfx
- * view state is last-write-wins, so binding the atlas framebuffer to them
- * pointed the post-processing chain at the shadow atlas and the composited
- * image never reached the backbuffer -- the viewport rendered black whenever
- * dual shadow maps were enabled.  View ORDER cannot fix that: it decides when a
- * view runs, not which subsystem owns the slot. */
-/* Offset of the dynamic-cascade shadow atlas from a viewport's view base.
- *
- * This is bounded by something easy to miss: bgfx_set_view_order rewrites the
- * whole contiguous window [first, first+count), so a viewport's order array
- * OWNS every id from its base up to the highest id it names.  Two viewports
- * therefore cannot each claim a window wider than the gap between their bases.
- *
- *   scene view  base = JCE_VIEW_EDITOR_SCENE =  3
- *   game view   base = GAME_VIEW_BASE        = 80      gap = 77
- *
- * At offset 120 the scene view's window was base..base+124 -- it swallowed the
- * whole game viewport and rewrote its sort keys, which is why enabling the
- * dynamic atlas rendered a black, flickering viewport.  Moving the band
- * elsewhere in that range does not help; the window is what overlaps.
- *
- * 52 keeps each window 57 ids wide, inside the 77 gap and disjoint:
- *
- *   scene view       base   3 ->  55..59   window   3..59
- *   game view        base  80 -> 132..136  window  80..136
- *   material preview base  60 -> 112..116  window  60..116
- *   runtime game     base  30 ->  82..86   window  30..86
- *
- * The editor's fixed ids that fall inside a window (EDITOR_OVERLAY 50,
- * EDITOR_PREVIEW 60, EDITOR_PICK 70/71) are fine: the builder appends every
- * unnamed id in the window so each keeps a sort position of its own.  What is
- * NOT fine is two viewports overlapping, which is what this constant guards.
- *
- * Anything that grows a viewport's claim past base+76 must move the bases
- * apart, not this number. */
-/* Single-sourced from the public reservation table so the editor's
- * static_assert and this builder cannot drift apart. */
+ * bgfx remaps the whole contiguous [first, first+count) window, including
+ * unnamed filler views. The current Scene base 3 and Game base 120 are 117
+ * slots apart. The sparse cube band at offsets 100..116 fits that gap; no
+ * added band may extend one viewport's window into its neighbour's.
+ * The builder closes each admitted window into a complete permutation. */
 #define JCE_VIEW_DYN_CSM_OFFSET JCE_VIEW_SR_DYN_CSM_OFFSET
 
 typedef struct {
     uint16_t first;
     uint16_t count;
-    /* How many of `order` are views the scene renderer actually RENDERS INTO.
+    /* How many of `order` are views the scene renderer OWNS, including the
+     * reserved current-camera depth slot. Empty reservations submit no work.
      * The rest are filler the builder appends to close the remap window into a
      * permutation (see the build function) -- ids that belong to postfx, the
      * editor overlays and whatever else lives in the span.  Sort position is
@@ -83,6 +49,9 @@ typedef struct {
     uint16_t order[JCE_SCENE_RENDERER_VIEW_ORDER_MAX];
 } JceSceneRendererViewOrder;
 
+/* Reserve base+1 before base+0 for any current-camera depth submission,
+ * including pipeline-only depth_prepass with every optional band disabled.
+ * This sets sort order only: it does not touch or enable an unused view. */
 bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_shadow_views,
                                          uint8_t csm_cascade_count,
@@ -97,5 +66,106 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_underwater_view,
                                          uint8_t camera_overlay_count,
                                          JceSceneRendererViewOrder *out);
+
+/* Keep the pair ordered even in Game frames that submit neither dispatch.
+ * A request for any other base is rejected. */
+bool jce_scene_renderer_view_order_build_ex(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            JceSceneRendererViewOrder *out);
+
+bool jce_scene_renderer_view_order_build_with_caustic(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            JceSceneRendererViewOrder *out);
+
+/* Optics reads opaque color after base+0 and resumes transparency before
+ * fog, underwater, overlay and downstream color readers. */
+bool jce_scene_renderer_view_order_build_with_optics(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            JceSceneRendererViewOrder *out);
+
+bool jce_scene_renderer_view_order_build_with_shafts(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            bool include_screen_shafts,
+                                            JceSceneRendererViewOrder *out);
+
+bool jce_scene_renderer_view_order_build_with_cloud_temporal(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            bool include_screen_shafts,
+                                            bool include_toon_hair,
+                                            bool include_cloud_temporal,
+                                            JceSceneRendererViewOrder *out);
+
+bool jce_scene_renderer_view_order_build_with_toon_hair(uint16_t view_id_base,
+                                            bool include_shadow_views,
+                                            uint8_t csm_cascade_count,
+                                            bool include_fog_views,
+                                            bool include_gpu_particle_view,
+                                            bool include_gpu_cull_view,
+                                            bool include_point_cube_views,
+                                            bool include_dyn_csm_views,
+                                            bool include_underwater_view,
+                                            uint8_t camera_overlay_count,
+                                            bool include_water_caustics,
+                                            bool include_water_optics,
+                                            bool include_screen_shafts,
+                                            bool include_toon_hair,
+                                            JceSceneRendererViewOrder *out);
+
+typedef struct {
+    uint16_t first;
+    uint16_t count;
+} JceSceneRendererViewOrderTail;
+
+/* bgfx retains the previous permutation. Restore just the retired suffix
+ * before installing the new order. The caller owns previous_count per base. */
+JceSceneRendererViewOrderTail jce_scene_renderer_view_order_tail_reset(
+    const JceSceneRendererViewOrder *order, uint16_t previous_count);
 
 #endif /* JCE_SCENE_RENDERER_VIEW_ORDER_H */

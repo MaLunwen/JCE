@@ -9,12 +9,12 @@
 ```powershell
 python scripts/jce.py cook tests/consumers/minesweeper
 python scripts/jce.py build-project tests/consumers/minesweeper
-python tests/consumers/minesweeper/tools/run.py --provider ollama
+python tests/consumers/minesweeper/tools/run.py --exe <当前游戏EXE> --provider ollama
 ```
 
-必须先 cook：本次实测仅 build-project 会沿用已有的陈旧 cooked 场景，出现构建成功却加载旧空场景的情况。
+正式 `build-project` 入口执行当前内容图准入及资产处理；应显式选择已安装 SDK、当前编辑器与最终输出目录，并检查真实产物和构建结果。单独 `cook` 可用于资产诊断，不能替代最终运行验证。
 
-输出为 `dist/games/Minesweeper-release-x86_64/Minesweeper.exe`。双击可离线玩；AI 功能需要 `tools/run.py` 配置本地 Python 和 CLI。
+默认最终输出位于 `<project>/dist/apps/<app>/<platform>-<arch>-<variant>`，也可由 `--out` 显式选择；以正式构建结果的实际文件为准。双击可离线玩；AI 启动器 `tools/run.py --exe <当前游戏EXE>` 显式选定程序并配置本地 Python 和 CLI。
 编辑器打开本目录的 `jce_project.json` 后 Play；首次需先构建出 `native/build/mines_controller.dll`。
 
 ## 操作
@@ -64,11 +64,11 @@ python tests/consumers/minesweeper/tools/ai_director.py --provider ollama --base
 ## 验证与限制
 
 ```powershell
-python tests/consumers/minesweeper/tools/verify_game.py --extended --editor --ai
+python tests/consumers/minesweeper/tools/verify_game.py --exe <当前游戏EXE> --editor-exe <当前编辑器EXE> --out <新的验证目录> --extended --editor --ai
 python tests/consumers/minesweeper/tools/test_ai.py
 ```
 
-真实证据在本地 `build/verification` 和 `build/ai`，这些构建输出不入库。已完成项目见 [REPORT.md](REPORT.md)。
+游戏验证器也接受 `MINES_VERIFY_GAME`、`MINES_VERIFY_EDITOR`、`MINES_VERIFY_OUT`，不猜测旧构建路径；输出目录必须为空。编辑器验证使用隔离 profile，不改用户配置。逐进程收据保留执行前后 EXE 哈希、结果和墙钟时间；合成输入验证不等于真实鼠标或键盘可达性。AI 证据在本地 `build/ai`，这些构建输出不入库。已完成项目见 [REPORT.md](REPORT.md)。
 编辑器 Play 当前仅会话内记录成绩；SDK 独立程序负责持久化和 AI 子进程。编辑器可通过 F 模式插旗；右键／中键的独立程序输入适配未声称与编辑器完全一致。编辑器中的 AI REMIX 暂不能启动独立程序专用的服务连接。缺口见报告。
 
 ## Consumer regression source location

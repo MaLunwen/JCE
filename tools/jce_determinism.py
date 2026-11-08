@@ -14,6 +14,7 @@ Import it, do not copy it:
     from jce_determinism import DETERMINISM, actual_backend, assert_backend
 """
 
+import math
 import re
 import struct
 import zlib
@@ -349,10 +350,27 @@ def assert_subject_in_frame(text, path):
 # looser one ("frame ... ms ... fps") that matched nothing the engine emits,
 # so its perf stage reported "the run never reached steady state" for runs
 # that had printed a perfectly good sample.
+_PERF_DECIMAL = r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+_PERF_MEMORY = r"(?:[0-9]+|N/A)"
 PERF_RE = re.compile(
-    r"engine: perf: ([\d.]+) ms avg \((\d+) FPS\) \| cpu ([\d.]+) / gpu ([\d.]+)"
-    r" ms \| (\d+) draws \| gpu-mem (\d+) MB \(tex (\d+) \+ rt (\d+)\)"
-    r" \| rss (\d+) MB \| commit (\d+)")
+    rf"engine: perf: (?P<frame_ms>{_PERF_DECIMAL}) ms avg \((?P<fps>[0-9]+) FPS\)"
+    rf" \| cpu (?P<cpu_ms>{_PERF_DECIMAL}) / gpu (?P<gpu_ms>{_PERF_DECIMAL})"
+    rf" ms \| (?P<draws>[0-9]+) draws \| gpu-mem (?P<gpu_mem_mb>{_PERF_MEMORY})"
+    rf" (?:(?P<modern_unit>MiB)|MB) \(tex (?P<tex_mb>{_PERF_MEMORY})"
+    rf" \+ rt (?P<rt_mb>{_PERF_MEMORY})\) \| rss (?P<rss_mb>{_PERF_MEMORY})"
+    rf" (?(modern_unit)MiB|MB) \| commit (?P<commit_mb>{_PERF_MEMORY})"
+    r"(?(modern_unit) MiB|(?: MB)?)(?=[ \t]*(?:\||at\b|\r?$))", re.MULTILINE)
+
+
+def _perf_memory_value(raw, modern):
+    if raw == "N/A":
+        return None, "UNAVAILABLE"
+    value = int(raw)
+    # Old MB-labelled output used the same binary conversion but clamped
+    # unknown values to zero. Its displayed zero cannot prove availability.
+    if not modern and value == 0:
+        return None, "LEGACY_ZERO_AMBIGUOUS"
+    return value, "AVAILABLE"
 
 
 def parse_perf(text):
@@ -362,13 +380,30 @@ def parse_perf(text):
     shader compilation are still running, and they are not the frame time
     anyone means.
     """
-    rows = PERF_RE.findall(text or "")
+    rows = list(PERF_RE.finditer(text or ""))
     if not rows:
         return None
     r = rows[-1]
-    return {"frame_ms": float(r[0]), "fps": int(r[1]), "cpu_ms": float(r[2]),
-            "gpu_ms": float(r[3]), "draws": int(r[4]), "gpu_mem_mb": int(r[5]),
-            "rss_mb": int(r[8]), "commit_mb": int(r[9]), "samples": len(rows)}
+    out = {key: float(r[key]) for key in ("frame_ms", "cpu_ms", "gpu_ms")}
+    if not all(math.isfinite(value) for value in out.values()):
+        return None
+    out.update(fps=int(r["fps"]), draws=int(r["draws"]), samples=len(rows))
+    modern = r["modern_unit"] is not None
+    fields = ("gpu_mem_mb", "tex_mb", "rt_mb", "rss_mb", "commit_mb")
+    out["memory_raw"] = {key: r[key] for key in fields}
+    out["memory_availability"] = {}
+    for key in fields:
+        out[key], out["memory_availability"][key] = _perf_memory_value(r[key], modern)
+    # Historical *_mb keys remain compatible. Both producer versions divide
+    # bytes by 2**20; only the modern label spells that unit correctly.
+    out["memory_unit"] = "MiB"
+    out["memory_log_unit"] = "MiB" if modern else "MB"
+    tail = (text or "")[r.end():].split("\n", 1)[0]
+    out["memory_scope"] = {}
+    for key in ("gpu_mem_scope", "process_mem_scope"):
+        scope = re.search(r"\b" + key + r"=([a-z_]+)\b", tail)
+        out["memory_scope"][key] = scope[1] if scope else None
+    return out
 
 
 # ── self-test ────────────────────────────────────────────────────────

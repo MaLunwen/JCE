@@ -21,6 +21,8 @@
 #include <jce/middleware/scene/jce_water_fft.h>
 
 #include "jce_ocean_spectrum.h"
+#include "jce_water_fft_internal.h"
+#include "jce_water_fft_motion_internal.h"
 
 #include "os/core/jce_memory.h"
 
@@ -90,6 +92,7 @@ struct JceWaterFft {
      * default so existing scenes keep their exact surface until someone opts
      * in and rebaselines. */
     int                    use_modern_spectrum;
+    bool                   physical_spectrum_bins; /* versioned API only */
     JceOceanSpectrumParams spectrum;
 };
 
@@ -422,10 +425,19 @@ static void wfft_build_h0(JceWaterFft *f, unsigned int seed)
                 const float amp = jce_ocean_spectrum_amplitude(
                     &f->spectrum, (float)kx, (float)kz,
                     f->wind_dir[0], f->wind_dir[1]);
-                /* The module deliberately omits the 1/sqrt(L) patch factor:
-                 * patch size is a property of this FFT grid, not of the sea
-                 * state.  Applying it here keeps the module reusable. */
-                root = ((double)amp / sqrt(Lp)) * 0.70710678118654752440;
+                if (f->physical_spectrum_bins) {
+                    /* amp^2 = 4*pi*S2D. Each bin covers (2*pi/L)^2 and
+                     * h(k,t) sums two independent complex h0 terms, each
+                     * with two unit-variance Gaussian components. Thus the
+                     * per-component root is sqrt(S2D)*dk/2. Our IFFT divides
+                     * by N^2, so undo that normalization in the coefficients.
+                     * This keeps physical variance independent of resolution. */
+                    root = (double)amp * (double)N * (double)N *
+                           0.88622692545275801365 / Lp; /* sqrt(pi)/2 */
+                } else {
+                    /* Preserve the old unversioned JONSWAP surface exactly. */
+                    root = ((double)amp / sqrt(Lp)) * 0.70710678118654752440;
+                }
             } else {
                 double ph = wfft_phillips(f, kx, kz);
                 root = sqrt(ph) * 0.70710678118654752440; /* 1/sqrt(2) */
@@ -437,7 +449,10 @@ static void wfft_build_h0(JceWaterFft *f, unsigned int seed)
             f->h0[idx].im = root * xi_i;
 
             double kk = sqrt(kx * kx + kz * kz);
-            f->omega[idx] = sqrt(WFFT_GRAVITY * kk);
+            f->omega[idx] = f->use_modern_spectrum &&
+                f->spectrum.type == JCE_OCEAN_SPECTRUM_TMA
+                ? jce_ocean_spectrum_dispersion(&f->spectrum, kk, NULL)
+                : sqrt(WFFT_GRAVITY * kk);
         }
     }
 
@@ -472,12 +487,34 @@ bool JCE_CALL jce_water_fft_use_jonswap(JceWaterFft *f, float wind_speed,
     f->spectrum.fetch      = fetch;
     f->spectrum.swell      = swell;
     f->use_modern_spectrum = 1;
+    f->physical_spectrum_bins = false;
 
     /* The FFT keeps its own wind speed for the Phillips path; keep the two in
      * step so a later read of either agrees. */
     f->wind_speed = wind_speed;
 
     wfft_build_h0(f, seed);
+    return true;
+}
+
+bool JCE_CALL jce_water_fft_configure_spectrum(
+    JceWaterFft *f, const JceWaterFftSpectrumDesc *d)
+{
+    if (!f || f->evolved || !jce_water_fft_spectrum_valid(d)) return false;
+
+    jce_ocean_spectrum_params_default(&f->spectrum);
+    f->spectrum.type = d->model == JCE_WATER_FFT_SPECTRUM_PM
+        ? JCE_OCEAN_SPECTRUM_PM : d->model == JCE_WATER_FFT_SPECTRUM_TMA
+        ? JCE_OCEAN_SPECTRUM_TMA : JCE_OCEAN_SPECTRUM_JONSWAP;
+    f->spectrum.wind_speed = d->wind_speed;
+    f->spectrum.fetch = d->fetch;
+    f->spectrum.swell = d->swell;
+    f->spectrum.depth = d->depth;
+    f->spectrum.directional_blend = d->directional_blend;
+    f->wind_speed = d->wind_speed;
+    f->use_modern_spectrum = 1;
+    f->physical_spectrum_bins = true;
+    wfft_build_h0(f, d->seed);
     return true;
 }
 
@@ -503,12 +540,15 @@ void JCE_CALL jce_water_fft_destroy(JceWaterFft *f)
     JCE_FREE(f);
 }
 
-void JCE_CALL jce_water_fft_evolve(JceWaterFft *f, float t)
+void jce_water_fft_evolve_motion(JceWaterFft *f, float t,
+    float horizontal_scale, double max_displacement)
 {
     if (!f) return;
     const int N = f->N;
     const double Lp = (double)f->patch_size;
     const double td = (double)t;
+    const bool modify_chop = horizontal_scale != 1.0f || max_displacement > 0.0;
+    const double max_displacement_sq = max_displacement * max_displacement;
 
     /* --- Build the time-evolved frequency fields h(k,t) and D_{x,z}(k). --- */
     for (int m = 0; m < N; ++m) {
@@ -576,8 +616,22 @@ void JCE_CALL jce_water_fft_evolve(JceWaterFft *f, float t)
             int idx = z * N + x;
             double sgn = ((x + z) & 1) ? -1.0 : 1.0;
             f->height[idx] = (float)(f->hkt[idx].re     * sgn);
-            f->disp_x[idx] = (float)(f->dispf_x[idx].re * sgn);
-            f->disp_z[idx] = (float)(f->dispf_z[idx].re * sgn);
+            double dx = f->dispf_x[idx].re * sgn;
+            double dz = f->dispf_z[idx].re * sgn;
+            if (modify_chop) {
+                dx *= (double)horizontal_scale;
+                dz *= (double)horizontal_scale;
+                if (max_displacement > 0.0) {
+                    const double length_sq = dx * dx + dz * dz;
+                    if (length_sq > max_displacement_sq) {
+                        const double reduction = max_displacement / sqrt(length_sq);
+                        dx *= reduction;
+                        dz *= reduction;
+                    }
+                }
+            }
+            f->disp_x[idx] = (float)dx;
+            f->disp_z[idx] = (float)dz;
             if (f->want_slopes) {
                 f->slope_x[idx] = (float)(f->slopef_x[idx].re * sgn);
                 f->slope_z[idx] = (float)(f->slopef_z[idx].re * sgn);
@@ -588,6 +642,10 @@ void JCE_CALL jce_water_fft_evolve(JceWaterFft *f, float t)
     /* Foam last: it is a function of the packed displacement fields, so it has
      * to run after them, not inside the same loop. */
     if (f->want_foam) {
+        /* det(I + dD/dX) uses world-space derivatives. Legacy calls retain
+         * their old per-cell interpretation for scene compatibility. */
+        const float derivative_scale = f->physical_spectrum_bins
+            ? 0.5f * (float)N / f->patch_size : 0.5f;
         for (int z = 0; z < N; ++z) {
             for (int x = 0; x < N; ++x) {
                 /* Wrapped neighbours -- the patch tiles, so the derivative at
@@ -596,18 +654,16 @@ void JCE_CALL jce_water_fft_evolve(JceWaterFft *f, float t)
                 const int zm = (z - 1 + N) % N, zp = (z + 1) % N;
 
                 const float dDxdx = (f->disp_x[z * N + xp] -
-                                     f->disp_x[z * N + xm]) * 0.5f;
+                                     f->disp_x[z * N + xm]) * derivative_scale;
                 const float dDzdz = (f->disp_z[zp * N + x] -
-                                     f->disp_z[zm * N + x]) * 0.5f;
+                                     f->disp_z[zm * N + x]) * derivative_scale;
                 const float dDxdz = (f->disp_x[zp * N + x] -
-                                     f->disp_x[zm * N + x]) * 0.5f;
+                                     f->disp_x[zm * N + x]) * derivative_scale;
                 const float dDzdx = (f->disp_z[z * N + xp] -
-                                     f->disp_z[z * N + xm]) * 0.5f;
+                                     f->disp_z[z * N + xm]) * derivative_scale;
 
-                /* The derivatives above are per-CELL, which is what the
-                 * Jacobian of the grid->world map wants: the displacement and
-                 * the spacing are both in world units, so the cell size
-                 * cancels and no patch_size factor belongs here. */
+                /* The unit diagonal is the derivative of the identity world
+                 * map, so displacement differences must use the same units. */
                 f->foam[z * N + x] =
                     (1.0f + dDxdx) * (1.0f + dDzdz) - dDxdz * dDzdx;
             }
@@ -616,6 +672,11 @@ void JCE_CALL jce_water_fft_evolve(JceWaterFft *f, float t)
 
     f->evolved   = 1;
     f->last_time = t;
+}
+
+void JCE_CALL jce_water_fft_evolve(JceWaterFft *f, float t)
+{
+    jce_water_fft_evolve_motion(f, t, 1.0f, 0.0);
 }
 
 float JCE_CALL
@@ -699,8 +760,8 @@ const float *JCE_CALL jce_water_fft_disp_z_data(const JceWaterFft *f)
  * fetch, so the whole query is tens of flops -- cheap enough that gameplay
  * can call it per buoyancy probe per tick. */
 
-static float wfft_bilinear(const JceWaterFft *f, const float *grid,
-                           float world_x, float world_z)
+static float wfft_bilinear_offset(const JceWaterFft *f, const float *grid,
+                                  float world_x, float world_z, float texel_offset)
 {
     const int   N  = f->N;
     const float Lp = f->patch_size;
@@ -710,8 +771,8 @@ static float wfft_bilinear(const JceWaterFft *f, const float *grid,
     if (u < 0.0f) u += Lp;
     if (v < 0.0f) v += Lp;
 
-    const float gx = u / Lp * (float)N;
-    const float gz = v / Lp * (float)N;
+    const float gx = u / Lp * (float)N + texel_offset;
+    const float gz = v / Lp * (float)N + texel_offset;
 
     const int x0 = (int)floorf(gx);
     const int z0 = (int)floorf(gz);
@@ -731,6 +792,12 @@ static float wfft_bilinear(const JceWaterFft *f, const float *grid,
     const float a = v00 + (v10 - v00) * fx;
     const float b = v01 + (v11 - v01) * fx;
     return a + (b - a) * fz;
+}
+
+static float wfft_bilinear(const JceWaterFft *f, const float *grid,
+                           float world_x, float world_z)
+{
+    return wfft_bilinear_offset(f, grid, world_x, world_z, 0.0f);
 }
 
 void JCE_CALL jce_water_fft_sample_surface(const JceWaterFft *f,
@@ -779,6 +846,40 @@ void JCE_CALL jce_water_fft_sample_surface(const JceWaterFft *f,
     }
     if (f->want_foam)
         out->jacobian = wfft_bilinear(f, f->foam, wx, wz);
+}
+
+void jce_water_fft_sample_surface_pair(const JceWaterFft *a, const JceWaterFft *b,
+    float world_x, float world_z, int iterations, JceWaterFftSample *out)
+{
+    /* The vertex shader linearly samples repeating textures at normalized
+     * world UV. GPU texel centres are half a texel inside the patch. */
+    const float texel_offset = -0.5f;
+    float wx = world_x;
+    float wz = world_z;
+    for (int i = 0; i < iterations; ++i) {
+        const float dx = wfft_bilinear_offset(a, a->disp_x, wx, wz, texel_offset) +
+                         wfft_bilinear_offset(b, b->disp_x, wx, wz, texel_offset);
+        const float dz = wfft_bilinear_offset(a, a->disp_z, wx, wz, texel_offset) +
+                         wfft_bilinear_offset(b, b->disp_z, wx, wz, texel_offset);
+        wx = world_x - dx;
+        wz = world_z - dz;
+    }
+
+    out->grid_x = wx;
+    out->grid_z = wz;
+    out->disp_x = wfft_bilinear_offset(a, a->disp_x, wx, wz, texel_offset) +
+                  wfft_bilinear_offset(b, b->disp_x, wx, wz, texel_offset);
+    out->disp_z = wfft_bilinear_offset(a, a->disp_z, wx, wz, texel_offset) +
+                  wfft_bilinear_offset(b, b->disp_z, wx, wz, texel_offset);
+    out->height = wfft_bilinear_offset(a, a->height, wx, wz, texel_offset) +
+                  wfft_bilinear_offset(b, b->height, wx, wz, texel_offset);
+    out->slope_x = wfft_bilinear_offset(a, a->slope_x, wx, wz, texel_offset) +
+                   wfft_bilinear_offset(b, b->slope_x, wx, wz, texel_offset);
+    out->slope_z = wfft_bilinear_offset(a, a->slope_z, wx, wz, texel_offset) +
+                   wfft_bilinear_offset(b, b->slope_z, wx, wz, texel_offset);
+    /* Match the fold channel packed by the two-cascade vertex shader. */
+    out->jacobian = fminf(wfft_bilinear_offset(a, a->foam, wx, wz, texel_offset),
+                          wfft_bilinear_offset(b, b->foam, wx, wz, texel_offset));
 }
 
 float JCE_CALL jce_water_fft_sample_height_displaced(const JceWaterFft *f,

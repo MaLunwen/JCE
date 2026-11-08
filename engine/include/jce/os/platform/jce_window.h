@@ -44,12 +44,16 @@ JCE_EXTERN_C_BEGIN
 #define JCE_WINDOW_MINIMIZED           0x00000040u
 #define JCE_WINDOW_MAXIMIZED           0x00000080u
 #define JCE_WINDOW_HIGH_PIXEL_DENSITY  0x00002000u
+/* Nonactivating window policy; platform support and observed focus can differ. */
+#define JCE_WINDOW_NOT_FOCUSABLE       UINT32_C(0x80000000)
+/* Read-only observed state. Do not pass it as a creation flag. */
+#define JCE_WINDOW_INPUT_FOCUS         UINT32_C(0x00000200)
 
 typedef struct JceWindowConfig {
     const char *title;
     int         logical_w;
     int         logical_h;
-    uint32_t    flags;          /* JCE_WINDOW_* */
+    uint32_t    flags;          /* JCE_WINDOW_* creation flags, not INPUT_FOCUS. */
 } JceWindowConfig;
 
 typedef struct JceWindow JceWindow;
@@ -59,7 +63,24 @@ JCE_API JceWindow  *jce_window_create(const JceWindowConfig *cfg);
 JCE_API void        jce_window_destroy(JceWindow *win);
 
 /* Accessors. */
+/* Main-thread query of the platform adapter's current supported JCE flags.
+ * This is observed state, not a copy of creation intent. Unknown backend bits
+ * are omitted. Valid zero flags return true. Invalid win/output returns false
+ * without modifying *out_flags. INPUT_FOCUS is observation only; flags do not
+ * certify OS foreground ownership, unobscured pixels or GPU presentation. */
+JCE_API bool        jce_window_get_flags(const JceWindow *win, uint32_t *out_flags);
+/* Cached drawable pixels used by the renderer/Canvas. */
 JCE_API void        jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h);
+/* Actual cached SDL window points used by physical mouse events, refreshed at
+ * creation/resize. These differ from configured logical layout and drawable
+ * pixels on HiDPI. No OS query; NULL window reports zero. Main thread only. */
+JCE_API void        jce_window_get_point_size(const JceWindow *win, uint32_t *w, uint32_t *h);
+/* Convert actual window-point mouse coordinates to drawable/Canvas pixels.
+ * No query, clamp or fabricated validity. Finite outside points stay outside;
+ * unavailable dimensions, nonfinite coordinates or NULL outputs return false
+ * and preserve outputs. Main thread, live borrowed window lifetime. */
+JCE_API bool        jce_window_point_to_pixels(const JceWindow *win, float x, float y,
+                                               float *out_x, float *out_y);
 JCE_API void        jce_window_get_logical(JceWindow *win, int *w, int *h);
 
 /* The part of the drawable no system decoration covers, in PIXELS.

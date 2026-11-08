@@ -16,7 +16,9 @@
  *   Android    | API 21 (Lollipop) | arm64-v8a    | NEON
  *   Web (wasm) | wasm32 + simd128  | —            | wasm-SIMD
  *
- * Language baseline: C11 + C++20.
+ * Language baseline: C99 + C++20.
+ * The independent A1 LLVM-MinGW-XP OS/Core probe may opt into XP via
+ * JCE_WINXP_LEGACY=1; this does NOT change full JCE minimum support.
  *
  * This header is intentionally dependency-light and safe for FFI tools.
  */
@@ -45,12 +47,32 @@ extern "C" {
 /* -- OS minimum versions -------------------------------------------- */
 
 #if JCE_PLATFORM_WINDOWS
+#if defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+/* A1 experimental, opt-in OS/Core probe only; NOT full engine support. */
+#if !defined(__clang__) || !defined(__MINGW32__) || defined(_MSC_VER)
+#error "JCE_WINXP_LEGACY requires LLVM-MinGW-XP (MinGW ABI)"
+#endif
+#if JCE_ARCH_X64
+#define JCE_MIN_WIN32_WINNT 0x0502 /* XP Professional x64 SP2 */
+#elif JCE_ARCH_X86
+#define JCE_MIN_WIN32_WINNT 0x0501 /* XP x86 SP3 */
+#else
+#error "JCE_WINXP_LEGACY supports only x86 and x64"
+#endif
+#if !defined(_WIN32_WINNT) || _WIN32_WINNT != JCE_MIN_WIN32_WINNT
+#error "JCE legacy probe requires exact XP _WIN32_WINNT"
+#endif
+#if !defined(WINVER) || WINVER != JCE_MIN_WIN32_WINNT
+#error "JCE legacy probe requires exact XP WINVER"
+#endif
+#else
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601 /* Windows 7 */
+#define _WIN32_WINNT 0x0601 /* Modern Windows 7 minimum */
 #elif _WIN32_WINNT < 0x0601
 #error "JCE requires _WIN32_WINNT >= 0x0601 (Windows 7)"
 #endif
 #define JCE_MIN_WIN32_WINNT 0x0601
+#endif
 #endif
 
 #if JCE_PLATFORM_IOS

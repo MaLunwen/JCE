@@ -35,10 +35,10 @@
  * afterwards is a language the scene has already been refused by.  es_app_init
  * in main.c calls it as its first statement, before app_init().
  *
- * NOTHING HERE FAILS THE PROCESS.  Every refusal is reported by name on
- * stderr and the run continues, so the failure surfaces as "python: 0 starts"
- * in the probe report rather than as a window that never opened.  A refusal
- * that killed the process would tell you less.
+ * The SDK branch consumes the public generated shim's native verification
+ * result before the scene loads. A negative result refuses app initialization.
+ * Compiled backend availability does not certify external-runtime bootstrap.
+ * The legacy in-tree branch retains its original diagnostic/probe behavior.
  */
 
 #include "es_script_langs.h"
@@ -83,28 +83,13 @@ void es_script_langs_shutdown(void)
  * one branch and absent in another. */
 #if defined(ES_SCRIPT_ENABLE_SHIM)
 #  include <jce_script_register_linked.h>
-#  if defined(JCE_SCRIPT_LINKED_CPP)
-extern bool es_flower_sway_register(void);
-#  endif
-#  if defined(JCE_SCRIPT_LINKED_C)
-extern bool es_prop_surface_register(void);
-#  endif
 
-/* The one thing that stays project code: the classes are this project's. */
-static void es_publish_native_modules(void)
-{
-#  if defined(JCE_SCRIPT_LINKED_CPP)
-    (void)es_flower_sway_register();
-#  endif
-#  if defined(JCE_SCRIPT_LINKED_C)
-    (void)es_prop_surface_register();
-#  endif
-}
-
-void es_script_langs_register(void)
+/* NATIVE_FACTORIES in CMake owns static module publication and selected-class
+ * verification. A project callback here would publish the same classes twice. */
+bool es_script_langs_register(void)
 {
     es_preload_runtime();
-    (void)jce_script_register_linked_languages(es_publish_native_modules);
+    return jce_script_register_linked_languages(NULL) >= 0;
 }
 #else
 

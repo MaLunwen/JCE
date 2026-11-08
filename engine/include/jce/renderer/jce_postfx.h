@@ -333,6 +333,12 @@ JCE_API float jce_postfx_get_exposure_ev(const JcePostFXPipeline *pipeline);
  * the jitter only sub-pixel-shifts the sampled image, not the reproject.
  */
 
+/* Query the current backend/pipeline target-format eligibility before camera
+ * jitter. This is a CPU capability/policy check; it does not certify shader,
+ * depth/motion input, allocation or GPU resolve completion. Safe without a
+ * live backend: returns false. Re-query after pipeline/device changes. */
+JCE_API bool jce_postfx_taa_supported(void);
+
 /* Enable/disable TAA and set its resolve parameters.
  *   feedback     : history blend weight (0.85-0.97 typical; higher = more
  *                  temporal accumulation / softer, lower = sharper/noisier).
@@ -387,6 +393,44 @@ JCE_API void jce_postfx_apply(JcePostFXPipeline *pipeline,
 /* Get the output texture after jce_postfx_apply.
    An empty chain returns its borrowed scene input; failed apply returns invalid. */
 JCE_API JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
+
+/* Versioned CPU allocation descriptor. Initialize struct_size to sizeof this
+ * type and version to JCE_POSTFX_OUTPUT_TARGET_VERSION before querying. */
+#define JCE_POSTFX_OUTPUT_TARGET_VERSION 1u
+typedef enum {
+    JCE_POSTFX_OUTPUT_UNAVAILABLE = 0,
+    JCE_POSTFX_OUTPUT_BORROWED = 1,
+    JCE_POSTFX_OUTPUT_OWNED = 2
+} JcePostFXOutputKind;
+typedef enum {
+    JCE_POSTFX_OUTPUT_FORMAT_UNKNOWN = 0,
+    JCE_POSTFX_OUTPUT_FORMAT_RGBA8 = 1,
+    JCE_POSTFX_OUTPUT_FORMAT_RGBA16F = 2
+} JcePostFXOutputFormat;
+typedef struct {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t kind;       /* JcePostFXOutputKind */
+    uint32_t width;      /* Actual allocated extent; zero for borrowed input. */
+    uint32_t height;
+    uint32_t format;     /* JcePostFXOutputFormat; unknown for borrowed input. */
+    JceTextureHandle texture;
+    uint16_t framebuffer;
+} JcePostFXOutputTarget;
+
+/* Allocation-free query, on the pipeline owner thread after apply(). Owned
+ * output describes a complete CPU-admitted texture/FBO pair, including handle
+ * zero; it does not certify GPU completion, liveness or context generation.
+ * An empty chain reports borrowed scene input with unknown extent/format and
+ * no writable FBO. Missing/failed output reports unavailable and returns false.
+ * A matching size/version is required; mismatch returns false without writing.
+ * Valid callers receive cleared unavailable fields even for a null pipeline.
+ * Every returned handle is borrowed until the next apply, resize or destroy.
+ * Submit overlays, display and capture before then; do not release the handles.
+ * Owned FBOs have color only: overlays must preserve color (clear NONE) and
+ * must not require scene depth/stencil. Existing render ordering still applies. */
+JCE_API bool jce_postfx_get_output_target(const JcePostFXPipeline *pipeline,
+                                         JcePostFXOutputTarget *target);
 
 /* Draw the chain's output texture to the BACKBUFFER as a fullscreen pass.
  * The runtime presentation step for consumers that render their scene into

@@ -134,10 +134,10 @@ static void insp_draw_material_override_row(JceMeshRenderer *mr)
 
     const int n = jce_mesh_renderer_override_count(mr);
 
-    ImGui::TextDisabled("%s: %d", jce_editor_i18n_id(
+    ImGui::TextDisabled("%s: %d", jce_editor_i18n_or(
         "inspector.materialOverrides", "Overrides on this renderer"), n);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", jce_editor_i18n_id(
+        ImGui::SetTooltip("%s", jce_editor_i18n_or(
             "inspector.materialOverrides.tip",
             "These factors are kept on this entity and are not overwritten "
             "when the material file is loaded or reloaded."));

@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "provider": "Pillow bundled default",
+  "pillow_version": "12.3.0",
+  "family": [
+    "Aileron",
+    "Regular"
+  ],
+  "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f",
+  "font_bytes": 12676,
+  "license": "No Rights Reserved",
+  "source": "https://dotcolon.net/fonts/aileron/",
+  "scope": "Rasterized UI images only; no font software is redistributed",
+  "original_typography": "Deliberately replaced by redistributable default typography; original captures remain reference evidence"
+}

@@ -46,6 +46,15 @@ extern "C" {
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
+#include <jce/middleware/scene/jce_scene_water_spectrum.h>
+#include <jce/middleware/scene/jce_scene_water_foam.h>
+#include <jce/middleware/scene/jce_scene_water_crest.h>
+#include <jce/middleware/scene/jce_scene_water_caustics.h>
+#include <jce/middleware/scene/jce_scene_water_nearshore.h>
+#include <jce/middleware/scene/jce_scene_water_motion.h>
+#include <jce/middleware/scene/jce_scene_water_optics.h>
+#include <jce/middleware/scene/jce_scene_water_caustic_detail.h>
+#include <jce/middleware/scene/jce_scene_water_normal_detail.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
 }
@@ -352,6 +361,15 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
 void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc);
 void draw_comp_grass_field(JceGrassFieldComponent *g);
 void draw_comp_water(JceWaterComponent *w);
+void draw_comp_water_foam(JceWaterFoamComponent *value);
+void draw_comp_water_crest(JceWaterCrestComponent *value);
+void draw_comp_water_caustics(JceWaterCausticsComponent *value);
+void draw_comp_water_nearshore(JceScene *scene, JceWaterNearshoreComponent *value);
+void draw_comp_water_motion(JceWaterMotionComponent *value);
+void draw_comp_water_optics(JceWaterOpticsComponent *value);
+void draw_comp_water_caustic_detail(JceWaterCausticDetailComponent *value);
+void draw_comp_water_normal_detail(JceScene *scene, JceEntity entity);
+void draw_comp_water_spectrum(JceWaterSpectrumComponent *value);
 void draw_comp_buoyancy(JceBuoyancyComponent *b);
 void draw_comp_particle_emitter(JceParticleEmitterComponent *pe);
 void draw_comp_script(JceScriptComponent *scr);

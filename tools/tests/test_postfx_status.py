@@ -36,7 +36,9 @@ typedef bgfx_program_handle_t bgfx_frame_buffer_handle_t;
 typedef struct {bool taa_enabled,taa_log_reported,taa_log_submitted;uint16_t view_base;
  bgfx_vertex_buffer_handle_t quad_vb;bgfx_index_buffer_handle_t quad_ib;
  bgfx_texture_handle_t output_tex;bgfx_frame_buffer_handle_t output_fb;
- int output_ping;bool mb_active,dof_active;bgfx_program_handle_t prog_composite;} JcePostFXPipeline;
+ int output_ping;bool mb_active,dof_active,mb_enabled,dof_enabled;
+ bool limited_composite_sampling,composite_limit_reported;
+ bgfx_program_handle_t prog_composite;} JcePostFXPipeline;
 #define BGFX_DISCARD_ALL 255
 #define BGFX_STATE_WRITE_RGB 1
 #define BGFX_STATE_WRITE_A 2
@@ -78,6 +80,17 @@ int main(int argc,char **argv)
   scene.quad_vb.idx=UINT16_MAX;unsigned previous=vertex_sets;
   assert(!draw_fullscreen(&scene,34,program));assert(vertex_sets==previous);
   assert(submits==1 && discards==2);
+ } else if(!strcmp(argv[1],"compat-composite")) {
+  scene.limited_composite_sampling=true;
+  assert(!postfx_composite_multisampling(&scene) && records==0);
+  scene.dof_enabled=true;
+  assert(!postfx_composite_multisampling(&scene) && records==1);
+  scene.mb_enabled=true;
+  assert(!postfx_composite_multisampling(&scene) && records==1);
+  assert(scene.dof_enabled && scene.mb_enabled);
+  assert(strstr(messages[0],"GL 2.1 stock Composite"));
+  game.dof_enabled=game.mb_enabled=true;
+  assert(postfx_composite_multisampling(&game) && records==1);
  } else if(!strcmp(argv[1],"output")) {
   scene.mb_active=scene.dof_active=true;scene.output_tex.idx=9;scene.output_fb.idx=10;scene.output_ping=1;
   reset_output_state(&scene);assert(!scene.mb_active && !scene.dof_active);
@@ -111,7 +124,7 @@ int main(int argc,char **argv)
                 env = None
             result = subprocess.run(command, cwd=directory, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            for control in ("interleave", "unsubmitted", "submission", "output"):
+            for control in ("interleave", "unsubmitted", "submission", "output", "compat-composite"):
                 result = subprocess.run([str(executable),control], cwd=directory, capture_output=True, text=True)
                 with self.subTest(control=control):
                     self.assertEqual(result.returncode, 0, control + ": " + result.stdout + result.stderr)

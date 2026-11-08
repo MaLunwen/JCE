@@ -6,10 +6,10 @@
 
 bool jce_editor_welcome_should_open_on_startup(
     JceEditorStartupBehavior startup_behavior,
-    bool has_current_project,
+    bool has_current_content,
     bool has_known_project)
 {
-    if (has_current_project)
+    if (has_current_content)
         return false;
 
     switch (startup_behavior) {

@@ -84,7 +84,8 @@ bool bench_asset_capture_configure(void)
         jce_cvar_set_bool(mode, indirect[0] == '1');
         LOG_INFO(LOG_TAG, "benchmark-asset: indirect policy=%u", jce_cvar_get_bool(mode));
     }
-    LOG_INFO(LOG_TAG, "benchmark-asset: still controls taa=0 ssao=0 ssr=0 motion_blur=0");
+    jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                  "benchmark-asset: still controls taa=0 ssao=0 ssr=0 motion_blur=0");
     return true;
 }
 

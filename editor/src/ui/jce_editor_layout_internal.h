@@ -35,6 +35,7 @@ typedef enum {
     PGA_OPEN_PROJECT,
     PGA_OPEN_RECENT_SCENE,
     PGA_OPEN_RECENT_PROJECT,
+    PGA_NEW_PROJECT,
 } PendingGatedAction;
 
 typedef enum {

@@ -14,22 +14,21 @@
 
 typedef struct {
     const char *asset_id;
-    const char *handler;
+    int state_index;
 } EsStateBinding;
 
 static const EsStateBinding ES_STATE_BINDINGS[] = {
-    { "elemental.state.spring.day", "es_state_spring_day" },
-    { "elemental.state.spring.night", "es_state_spring_night" },
-    { "elemental.state.winter.day", "es_state_winter_day" },
-    { "elemental.state.winter.night", "es_state_winter_night" },
-    { "elemental.state.autumn.day", "es_state_autumn_day" },
-    { "elemental.state.autumn.night", "es_state_autumn_night" },
-    { "elemental.state.rainy.day", "es_state_rainy_day" },
-    { "elemental.state.rainy.night", "es_state_rainy_night" },
+    { "elemental.state.spring.day", 0 },
+    { "elemental.state.spring.night", 1 },
+    { "elemental.state.winter.day", 2 },
+    { "elemental.state.winter.night", 3 },
+    { "elemental.state.autumn.day", 4 },
+    { "elemental.state.autumn.night", 5 },
+    { "elemental.state.rainy.day", 6 },
+    { "elemental.state.rainy.night", 7 },
 };
 
 struct EsSceneOrchestrator {
-    JceRuntime *runtime;
     JceAiSceneDirector *director;
     JceSceneCatalog catalog;
     JceSceneRecipe bootstrap[ES_AI_MAX_BOOTSTRAP];
@@ -38,6 +37,9 @@ struct EsSceneOrchestrator {
     uint64_t next_seed;
     uint64_t last_plan_hash;
     bool pending;
+    int result_status;
+    int result_state;
+    int result_error;
 };
 
 static bool root_key_allowed(const char *key)
@@ -145,16 +147,16 @@ static bool load_contracts(EsSceneOrchestrator *orchestrator,
     return ok;
 }
 
-static const char *handler_for_asset(const char *asset_id)
+static int state_for_asset(const char *asset_id)
 {
     uint32_t i;
 
     for (i = 0u; i < sizeof(ES_STATE_BINDINGS) /
                         sizeof(ES_STATE_BINDINGS[0]); ++i) {
         if (strcmp(asset_id, ES_STATE_BINDINGS[i].asset_id) == 0)
-            return ES_STATE_BINDINGS[i].handler;
+            return ES_STATE_BINDINGS[i].state_index;
     }
-    return NULL;
+    return -1;
 }
 
 static const JceScenePlanOperation *find_plan_role(
@@ -185,7 +187,6 @@ EsSceneOrchestrator *es_scene_orchestrator_create(
     if (!orchestrator)
         return NULL;
     memset(orchestrator, 0, sizeof(*orchestrator));
-    orchestrator->runtime = runtime;
     orchestrator->next_request_id = 1u;
     orchestrator->next_seed = 1u;
     if (!load_contracts(orchestrator, filesystem)) {
@@ -236,6 +237,8 @@ bool es_scene_orchestrator_request_next(
                  (int)jce_ai_scene_director_error(orchestrator->director));
         return false;
     }
+    orchestrator->result_status = 0;
+    orchestrator->result_error = 0;
     orchestrator->pending = true;
     return true;
 }
@@ -247,45 +250,52 @@ void es_scene_orchestrator_update(EsSceneOrchestrator *orchestrator,
     JceSceneFrozenPlan plan;
     const JceScenePlanOperation *root;
     const JceScenePlanOperation *primary;
-    const char *handler;
-
-    if (!orchestrator || !orchestrator->pending)
-        return;
+    int state;
+    if (!orchestrator || !orchestrator->pending) return;
     jce_ai_scene_director_update(orchestrator->director, delta_seconds);
     status = jce_ai_scene_director_status(orchestrator->director);
-    if (status == JCE_AI_SCENE_DIRECTOR_WAITING)
-        return;
+    if (status == JCE_AI_SCENE_DIRECTOR_WAITING) return;
     orchestrator->pending = false;
+    orchestrator->result_status = -1;
+    orchestrator->result_error = (int)jce_ai_scene_director_error(orchestrator->director);
     if (status != JCE_AI_SCENE_DIRECTOR_READY ||
         !jce_ai_scene_director_result(orchestrator->director, &plan) ||
-        plan.operation_count != 2u ||
-        !jce_scene_frozen_plan_graph_validate(&plan)) {
-        LOG_WARN("es_ai", "scene planning failed: %d",
-                 (int)jce_ai_scene_director_error(orchestrator->director));
+        plan.operation_count != 2u || !jce_scene_frozen_plan_graph_validate(&plan)) {
+        LOG_WARN("es_ai", "planning failed: stage=result error=%d", orchestrator->result_error);
         return;
     }
     root = find_plan_role(&plan, "environment.root");
     primary = find_plan_role(&plan, "environment.primary");
     if (!root || !primary || root->parent_stable_entity_id != 0u ||
         primary->parent_stable_entity_id != root->stable_entity_id) {
-        LOG_ERROR("es_ai", "%s", "scene plan hierarchy mismatch");
+        orchestrator->result_error = -2;
+        LOG_ERROR("es_ai", "%s", "planning failed: stage=hierarchy");
         return;
     }
-    handler = handler_for_asset(primary->asset_id);
-    if (!handler) {
-        LOG_ERROR("es_ai", "unbound semantic asset: %s",
-                  primary->asset_id);
-        return;
-    }
-    if (!jce_runtime_dispatch_ui_click(orchestrator->runtime, 0u, handler)) {
-        LOG_ERROR("es_ai", "runtime rejected semantic handler: %s", handler);
+    state = state_for_asset(primary->asset_id);
+    if (state < 0) {
+        orchestrator->result_error = -3;
+        LOG_ERROR("es_ai", "planning failed: stage=semantic asset=%s", primary->asset_id);
         return;
     }
     orchestrator->last_plan_hash = plan.plan_hash;
-    LOG_INFO("es_ai", "activated plan=%llu source=%d asset=%s",
+    orchestrator->result_state = state;
+    orchestrator->result_status = 1;
+    LOG_INFO("es_ai", "planned (not yet applied) plan=%llu source=%d asset=%s",
              (unsigned long long)plan.plan_hash,
-             (int)jce_ai_scene_director_source(orchestrator->director),
-             primary->asset_id);
+             (int)jce_ai_scene_director_source(orchestrator->director), primary->asset_id);
+}
+
+int es_scene_orchestrator_take_result(EsSceneOrchestrator *orchestrator,
+                                     int *state, int *error)
+{
+    int result;
+    if (!orchestrator) return -1;
+    result = orchestrator->result_status;
+    if (state) *state = orchestrator->result_state;
+    if (error) *error = orchestrator->result_error;
+    orchestrator->result_status = 0;
+    return result;
 }
 
 uint64_t es_scene_orchestrator_last_plan_hash(

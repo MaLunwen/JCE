@@ -1,51 +1,37 @@
-/* Bootstrap service scopes reuse the public bounded trace authority. */
+/* Application aliases; implementation belongs to the core trace owner. */
 #ifndef JCE_ENGINE_TRACE_SCOPE_H
 #define JCE_ENGINE_TRACE_SCOPE_H
-#include <jce/os/core/jce_trace.h>
-#include <jce/os/core/jce_timer.h>
-
-typedef struct JceEngineTraceScope {
-    uint64_t id;
-    uint64_t parent;
-    uint64_t started;
-    const char *name;
-} JceEngineTraceScope;
-
-static inline JceEngineTraceScope engine_trace_begin(const char *name)
+#include <jce/os/core/jce_env.h>
+#include <jce/os/core/jce_perf_phase.h>
+#include "os/core/jce_trace_scope_internal.h"
+/* Environment policy shared by startup and frame telemetry. */
+static inline bool engine_trace_flag_enabled(const char *value)
 {
-    JceEngineTraceScope scope = {0, 0, 0, name};
-    if (jce_trace_enabled()) {
-        scope.parent = jce_trace_task_current_id();
-        scope.id = jce_trace_next_id();
-        scope.started = jce_time_perf_counter();
-        jce_trace_task_submit(scope.id, scope.parent,
-                              JCE_TRACE_TASK_SERVICE, name);
-        jce_trace_task_begin(scope.id, scope.id, name, 0);
-    }
-    return scope;
+    return jce_env_flag_enabled(value) != 0;
+}
+static inline bool engine_trace_policy(const char *trace, const char *perf,
+                                       const char *export_path,
+                                       const char *stream_path, bool debug_default)
+{
+    if ((export_path && export_path[0]) || (stream_path && stream_path[0]))
+        return true;
+    if (trace && trace[0]) return engine_trace_flag_enabled(trace);
+    return engine_trace_flag_enabled(perf) || debug_default;
+}
+typedef JceTraceScope JceEngineTraceScope;
+#define engine_trace_begin jce_trace_scope_begin
+#define engine_trace_end jce_trace_scope_end
+/* Scope success records the void API returning. Admission follows. */
+static inline void engine_trace_renderer_tail_end(JceEngineTraceScope scope,
+                                                  uint64_t begin, uint64_t end)
+{
+    jce_perf_phase_add("end_frame", jce_time_perf_to_ms(begin, end));
+    const JceTracePerfIntervalNames names = {"engine.renderer_tail_clock.frequency",
+        "engine.renderer_tail_clock.begin", "engine.renderer_tail_clock.end"};
+    jce_trace_perf_interval_emit(scope, JCE_TRACE_CATEGORY_RENDER, names, begin, end);
+    engine_trace_end(scope, JCE_TRACE_TASK_SUCCEEDED);
 }
 
-static inline void engine_trace_end(JceEngineTraceScope scope,
-                                    JceTraceTaskState state)
-{
-    if (scope.id) {
-        const double ms = jce_time_perf_to_ms(scope.started,
-                                              jce_time_perf_counter());
-        jce_trace_task_end(scope.id, scope.id, scope.name, state,
-                           ms > 0.0 ? (uint64_t)(ms * 1000000.0) : 0);
-        jce_trace_task_restore_id(scope.parent);
-    }
-}
-
-#define JCE_ENGINE_TRACE_CALL(name_, call_) do { \
-    JceEngineTraceScope scope_ = engine_trace_begin(name_); \
-    call_; \
-    engine_trace_end(scope_, JCE_TRACE_TASK_SUCCEEDED); \
-} while (0)
-#define JCE_ENGINE_TRACE_RESULT(name_, call_, succeeded_) do { \
-    JceEngineTraceScope scope_ = engine_trace_begin(name_); \
-    call_; \
-    engine_trace_end(scope_, (succeeded_) ? JCE_TRACE_TASK_SUCCEEDED \
-                                         : JCE_TRACE_TASK_FAILED); \
-} while (0)
+#define JCE_ENGINE_TRACE_CALL JCE_TRACE_SCOPE_CALL
+#define JCE_ENGINE_TRACE_RESULT JCE_TRACE_SCOPE_RESULT
 #endif

@@ -1,6 +1,7 @@
 #include "core/jce_editor_kpi_game_capture.h"
 
 extern "C" {
+#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
 }
 
@@ -178,10 +179,21 @@ const char *jce_editor_kpi_game_capture_global_due_path(void)
     return entry ? entry->path : nullptr;
 }
 
-bool jce_editor_kpi_game_capture_global_mark_submitted(void)
+void jce_editor_kpi_game_capture_global_mark_submitted(
+    uint32_t source_frame, uint32_t submit_frame)
 {
-    return g_capture.active &&
-           jce_editor_kpi_game_capture_mark_submitted(&g_capture.schedule);
+    if (!g_capture.active)
+        return;
+    auto &schedule = g_capture.schedule;
+    const auto *entry = jce_editor_kpi_game_capture_due(&schedule);
+    if (!entry || !jce_editor_kpi_game_capture_mark_submitted(&schedule))
+        return;
+    jce_log_write(JCE_LOG_LEVEL_INFO, "editor.game_view", __FILE__, __LINE__,
+                  "Game View capture admitted source_frame=%u submit_frame=%u "
+                  "due_seconds=%.9f admitted_seconds=%.9f path=%s",
+                  static_cast<unsigned>(source_frame),
+                  static_cast<unsigned>(submit_frame),
+                  entry->seconds, schedule.elapsed_seconds, entry->path);
 }
 
 void jce_editor_kpi_game_capture_global_mark_complete(bool success)

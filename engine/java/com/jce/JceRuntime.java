@@ -26,7 +26,7 @@ public final class JceRuntime implements AutoCloseable {
      * lockstep with project(JCE VERSION ...) in the root CMakeLists.txt
      * whenever the native surface used below changes shape.
      */
-    private static final int EXPECTED_API_VERSION = 0x000D0400;
+    private static final int EXPECTED_API_VERSION = 0x000E0000;
 
     /**
      * Mirror of JceAppResult in engine/include/jce/application/jce_engine.h.
@@ -109,6 +109,10 @@ public final class JceRuntime implements AutoCloseable {
 
     public void init() {
         if (nativeHandle != 0L) {
+            if (lastResult() != Result.CONTINUE) {
+                throw new IllegalStateException(
+                    "JCE session ended or failed; close the retained runtime before init()");
+            }
             return;
         }
 
@@ -125,6 +129,12 @@ public final class JceRuntime implements AutoCloseable {
         if (nativeHandle == 0L) {
             throw new IllegalStateException("Failed to create native JCE engine");
         }
+        if (lastResult() != Result.CONTINUE) {
+            /* This object already owns the handle, even when init fails.
+             * close() must remain reachable for deferred native cleanup. */
+            throw new IllegalStateException(
+                "Failed to initialize native JCE engine; close this runtime to finish cleanup");
+        }
     }
 
     /** Runs one frame. Returns the engine's own JceAppResult, not a boolean. */
@@ -133,7 +143,7 @@ public final class JceRuntime implements AutoCloseable {
         return Result.fromNative(nativeIterate(nativeHandle));
     }
 
-    /** Result of the last {@link #iterate()} — survives the loop exit. */
+    /** Result of native initialization or the last frame; survives loop exit. */
     public Result lastResult() {
         ensureInitialized();
         return Result.fromNative(nativeLastResult(nativeHandle));
@@ -143,6 +153,12 @@ public final class JceRuntime implements AutoCloseable {
         return lastResult() != Result.CONTINUE;
     }
 
+    /**
+     * Release native ownership. If cleanup is still borrowed by a worker or
+     * callback, throws IllegalStateException and retains the handle. Retry
+     * close() on this same object after control returns to its owner thread;
+     * do not discard it, call init(), or run further gameplay while closing.
+     */
     @Override
     public void close() {
         if (nativeHandle != 0L) {

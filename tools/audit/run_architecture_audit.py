@@ -105,6 +105,8 @@ CHECKS = [
     # (a preset silently re-stamping a cache entry; a message(WARNING) CMake
     # does not repeat on incremental reconfigures).
     (AUDIT_DIR / "check_patented_codec_gate.py", [], True),
+    # Scratch mutation controls exercise this gate; the real source gate stays above.
+    (AUDIT_DIR / "tests" / "test_patented_source_pins.py", [], True),
     # The version-handshake mirror gates; the parity MATRIX does not.
     # A drifted EXPECTED_API_VERSION makes the JNI binding reject a
     # correctly paired engine at runtime, which is a fact, not a judgement.
@@ -308,7 +310,7 @@ def run_one(path: Path, args: list[str]) -> tuple[int, str]:
     return rc, out
 
 
-DEFAULT_LOG = REPO_ROOT / "reports" / "architecture-audit-failure.txt"
+DEFAULT_LOG = REPO_ROOT / "build" / "reports" / "architecture-audit-failure.txt"
 
 
 def write_transcript(entries, explicit, failed):

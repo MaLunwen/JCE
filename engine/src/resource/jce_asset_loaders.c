@@ -20,6 +20,7 @@
 #include <jce/resource/jce_asset_format.h>
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
 
 #include <SDL3/SDL.h>
 #include <string.h>
@@ -70,7 +71,9 @@ void destroy_slot_payload(JceAssetManager *mgr, JceAssetSlot *slot)
             jce_mesh_destroy((JceMesh *)slot->data);
             break;
         case JCE_ASSET_SOUND:
-            /* Sound data is owned by audio subsystem. */
+            /* The asset owns this audio registration, including active voices. */
+            if (mgr->audio)
+                jce_audio_unload(mgr->audio, *(JceSound *)slot->data);
             JCE_FREE(slot->data);
             break;
         case JCE_ASSET_MODEL:
@@ -160,7 +163,11 @@ static void load_sound_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     }
 
     JceSound *heap = JCE_MALLOC(sizeof(JceSound));
-    if (!heap) { JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED); return; }
+    if (!heap) {
+        jce_audio_unload(mgr->audio, snd);
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
+        return;
+    }
     *heap = snd;
 
     slot->data = heap;
@@ -212,7 +219,11 @@ static void load_font_sync(JceAssetManager *mgr, JceAssetSlot *slot,
                             const char *path, const JceAssetLoadParams *p)
 {
     float pt_size = (p && p->font_size > 0.0f) ? p->font_size : 24.0f;
-    JceFont *font = jce_font_open(mgr->pak, path, pt_size);
+    const uint32_t *codepoints = p ? p->font_codepoints : NULL;
+    int count = codepoints && p->font_codepoint_count > 0
+        ? p->font_codepoint_count : 0;
+    JceFont *font = jce_font_open_ex(mgr->pak, path, pt_size,
+                                    codepoints, count);
     if (!font) {
         JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "font load failed: %s", path);
@@ -224,7 +235,7 @@ static void load_font_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
-void load_slot_sync(JceAssetManager *mgr,
+static void load_slot_sync_impl(JceAssetManager *mgr,
                     JceAssetSlot *slot,
                     const char *asset_path,
                     JceAssetType type,
@@ -357,7 +368,10 @@ void finalize_texture(JceAssetManager *mgr, JceAssetSlot *slot,
                       JceAsyncRequest *req)
 {
     JCE_PROFILE_ZONE_N("Asset::FinalizeTexture");
+    JceTraceScope scope = jce_trace_scope_begin("asset.finalize_texture_cpu");
     finalize_texture_inner(mgr, slot, req);
+    jce_trace_scope_end(scope, JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY
+                         ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
     JCE_PROFILE_ZONE_END;
 }
 
@@ -393,7 +407,11 @@ static void finalize_audio_inner(JceAssetManager *mgr, JceAssetSlot *slot,
     }
 
     JceSound *heap = JCE_MALLOC(sizeof(JceSound));
-    if (!heap) { JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED); return; }
+    if (!heap) {
+        jce_audio_unload(mgr->audio, snd);
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
+        return;
+    }
     *heap = snd;
 
     slot->data = heap;
@@ -406,11 +424,14 @@ void finalize_audio(JceAssetManager *mgr, JceAssetSlot *slot,
                     JceAsyncRequest *req)
 {
     JCE_PROFILE_ZONE_N("Asset::FinalizeAudio");
+    JceTraceScope scope = jce_trace_scope_begin("asset.finalize_audio_cpu");
     finalize_audio_inner(mgr, slot, req);
+    jce_trace_scope_end(scope, JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY
+                         ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
     JCE_PROFILE_ZONE_END;
 }
 
-void finalize_raw(JceAssetManager *mgr, JceAssetSlot *slot,
+static void finalize_raw_impl(JceAssetManager *mgr, JceAssetSlot *slot,
                   JceAsyncRequest *req)
 {
     if (!req->decoded_data) {
@@ -425,4 +446,27 @@ void finalize_raw(JceAssetManager *mgr, JceAssetSlot *slot,
     jce_mem_profile_record_alloc(JCE_MEM_TAG_RESOURCE_OTHER, slot->memory_bytes);
     mgr->total_loaded++;
     mgr->total_memory += slot->memory_bytes;
+}
+
+void load_slot_sync(JceAssetManager *mgr,
+                    JceAssetSlot *slot,
+                    const char *asset_path,
+                    JceAssetType type,
+                    const JceAssetLoadParams *params)
+{
+    JceTraceScope scope = jce_trace_scope_begin("asset.load_sync");
+    load_slot_sync_impl(mgr, slot, asset_path, type, params);
+    jce_trace_scope_end(scope, mgr && slot && asset_path &&
+                         JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY
+                         ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+}
+
+void finalize_raw(JceAssetManager *mgr, JceAssetSlot *slot,
+                  JceAsyncRequest *req)
+{
+    JceTraceScope scope = jce_trace_scope_begin("asset.finalize_raw_cpu");
+    finalize_raw_impl(mgr, slot, req);
+    jce_trace_scope_end(scope, mgr && slot && req &&
+                         JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY
+                         ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
 }

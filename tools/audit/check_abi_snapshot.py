@@ -289,6 +289,9 @@ def dirty_public_headers() -> list[str] | None:
 # ---------------------------------------------------------------------------
 
 KEY_RE = re.compile(r"^(?P<kind>\w+) (?P<name>\w+)")
+# Strip only the emitter's anchored locator, never declaration-internal arrays.
+LOCATION_LINE_RE = re.compile(
+    r"^(?P<declaration>.+)    \[(?P<path>[^\]]*)\]$")
 
 # Greedy body, anchored tail: a nested anonymous struct/union puts `}` inside
 # the body, and only the LAST one is followed by the `    [path]` locator.
@@ -310,7 +313,8 @@ def record_members(line: str) -> tuple[str, list[str]] | None:
     """(header path, ordered member list) for a `struct`/`enum` snapshot line.
 
     Returns None for `fn` / `fnptr` / `opaque`, which have no member ORDER to
-    reason about — a changed signature there is simply incompatible.
+    reason about. classify_change first handles exact declaration relocation;
+    any remaining change to those signatures is incompatible.
 
     The split mirrors the emitter exactly: struct fields were joined with
     "; " after a depth-aware split, so they are split back depth-aware
@@ -334,6 +338,14 @@ def classify_change(before: str, after: str) -> tuple[str, str]:
     "appended" and "moved" are compatible with an already-compiled consumer;
     "changed" is not.  A pure append leaves every existing member at the same
     index, which is the only property that keeps an old binary correct."""
+    b_loc = LOCATION_LINE_RE.fullmatch(before)
+    a_loc = LOCATION_LINE_RE.fullmatch(after)
+    if (b_loc is not None and a_loc is not None
+            and b_loc.group("declaration") == a_loc.group("declaration")
+            and b_loc.group("path") != a_loc.group("path")):
+        return "moved", (f"declared in {b_loc.group('path')} -> "
+                         f"{a_loc.group('path')}")
+
     b_rec, a_rec = record_members(before), record_members(after)
     if b_rec is None or a_rec is None:
         return "changed", "signature changed"

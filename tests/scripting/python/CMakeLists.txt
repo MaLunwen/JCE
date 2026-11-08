@@ -1,3 +1,5 @@
+jce_register_test_directory()
+
 cmake_minimum_required(VERSION 3.20)
 
 # ----------------------------------------------------------------------- #
@@ -44,7 +46,7 @@ add_test(NAME test_jce_script_python_emitter
 	        "${CMAKE_CURRENT_SOURCE_DIR}/test_emit_python.py")
 set_tests_properties(test_jce_script_python_emitter PROPERTIES
 	TIMEOUT 60
-	LABELS  "unit"
+	LABELS  "unit" JCE_TEST_KIND contract
 	# JCE_TEST_ENVIRONMENT first, because tests/CMakeLists.txt:280 refuses to
 	# configure a registered test that does not carry it.  Then
 	# PYTHONDONTWRITEBYTECODE, deliberately: this test imports
@@ -63,6 +65,56 @@ if(NOT TARGET jce_script_api)
 	jce_test_suite_skipped("script-python-binding"
 		"the Python binding differential; jce_script_api is not built (-DJCE_BUILD_SCRIPT_API_SHARED=OFF)")
 	return()
+endif()
+
+# The production API may be STATIC for embedded single-app delivery, but
+# the standalone Python differential needs an actual dlopen/ctypes transport.
+# Keep the shipping target/profile untouched.  This private test target uses
+# the exact production marshalling sources and generated export lists; it is
+# not linked into, installed with, or staged beside a shipped application.
+set(_jce_python_api_transport jce_script_api)
+get_target_property(_jce_python_api_type jce_script_api TYPE)
+if(_jce_python_api_type STREQUAL "STATIC_LIBRARY")
+    get_target_property(_jce_python_api_sources jce_script_api SOURCES)
+    get_target_property(_jce_python_api_includes jce_script_api INCLUDE_DIRECTORIES)
+    get_target_property(_jce_python_api_defines jce_script_api COMPILE_DEFINITIONS)
+    add_library(jce_script_python_api_fixture SHARED ${_jce_python_api_sources})
+    set_target_properties(jce_script_python_api_fixture PROPERTIES
+        C_STANDARD 99 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF
+        DEFINE_SYMBOL "" WINDOWS_EXPORT_ALL_SYMBOLS OFF
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/api-transport"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/api-transport")
+    target_include_directories(jce_script_python_api_fixture PRIVATE ${_jce_python_api_includes})
+    target_compile_definitions(jce_script_python_api_fixture PRIVATE ${_jce_python_api_defines})
+    jce_target_warnings(jce_script_python_api_fixture STRICT)
+    if(MSVC)
+        target_sources(jce_script_python_api_fixture PRIVATE
+            "${CMAKE_SOURCE_DIR}/scripting/c_abi/src/jce_script_api.def")
+    else()
+        target_compile_options(jce_script_python_api_fixture PRIVATE -fvisibility=hidden)
+        if(NOT APPLE)
+            target_link_options(jce_script_python_api_fixture PRIVATE
+                "LINKER:--version-script=${CMAKE_SOURCE_DIR}/scripting/c_abi/src/jce_script_api.map")
+            set_property(TARGET jce_script_python_api_fixture APPEND PROPERTY LINK_DEPENDS
+                "${CMAKE_SOURCE_DIR}/scripting/c_abi/src/jce_script_api.map")
+        endif()
+    endif()
+    set(_jce_python_api_transport jce_script_python_api_fixture)
+
+    # Reuse the actual C-ABI loader/export test for this private transport.
+    # Static shipping and a ctypes test DLL are different product scopes.
+    jce_add_unit_test(test_jce_script_python_api_transport
+        SOURCES "${CMAKE_SOURCE_DIR}/tests/scripting/c_abi/test_jce_script_api_abi.c"
+        INCLUDES "${CMAKE_SOURCE_DIR}/scripting/c_abi/include"
+                 "${CMAKE_SOURCE_DIR}/scripting/c_abi/src")
+    target_compile_definitions(test_jce_script_python_api_transport PRIVATE
+        JCE_SCRIPT_API_DLL_PATH="$<TARGET_FILE:jce_script_python_api_fixture>")
+    add_dependencies(test_jce_script_python_api_transport jce_script_python_api_fixture)
+    if(UNIX)
+        target_link_libraries(test_jce_script_python_api_transport PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+elseif(NOT _jce_python_api_type STREQUAL "SHARED_LIBRARY")
+    message(FATAL_ERROR "Python differential needs a static or shared script API production target")
 endif()
 
 # ── The shared recording mock host ───────────────────────────────────────── #
@@ -123,8 +175,9 @@ target_include_directories(jce_lua_case_runner PRIVATE
 # `cmake --build --target jce_tests` succeeding while `ctest -L unit` fails
 # inside differential.py's "the api was not built" guard, which reads like a
 # broken test rather than a missing artefact.
-add_dependencies(jce_tests
-	jce_lua_case_runner jce_script_py_mock jce_script_api)
+jce_test_build_dependencies(jce_lua_case_runner jce_script_py_mock jce_script_api)
+jce_test_build_dependencies(${_jce_python_api_transport})
+add_dependencies(jce_lua_case_runner ${_jce_python_api_transport})
 
 # ── The test ─────────────────────────────────────────────────────────────── #
 add_test(NAME test_jce_script_python_differential
@@ -133,10 +186,10 @@ add_test(NAME test_jce_script_python_differential
 	        --repo    "${CMAKE_SOURCE_DIR}"
 	        --runner  "$<TARGET_FILE:jce_lua_case_runner>"
 	        --mock    "$<TARGET_FILE:jce_script_py_mock>"
-	        --api     "$<TARGET_FILE:jce_script_api>")
+	        --api     "$<TARGET_FILE:${_jce_python_api_transport}>")
 set_tests_properties(test_jce_script_python_differential PROPERTIES
 	TIMEOUT 120
-	LABELS  "unit"
+	LABELS  "unit" JCE_TEST_KIND integration
 	ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
 set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
 	test_jce_script_python_differential)
@@ -196,27 +249,27 @@ jce_add_unit_test(test_jce_runtime_python_scene
 	LINK     JCE jce_script_vm_python)
 target_compile_definitions(test_jce_runtime_python_scene PRIVATE
 	JCE_PY_TEST_PACKAGE_DIR="${JCE_SCRIPT_PYTHON_PACKAGE_DIR}"
-	JCE_PY_TEST_API="$<TARGET_FILE:jce_script_api>")
-add_dependencies(test_jce_runtime_python_scene jce_script_api)
+	JCE_PY_TEST_API="$<TARGET_FILE:${_jce_python_api_transport}>")
+add_dependencies(test_jce_runtime_python_scene jce_script_api ${_jce_python_api_transport})
 
 # EVERY binary the differential opens, named on jce_tests — the same reasoning
 # as the block above: jce_script_api is LOADED through ctypes, which creates no
 # build edge, so a suite built with `--target jce_tests` would otherwise be one
 # deletion away from failing inside the driver's "the api was not built" path.
-add_dependencies(jce_tests
-	jce_lifecycle_runner jce_script_vm_python jce_script_api)
+jce_test_build_dependencies(jce_lifecycle_runner jce_script_vm_python jce_script_api ${_jce_python_api_transport})
+add_dependencies(jce_lifecycle_runner ${_jce_python_api_transport})
 
 add_test(NAME test_jce_script_python_lifecycle
 	COMMAND "${Python3_EXECUTABLE}"
 	        "${CMAKE_CURRENT_SOURCE_DIR}/lifecycle_differential.py"
 	        --repo    "${CMAKE_SOURCE_DIR}"
 	        --runner  "$<TARGET_FILE:jce_lifecycle_runner>"
-	        --api     "$<TARGET_FILE:jce_script_api>"
+	        --api     "$<TARGET_FILE:${_jce_python_api_transport}>"
 	        --package "${JCE_SCRIPT_PYTHON_PACKAGE_DIR}"
 	        --work    "${CMAKE_CURRENT_BINARY_DIR}/lifecycle_work")
 set_tests_properties(test_jce_script_python_lifecycle PROPERTIES
 	TIMEOUT 180
-	LABELS  "unit"
+	LABELS  "unit" JCE_TEST_KIND integration
 	ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
 set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
 	test_jce_script_python_lifecycle)
@@ -228,4 +281,6 @@ set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
 # silently stops applying.
 target_compile_definitions(test_jce_script_vm_python PRIVATE
 	JCE_PY_TEST_PACKAGE_DIR="${JCE_SCRIPT_PYTHON_PACKAGE_DIR}"
-	JCE_PY_TEST_API="$<TARGET_FILE:jce_script_api>")
+	JCE_PY_TEST_API="$<TARGET_FILE:${_jce_python_api_transport}>")
+
+add_dependencies(test_jce_script_vm_python ${_jce_python_api_transport})

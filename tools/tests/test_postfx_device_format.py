@@ -13,8 +13,9 @@ class PostFXDeviceFormatTests(unittest.TestCase):
         driver = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(driver)
         source = (ROOT / "engine/src/renderer/jce_postfx.c").read_text(encoding="utf-8")
-        selector = source[source.index("static bgfx_texture_format_t postfx_color_format("):
-                          source.index("/* Allocate one full-res", source.index("static bgfx_texture_format_t postfx_color_format("))]
+        selector_start = source.index("static bgfx_texture_format_t postfx_color_format(")
+        selector_end = source.index("\n}", selector_start) + 2
+        selector = source[selector_start:selector_end]
         harness = r'''
 #include <assert.h>
 #include <stdbool.h>

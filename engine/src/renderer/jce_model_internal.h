@@ -24,11 +24,26 @@ typedef struct {
     JceMorphWeightTrack *track;        /* owned */
 } JceModelMorphAnim;
 
+/* Shared by rigid draws and CPU picking, including bone attachments. */
+jce_mat4 jce_model_static_node_world(const JceModel *model,
+    const JceModelNode *node, const jce_mat4 *root,
+    const jce_mat4 *fallback_world, const jce_mat4 *joint_matrices,
+    uint32_t num_joints);
+
+/* Imported opt-in atlas metadata, parallel to the model's material slots. */
+typedef struct {
+    JceTexture texture; /* borrowed from the model texture pool */
+    int16_t head_joint; /* skin.joints index, -1 for no face lookup */
+    bool active;
+    bool hair_caster;
+} JceModelToonAtlas;
+
 struct JceModel {
     JceModelNode      *nodes;
     uint32_t           num_nodes;
     JcePbrMaterial    *materials;
     uint32_t           num_materials;
+    JceModelToonAtlas *toon_atlases;
     JceModelTexturePool *texture_pool; /* owns maps borrowed by materials */
     JceSkeleton       *skeleton;       /* NULL if no skinning */
     JceAnimClip      **anim_clips;

@@ -11,6 +11,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/middleware/scene/jce_scene_identity.h>
 #include <jce/middleware/scene/jce_water_field.h>
 #include <jce/middleware/world/jce_environment.h>
 #include <jce/os/core/jce_math.h>
@@ -561,8 +562,8 @@ typedef struct {
 
     /* ── Look Profile (stylized vertical slice; foundation plan 02) ─────
      * Continuous APPENDED block.  EVERY field is a neutral / algebraic
-     * no-op default so an old scene (block absent → defaults-first parse)
-     * and a LOW-tier render are BYTE-IDENTICAL to before this feature.
+     * no-op defaults keep old scenes and explicit requested LOW neutral;
+     * MID/HIGH/ULTRA material look survives postfx budgets; QA force wins.
      * Consumed by: plan 03 (wrap/hemisphere/rim in fs_pbr_body.sh),
      * plan 04 (sky/fog reuse the EXISTING fog_* fields), plan 06 (tonemap/
      * LUT/bloom_knee in the postfx layer).  AERIAL PERSPECTIVE reuses the
@@ -1261,10 +1262,10 @@ typedef struct {
  * the scene renderer binds as the entity's mesh albedo (and which UI image
  * sources may reference).  Persisted fields are clip_path / loop / autoplay;
  * the runtime fields (video handle, GPU texture, dimensions, frame counter,
- * playing/started flags) are populated by jce_scene_video_update() and never
- * serialized.  jce_scene_video_update() advances exactly one clip frame per
- * frame and uploads it via the same zero-copy ref path the editor file
- * viewer uses. */
+ * playing/started flags) are engine-owned and never serialized.
+ * jce_scene_video_advance() advances the decoder against elapsed time; scene
+ * rendering uploads the freshest published frame once, using backend-owned
+ * pixel storage. The compatibility jce_scene_video_update() does both. */
 typedef struct {
     /* Persisted authoring fields. */
     char     clip_path[256];
@@ -3291,14 +3292,7 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_VOLUME               (UINT64_C(1) << 62)
 #define JCE_COMP_FLAG_OCCLUSION_PORTAL     (UINT64_C(1) << 63)
 
-/* ── Entity handle ───────────────────────────────────────────────── */
-
-typedef uint64_t JceEntity;
-#define JCE_ENTITY_INVALID 0
-
 /* ── Scene ───────────────────────────────────────────────────────── */
-
-typedef struct JceScene JceScene;
 
 /* Create / destroy. */
 JCE_API JceScene *jce_scene_create(void);
@@ -3514,73 +3508,6 @@ JCE_API void      jce_scene_invalidate_world_cache(JceScene *s);
  * cache (not this) after a real transform/parent/component edit. */
 JCE_API void      jce_scene_begin_render_world_cache(JceScene *s);
 
-/* Monotonic counter bumped only by jce_scene_invalidate_world_cache (i.e. by a
- * real structural edit), never by the per-frame drops.  The scene renderer keys
- * its cross-frame persistent static world-matrix + AABB cache on this. */
-JCE_API uint64_t  jce_scene_get_structural_epoch(const JceScene *s);
-
-/* Per-entity transform generation (dynamic-scene world-cache, large-world opt).
- * set_transform / set_pivot bump ONLY the moved entity's subtree's gen instead
- * of the global structural epoch, so a moving camera / script-animated entity no
- * longer drops the renderer's static world-cache for the whole scene.  The
- * renderer keys a static entity's cache validity on BOTH the structural epoch
- * (global edits) AND this per-entity gen (transform edits).  jce_scene_xgen_active
- * is false until the first per-entity bump, so a never-moved scene stays on the
- * cheap epoch-only fast path. */
-JCE_API uint64_t  jce_scene_entity_xform_gen(const JceScene *s, JceEntity e);
-JCE_API bool      jce_scene_xgen_active(const JceScene *s);
-JCE_API void      jce_scene_invalidate_entity_world(JceScene *s, JceEntity e);
-
-/* Frame-invariance generation counters (DOTS-floor slice 1).  Together with
- * structural_epoch they form the frozen-frame key a cross-frame consumer can
- * compare to prove "nothing observable changed since last frame":
- *  - roster_epoch:  entity create/destroy (flecs swap-remove silently reorders
- *    table rows, so ANY roster change invalidates positional index caches).
- *  - enable_gen:    any EditorMeta.enabled flip (routed through the editor's
- *    single jce_state_set_entity_enabled entry; bumped via
- *    jce_scene_bump_enable_gen because the flag is mutated in place).
- *  - xform_counter: bumped by every jce_scene_invalidate_entity_world call
- *    (set_transform/set_pivot subtree bumps) AND by the runtime physics
- *    write-back (jce_scene_notify_physics_writeback) which otherwise mutates
- *    Transforms in place with no signal — one integer compare answers "did
- *    ANY world matrix change" without probing 150k per-entity gens. */
-JCE_API uint64_t  jce_scene_get_roster_epoch(const JceScene *s);
-JCE_API uint64_t  jce_scene_get_enable_gen(const JceScene *s);
-/* Bumped whenever any component's data is written through jce_scene_set_*.
- * Cache keys that memoize per-entity state derived from component FIELDS
- * must include this, or a runtime edit to that field will not take effect. */
-JCE_API uint64_t  jce_scene_get_cull_data_gen(const JceScene *s);
-JCE_API void      jce_scene_bump_cull_data_gen(JceScene *s);
-JCE_API uint64_t  jce_scene_get_xform_counter(const JceScene *s);
-JCE_API void      jce_scene_bump_enable_gen(JceScene *s);
-JCE_API void      jce_scene_notify_physics_writeback(JceScene *s);
-/* Per-entity variant: the writer KNOWS which entity it mutated in place —
- * ring-push it (plus descendants) so the renderer's L2 incremental repair
- * rebuilds just those slots instead of the whole frame.  Falls back to
- * dirty-overflow (== the blanket notify) when the ring/subtree bounds hit. */
-JCE_API void      jce_scene_notify_physics_writeback_entity(JceScene *s, JceEntity e);
-
-/* Drain the dirty-entity ring (DOTS-floor L2): every entity whose world was
- * invalidated since the last take (subtree-expanded).  out may be NULL to
- * discard.  *out_overflow is set when the ring overflowed OR an in-place
- * mutation with an unknown entity set occurred (physics write-back) — the
- * consumer must then treat the whole scene as dirty. */
-JCE_API uint32_t  jce_scene_take_dirty_entities(JceScene *s, JceEntity *out,
-                                                uint32_t cap, bool *out_overflow);
-/* Read-only variant (does not clear) — for consumers earlier in the frame
- * than the taker (the collect membership check runs before the ecull
- * repair, which owns the take). */
-JCE_API uint32_t  jce_scene_peek_dirty_entities(const JceScene *s, JceEntity *out,
-                                                uint32_t cap, bool *out_overflow);
-
-/* Per-entity MATERIAL generation (lever ③ persistent draw-cmd cache). Mirrors
- * xform_gen for material/mesh content: bumped by the MeshRenderer set path and
- * async texture/model pop-in via jce_scene_invalidate_entity_material. A cache
- * stores the mat_gen it saw and rebuilds the entity's draw command when it
- * differs. Shares the xgen slot table (jce_scene_xgen_active gates both). */
-JCE_API uint64_t  jce_scene_entity_material_gen(const JceScene *s, JceEntity e);
-JCE_API void      jce_scene_invalidate_entity_material(JceScene *s, JceEntity e);
-
 /* Floating-origin rebase: add `shift` (metres, float[3]) to the LOCAL position
  * of every ROOT entity (one with no parent) that carries a JceTransform, then
  * invalidate the world-matrix cache once.  Children are parent-relative and
@@ -3758,15 +3685,25 @@ JCE_API void                          jce_scene_remove_video_player(JceScene *s,
  * Iterates every entity holding a JceVideoPlayerComponent and, for those
  * that are playing (or set to autoplay), opens the clip on first use,
  * advances the decoder by `dt` seconds, and uploads the freshest decoded
- * frame into the component's `output_tex`.  Call ONCE per frame.  Both the
- * runtime (jce_runtime_step) and the editor (when not in play mode) drive
- * this; the renderer only reads output_tex, so it stays idempotent across
- * multiple render passes/viewports.
+ * frame into the component's `output_tex`. This compatibility entry combines
+ * decoder advancement with immediate texture preparation. Call once per tick.
+ * Runtime and Editor hosts use jce_scene_video_advance instead; the ordinary
+ * scene renderer prepares textures without advancing playback. Preparation is
+ * idempotent across multiple render passes/viewports for a published frame.
  *
  * `resolve_path`, when non-NULL, maps the asset-relative clip_path to a
  * host-openable path (mirrors the scene renderer's resolve_path callback);
  * pass NULL to open clip_path as-is. */
 typedef bool (*JceVideoResolvePathFn)(const char *in, char *out, int outsz, void *ud);
+/* Advance transport and decode only. No texture creation, pixel upload or draw
+ * submission occurs. Path changes and component destruction retain existing
+ * one-time resource retirement; they do not establish GPU completion.
+ * Call once per simulation/preview tick. Ordinary scene rendering prepares
+ * the freshest published frame, including a stopped one-shot's last frame. */
+JCE_API void jce_scene_video_advance(JceScene *s, double dt,
+                                    JceVideoResolvePathFn resolve_path,
+                                    void *resolve_ud);
+/* Compatibility combined advance and texture preparation for explicit callers. */
 JCE_API void jce_scene_video_update(JceScene *s, double dt,
                                     JceVideoResolvePathFn resolve_path,
                                     void *resolve_ud);

@@ -53,6 +53,26 @@ class SkillsPathTests(unittest.TestCase):
             self.assertEqual(len(findings), 1)
             self.assertIn("triggering conditions", findings[0])
 
+    def test_source_scan_handles_nested_checkout_and_build_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "build" / "source-export"
+            contents = {
+                "engine/src/main.c": "JCE_ENGINE_DECLARATION",
+                "tools/build/driver.py": "JCE_BUILD_DECLARATION",
+                "engine/src/build/generated.c": "JCE_GENERATED_COPY",
+                "engine/src/third_party/vendor.c": "JCE_VENDOR_COPY",
+            }
+            for relative, token in contents.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(token, encoding="utf-8")
+            with patch.object(GATE, "REPO_ROOT", root), patch.object(GATE, "_source_blob", None):
+                blob = GATE.source_blob()
+            self.assertIn("JCE_ENGINE_DECLARATION", blob)
+            self.assertIn("JCE_BUILD_DECLARATION", blob)
+            self.assertNotIn("JCE_GENERATED_COPY", blob)
+            self.assertNotIn("JCE_VENDOR_COPY", blob)
+
     def test_missing_generated_path_remains_note_not_pass_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             findings, notes = self.check_body(Path(tmp), "SDK output: `dist/sdk`")

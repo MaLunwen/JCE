@@ -222,23 +222,20 @@ if(JCE_BUILD_JNI)
 	target_link_libraries(CagedKingdom PRIVATE JCE)
 	if(MSVC)
 		# MSVC: /WHOLEARCHIVE forces all .obj from each .lib to be included.
-		# jce_platform must be included: jce_jni_bridge.c lives there.
+		# The application archive owns the otherwise unreferenced JNI exports.
 		foreach(_lib jce_application jce_platform jce_core)
 			target_link_options(CagedKingdom PRIVATE
 				"/WHOLEARCHIVE:$<TARGET_FILE:${_lib}>")
 		endforeach()
 	elseif(APPLE)
-		# macOS ld64 errors on duplicate symbols, unlike GNU ld which silently picks one.
-		# jce_core and jce_application share jce_config.c, so force-loading both causes
-		# duplicate '_jce_config_*' errors. Only jce_platform needs -force_load because
-		# jce_jni_bridge.c (Java_com_jce_JceRuntime_*) is unreferenced by C code and
-		# would otherwise be silently dropped. The other libs are pulled in via the
-		# normal target_link_libraries(CagedKingdom PRIVATE JCE) link above.
+		# JNI exports are discovered by the JVM, not referenced by C. Force-load
+		# their Application owner; other layers follow the normal JCE link graph.
+		# jce_config.c belongs only to Core in the current source target layout.
 		target_link_options(CagedKingdom PRIVATE
-			"-Wl,-force_load,$<TARGET_FILE:jce_platform>")
+			"-Wl,-force_load,$<TARGET_FILE:jce_application>")
 	else()
 		# GCC (Linux): --whole-archive / --no-whole-archive bracket.
-		# jce_platform must be included: jce_jni_bridge.c lives there.
+		# The application archive owns the otherwise unreferenced JNI exports.
 		target_link_options(CagedKingdom PRIVATE
 			"LINKER:--whole-archive"
 			"$<TARGET_FILE:jce_application>"

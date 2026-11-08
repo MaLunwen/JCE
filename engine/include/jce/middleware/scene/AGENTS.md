@@ -8,6 +8,7 @@ Public API surface for the ECS / scene subsystem.  Consumed via
 | Header | Role |
 |--------|------|
 | `jce_scene.h`                   | Components, entity helpers, hierarchy, world iteration. |
+| `jce_scene_identity.h`          | Standalone opaque scene/entity handles and scene-owned cache generations, dirty observations, and invalidation signals. Re-exported by `jce_scene.h`; depends only on core definitions and C standard types. |
 | `jce_scene_camera.h`            | Strict single-primary scene-camera world-pose resolution and render-camera binding. |
 | `jce_scene_components_json.h`   | JSON (de)serializer entry points for every public component. |
 | `jce_material_override.h`       | Per-renderer overrides of a shared material (Unity's MaterialPropertyBlock): the `JCE_MR_OVERRIDE_*` bits of `JceMeshRenderer.material_override_mask`, and `jce_mesh_renderer_apply_material_pbr()` -- the single authority for "copy the material's factors, except the ones this renderer claims".  Every load path must go through it; three hand-written copies existed and two of them had no guard at all. |
@@ -68,3 +69,55 @@ Spot lights ship end-to-end (cookie texture + IES LM-63 photometric LUT) via new
 **kind 的数值是 ABI 的一部分。** `jce_rt_script.c` 里有一条 C99 负长度数组把
 `NUMBER/BOOL/TEXT/ENTITY == 0/1/2/3` 钉死：脚本头与场景头不能互相 include，
 那个 TU 是唯一同时看见两者的地方，而一次静默的重新编号会把 TEXT 当 ENTITY 交给每个脚本。
+
+WaterSpectrum is an optional versioned component in the existing ECS registry,
+not an expansion of the unversioned Water ABI. Its append-only registry row
+preserves old dense IDs. Water retains wind/seed/fetch/swell ownership; PM/TMA
+and directionality are configured before FFT evolution. Shared scene acquisition
+uses the extension only for enabled FFT bodies; absent, disabled and non-FFT
+bodies keep legacy selection. WaterField rebuilds commit only complete resources
+and preserve borrowed field addresses and the single scene clock. CPU regression
+coverage is not proof of current GPU pixels or low-end visual acceptance.
+
+WaterFoam's additive versioned component is declared in jce_scene_water_foam.h
+and included by api_scene.h. Rates are in inverse seconds and detail scale in
+inverse metres. It requires an enabled versioned FFT WaterSpectrum; absence or
+disable keeps old water rendering. Its history never changes the ambient
+absolute-time sampling contract. It is transient simulation state, not scene
+JSON state; JSON retains only authoring parameters.
+
+WaterCrest is an optional versioned optical component in jce_scene_water_crest.h. It does not change the Water layout, spectrum sampling or the simulation clock.
+
+WaterCaustics opts a physical FFT body into RGB caustic projection. It is additive and uses the existing Water clarity and caustic strength.
+
+WaterNearshore is an optional versioned FFT-water component with a scene-local
+terrain reference and a world-space square simulation region. Terrain zero
+leaves the extension inert. The published composite surface query includes wet
+coverage and leaves its outputs intact when no current sample is available.
+
+WaterMotion is an optional versioned FFT authoring component in
+jce_scene_water_motion.h. A zero cascade fraction selects one FFT. The phase
+rate, horizontal strength and metre cap default to 1, 1 and 0 respectively.
+The public Water and WaterSpectrum component layouts stay unchanged.
+
+WaterOptics adds versioned strengths for screen-space reflection and scene-color
+refraction. Both default to zero. Its registry row is append-only and the
+unversioned Water layout remains stable.
+
+WaterCausticDetail is an optional versioned extension of the projected caustic
+effect. Zero secondary weight and tile size keep single-scale, single-sample
+projection. The WaterCaustics component retains its existing layout.
+The fine layer uses a fraction of the primary period, with zero period ratio
+and weight by default. Its fade depth defaults to 1.25 m. Double-scale JSON
+without these three fields retains the same behavior.
+
+The physical sky accepts optional scene-level celestial controls through
+jce_scene_sky_celestial.h. These settings retain the existing rendering and
+environment ABI and use the existing scene time-of-day directions.
+
+WaterNormalDetail is an optional versioned FFT-water micro-normal component in
+jce_scene_water_normal_detail.h. Its two independent inverse-metre noise scales
+retain their authored order in [0.1,64], defaulting to 6 and 16; slope strength
+is [0,1], default 0.14. Absence/disable retains legacy detail; strength zero
+explicitly suppresses this extension's micro-normal. Existing Water/WaterMotion
+layouts are unchanged. Set/get/remove follow scene-owned main-thread storage.

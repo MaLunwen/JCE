@@ -24,6 +24,7 @@ extern "C" {
 #include "gizmo/jce_gizmo_compound_collider.h"
 #include "jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -46,7 +47,7 @@ static bool build_overlay_entity_model(uint32_t entity_id,
 {
     JceScene *scene = jce_state_get_scene();
     if (!scene || entity_id == 0) return false;
-    JceEntity e = (JceEntity)entity_id;
+    JceEntity e = jce_state_to_ecs_entity(entity_id);
 
     if (!jce_scene_has_transform(scene, e)) return false;
 
@@ -594,6 +595,105 @@ static void draw_sequence_camera_path(JceScene *scene, const char *seq_path)
     }
 }
 
+static bool trigger_overlay_finite(jce_vec3 v)
+{
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+static void draw_trigger_obb(jce_vec3 center,
+                             const JceTriggerVolumeComponent &volume,
+                             uint32_t color)
+{
+    const jce_vec3 x = jce_v3(volume.axis_x[0], volume.axis_x[1], volume.axis_x[2]);
+    const jce_vec3 y = jce_v3(volume.axis_y[0], volume.axis_y[1], volume.axis_y[2]);
+    const jce_vec3 z = jce_v3(volume.axis_z[0], volume.axis_z[1], volume.axis_z[2]);
+    const jce_vec3 yz = jce_v3_cross(y, z);
+    const float determinant = jce_v3_dot(x, yz);
+    if (!std::isfinite(determinant) || determinant == 0.0f)
+        return; /* No finite box for linearly dependent slab normals. */
+
+    /* Runtime projects the displacement onto the authored axes. Use the
+     * dual basis so scaled or skewed axes enclose those same slabs. */
+    const jce_vec3 ax = jce_v3_scale(yz, volume.half_extents[0] / determinant);
+    const jce_vec3 ay = jce_v3_scale(jce_v3_cross(z, x),
+                                    volume.half_extents[1] / determinant);
+    const jce_vec3 az = jce_v3_scale(jce_v3_cross(x, y),
+                                    volume.half_extents[2] / determinant);
+    jce_vec3 corners[8];
+    for (int i = 0; i < 8; ++i) {
+        jce_vec3 p = center;
+        p = jce_v3_add(p, jce_v3_scale(ax, (i & 1) ? 1.0f : -1.0f));
+        p = jce_v3_add(p, jce_v3_scale(ay, (i & 2) ? 1.0f : -1.0f));
+        p = jce_v3_add(p, jce_v3_scale(az, (i & 4) ? 1.0f : -1.0f));
+        if (!trigger_overlay_finite(p))
+            return;
+        corners[i] = p;
+    }
+    for (int i = 0; i < 8; ++i) {
+        for (int bit = 1; bit < 8; bit <<= 1) {
+            if ((i & bit) == 0)
+                jce_debug_draw_line(corners[i], corners[i | bit], color);
+        }
+    }
+}
+
+static void draw_trigger_script_references(JceScene *scene, JceEntity source,
+                                           jce_vec3 center, uint32_t color)
+{
+    const JceScriptComponent *script = jce_scene_get_script(scene, source);
+    if (!script || !script->script_path[0] ||
+        !jce_scene_component_enabled(scene, source, JCE_COMP_FLAG_SCRIPT))
+        return;
+
+    for (int i = 0; i < script->param_count && i < JCE_SCRIPT_PARAM_MAX; ++i) {
+        const JceScriptParam &param = script->params[i];
+        const JceEntity target = static_cast<JceEntity>(param.entity);
+        if (!param.name[0] || param.kind != JCE_SCRIPT_PARAM_ENTITY ||
+            target == JCE_ENTITY_INVALID || target == source ||
+            !jce_scene_entity_alive(scene, target) ||
+            !jce_scene_has_transform(scene, target))
+            continue;
+        const jce_mat4 world = jce_scene_get_world_matrix(scene, target);
+        const jce_vec3 position = jce_v3(world.col[3].x, world.col[3].y, world.col[3].z);
+        if (trigger_overlay_finite(position))
+            jce_debug_draw_line(center, position, color);
+    }
+}
+
+static bool draw_trigger_volume_overlay(JceScene *scene, JceEntity entity,
+                                        uint32_t color)
+{
+    const JceTriggerVolumeComponent *volume = jce_scene_get_trigger_volume(scene, entity);
+    if (!volume)
+        return false;
+
+    /* Same world-axis offset as the runtime's trigger registration. */
+    const jce_mat4 world = jce_scene_get_world_matrix(scene, entity);
+    const jce_vec3 center = jce_v3(world.col[3].x + volume->center[0],
+                                  world.col[3].y + volume->center[1],
+                                  world.col[3].z + volume->center[2]);
+    const jce_vec3 half = jce_v3(volume->half_extents[0], volume->half_extents[1],
+                                volume->half_extents[2]);
+    if (!trigger_overlay_finite(center))
+        return true;
+    if (volume->shape == JCE_TRIGGER_VOL_SPHERE) {
+        if (std::isfinite(half.x))
+            jce_debug_draw_sphere(center, std::fabs(half.x), color);
+    } else if (trigger_overlay_finite(half) && half.x >= 0.0f &&
+               half.y >= 0.0f && half.z >= 0.0f) {
+        if (volume->shape == JCE_TRIGGER_VOL_OBB)
+            draw_trigger_obb(center, *volume, color);
+        else
+            jce_debug_draw_box(center, half, jce_q_identity(), color);
+    }
+
+    /* These are authored entity references, independent of script execution. */
+    if (volume->enabled &&
+        jce_scene_component_enabled(scene, entity, JCE_COMP_FLAG_TRIGGER_VOLUME))
+        draw_trigger_script_references(scene, entity, center, color);
+    return true;
+}
+
 void draw_selection_outlines(void)
 {
     int sel_count = 0;
@@ -617,7 +717,7 @@ void draw_selection_outlines(void)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
 
         /* Cinematic dolly rail: a selected SequencePlayer draws its camera
          * path in the viewport (standard-engine Sequencer feedback).  Done up
@@ -706,7 +806,8 @@ void draw_selection_outlines(void)
            below — that path skips the `drew_any_debug = true` at the loop end, so
            without this the gizmo is accumulated into the buffer but never flushed
            and disappears entirely (the regression that hid ALL light gizmos). */
-        if (drew_light_early) drew_any_debug = true;
+        const bool drew_trigger = scene && draw_trigger_volume_overlay(scene, e, col_outline);
+        if (drew_light_early || drew_trigger) drew_any_debug = true;
 
         /* --- Rendered mesh: keep the high-fidelity wireframe overlay.
            NOTE: the per-iteration uniform/texture sets below are REQUIRED —
@@ -731,7 +832,7 @@ void draw_selection_outlines(void)
         JceTransform *t = jce_scene_get_transform(scene, e);
         if (!t) continue;
 
-        bool drew_shape = drew_light_early;   /* light gizmo already drawn above */
+        bool drew_shape = drew_light_early || drew_trigger;
 
         /* --- Skeletal-animated (skinned) model.
          *     Submit the true geometric wireframe of every primitive in
@@ -752,9 +853,8 @@ void draw_selection_outlines(void)
                 jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
                 jce_uniform_set(s_sr.u_light_color, flat_color, 1);
                 jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
-                jce_model_submit_wireframe_overlay(mdl, s_sr.renderer,
-                                                    scene_view_id(),
-                                                    &world, NULL, 0);
+                jce_scene_renderer_submit_model_wireframe(
+                    s_sr.scene_renderer, scene, e, mdl, scene_view_id(), &world);
                 continue;
             }
         }
@@ -928,56 +1028,6 @@ void draw_selection_outlines(void)
             if (c2) {
                 draw_collider2d_outline(t, c2, col_outline, col_outline,
                                         col_outline);
-                drew_shape = true;
-            }
-        }
-
-        /* --- Trigger volume (gameplay region, not a collider).  Mirrors the
-         *     RUNTIME interpretation exactly (jce_runtime.c rt trigger sync):
-         *     center is a world-axis offset from the entity position — NOT
-         *     rotated by the entity and NOT scaled — and the OBB basis comes
-         *     from the component's own axes. Drawing anything else would lie
-         *     about where the trigger actually fires. */
-        if (jce_scene_has_trigger_volume(scene, e)) {
-            JceTriggerVolumeComponent *tv = jce_scene_get_trigger_volume(scene, e);
-            if (tv) {
-                jce_vec3 c = jce_v3(t->position.x + tv->center[0],
-                                    t->position.y + tv->center[1],
-                                    t->position.z + tv->center[2]);
-                if (tv->shape == JCE_TRIGGER_VOL_SPHERE) {
-                    float r = (tv->half_extents[0] > 0.0f)
-                            ? tv->half_extents[0] : 0.5f;
-                    jce_debug_draw_sphere(c, r, col_outline);
-                } else if (tv->shape == JCE_TRIGGER_VOL_OBB) {
-                    /* 12 edges from the component's own basis. */
-                    jce_vec3 ax = jce_v3(tv->axis_x[0], tv->axis_x[1], tv->axis_x[2]);
-                    jce_vec3 ay = jce_v3(tv->axis_y[0], tv->axis_y[1], tv->axis_y[2]);
-                    jce_vec3 az = jce_v3(tv->axis_z[0], tv->axis_z[1], tv->axis_z[2]);
-                    ax = jce_v3_scale(ax, tv->half_extents[0]);
-                    ay = jce_v3_scale(ay, tv->half_extents[1]);
-                    az = jce_v3_scale(az, tv->half_extents[2]);
-                    jce_vec3 corners[8];
-                    for (int ci = 0; ci < 8; ci++) {
-                        jce_vec3 p = c;
-                        p = jce_v3_add(p, jce_v3_scale(ax, (ci & 1) ? 1.0f : -1.0f));
-                        p = jce_v3_add(p, jce_v3_scale(ay, (ci & 2) ? 1.0f : -1.0f));
-                        p = jce_v3_add(p, jce_v3_scale(az, (ci & 4) ? 1.0f : -1.0f));
-                        corners[ci] = p;
-                    }
-                    static const int edges[12][2] = {
-                        {0,1},{2,3},{4,5},{6,7},   /* x edges */
-                        {0,2},{1,3},{4,6},{5,7},   /* y edges */
-                        {0,4},{1,5},{2,6},{3,7},   /* z edges */
-                    };
-                    for (int ei = 0; ei < 12; ei++)
-                        jce_debug_draw_line(corners[edges[ei][0]],
-                                            corners[edges[ei][1]], col_outline);
-                } else { /* AABB — axis-aligned, ignores entity rotation */
-                    jce_vec3 half = jce_v3(tv->half_extents[0],
-                                           tv->half_extents[1],
-                                           tv->half_extents[2]);
-                    jce_debug_draw_box(c, half, jce_q_identity(), col_outline);
-                }
                 drew_shape = true;
             }
         }
@@ -1295,7 +1345,7 @@ void draw_physics_debug(void)
         for (int s = 0; s < sel_n; ++s) if (sel[s] == id) { is_selected = true; break; }
         if (is_selected) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
         JceTransform *t = jce_scene_get_transform(scene, e);
         if (!t) continue;
 
@@ -1419,7 +1469,7 @@ void draw_joint_gizmos(void)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
         if (!jce_scene_has_constraint(scene, e)) continue;
 
         JceConstraintComponent *c = jce_scene_get_constraint(scene, e);
@@ -1449,7 +1499,7 @@ void draw_cloth_gizmos(void)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
         if (!jce_scene_has_cloth(scene, e)) continue;
 
         JceClothComponent *cl = jce_scene_get_cloth(scene, e);
@@ -1612,7 +1662,7 @@ void draw_compound_collider_gizmos(void)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
 
         /* Selected: fitted (detailed=1) wireframe in the selection colour
          * (orange). Only ONE prop, so the trimesh line load is bounded. */

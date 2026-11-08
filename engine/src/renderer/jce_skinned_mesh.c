@@ -3,6 +3,11 @@
  */
 
 #include "renderer/jce_vertex_layout.h"
+#include "jce_renderer_shader_profile_internal.h"
+#include "jce_pick_capability_internal.h"
+#include "jce_pick_geometry_internal.h"
+#include "jce_skinned_mesh_deform_internal.h"
+#include "jce_view_wireframe_internal.h"
 #include "jce_upload_metrics.h"
 #include <jce/renderer/jce_skinned_mesh.h>
 #include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices */
@@ -49,15 +54,17 @@ struct JceSkinnedMesh {
     bgfx_vertex_buffer_handle_t ml_data;
     uint32_t                    ml_count;
 
-    /* Morph deform support (FEATURE 3.1, opt-in via retain_cpu).  When
-     * non-NULL, holds an undeformed CPU copy of the source vertex array
-     * (num_verts * stride bytes) so a per-instance morph can produce a
-     * deformed copy without touching the shared static VB.  NULL (the default)
-     * = zero extra RAM, byte-identical legacy behavior. */
+    /* Immutable source for per-instance morphs and compatibility CPU skinning.
+     * The modern non-morph path retains no extra vertex bytes. */
     void    *base_cpu;     /* owned; NULL unless retain_cpu requested */
     uint32_t stride;       /* byte stride of the retained vertex format */
     uint32_t pos_offset;   /* byte offset of POSITION float[3] */
     uint32_t normal_offset;/* byte offset of NORMAL float[3] */
+
+    /* The position-only copy is only needed for a rigid, non-morph mesh. */
+    float *pick_positions;
+    uint32_t *pick_indices;
+    bool pick_source;
 };
 
 /* ================================================================== */
@@ -86,12 +93,88 @@ static void init_skinned_layout(bgfx_vertex_layout_t *layout)
 /* Create / Destroy                                                    */
 /* ================================================================== */
 
+bool jce_skinned_mesh_cpu_skin_required(void)
+{
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    return jce_renderer_shader_profile_compatibility(&api, bgfx_get_renderer_type());
+}
+
+#define JCE_PICK_MAX_SOURCE_BYTES (16u * 1024u * 1024u)
+
+static bool pick_source_fits(uint32_t vertices, uint32_t stride, uint32_t indices)
+{
+    if (indices > JCE_PICK_MAX_SOURCE_BYTES / sizeof(uint32_t))
+        return false;
+    const size_t index_bytes = (size_t)indices * sizeof(uint32_t);
+    return vertices <= (JCE_PICK_MAX_SOURCE_BYTES - index_bytes) / stride;
+}
+
+static void retain_pick_source(JceSkinnedMesh *mesh, const void *vertices,
+                               uint32_t stride, const uint32_t *indices)
+{
+    if (mesh->is_skinned && !mesh->base_cpu)
+        return;
+
+    const bool indexed = indices && BGFX_HANDLE_IS_VALID(mesh->ibh);
+    const uint32_t pick_stride = mesh->base_cpu ? mesh->stride
+        : 3u * (uint32_t)sizeof(float);
+    if (!pick_source_fits(mesh->num_verts, pick_stride,
+                         indexed ? mesh->num_indices : 0u))
+        return;
+
+    uint32_t *index_copy = NULL;
+    if (indexed) {
+        const size_t bytes = (size_t)mesh->num_indices * sizeof(*index_copy);
+        index_copy = JCE_MALLOC(bytes);
+        if (!index_copy)
+            return;
+        memcpy(index_copy, indices, bytes);
+    }
+
+    float *positions = NULL;
+    if (!mesh->base_cpu) {
+        const size_t pos_size = 3u * sizeof(*positions);
+        positions = JCE_MALLOC((size_t)mesh->num_verts * pos_size);
+        if (!positions) {
+            JCE_FREE(index_copy);
+            return;
+        }
+        const unsigned char *source = vertices;
+        for (uint32_t i = 0; i < mesh->num_verts; ++i)
+            memcpy(positions + (size_t)i * 3u, source + (size_t)i * stride, pos_size);
+    }
+
+    mesh->pick_indices = index_copy;
+    mesh->pick_positions = positions;
+    mesh->pick_source = true;
+}
+
+bool jce_skinned_mesh_pick_geometry(const JceSkinnedMesh *mesh,
+                                    JcePickGeometry *geometry)
+{
+    if (!mesh || !mesh->pick_source || !geometry)
+        return false;
+
+    const unsigned char *base = mesh->base_cpu;
+    *geometry = (JcePickGeometry){
+        .positions = base ? (const void *)(base + mesh->pos_offset) : mesh->pick_positions,
+        .stride = base ? mesh->stride : 3u * (uint32_t)sizeof(float),
+        .vertex_count = mesh->num_verts,
+        .indices = mesh->pick_indices,
+        .index_count = mesh->pick_indices ? mesh->num_indices : 0u,
+    };
+    return true;
+}
+
 JceSkinnedMesh *jce_skinned_mesh_create(
     const JceSkinnedVertex *vertices, uint32_t num_verts,
     const uint32_t *indices, uint32_t num_indices,
     bool retain_cpu)
 {
-    if (!vertices || num_verts == 0) return NULL;
+    if (!vertices || num_verts == 0 ||
+        num_verts > UINT32_MAX / sizeof(JceSkinnedVertex) ||
+        (indices && num_indices > UINT32_MAX / sizeof(*indices)))
+        return NULL;
 
     JceSkinnedMesh *m = (JceSkinnedMesh *)JCE_CALLOC(1, sizeof(*m));
     if (!m) return NULL;
@@ -101,10 +184,11 @@ JceSkinnedMesh *jce_skinned_mesh_create(
     m->num_indices = num_indices;
     m->is_skinned  = true;
 
-    /* Morph deform: optionally retain an undeformed CPU copy of the source
-     * verts (FEATURE 3.1).  Gated to morph-bearing prims by the caller, so the
-     * default path allocates nothing.  pos@0 / normal@12 match the layout. */
-    if (retain_cpu) {
+    const bool cpu_skin = jce_skinned_mesh_cpu_skin_required();
+    const bool cpu_pick = !jce_pick_gpu_readback_available() &&
+        pick_source_fits(num_verts, (uint32_t)sizeof(*vertices),
+                         indices ? num_indices : 0u);
+    if (retain_cpu || cpu_skin || cpu_pick) {
         uint32_t bytes = num_verts * (uint32_t)sizeof(JceSkinnedVertex);
         m->base_cpu = JCE_MALLOC(bytes);
         if (m->base_cpu) {
@@ -112,6 +196,10 @@ JceSkinnedMesh *jce_skinned_mesh_create(
             m->stride        = (uint32_t)sizeof(JceSkinnedVertex);
             m->pos_offset    = (uint32_t)offsetof(JceSkinnedVertex, pos);
             m->normal_offset = (uint32_t)offsetof(JceSkinnedVertex, normal);
+        } else if (cpu_skin) {
+            LOG_WARN(LOG_TAG, "skinned mesh: CPU source allocation failed");
+            JCE_FREE(m);
+            return NULL;
         }
     }
 
@@ -143,7 +231,8 @@ JceSkinnedMesh *jce_skinned_mesh_create(
         /* Build wireframe IBO: each triangle -> 3 line pairs. */
         uint32_t num_tris = num_indices / 3;
         uint32_t wf_count = num_tris * 6;
-        uint32_t *wf = (uint32_t *)JCE_MALLOC(wf_count * sizeof(uint32_t));
+        uint32_t *wf = wf_count && wf_count <= UINT32_MAX / sizeof(*wf)
+            ? JCE_MALLOC((size_t)wf_count * sizeof(*wf)) : NULL;
         if (wf) {
             for (uint32_t t = 0; t < num_tris; t++) {
                 uint32_t a = indices[t*3+0], b = indices[t*3+1], c = indices[t*3+2];
@@ -166,6 +255,9 @@ JceSkinnedMesh *jce_skinned_mesh_create(
         m->wf_ibh.idx = UINT16_MAX;
     }
 
+    if (cpu_pick)
+        retain_pick_source(m, vertices, (uint32_t)sizeof(*vertices), indices);
+
     LOG_DEBUG(LOG_TAG, "created skinned mesh: %u verts, %u indices",
               num_verts, num_indices);
     return m;
@@ -176,7 +268,10 @@ JceSkinnedMesh *jce_pbr_mesh_create(
     const uint32_t *indices, uint32_t num_indices,
     bool retain_cpu)
 {
-    if (!vertices || num_verts == 0) return NULL;
+    if (!vertices || num_verts == 0 ||
+        num_verts > UINT32_MAX / sizeof(JcePbrVertex) ||
+        (indices && num_indices > UINT32_MAX / sizeof(*indices)))
+        return NULL;
 
     JceSkinnedMesh *m = (JceSkinnedMesh *)JCE_CALLOC(1, sizeof(*m));
     if (!m) return NULL;
@@ -226,7 +321,8 @@ JceSkinnedMesh *jce_pbr_mesh_create(
         /* Build wireframe IBO. */
         uint32_t num_tris = num_indices / 3;
         uint32_t wf_count = num_tris * 6;
-        uint32_t *wf = (uint32_t *)JCE_MALLOC(wf_count * sizeof(uint32_t));
+        uint32_t *wf = wf_count && wf_count <= UINT32_MAX / sizeof(*wf)
+            ? JCE_MALLOC((size_t)wf_count * sizeof(*wf)) : NULL;
         if (wf) {
             for (uint32_t t = 0; t < num_tris; t++) {
                 uint32_t a = indices[t*3+0], b = indices[t*3+1], c = indices[t*3+2];
@@ -248,6 +344,9 @@ JceSkinnedMesh *jce_pbr_mesh_create(
         m->ibh.idx    = UINT16_MAX;
         m->wf_ibh.idx = UINT16_MAX;
     }
+
+    if (!jce_pick_gpu_readback_available())
+        retain_pick_source(m, vertices, (uint32_t)sizeof(*vertices), indices);
 
     LOG_DEBUG(LOG_TAG, "created PBR mesh: %u verts, %u indices",
               num_verts, num_indices);
@@ -272,6 +371,8 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
     }
     if (mesh->base_cpu)
         JCE_FREE(mesh->base_cpu);   /* retained morph base (NULL unless retained) */
+    JCE_FREE(mesh->pick_positions);
+    JCE_FREE(mesh->pick_indices);
     JCE_FREE(mesh);
 }
 
@@ -343,14 +444,50 @@ void jce_skinned_mesh_set_submit_index_range(uint32_t first, uint32_t count)
     s_submit.range_count = count;
 }
 
+bool jce_skinned_mesh_deform_transient(const JceSkinnedMesh *mesh,
+                                     const jce_mat4 *palette, uint32_t joints,
+                                     bgfx_transient_vertex_buffer_t *out)
+{
+    if (!mesh || !mesh->is_skinned || !mesh->base_cpu ||
+        !palette || joints == 0 || !out ||
+        bgfx_get_avail_transient_vertex_buffer(mesh->num_verts, &mesh->layout) <
+            mesh->num_verts)
+        return false;
+
+    bgfx_alloc_transient_vertex_buffer(out, mesh->num_verts, &mesh->layout);
+    memcpy(out->data, mesh->base_cpu, (size_t)mesh->num_verts * mesh->stride);
+    jce_skin_deform_vertices((JceSkinnedVertex *)out->data, mesh->num_verts,
+                             palette, joints);
+    return true;
+}
+
+static void sm_bind_vertices(const JceSkinnedMesh *mesh,
+                             const JceSkinVertexSource *source)
+{
+    if (source && source->transient) {
+        bgfx_set_transient_vertex_buffer(0, source->transient, 0, mesh->num_verts);
+    } else if (source && source->dynamic_idx != UINT16_MAX) {
+        bgfx_dynamic_vertex_buffer_handle_t handle = {source->dynamic_idx};
+        bgfx_set_dynamic_vertex_buffer(0, handle, 0, mesh->num_verts);
+    } else {
+        bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    }
+}
+
 void jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
-                              const JceRenderer *r, uint16_t view_id)
+                             const JceRenderer *r, uint16_t view_id)
+{
+    jce_skinned_mesh_submit_vertices(mesh, r, view_id, NULL);
+}
+
+void jce_skinned_mesh_submit_vertices(const JceSkinnedMesh *mesh,
+    const JceRenderer *r, uint16_t view_id, const JceSkinVertexSource *source)
 {
     if (!mesh) return;
     JCE_PROFILE_ZONE_N("SkinnedMesh::Submit");
     (void)view_id;
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    sm_bind_vertices(mesh, source);
 
     if (r && jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
         /* Wireframe: line pairs from the wf_ibh, no back-face culling. */
@@ -437,14 +574,23 @@ void jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
                                     const JceRenderer *r, uint16_t view_id,
                                     JceShaderHandle program)
 {
-    if (!mesh || !r || program.idx == UINT16_MAX) return;
-    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitShadow");
-    (void)view_id;
+    jce_skinned_mesh_submit_shadow_vertices(mesh, r, view_id, program, NULL);
+}
 
-    /* Caller must have uploaded the bone palette via
-     * jce_skinned_mesh_set_bones() (skinned program) or a single
-     * bgfx_set_transform() (static-PBR fallback) before this call. */
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+void jce_skinned_mesh_submit_shadow_vertices(const JceSkinnedMesh *mesh,
+    const JceRenderer *r, uint16_t view_id, JceShaderHandle program,
+    const JceSkinVertexSource *source)
+{
+    if (!mesh || !r || program.idx == UINT16_MAX) return;
+    if (source && !source->transient && source->dynamic_idx != UINT16_MAX) {
+        jce_skinned_mesh_submit_shadow_morphed(mesh, r, view_id, program,
+                                               source->dynamic_idx);
+        return;
+    }
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitShadow");
+
+    /* The caller owns the model transform or GPU bone palette. */
+    sm_bind_vertices(mesh, source);
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
@@ -505,40 +651,34 @@ void jce_skinned_mesh_submit_shadow_morphed(const JceSkinnedMesh *mesh,
     JCE_PROFILE_ZONE_END;
 }
 
-/* Wireframe overlay: line-topology submit using the per-mesh wf_ibh.
- * For skinned variants the caller must have uploaded the bone palette
- * via jce_skinned_mesh_set_bones() (or bgfx_set_transform for static
- * PBR variants).  Uses the PBR shader matching the layout so the
- * vertex stage produces correctly skinned positions; fragment output
- * is overwritten by the line rasterizer, so colour is irrelevant. */
 void jce_skinned_mesh_submit_wireframe_overlay(const JceSkinnedMesh *mesh,
                                                 const JceRenderer *r,
                                                 uint16_t view_id)
 {
     if (!mesh || !r) return;
-    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitWireframeOverlay");
-
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
-
-    if (mesh->wf_ibh.idx != UINT16_MAX) {
-        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-    } else if (mesh->ibh.idx != UINT16_MAX) {
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-    }
-
-    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                   | BGFX_STATE_DEPTH_TEST_LEQUAL
-                   | BGFX_STATE_MSAA | BGFX_STATE_PT_LINES;
-    if (mesh->num_wf_indices < 1500000u)
-        state |= BGFX_STATE_LINEAA;
-
-    bgfx_set_state(state, 0);
-
-    JceShaderHandle sh = mesh->is_skinned
+    JceShaderHandle program = mesh->is_skinned
         ? jce_renderer_get_program_pbr_skinned(r)
         : jce_renderer_get_program_pbr(r);
-    bgfx_program_handle_t prog = { sh.idx };
-    jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    jce_skinned_mesh_submit_wireframe_vertices(mesh, r, view_id, program, NULL, true);
+}
+
+void jce_skinned_mesh_submit_wireframe_vertices(const JceSkinnedMesh *mesh,
+    const JceRenderer *r, uint16_t view_id, JceShaderHandle program,
+    const JceSkinVertexSource *source, bool overlay)
+{
+    if (!mesh || !r || program.idx == UINT16_MAX ||
+        mesh->wf_ibh.idx == UINT16_MAX) {
+        bgfx_discard(BGFX_DISCARD_ALL);
+        return;
+    }
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitWireframe");
+
+    sm_bind_vertices(mesh, source);
+    bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+    bgfx_set_state(jce_view_wireframe_state(overlay, mesh->num_wf_indices), 0);
+
+    bgfx_program_handle_t prog = { program.idx };
+    jce_enc_submit_implicit(view_id, prog, 0, BGFX_DISCARD_ALL);
 
     JCE_PROFILE_ZONE_END;
 }
@@ -549,11 +689,19 @@ void jce_skinned_mesh_submit_pick_id(const JceSkinnedMesh *mesh,
                                       JceShaderHandle program,
                                       bool double_sided)
 {
+    jce_skinned_mesh_submit_pick_vertices(mesh, r, view_id, program,
+                                          double_sided, NULL);
+}
+
+void jce_skinned_mesh_submit_pick_vertices(const JceSkinnedMesh *mesh,
+    const JceRenderer *r, uint16_t view_id, JceShaderHandle program,
+    bool double_sided, const JceSkinVertexSource *source)
+{
     if (!mesh || !r || program.idx == UINT16_MAX)
         return;
     JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitPickID");
 
-    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    sm_bind_vertices(mesh, source);
 
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);

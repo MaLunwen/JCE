@@ -86,3 +86,6 @@ Thumbs.db -text
 
 # Fixed first-party half-float renderer tables are binary payloads.
 *.f16 -text
+
+# Preserve upstream OFL text, including its original trailing space.
+/engine/ui/fonts/JCE-CJK-Fallback-OFL.txt -text whitespace=-blank-at-eol

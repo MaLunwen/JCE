@@ -23,7 +23,10 @@ class StaticRegistryTests(unittest.TestCase):
         self.base = Path(self.temp.name)
 
     def configure(self, factories='fixture_provider', required='fixture_provider',
-                  target='probe', paths='scripts/Fixture.jcec', languages='c cpp', sha='a' * 64, env_contract=False, registry_args=None):
+                  target='probe', paths='scripts/Fixture.jcec', languages='c cpp', sha='a' * 64,
+                  env_contract=False, registry_args=None, deferred=False,
+                  deferred_languages='c', declaration_dir=False, declare=True,
+                  deferred_factories=None, old_deferred=False):
         source = self.base / 'source'
         source.mkdir(exist_ok=True)
         (source / 'empty.c').write_text('int fixture;\n')
@@ -38,7 +41,49 @@ set(JCE_REQUIRED_NATIVE_SCRIPT_PATHS [==[{paths}]==])
 set(JCE_REQUIRED_NATIVE_FACTORIES [==[{required}]==])
 set(JCE_NATIVE_SCRIPT_CLOSURE_SHA256 [==[{sha}]==])
 include([==[{(ROOT / 'scripting/cmake/JCEScriptEnable.cmake').as_posix()}]==])
-jce_script_enable(probe LANGUAGES {languages} NO_STAGE NATIVE_FACTORIES {factories})
+"""
+        if deferred:
+            template = (ROOT / 'cmake/JCEConfig.cmake.in').read_text(encoding='utf-8')
+            tail = template[template.index('# Shipping admission is checked'):]
+            if old_deferred:
+                current = 'LANGUAGES ${_jce_delivery_languages} REQUIRED NO_STAGE ${_jce_factory_args})'
+                self.assertEqual(tail.count(current), 1, 'deferred owner mutation must be unique')
+                tail = tail.replace(current,
+                                    'LANGUAGES ${JCE_REQUIRED_SCRIPT_LANGUAGES} REQUIRED NO_STAGE)')
+            text += ('set(JCE_BUILD_VARIANT dist)\n'
+                     'set(JCE_DELIVERY_PROFILE embedded)\nset(JCE_SDK_DELIVERY_PROFILE embedded)\n'
+                     'set(JCE_SCRIPT_LANGUAGES c cpp)\n'
+                     f'set(JCE_REQUIRED_SCRIPT_LANGUAGES {deferred_languages})\n' + tail + '\n')
+        declaration = f'jce_script_enable(probe LANGUAGES {languages} NO_STAGE NATIVE_FACTORIES {factories})\n'
+        if declare:
+            if declaration_dir:
+                declared = source / 'declared'
+                declared.mkdir(exist_ok=True)
+                (declared / 'CMakeLists.txt').write_text(declaration, encoding='utf-8', newline='\n')
+                text += 'add_subdirectory(declared)\n'
+            else:
+                text += declaration
+        if deferred_factories is not None:
+            text += f'set(JCE_REQUIRED_NATIVE_FACTORIES [==[{deferred_factories}]==])\n'
+        if deferred:
+            # This runs after the real SDK deferred hook. Target properties and
+            # the real SOURCES list, not a substitute enable port, are witnesses.
+            text += """
+function(registry_target_witness)
+    get_target_property(sources probe SOURCES)
+    set(registry_count 0)
+    foreach(item IN LISTS sources)
+        if(item MATCHES "/jce_script_register_linked[.]c$")
+            math(EXPR registry_count "${registry_count} + 1")
+        endif()
+    endforeach()
+    get_property(languages TARGET probe PROPERTY _JCE_SCRIPT_ENABLED_LANGUAGES)
+    get_property(factories TARGET probe PROPERTY _JCE_SCRIPT_NATIVE_FACTORIES)
+    get_property(shim TARGET probe PROPERTY _JCE_SCRIPT_SHIM_DIR)
+    file(WRITE "${CMAKE_BINARY_DIR}/registry-witness.txt"
+         "${registry_count}\n${languages}\n${factories}\n${shim}\n")
+endfunction()
+cmake_language(DEFER CALL registry_target_witness)
 """
         env = dict(os.environ)
         if env_contract:
@@ -59,7 +104,10 @@ jce_script_enable(probe LANGUAGES {languages} NO_STAGE NATIVE_FACTORIES {factori
         result = subprocess.run([CMAKE, '-S', str(source), '-B', str(self.base / 'configured'),
                                  '-G', 'Ninja', '-DCMAKE_C_COMPILER=' + Path(CC).as_posix(), *extra],
                                 capture_output=True, text=True, timeout=45, env=env)
-        return result, self.base / 'configured/jce_script_enable/probe'
+        generated = self.base / 'configured'
+        if declare and declaration_dir:
+            generated /= 'declared'
+        return result, generated / 'jce_script_enable/probe'
 
     def compile_probe(self, generated, omit_provider=False):
         include = self.base / 'headers'
@@ -210,6 +258,46 @@ int main(void){return jce_script_register_linked_languages(NULL)<0?3:0;}
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         text = (generated / 'jce_script_register_linked.c').read_text()
         self.assertNotIn('jce_script_vm_cpp_has_class("', text)
+
+    def test_actual_sdk_deferred_hook_keeps_factory_and_one_registry_source(self):
+        result, generated = self.configure(deferred=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        witness = (self.base / 'configured/registry-witness.txt').read_text().splitlines()
+        self.assertEqual(witness[:3], ['1', 'c;cpp', 'fixture_provider'])
+        self.assertEqual(Path(witness[3]), generated)
+        text = (generated / 'jce_script_register_linked.c').read_text()
+        self.assertIn('extern const JceCppModuleDesc *fixture_provider(void);', text)
+        result, exe = self.compile_probe(generated)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(subprocess.run([str(exe)], timeout=10).returncode, 0)
+
+    def test_actual_sdk_deferred_hook_merges_languages_without_moving_child_registry(self):
+        result, generated = self.configure(deferred=True, languages='c',
+                                           deferred_languages='cpp', declaration_dir=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        witness = (self.base / 'configured/registry-witness.txt').read_text().splitlines()
+        self.assertEqual(witness[:3], ['1', 'c;cpp', 'fixture_provider'])
+        self.assertEqual(Path(witness[3]), generated)
+        self.assertFalse((self.base / 'configured/jce_script_enable/probe').exists())
+        self.assertIn('JCE_SCRIPT_LINKED_CPP', (generated / 'jce_script_register_linked.c').read_text())
+
+    def test_actual_sdk_deferred_hook_cannot_synthesize_missing_factory_declaration(self):
+        result, _ = self.configure(deferred=True, declare=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Selected native scripts require explicit factories', result.stderr)
+        self.assertFalse((self.base / 'configured/registry-witness.txt').exists())
+
+    def test_actual_sdk_deferred_hook_revalidates_factory_mismatch(self):
+        result, _ = self.configure(deferred=True, deferred_factories='other_provider')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Selected native factories do not match target declaration', result.stderr)
+        self.assertFalse((self.base / 'configured/registry-witness.txt').exists())
+
+    def test_old_deferred_wire_has_ordinary_missing_factory_failure(self):
+        result, _ = self.configure(deferred=True, old_deferred=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Selected native scripts require explicit factories', result.stderr)
+        self.assertFalse((self.base / 'configured/registry-witness.txt').exists())
 
 
 if __name__ == '__main__':

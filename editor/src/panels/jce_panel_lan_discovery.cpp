@@ -13,6 +13,7 @@
 #include "jce_panel_common.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_lan_discovery.h"
 
 #include <jce/tools/jce_imgui.hpp>
 
@@ -27,13 +28,9 @@ extern "C" {
 
 #define LOG_TAG "panel_lan_discovery"
 
-/* Default scan duration when the user clicks Refresh. */
-#define SCAN_DURATION_MS 3000u
-
 namespace {
 
 struct State {
-    bool scanning = false;
     /* "name (ip:port)" of the server the user last joined from this
      * panel; shown on the session status line.  Cleared on Leave. */
     char join_target[96] = "";
@@ -43,28 +40,19 @@ State g_st;
 
 void start_scan(void)
 {
-    jce_lan_discovery_client_stop_scan();
-    jce_lan_discovery_client_clear();
-    jce_lan_discovery_client_start_scan(0, SCAN_DURATION_MS);
-    g_st.scanning = true;
-    LOG_INFO(LOG_TAG, "LAN scan started (%u ms)", SCAN_DURATION_MS);
+    if (jce_editor_lan_discovery_refresh())
+        LOG_INFO(LOG_TAG, "LAN scan started (3000 ms)");
 }
 
 } /* namespace */
 
 extern "C" void jce_editor_panel_lan_discovery_content(void)
 {
-    /* The discovery client socket is caller-driven (jce_lan_discovery.h)
-     * and nothing else in the editor pumps it — drain RESPs here so the
-     * scan actually accumulates servers.  No-op while not scanning. */
-    jce_lan_discovery_client_tick();
-
-    /* Update scanning state. */
-    if (g_st.scanning && !jce_lan_discovery_client_is_scanning())
-        g_st.scanning = false;
+    /* CPU maintenance owns expiry even when this tab is not drawn. */
+    const bool scanning = jce_lan_discovery_client_is_scanning();
 
     /* Toolbar row. */
-    if (g_st.scanning) {
+    if (scanning) {
         ImGui::BeginDisabled();
         ImGui::Button(jce_editor_i18n("panel.lan_discovery.refresh"));
         ImGui::EndDisabled();

@@ -10,14 +10,13 @@
   ],
   "source_assets": "resources/assets",
   "cooked_assets": "resources/_cooked",
-  "startup_scene": "scenes/elemental_serenity.scene.json",
+  "startup_scene": "scenes/elemental_serenity.bundle.scene.json",
   "variants": [
     "debug",
     "release",
     "dist"
   ],
-  "script_modules": [
-    "native/bin/es_scripts.dll",
-    "native/bin/es_scripts_c.dll"
+  "required_languages": [
+    "lua"
   ]
 }

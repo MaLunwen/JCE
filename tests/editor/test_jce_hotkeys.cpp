@@ -50,8 +50,8 @@ TEST_CASE("invalid hotkey id yields zero-chord on get / get_default")
 TEST_CASE("jce_hotkeys_reset_all installs defaults into the live chord slot")
 {
     /* Make sure the current binding is different from the default first. */
-    jce_hotkey_set(JCE_HK_EDIT_UNDO, JceHotkeyChord{ 999, 0 });
-    REQUIRE(jce_hotkey_get(JCE_HK_EDIT_UNDO).key == 999);
+    jce_hotkey_set(JCE_HK_EDIT_UNDO, JceHotkeyChord{ ImGuiKey_A, 0 });
+    REQUIRE(jce_hotkey_get(JCE_HK_EDIT_UNDO).key == ImGuiKey_A);
 
     jce_hotkeys_reset_all();
 
@@ -64,7 +64,7 @@ TEST_CASE("jce_hotkeys_reset_all installs defaults into the live chord slot")
 
 TEST_CASE("jce_hotkey_set / jce_hotkey_get round-trip")
 {
-    JceHotkeyChord want{ 1234, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) };
+    JceHotkeyChord want{ ImGuiKey_B, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) };
     jce_hotkey_set(JCE_HK_EDIT_REDO, want);
     JceHotkeyChord got = jce_hotkey_get(JCE_HK_EDIT_REDO);
     CHECK(got.key  == want.key);
@@ -135,4 +135,53 @@ TEST_CASE("jce_hotkey_pressed requires the bound key edge, not only a chord repo
     jce_test_imgui_set_pressed(ctrl_o, ImGuiKey_O, 101);
     CHECK(jce_hotkey_pressed(JCE_HK_FILE_OPEN));
     CHECK_FALSE(jce_hotkey_pressed(JCE_HK_FILE_OPEN));
+}
+
+
+TEST_CASE("Preferences default chord and menu label share the actual registry")
+{
+    jce_hotkeys_reset_all();
+    CHECK(std::strcmp(jce_hotkey_id_string(JCE_HK_EDIT_PREFERENCES),
+                      "edit.preferences") == 0);
+    const auto def = jce_hotkey_get_default(JCE_HK_EDIT_PREFERENCES);
+    const auto current = jce_hotkey_get(JCE_HK_EDIT_PREFERENCES);
+    CHECK(def.key == ImGuiKey_Comma);
+    CHECK(def.mods == JCE_HKM_CTRL);
+    CHECK(jce_hotkey_chord_equal(def, current));
+    CHECK(jce_hotkey_find_conflict(JCE_HK_EDIT_PREFERENCES, current) == JCE_HK_COUNT);
+    char label[64];
+    jce_hotkey_chord_label(current, label, sizeof(label));
+    CHECK(std::strcmp(label, "Ctrl+,") == 0);
+}
+
+TEST_CASE("Preferences only consumes the matching modifier and key edge once")
+{
+    jce_hotkeys_reset_all();
+    const ImGuiKeyChord chord = ImGuiMod_Ctrl | ImGuiKey_Comma;
+    jce_test_imgui_set_pressed(ImGuiKey_Comma, ImGuiKey_Comma, 201);
+    CHECK_FALSE(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+    jce_test_imgui_set_pressed(chord, ImGuiKey_Period, 202);
+    CHECK_FALSE(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+    jce_test_imgui_set_pressed(chord, ImGuiKey_Comma, 203);
+    CHECK(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+    CHECK_FALSE(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+}
+
+TEST_CASE("Preferences rebinding changes both queried shortcut and actual dispatch")
+{
+    jce_hotkeys_reset_all();
+    jce_hotkey_set(JCE_HK_EDIT_PREFERENCES, {ImGuiKey_Period, JCE_HKM_CTRL});
+    char label[64];
+    jce_hotkey_chord_label(jce_hotkey_get(JCE_HK_EDIT_PREFERENCES), label, sizeof(label));
+    CHECK(std::strcmp(label, "Ctrl+.") == 0);
+    jce_test_imgui_set_pressed(ImGuiMod_Ctrl | ImGuiKey_Comma, ImGuiKey_Comma, 204);
+    CHECK_FALSE(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+    jce_test_imgui_set_pressed(ImGuiMod_Ctrl | ImGuiKey_Period, ImGuiKey_Period, 205);
+    CHECK(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+    jce_hotkey_set(JCE_HK_EDIT_PREFERENCES, {ImGuiKey_None, JCE_HKM_NONE});
+    jce_hotkey_chord_label(jce_hotkey_get(JCE_HK_EDIT_PREFERENCES), label, sizeof(label));
+    CHECK(std::strcmp(label, "(unbound)") == 0);
+    jce_test_imgui_set_pressed(ImGuiMod_Ctrl | ImGuiKey_Comma, ImGuiKey_Comma, 206);
+    CHECK_FALSE(jce_hotkey_pressed(JCE_HK_EDIT_PREFERENCES));
+    jce_hotkeys_reset_all();
 }

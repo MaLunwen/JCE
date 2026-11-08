@@ -40,6 +40,31 @@ uint32_t jce_rcb_host_frame_index(void);
 /* The interface handed to bgfx_init().  Never NULL. */
 bgfx_callback_interface_t *jce_rcb_callback_interface(void);
 
+/* Build metadata, bridge support and callbacks actually received are distinct.
+ * A missing package macro is unknown (-1), not proof of a disabled profiler.
+ * begin_observed counts both begin variants, even while tracing is disabled.
+ * INT32_MAX is a lower bound once begin_count_saturated is true. The getter
+ * is non-mutating; a new callback-interface/init attempt resets the count. */
+typedef struct JceBgfxCpuProfilerWitness {
+    int32_t compiled;
+    bool bridge_supported;
+    uint32_t begin_observed;
+    bool begin_count_saturated;
+} JceBgfxCpuProfilerWitness;
+
+JceBgfxCpuProfilerWitness jce_rcb_cpu_profiler_witness(void);
+
+/* Owner-thread terminal after init(false) has returned, or an admitted init has
+ * actually been shut down. This does not release readbacks or report successful
+ * backend lifetime completion. Repeated finalization is a no-op. */
+typedef enum JceBgfxCpuProfilerAttemptResult {
+    JCE_BGFX_CPU_ATTEMPT_INIT_FAILED,
+    JCE_BGFX_CPU_ATTEMPT_API_REFUSED,
+    JCE_BGFX_CPU_ATTEMPT_ALLOCATION_FAILED,
+    JCE_BGFX_CPU_ATTEMPT_SUPERSEDED_UNFINALIZED
+} JceBgfxCpuProfilerAttemptResult;
+void jce_rcb_cpu_profiler_attempt_end(JceBgfxCpuProfilerAttemptResult result);
+
 /* True when recording is on, is not the imgui-composited mode, and no shot is
  * already in flight -- i.e. this frame should request a backbuffer capture. */
 bool jce_rcb_capture_wants_shot(void);
@@ -51,6 +76,14 @@ void jce_rcb_capture_mark_shot_pending(void);
 /* Start or stop backbuffer recording.  Stopping frees the swizzle scratch: an
  * idle editor should not hold capture-sized buffers. */
 void jce_rcb_capture_set_active(bool enable);
+
+/* Main-thread success hook for a windowed backend with our callback. The
+ * headless/fallback paths lack file capture capability and do not activate it. */
+void jce_rcb_backend_started(void);
+
+/* Renderer shutdown has joined bgfx: release retained CPU readback storage.
+ * Call after the backend stops, never while it can still write borrowed data. */
+void jce_rcb_after_backend_shutdown(void);
 
 /* jce_rcb_host_took_capture() is declared in jce_renderer_host_hook.h, which
  * this header includes above -- ONE declaration, in a file with no

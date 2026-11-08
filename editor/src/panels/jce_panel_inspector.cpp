@@ -1058,6 +1058,23 @@ INSP_DRAWFN(tilemap_collider2d,
             draw_comp_tilemap_collider2d(jce_scene_get_tilemap_collider2d(scene, e)))
 INSP_DRAWFN(avatar, draw_comp_avatar(jce_scene_get_avatar(scene, e)))
 INSP_DRAWFN(volume, draw_comp_volume(jce_scene_get_volume(scene, e)))
+INSP_DRAWFN(water_foam,
+            draw_comp_water_foam(jce_scene_get_water_foam(scene, e)))
+INSP_DRAWFN(water_crest,
+            draw_comp_water_crest(jce_scene_get_water_crest(scene, e)))
+INSP_DRAWFN(water_caustics,
+            draw_comp_water_caustics(jce_scene_get_water_caustics(scene, e)))
+INSP_DRAWFN(water_nearshore,
+            draw_comp_water_nearshore(scene, jce_scene_get_water_nearshore(scene, e)))
+INSP_DRAWFN(water_motion,
+            draw_comp_water_motion(jce_scene_get_water_motion(scene, e)))
+INSP_DRAWFN(water_optics,
+            draw_comp_water_optics(jce_scene_get_water_optics(scene, e)))
+INSP_DRAWFN(water_caustic_detail,
+            draw_comp_water_caustic_detail(jce_scene_get_water_caustic_detail(scene, e)))
+INSP_DRAWFN(water_normal_detail, draw_comp_water_normal_detail(scene, e))
+INSP_DRAWFN(water_spectrum,
+            draw_comp_water_spectrum(jce_scene_get_water_spectrum(scene, e)))
 INSP_DRAWFN(fullscreen_effect,
             draw_comp_fullscreen_effect(jce_scene_get_fullscreen_effect(scene, e)))
 INSP_DRAWFN(occlusion_portal, draw_comp_occlusion_portal(jce_scene_get_occlusion_portal(scene, e)))
@@ -1158,6 +1175,15 @@ static void insp_register_draw_fns(void)
         { "Avatar", drawfn_avatar },
         { "Volume", drawfn_volume },
         { "FullscreenEffect", drawfn_fullscreen_effect },
+        { "WaterSpectrum", drawfn_water_spectrum },
+        { "WaterFoam", drawfn_water_foam },
+        { "WaterCrest", drawfn_water_crest },
+        { "WaterCaustics", drawfn_water_caustics },
+        { "WaterNearshore", drawfn_water_nearshore },
+        { "WaterMotion", drawfn_water_motion },
+        { "WaterOptics", drawfn_water_optics },
+        { "WaterCausticDetail", drawfn_water_caustic_detail },
+        { "WaterNormalDetail", drawfn_water_normal_detail },
         { "OcclusionPortal", drawfn_occlusion_portal },
         { "VideoPlayer", drawfn_video_player },
         { "NavAgent", drawfn_nav_agent },

@@ -22,10 +22,15 @@ add_executable(Minesweeper src/main.c src/controller.c src/board.c src/view.c sr
 target_compile_definitions(Minesweeper PRIVATE SDL_MAIN_USE_CALLBACKS=1)
 target_link_libraries(Minesweeper PRIVATE JCE::JCE)
 target_compile_definitions(Minesweeper PRIVATE JCE_SCRIPT_MODULE_NO_ENTRY JCE_APP_AUTHORED_CAMERA_ONLY=1)
-jce_script_enable(Minesweeper LANGUAGES c)
+jce_script_enable(Minesweeper LANGUAGES lua c REQUIRED NO_STAGE NATIVE_FACTORIES mines_module)
 add_library(mines_controller MODULE src/controller.c src/board.c src/view.c)
 target_link_libraries(mines_controller PRIVATE JCE::ScriptCModule)
 set_target_properties(mines_controller PROPERTIES PREFIX "" LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build" RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/native/build")
+foreach(_cfg DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set_target_properties(mines_controller PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_SOURCE_DIR}/native/build"
+        RUNTIME_OUTPUT_DIRECTORY_${_cfg} "${CMAKE_SOURCE_DIR}/native/build")
+endforeach()
 add_dependencies(Minesweeper mines_controller)
 
 # Cooked-asset tree to pack into the embedded PAK.  build-project.bat

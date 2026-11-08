@@ -63,7 +63,8 @@ def headers() -> tuple:
     listing = _lgf.working_tree()
     pub, priv = [], []
     for rel in listing:
-        if not rel.endswith(HEADER_SUFFIXES):
+        # Cached Git entries can name files deleted in the current worktree.
+        if not rel.endswith(HEADER_SUFFIXES) or not (REPO_ROOT / rel).is_file():
             continue
         if rel.startswith(PUBLIC_PREFIX):
             pub.append(rel)

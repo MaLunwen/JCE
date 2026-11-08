@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "asset": "fonts/JCE-CJK-Fallback.ttf",
+  "family": "JCE CJK Fallback",
+  "style": "Regular",
+  "source": "https://github.com/lxgw/LxgwWenKai/releases/download/v1.522/LXGWWenKai-Regular.ttf",
+  "source_sha256": "39ad71264b588165b469e35e6afb162a378dacd1f95348160240ba9038ac3009",
+  "license": "OFL-1.1",
+  "bytes": 2684844,
+  "sha256": "72ec3c0f59ff4ace2daaf9a8aa091094ed10029932fbf82be7f3a37316af5fc7",
+  "codepoints": 6869,
+  "glyphs": 6975,
+  "coverage": "Editor translations, GB2312 level one and selected UI symbols",
+  "modified": true
+}

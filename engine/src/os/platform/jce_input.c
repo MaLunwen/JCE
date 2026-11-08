@@ -94,6 +94,7 @@ struct JceInput {
      * reader had to remember to consult. */
     JceInputDeviceTable devices;
 
+    bool snapshot_replayed; /* origin of this CPU-tick sample, never on JIRC wire */
     const JceInputBackend *backend;   /* NULL == null backend, see the header */
 };
 
@@ -152,6 +153,7 @@ void jce_input_destroy(JceInput *input)
 void jce_input_update(JceInput *input)
 {
     if (!input) return;
+    input->snapshot_replayed = false;
     JCE_PROFILE_ZONE_N("Input::Update");
 
     memcpy(input->keys_prev, input->keys_cur, sizeof(input->keys_cur));
@@ -409,6 +411,7 @@ static void apply_event(JceInput *input, const JceInputEvent *ev)
 void jce_input_submit(JceInput *input, const JceInputEvent *events, int count)
 {
     if (!input || !events || count <= 0) return;
+    input->snapshot_replayed = false;
     for (int i = 0; i < count; ++i) {
         /* A short record is refused, not partially read: the fields past its
          * end do not exist. */
@@ -624,8 +627,9 @@ void jce_input_capture(const JceInput *input, JceInputFrame *out)
 bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
 {
     int i, n;
-    if (!input || !frame) return false;
-    if (frame->version != JCE_INPUT_FRAME_VERSION) return false;
+    if (!input) return false;
+    input->snapshot_replayed = false;
+    if (!frame || frame->version != JCE_INPUT_FRAME_VERSION) return false;
 
     int old_touches = input->touch_count;
     bool mouse_changed = input->mouse_x != frame->mouse_x ||
@@ -678,5 +682,23 @@ bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
      * reason a capture/apply round trip can now be checked through the public
      * query API and mean something. */
     jce_input_devices_apply(&input->devices, frame);
+    return true;
+}
+
+
+bool jce_input_snapshot_was_replayed(const JceInput *input)
+{
+    return input && input->snapshot_replayed;
+}
+
+void jce_input_clear_snapshot_replayed(JceInput *input)
+{
+    if (input) input->snapshot_replayed = false;
+}
+
+bool jce_input_apply_replayed(JceInput *input, const JceInputFrame *frame)
+{
+    if (!jce_input_apply(input, frame)) return false;
+    input->snapshot_replayed = true;
     return true;
 }

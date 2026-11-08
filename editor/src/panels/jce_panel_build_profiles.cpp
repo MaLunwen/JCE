@@ -22,6 +22,8 @@
 #include "core/jce_build_manager.h"
 #include "core/jce_cook_manager.h"
 #include "core/jce_run_manager.h"
+#include "core/jce_project_build_target.h"
+#include "core/jce_build_package.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_project.h"
 #include "dialogs/jce_editor_dialogs.h"
@@ -67,13 +69,8 @@ static const char *s_arch_cli[] = {
  * machine we're running on when "host (default)" is selected. */
 static const char *host_arch_triplet(void)
 {
-#if defined(_M_ARM64) || defined(__aarch64__)
-    return "aarch64";
-#elif defined(_M_IX86) || defined(__i386__)
-    return "i686";
-#else
-    return "x86_64";
-#endif
+    const char *arch = jce_project_build_host_arch();
+    return arch ? arch : "unsupported";
 }
 
 struct Profile {
@@ -115,7 +112,7 @@ static struct {
     bool                 pick_cancelled = false;
     /* Script-delegated build options (▶ Build Project). */
     bool                 use_clean   = false;
-    bool                 use_dist    = false; /* Windows --dist variant */
+    bool                 use_dist    = true;  /* final user-project delivery */
     char                 script_override[512] = {0}; /* empty = platform default */
     /* Empty until a project is opened: filled by refresh_prefill_from_project()
      * from jce_project.json, else by default_build_target/exe() below. */
@@ -162,34 +159,14 @@ static void refresh_prefill_from_project(void)
     const JceProject *p = jce_editor_project_get();
     if (!p) return; /* No jce_project.json — keep current inputs. */
 
-    if (p->target_name && p->target_name[0]) {
-        snprintf(s_bp.build_target, sizeof(s_bp.build_target),
-                 "%s", p->target_name);
-    }
-    /* Project Settings > Build > "CMake Target" (JceEditorConfig.game_target_name)
-     * overrides the jce_project.json target when the user set it, so the
-     * Project-Settings field is authoritative for the --target the engine-
-     * workspace build passes (previously game_target_name was persisted but
-     * never read by any builder). */
-    {
-        JceEditorConfig ecfg;
-        if (jce_editor_config_load(&ecfg) && ecfg.game_target_name[0]) {
-            snprintf(s_bp.build_target, sizeof(s_bp.build_target),
-                     "%s", ecfg.game_target_name);
-        }
-    }
-    if (p->output_exe && p->output_exe[0]) {
-        snprintf(s_bp.build_exe, sizeof(s_bp.build_exe),
-                 "%s", p->output_exe);
-    } else if (p->target_name && p->target_name[0]) {
-#if JCE_PLATFORM_WINDOWS
-        snprintf(s_bp.build_exe, sizeof(s_bp.build_exe),
-                 "%s.exe", p->target_name);
-#else
-        snprintf(s_bp.build_exe, sizeof(s_bp.build_exe),
-                 "%s", p->target_name);
-#endif
-    }
+    JceEditorConfig ecfg{};
+    const bool engine_workspace = jce_editor_project_is_engine_workspace();
+    if (engine_workspace) jce_editor_config_load(&ecfg);
+    snprintf(s_bp.build_target, sizeof(s_bp.build_target), "%s",
+        jce_project_build_initial_target(engine_workspace, p->target_name,
+                                        p->name, ecfg.game_target_name));
+    const std::string exe = jce_project_build_exe_name(s_bp.build_target, p->output_exe);
+    snprintf(s_bp.build_exe, sizeof(s_bp.build_exe), "%s", exe.c_str());
 }
 
 /* Neutral fallbacks for the build target / output exe.
@@ -402,9 +379,8 @@ static void load_profiles()
     load_root_from_config_once();
 
     /* Project mode: no CMakePresets.json needed.  Synthesize a single
-     * "project" entry so the panel renders and the user can hit Build,
-     * which delegates to build-project.bat (it does its own cmake
-     * configure, no presets involved). */
+     * "project" entry so the panel renders the native SDK build owner;
+     * its CMake configure needs no project presets. */
     if (s_bp.project_root[0] &&
         !jce_editor_project_is_engine_workspace() &&
         jce_editor_project_get() != nullptr) {
@@ -412,7 +388,7 @@ static void load_profiles()
         Profile pr;
         pr.preset      = "project";
         pr.display     = (jp->name && jp->name[0]) ? jp->name : "Project";
-        pr.description = "User project (jce_project.json — uses build-project script)";
+        pr.description = jce_editor_i18n("buildProfiles.nativeBuild");
         pr.generator   = "Ninja";
         s_bp.profiles.push_back(std::move(pr));
         s_bp.loaded = true;
@@ -480,30 +456,23 @@ static void load_profiles()
  * scripts/build-*.{bat,sh} layout used by the editor's launcher. */
 static std::string guess_output_exe(const std::string &preset_name)
 {
-    /* Project mode maps to the editor-native build tree:
-     *   <project_root>/build/<platform>-<arch>/<variant>/<exe>
-     * We default to release/win since the panel doesn't yet expose
-     * a variant selector for the synthetic preset. */
+    /* Project preview uses the same layout, variant and artifact naming
+     * owner as the native manager. Edited inputs are part of the request. */
     if (preset_name == "project") {
         const JceProject *jp = jce_editor_project_get();
         if (jp) {
-            const char *exe = (jp->output_exe && jp->output_exe[0])
-                                  ? jp->output_exe
-                                  : (jp->name ? jp->name : "game");
-            std::string exe_name = exe;
-            /* Ensure .exe suffix on Windows host (case-insensitive). */
-            if (exe_name.size() < 4 ||
-                jce_strcasecmp(exe_name.c_str() + exe_name.size() - 4, ".exe") != 0)
-                exe_name += ".exe";
+            const char *target = s_bp.build_target[0] ? s_bp.build_target :
+                jce_project_build_initial_target(false, jp->target_name, jp->name, nullptr);
+            const char *exe = s_bp.build_exe[0] ? s_bp.build_exe : jp->output_exe;
             const char *arch_sel = s_arch_cli[
                 (s_bp.arch_idx >= 0 &&
                  s_bp.arch_idx < (int)(sizeof(s_arch_cli)/sizeof(s_arch_cli[0])))
                 ? s_bp.arch_idx : 0];
             const char *arch = arch_sel ? arch_sel : host_arch_triplet();
-            std::string dir = "build/win32-";
-            dir += arch;
-            dir += "/release/";
-            return dir + exe_name;
+            return jce_project_build_output_dir(jce_project_build_root("",
+                jce_project_build_host_platform(), arch),
+                jce_project_build_variant(s_bp.use_dist)) + "/" +
+                jce_project_build_exe_name(target, exe);
         }
     }
 
@@ -549,11 +518,13 @@ static void apply_post_success(const JceBuildStatus &st)
 
     if (!s_bp.auto_update_run_path) return;
 
-    std::string exe = guess_output_exe(st.preset);
+    std::string exe = st.artifact_path[0] ? std::string(st.artifact_path)
+                                             : guess_output_exe(st.preset);
     /* Project mode: paths are relative to the user project root, not
      * the editor cwd.  Rebase to absolute so the Run Manager finds it
      * without needing the user to also change game_working_directory. */
-    const bool project_mode = (strcmp(st.preset, "project") == 0) &&
+    const bool project_mode = !st.artifact_path[0] &&
+                              (strcmp(st.preset, "project") == 0) &&
                               s_bp.project_root[0] != '\0';
     if (project_mode) {
         std::string root = s_bp.project_root;
@@ -676,7 +647,8 @@ static void draw_tool_status_strip(void)
     ImGui::SameLine();
     if (s_bp.tools_probed) {
         badge("cmake", s_bp.tools.cmake_ok, s_bp.tools.cmake_version);
-        badge("conan", s_bp.tools.conan_ok, s_bp.tools.conan_version);
+        if (jce_editor_project_is_engine_workspace() || !jce_editor_project_get())
+            badge("conan", s_bp.tools.conan_ok, s_bp.tools.conan_version);
         badge("ninja", s_bp.tools.ninja_ok, s_bp.tools.ninja_version);
     } else {
         ImGui::TextDisabled("%s",
@@ -687,17 +659,30 @@ static void draw_tool_status_strip(void)
         check_tools();
 }
 
+static bool project_tools_ready(void)
+{
+    const bool project_mode = !jce_editor_project_is_engine_workspace() &&
+                              jce_editor_project_get() != nullptr;
+    return jce_project_build_tools_ready(project_mode, s_bp.tools.cmake_ok,
+                                         s_bp.tools.ninja_ok, s_bp.tools.conan_ok);
+}
+
 static bool ensure_tools_checked(void)
 {
     if (!s_bp.tools_probed) {
         jce_build_manager_check_tools(&s_bp.tools);
         s_bp.tools_probed = true;
     }
-    return s_bp.tools.cmake_ok && s_bp.tools.ninja_ok && s_bp.tools.conan_ok;
+    return project_tools_ready();
 }
 
 static void draw_profiles_tab(void)
 {
+    /* Restore persisted defaults first, then let the currently opened project
+     * win. Late restoration inside load_profiles otherwise erases that root
+     * and emits a false missing-CMakePresets warning on the first frame. */
+    load_root_from_config_once();
+
     /* Sync this panel's project_root with whatever root the editor has
      * currently open (File > Open Project, Welcome dialog, etc.).
      * Without this the Browse… button inside this panel is the only way
@@ -781,8 +766,24 @@ static void draw_profiles_tab(void)
 
         /* Predicted output path — mirrors what auto-update would write. */
         std::string predicted = guess_output_exe(p.preset);
-        ImGui::Text("%s: %s",   jce_editor_i18n("buildProfiles.outputPath"),
+        ImGui::Text("%s: %s", jce_editor_i18n("buildProfiles.outputPath"),
                     predicted.c_str());
+        if (p.preset == "project") {
+            const JceProject *jp = jce_editor_project_get();
+            const char *arch = (s_bp.arch_idx > 0 && s_bp.arch_idx <
+                (int)(sizeof(s_arch_cli)/sizeof(s_arch_cli[0]))) ?
+                s_arch_cli[s_bp.arch_idx] : host_arch_triplet();
+            std::string package_path, path_error;
+            if (jp && jce_build_package_default_path(s_bp.project_root,
+                    jp->name && jp->name[0] ? jp->name : "game",
+                    jce_project_build_package_platform(jce_project_build_host_platform()),
+                    arch, jce_project_build_variant(s_bp.use_dist), &package_path, &path_error)) {
+                const size_t slash = predicted.find_last_of("/\\");
+                package_path += "/" + predicted.substr(slash == std::string::npos ? 0 : slash + 1);
+                ImGui::TextWrapped("%s: %s", jce_editor_i18n("buildProfiles.packagePath"),
+                                   package_path.c_str());
+            }
+        }
 
         /* Show derived Conan profile + output for transparency. */
         if (!p.conan_profile.empty()) {
@@ -799,14 +800,10 @@ static void draw_profiles_tab(void)
 
         ImGui::Separator();
 
-        /* Script-delegated build helper — invokes the platform's
-         * authoritative build script (scripts/build-desktop.bat on
-         * Windows, scripts/linux/build-linux-x64.sh on Linux, etc.).
-         * The scripts are the source of truth for the conan→cmake→
-         * ninja choreography and already handle every edge case
-         * (toolchain caching, variant selection, output verification).
-         * The editor's role is strictly orchestration + log streaming. */
-        auto start_build_via_script = [&]() {
+        /* User projects reuse the native SDK owner; full engine workspaces
+         * retain their authoritative build script. Dispatch acceptance is
+         * required before Play can consume a build completion. */
+        auto start_build_via_script = [&]() -> bool {
             LOG_INFO("build", "dispatch: entering build lambda");
             jce_log_flush();
             /* Two distinct invocation conventions:
@@ -831,12 +828,6 @@ static void draw_profiles_tab(void)
                                        ? s_bp.project_root
                                        : jp->project_root;
                 const char *sdk = resolve_project_sdk(jp);
-                if (!sdk || !sdk[0]) {
-                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "[build] project mode needs an SDK: set SDK Root in "
-                        "Build Profiles, project.sdk_path, or JCE_SDK_DIR");
-                    return;
-                }
                 const char *tgt = s_bp.build_target[0]
                                       ? s_bp.build_target
                                       : (jp->target_name && jp->target_name[0]
@@ -863,7 +854,7 @@ static void draw_profiles_tab(void)
                 pcfg.sdk_dir       = sdk;
                 pcfg.target        = tgt;
                 pcfg.exe_name      = exe;
-                pcfg.variant       = s_bp.use_dist ? "dist" : "release";
+                pcfg.variant       = jce_project_build_variant(s_bp.use_dist);
                 pcfg.arch          = arch;
                 pcfg.cooked_assets = (jp->cooked_assets && jp->cooked_assets[0])
                                          ? jp->cooked_assets : nullptr;
@@ -875,21 +866,14 @@ static void draw_profiles_tab(void)
                 pcfg.app_version   = nullptr;
                 jce_editor_console_log_level(JCE_CONSOLE_INFO,
                     "[build] native project build: target=%s sdk=%s",
-                    tgt ? tgt : "(none)", sdk);
-                jce_build_manager_start_project_build(&pcfg);
-                return;
+                    tgt ? tgt : "(none)", sdk ? sdk : "(none)");
+                return jce_build_manager_start_project_build(&pcfg);
             }
 
             const char *def = jce_build_manager_default_desktop_script();
             const char *script = s_bp.script_override[0]
                                      ? s_bp.script_override
                                      : def;
-            if (!script || !script[0]) {
-                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                    "[build] no default build script available for this "
-                    "platform; set a custom script path");
-                return;
-            }
             /* Compose args. */
             std::string args;
             auto append_arg = [&](const char *a) {
@@ -932,7 +916,18 @@ static void draw_profiles_tab(void)
                 args.empty() ? "(none)" : args.c_str(),
                 scfg.working_dir ? scfg.working_dir : "(default)");
             jce_log_flush();
-            jce_build_manager_run_script(&scfg);
+            return jce_build_manager_run_script(&scfg);
+        };
+        auto start_play_build = [&]() {
+            const bool accepted = start_build_via_script();
+            jce_build_manager_get_status(&st);
+            if (accepted) {
+                s_bp.play_stage = decltype(s_bp)::PLAY_BUILDING;
+            } else {
+                snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
+                         jce_editor_i18n("buildProfiles.play.buildFailed"), st.last_error);
+                s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
+            }
         };
 
         /* Script options strip (▶ Build Project). */
@@ -1010,10 +1005,10 @@ static void draw_profiles_tab(void)
             }
             ImGui::SameLine();
             ImGui::Checkbox("--clean", &s_bp.use_clean);
-#if JCE_PLATFORM_WINDOWS
-            ImGui::SameLine();
-            ImGui::Checkbox("--dist", &s_bp.use_dist);
-#endif
+            if (_project_mode_display || JCE_PLATFORM_WINDOWS) {
+                ImGui::SameLine();
+                ImGui::Checkbox("--dist", &s_bp.use_dist);
+            }
             ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.target"));
             ImGui::SameLine();
             ImGui::SetNextItemWidth(180.0f);
@@ -1051,9 +1046,7 @@ static void draw_profiles_tab(void)
         }
 
         bool script_disabled = running ||
-            (s_bp.tools_probed &&
-             (!s_bp.tools.cmake_ok || !s_bp.tools.ninja_ok ||
-              !s_bp.tools.conan_ok));
+            (s_bp.tools_probed && !project_tools_ready());
 
         /* ── Play state machine driver ──
          * Watches cook_manager / build_manager / run_manager and
@@ -1066,8 +1059,7 @@ static void draw_profiles_tab(void)
             switch (s_bp.play_stage) {
             case decltype(s_bp)::PLAY_COOKING:
                 if (cs.state == JCE_COOK_SUCCEEDED) {
-                    start_build_via_script();
-                    s_bp.play_stage = decltype(s_bp)::PLAY_BUILDING;
+                    start_play_build();
                 } else if (cs.state == JCE_COOK_FAILED) {
                     snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
                              jce_editor_i18n("buildProfiles.play.cookFailed"), cs.last_error);
@@ -1135,6 +1127,7 @@ static void draw_profiles_tab(void)
                          "%s",
                          jce_editor_i18n("buildProfiles.tools.missing"));
                 s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
+                jce_build_manager_reject_request(p.preset.c_str(), s_bp.play_fail_msg);
             } else {
             /* Choose project root: explicit override > current project. */
             const JceProject *jp_local = jce_editor_project_get();
@@ -1152,8 +1145,7 @@ static void draw_profiles_tab(void)
                 }
             } else {
                 /* Skip cook stage — straight to build. */
-                start_build_via_script();
-                s_bp.play_stage = decltype(s_bp)::PLAY_BUILDING;
+                start_play_build();
             }
             }
         }
@@ -1183,6 +1175,9 @@ static void draw_profiles_tab(void)
         if (ImGui::Button(jce_editor_i18n("buildProfiles.buildNow"))) {
             if (ensure_tools_checked())
                 start_build_via_script();
+            else
+                jce_build_manager_reject_request(p.preset.c_str(),
+                    jce_editor_i18n("buildProfiles.tools.missing"));
         }
         if (script_disabled) ImGui::EndDisabled();
         if (script_disabled && ImGui::IsItemHovered()) {
@@ -1202,37 +1197,27 @@ static void draw_profiles_tab(void)
         ImGui::Checkbox(jce_editor_i18n("buildProfiles.autoUpdatePath"),
                         &s_bp.auto_update_run_path);
 
-        /* ── 📦 Pack: spawn scripts/package-game.bat for the active
-         * project root.  Uses the same async script runner as Build so
-         * stdout streams into the Console. */
+        /* Pack uses the native project owner and verified publisher;
+         * Dist is the default final single-executable profile. */
         {
             const JceProject *jp_pack = jce_editor_project_get();
             const char *root = s_bp.project_root[0]
                                    ? s_bp.project_root
                                    : (jp_pack ? jp_pack->project_root : "");
             const bool can_pack = (root && *root) && !running &&
-                                  (!s_bp.tools_probed ||
-                                   (s_bp.tools.cmake_ok &&
-                                    s_bp.tools.ninja_ok &&
-                                    s_bp.tools.conan_ok));
+                                  (!s_bp.tools_probed || project_tools_ready());
             if (!can_pack) ImGui::BeginDisabled();
             if (ImGui::Button(jce_editor_i18n("buildProfiles.pack"))) {
-                /* Native package staging: build + verify + copy exe and
-                 * cooked assets into build/<plat>-<arch>/dist/<package>.
+                /* Native package publication: build/cache/reports remain in
+                 * build; verified application artifacts publish to dist/apps.
                  * Replaces scripts/package-game.bat so the editor ships
                  * without first-party scripts. */
                 if (!ensure_tools_checked()) {
-                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "[pack] %s",
+                    jce_build_manager_reject_request("package-game",
                         jce_editor_i18n("buildProfiles.tools.missing"));
                 } else {
-                const JceProject *jpk = jp_pack;
-                const char *sdk = resolve_project_sdk(jpk);
-                if (!sdk || !sdk[0]) {
-                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "[pack] needs an SDK: set SDK Root in Build Profiles, "
-                        "project.sdk_path, or JCE_SDK_DIR");
-                } else {
+                    const JceProject *jpk = jp_pack;
+                    const char *sdk = resolve_project_sdk(jpk);
                     const char *tgt = s_bp.build_target[0]
                                           ? s_bp.build_target
                                           : (jpk && jpk->target_name &&
@@ -1249,9 +1234,9 @@ static void draw_profiles_tab(void)
                             (int)(sizeof(s_arch_cli)/sizeof(s_arch_cli[0])))
                             ? s_arch_cli[s_bp.arch_idx] : host_arch_triplet();
 #if JCE_PLATFORM_WINDOWS
-                    const char *plat = "win32";
+                    const char *plat = "windows";
 #elif JCE_PLATFORM_MACOS
-                    const char *plat = "darwin";
+                    const char *plat = "macos";
 #else
                     const char *plat = "linux";
 #endif
@@ -1267,10 +1252,10 @@ static void draw_profiles_tab(void)
                                            ? jpk->name : "game";
                     const char *ver = (jpk && jpk->version && jpk->version[0])
                                           ? jpk->version : "0.0.0";
-                    std::string out_dir = std::string(root) +
-                        "/build/" + std::string(plat) + "-" + arch_cli +
-                        "/dist/" + name + "-" + ver + "-" +
-                        plat + "-" + arch_cli;
+                    std::string out_dir, path_error;
+                    const bool output_valid = jce_build_package_default_path(
+                        root, name, plat, arch_cli,
+                        jce_project_build_variant(s_bp.use_dist), &out_dir, &path_error);
 
                     JceBuildProjectConfig pcfg{};
                     pcfg.label         = "package-game";
@@ -1278,7 +1263,7 @@ static void draw_profiles_tab(void)
                     pcfg.sdk_dir       = sdk;
                     pcfg.target        = tgt;
                     pcfg.exe_name      = exe;
-                    pcfg.variant       = s_bp.use_dist ? "dist" : "release";
+                    pcfg.variant       = jce_project_build_variant(s_bp.use_dist);
                     pcfg.arch          = (s_bp.arch_idx > 0) ?
                                              s_arch_cli[s_bp.arch_idx] : nullptr;
                     pcfg.cooked_assets = (jpk && jpk->cooked_assets &&
@@ -1291,7 +1276,9 @@ static void draw_profiles_tab(void)
                     pcfg.package_out_dir = out_dir.c_str();
                     pcfg.app_name      = name;
                     pcfg.app_version   = ver;
-                    if (jce_build_manager_start_project_build(&pcfg)) {
+                    if (!output_valid) {
+                        jce_build_manager_reject_request("package-game", path_error.c_str());
+                    } else if (jce_build_manager_start_project_build(&pcfg)) {
                         jce_editor_console_log_level(JCE_CONSOLE_INFO,
                             "[pack] native package started -> %s",
                             out_dir.c_str());
@@ -1299,7 +1286,6 @@ static void draw_profiles_tab(void)
                         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                             "[pack] failed to start native package");
                     }
-                }
                 }
             }
             if (!can_pack) ImGui::EndDisabled();
@@ -1311,6 +1297,7 @@ static void draw_profiles_tab(void)
 
         ImGui::Separator();
 
+        jce_build_manager_get_status(&st);
         const char *stage_names[] = { "idle", "configure", "compile",
                                       "conan install", "cooking assets" };
         const char *state_names[] = { "idle", "running", "succeeded", "failed" };

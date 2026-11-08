@@ -11,6 +11,7 @@
 #define JCE_IMGUI_RENDERER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <jce/os/core/jce_defs.h>
@@ -25,9 +26,46 @@ JCE_API bool jce_imgui_renderer_init(const JcePakArchive *pak,
 
 JCE_API void jce_imgui_renderer_shutdown(void);
 
+/* Set the actual drawable pixel extent before drawing this frame. Current
+ * hosts use pixel coordinates with ImGui FramebufferScale=1. Drawing rejects
+ * clips outside this extent; an empty extent admits no draw commands. */
 JCE_API void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height);
 
+/** Draw the current final ImGui draw data on the initialized UI thread. */
 JCE_API void jce_imgui_renderer_draw(void);
+
+/** The final draw-data queue was inspected, including an observed empty queue. */
+#define JCE_IMGUI_DRAW_QUEUE_OBSERVED UINT32_C(1)
+/** The CPU submit path was observed, including zero accepted matching submits. */
+#define JCE_IMGUI_DRAW_SUBMISSIONS_OBSERVED UINT32_C(2)
+
+/** Optional CPU-only observations for one texture in one draw invocation.
+ * Counts include only noncallback commands with nonzero element counts.
+ * Main and recording counts identify actual bgfx submission calls, never GPU
+ * execution, visibility, presentation or resource lifetime completion. Flags
+ * distinguish a measured zero from unavailable initialization/draw data. */
+typedef struct JceImGuiDrawObservation {
+    uint32_t struct_size;       /**< Bytes written by this implementation. */
+    uint32_t flags;             /**< JCE_IMGUI_DRAW_*_OBSERVED availability. */
+    uint32_t queued_commands;   /**< Matching commands before draw admission. */
+    uint32_t main_submits;      /**< Matching main-view CPU submission calls. */
+    uint32_t recording_submits; /**< Matching recording-view submission calls. */
+} JceImGuiDrawObservation;
+
+/** Draw once and optionally observe one live renderer texture handle index.
+ * Call on the same UI thread and after the same setup as the ordinary draw.
+ * No pointer is retained. The caller supplies writable storage of out_size
+ * bytes; this function writes only sizeof(JceImGuiDrawObservation), sets its
+ * struct_size, and does not read the prior buffer contents. UINT16_MAX is an
+ * invalid watched handle; handle zero is valid (ImGui encodes it as ID one).
+ * Returns true when a complete observation was written. NULL/short storage,
+ * an invalid handle, or counter overflow returns false and leaves all caller
+ * bytes untouched. Rejected observation requests still perform the ordinary
+ * draw once. Unavailable initialization/draw data writes a valid flags-zero
+ * observation. Queue inspection precedes transient/clip/empty-draw rejection.
+ * The ordinary draw has no observation scan, allocation or GPU query. */
+JCE_API bool jce_imgui_renderer_draw_observed(uint16_t watched_texture,
+    JceImGuiDrawObservation *out, size_t out_size);
 
 JCE_API void jce_imgui_renderer_rebuild_fonts(void);
 

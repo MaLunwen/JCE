@@ -10,6 +10,7 @@
 #include <jce/os/core/jce_trace.h>
 
 #include <string.h>
+#include <SDL3/SDL_thread.h>
 
 void setUp(void)
 {
@@ -327,8 +328,13 @@ static void test_export_reports_ring_overwrite_and_failed_task_state(void)
     json = (char *)jce_fs_host_read_all(path, &size);
     TEST_ASSERT_NOT_NULL(json);
     TEST_ASSERT_NOT_NULL(strstr(json, "\"jceTrace\""));
-    TEST_ASSERT_NOT_NULL(strstr(json, "\"recorded\":16394"));
-    TEST_ASSERT_NOT_NULL(strstr(json, "\"captured\":16384"));
+    char expected[96];
+    snprintf(expected, sizeof expected, "\"capacity\":%u", stats.capacity);
+    TEST_ASSERT_NOT_NULL(strstr(json, expected));
+    snprintf(expected, sizeof expected, "\"recorded\":%u", stats.capacity + 10u);
+    TEST_ASSERT_NOT_NULL(strstr(json, expected));
+    snprintf(expected, sizeof expected, "\"captured\":%u", stats.capacity);
+    TEST_ASSERT_NOT_NULL(strstr(json, expected));
     TEST_ASSERT_NOT_NULL(strstr(json, "\"overwritten_before_capture\":10"));
     TEST_ASSERT_NOT_NULL(strstr(json, "\"cursor_lost\":0"));
     TEST_ASSERT_NOT_NULL(strstr(json, "\"lost\":10"));
@@ -337,9 +343,242 @@ static void test_export_reports_ring_overwrite_and_failed_task_state(void)
     TEST_ASSERT_TRUE(jce_fs_host_remove_file(path));
 }
 
+typedef struct PoolLifetimeControl {
+    JceSemaphore *started;
+    JceSemaphore *release;
+    uint64_t worker_tid;
+} PoolLifetimeControl;
+
+static void pool_lifetime_worker(void *arg)
+{
+    PoolLifetimeControl *control = arg;
+    control->worker_tid = jce_thread_current_id();
+    jce_semaphore_signal(control->started);
+    jce_semaphore_wait(control->release);
+}
+
+static void test_real_pool_worker_exit_unregisters_trace_thread(void)
+{
+    PoolLifetimeControl control = {0};
+    control.started = jce_semaphore_create(0);
+    control.release = jce_semaphore_create(0);
+    JceThreadPool *pool = jce_thread_pool_create_named(2, "trace-worker-exit");
+    TEST_ASSERT_NOT_NULL(control.started);
+    TEST_ASSERT_NOT_NULL(control.release);
+    TEST_ASSERT_NOT_NULL(pool);
+    bool submitted = jce_thread_pool_submit_named(pool, "worker-lifetime-control",
+                                                  pool_lifetime_worker, &control);
+    /* Owner blocks on a semaphore, not enki wait: it cannot steal this task. */
+    bool started = submitted && jce_semaphore_wait_timeout(control.started, 5000);
+    JceTraceStats during;
+    jce_trace_get_stats(&during);
+    jce_semaphore_signal(control.release);
+    jce_thread_pool_destroy(pool);
+    JceTraceStats after;
+    jce_trace_get_stats(&after);
+    jce_semaphore_destroy(control.started);
+    jce_semaphore_destroy(control.release);
+    TEST_ASSERT_TRUE(submitted);
+    TEST_ASSERT_TRUE(started);
+    TEST_ASSERT_NOT_EQUAL(jce_thread_current_id(), control.worker_tid);
+    TEST_ASSERT_EQUAL_UINT32(1, during.active_threads);
+    TEST_ASSERT_EQUAL_UINT32(0, after.active_threads);
+    TEST_ASSERT_EQUAL_UINT32(0, after.active_work_items);
+    JceTraceCursor cursor;
+    JceTraceEvent events[64];
+    jce_trace_cursor_init(&cursor);
+    uint32_t count = jce_trace_read(&cursor, events, 64);
+    const JceTraceEvent *exit = find_event(events, count,
+                                          JCE_TRACE_EVENT_THREAD_UNREGISTER,
+                                          "thread-exit");
+    TEST_ASSERT_NOT_NULL(exit);
+    TEST_ASSERT_EQUAL_UINT64(control.worker_tid, exit->thread_id);
+}
+
+static void test_pool_exit_preserves_other_pool_and_disabled_trace_cleanup(void)
+{
+    PoolLifetimeControl controls[2] = {{0}};
+    JceThreadPool *pools[2];
+    JceTask *tasks[2];
+    jce_trace_set_enabled(false);
+    for (unsigned i = 0; i < 2; ++i) {
+        controls[i].started = jce_semaphore_create(0);
+        controls[i].release = jce_semaphore_create(0);
+        pools[i] = jce_thread_pool_create_named(2, "trace-independent-pool");
+        TEST_ASSERT_NOT_NULL(pools[i]);
+    }
+    /* Workers already exist when tracing starts; registration must be lazy. */
+    jce_trace_set_enabled(true);
+    for (unsigned i = 0; i < 2; ++i) {
+        tasks[i] = jce_thread_pool_submit_tracked_named(pools[i], "late-trace-worker",
+                                                        pool_lifetime_worker, &controls[i]);
+        TEST_ASSERT_NOT_NULL(tasks[i]);
+        TEST_ASSERT_TRUE(jce_semaphore_wait_timeout(controls[i].started, 5000));
+    }
+    JceTraceStats stats;
+    jce_trace_get_stats(&stats);
+    TEST_ASSERT_EQUAL_UINT32(2, stats.active_threads);
+    TEST_ASSERT_NOT_EQUAL(controls[0].worker_tid, controls[1].worker_tid);
+    jce_semaphore_signal(controls[0].release);
+    jce_task_wait(tasks[0]);
+    jce_task_free(tasks[0]);
+    jce_thread_pool_destroy(pools[0]);
+    jce_trace_get_stats(&stats);
+    TEST_ASSERT_EQUAL_UINT32(1, stats.active_threads);
+    /* Disabling emission must not leak an already registered worker owner. */
+    jce_semaphore_signal(controls[1].release);
+    jce_task_wait(tasks[1]);
+    jce_task_free(tasks[1]);
+    jce_trace_set_enabled(false);
+    jce_thread_pool_destroy(pools[1]);
+    jce_trace_get_stats(&stats);
+    TEST_ASSERT_EQUAL_UINT32(0, stats.active_threads);
+    TEST_ASSERT_EQUAL_UINT32(0, stats.active_work_items);
+    for (unsigned i = 0; i < 2; ++i) {
+        jce_semaphore_destroy(controls[i].started);
+        jce_semaphore_destroy(controls[i].release);
+    }
+}
+
+static JceAsyncRunResult async_lifetime_worker(JceAsyncContext *ctx, void *arg)
+{
+    (void)ctx;
+    pool_lifetime_worker(arg);
+    return JCE_ASYNC_RUN_SUCCESS;
+}
+
+static void test_default_async_worker_exit_unregisters_trace_thread(void)
+{
+    PoolLifetimeControl control = {0};
+    control.started = jce_semaphore_create(0);
+    control.release = jce_semaphore_create(0);
+    JceAsyncExecutor *executor = jce_async_default_executor();
+    TEST_ASSERT_NOT_NULL(executor);
+    JceAsyncTaskDesc desc;
+    jce_async_task_desc_init(&desc);
+    desc.work = async_lifetime_worker;
+    desc.user_data = &control;
+    desc.debug_name = "default-async-worker-lifetime";
+    JceAsyncTask *task = jce_async_submit(executor, &desc);
+    bool started = task && jce_semaphore_wait_timeout(control.started, 5000);
+    JceTraceStats during;
+    jce_trace_get_stats(&during);
+    jce_semaphore_signal(control.release);
+    if (task) { jce_async_task_wait(task); jce_async_task_release(task); }
+    bool stopped = jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_DRAIN,
+                                               JCE_ASYNC_WAIT_INFINITE);
+    JceTraceStats after;
+    jce_trace_get_stats(&after);
+    jce_semaphore_destroy(control.started);
+    jce_semaphore_destroy(control.release);
+    TEST_ASSERT_TRUE(started);
+    TEST_ASSERT_TRUE(stopped);
+    TEST_ASSERT_NOT_EQUAL(jce_thread_current_id(), control.worker_tid);
+    TEST_ASSERT_EQUAL_UINT32(1, during.active_threads);
+    TEST_ASSERT_EQUAL_UINT32(0, after.active_threads);
+    TEST_ASSERT_EQUAL_UINT32(0, after.active_work_items);
+    JceTraceCursor cursor;
+    JceTraceEvent events[64];
+    jce_trace_cursor_init(&cursor);
+    uint32_t count = jce_trace_read(&cursor, events, 64);
+    const JceTraceEvent *exit = find_event(events, count,
+                                          JCE_TRACE_EVENT_THREAD_UNREGISTER,
+                                          "thread-exit");
+    TEST_ASSERT_NOT_NULL(exit);
+    TEST_ASSERT_EQUAL_UINT64(control.worker_tid, exit->thread_id);
+}
+
+typedef struct ExternalTlsControl {
+    PoolLifetimeControl life;
+    SDL_TLSID slot;
+    bool installed;
+    unsigned destroyed;
+    uint64_t cleanup_tid;
+} ExternalTlsControl;
+
+static void SDLCALL external_tls_destructor(void *value)
+{
+    ExternalTlsControl *control = value;
+    control->cleanup_tid = jce_thread_current_id();
+    ++control->destroyed;
+}
+
+static void external_tls_worker(void *arg)
+{
+    ExternalTlsControl *control = arg;
+    control->installed = SDL_SetTLS(&control->slot, control, external_tls_destructor);
+    pool_lifetime_worker(&control->life);
+}
+
+static JceAsyncRunResult external_tls_async_worker(JceAsyncContext *ctx, void *arg)
+{
+    (void)ctx;
+    external_tls_worker(arg);
+    return JCE_ASYNC_RUN_SUCCESS;
+}
+
+static void check_external_worker_tls_cleanup(bool asynchronous, bool trace_on)
+{
+    ExternalTlsControl control = {0};
+    control.life.started = jce_semaphore_create(0);
+    control.life.release = jce_semaphore_create(0);
+    JceThreadPool *pool = NULL;
+    JceAsyncTask *task = NULL;
+    bool admitted;
+    jce_trace_set_enabled(trace_on);
+    if (asynchronous) {
+        JceAsyncTaskDesc desc;
+        jce_async_task_desc_init(&desc);
+        desc.work = external_tls_async_worker;
+        desc.user_data = &control;
+        task = jce_async_submit(jce_async_default_executor(), &desc);
+        admitted = task != NULL;
+    } else {
+        pool = jce_thread_pool_create_named(2, "external-tls-control");
+        admitted = pool && jce_thread_pool_submit(pool, external_tls_worker, &control);
+    }
+    bool started = admitted && jce_semaphore_wait_timeout(control.life.started, 5000);
+    unsigned before_exit = control.destroyed;
+    jce_semaphore_signal(control.life.release);
+    bool stopped = true;
+    if (asynchronous) {
+        if (task) { jce_async_task_wait(task); jce_async_task_release(task); }
+        stopped = jce_async_default_shutdown(JCE_ASYNC_SHUTDOWN_DRAIN,
+                                              JCE_ASYNC_WAIT_INFINITE);
+    } else {
+        jce_thread_pool_destroy(pool);
+    }
+    jce_semaphore_destroy(control.life.started);
+    jce_semaphore_destroy(control.life.release);
+    TEST_ASSERT_TRUE(admitted);
+    TEST_ASSERT_TRUE(started);
+    TEST_ASSERT_TRUE(stopped);
+    TEST_ASSERT_TRUE(control.installed);
+    TEST_ASSERT_NOT_EQUAL(jce_thread_current_id(), control.life.worker_tid);
+    TEST_ASSERT_EQUAL_UINT(0, before_exit);
+    TEST_ASSERT_EQUAL_UINT(1, control.destroyed);
+    TEST_ASSERT_EQUAL_UINT64(control.life.worker_tid, control.cleanup_tid);
+}
+
+static void test_pool_external_tls_cleanup_trace_on(void)
+{ check_external_worker_tls_cleanup(false, true); }
+static void test_pool_external_tls_cleanup_trace_off(void)
+{ check_external_worker_tls_cleanup(false, false); }
+static void test_async_external_tls_cleanup_trace_on(void)
+{ check_external_worker_tls_cleanup(true, true); }
+static void test_async_external_tls_cleanup_trace_off(void)
+{ check_external_worker_tls_cleanup(true, false); }
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_pool_external_tls_cleanup_trace_on);
+    RUN_TEST(test_pool_external_tls_cleanup_trace_off);
+    RUN_TEST(test_async_external_tls_cleanup_trace_on);
+    RUN_TEST(test_async_external_tls_cleanup_trace_off);
+    RUN_TEST(test_default_async_worker_exit_unregisters_trace_thread);
+    RUN_TEST(test_real_pool_worker_exit_unregisters_trace_thread);
+    RUN_TEST(test_pool_exit_preserves_other_pool_and_disabled_trace_cleanup);
     RUN_TEST(test_disabled_trace_has_zero_producer_cost_visible_to_consumer);
     RUN_TEST(test_lifecycle_events_preserve_ids_names_and_timing);
     RUN_TEST(test_stats_preserve_multi_second_hitches_without_int_clamping);

@@ -34,6 +34,7 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_ai_panel_session.h"
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
 
@@ -77,7 +78,7 @@ struct AiPanelState {
      * and because the transport is a file precisely so it need not be short. */
     char brief[8192] = { 0 };
 
-    bool send_for_real = false;   /* off on every open, on purpose */
+    JceEditorAiPanelSession session;
     bool look          = false;
     bool verify        = false;
     int  iterate       = 1;
@@ -107,8 +108,7 @@ void load_prefs(void)
  * keeps their template and simply gets no flags they did not ask for. */
 std::string build_args(void)
 {
-    std::string a = s_ai.args;
-    if (s_ai.send_for_real) a += " --send";
+    std::string a = jce_editor_ai_panel_session_args(s_ai.session, s_ai.args);
     if (s_ai.look)          a += " --look";
     if (s_ai.verify)        a += " --verify";
     if (s_ai.iterate > 1)   { char b[32]; snprintf(b, sizeof b, " --iterate %d", s_ai.iterate); a += b; }
@@ -204,14 +204,14 @@ void draw_content(void)
 
     /* THE ONE CONTROL THAT SPENDS SOMETHING AND LEAVES THE MACHINE.  Off on
      * every open; the button below says which of the two it will do. */
-    ImGui::Checkbox(jce_editor_i18n("ai.send"), &s_ai.send_for_real);
+    ImGui::Checkbox(jce_editor_i18n("ai.send"), &s_ai.session.send_for_real);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", jce_editor_i18n("ai.send.tip"));
 
     ImGui::Separator();
 
     const bool running = request_running();
     ImGui::BeginDisabled(running || s_ai.brief[0] == 0);
-    if (ImGui::Button(s_ai.send_for_real ? jce_editor_i18n("ai.ask")
+    if (ImGui::Button(s_ai.session.send_for_real ? jce_editor_i18n("ai.ask")
                                       : jce_editor_i18n("ai.dryRun"),
                       ImVec2(200, 0)))
         submit();
@@ -271,6 +271,10 @@ void draw_content(void)
  * the window hidden, which is the kind of bug that gets blamed on the model. */
 extern "C" void jce_editor_ai_assistant_tick(void)
 {
+    /* Visibility stays true for a collapsed or inactive dock tab. The update
+     * still observes a menu/layout close when this panel is no longer drawn. */
+    const bool *visible = jce_editor_panel_visible_ptr(JCE_PANEL_AI_ASSISTANT);
+    jce_editor_ai_panel_session_observe(s_ai.session, visible && *visible);
     jce_llm_tick();
 }
 
@@ -279,9 +283,13 @@ extern "C" void jce_editor_panel_ai_assistant(void)
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###ai_assistant",
              jce_editor_i18n("window.aiAssistant"));
-    if (!ImGui::Begin(_wt,
-                      jce_editor_panel_visible_ptr(JCE_PANEL_AI_ASSISTANT),
-                      ImGuiWindowFlags_NoFocusOnAppearing)) {
+    bool *visible = jce_editor_panel_visible_ptr(JCE_PANEL_AI_ASSISTANT);
+    /* A Window-menu open can happen after this frame's update. Begin can
+     * also close the window immediately; observe both before drawing actions. */
+    jce_editor_ai_panel_session_observe(s_ai.session, visible && *visible);
+    const bool draw = ImGui::Begin(_wt, visible, ImGuiWindowFlags_NoFocusOnAppearing);
+    jce_editor_ai_panel_session_observe(s_ai.session, visible && *visible);
+    if (!draw) {
         ImGui::End();
         return;
     }

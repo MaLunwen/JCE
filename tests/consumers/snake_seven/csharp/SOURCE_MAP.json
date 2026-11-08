@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "active_source": "resources/scripts/Hud.cs",
+  "preserved_inactive_source": "csharp/Hud.cs",
+  "sha256_at_migration": "3083039c596cec62130da8808ab2fbf1fe22a9c999fc0764d594b088740fed66",
+  "bytes_at_migration": 3874,
+  "reason": "The scene and packer select scripts/Hud.cs; SnakeScripts.csproj compiles that canonical resource source. Original authoring bytes remain unchanged and inactive.",
+  "scope": "Local first-party source address recovery; no external VM payload or deployment certification."
+}

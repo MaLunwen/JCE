@@ -54,12 +54,12 @@ def mesh(rgb, shape=MESH_CUBE):
 def script(path):
     """A Script component stores a PATH.
 
-    For SOURCE forms (.lua, .py, .java, .jcejs) the bytes at that path are
-    read.  For REFERENCE forms (.jcec, .jcecpp, .cs) they are NOT: the
-    basename IS the class name, the class lives in a linked native module
-    or a loaded assembly, and no such file needs to exist on disk.  So
-    "scripts/SnakeBody.jcecpp" names the C++ class SnakeBody and nothing
-    more -- do not go looking for the file, and do not create one.
+    Source paths retain their real bytes under resources/scripts. Native
+    class references have explicit addressable descriptors plus manifest
+    factory bindings, while behavior stays in native/ and the managed
+    assembly is built from the canonical resources/scripts/Hud.cs source.
+    Runtime class lookup still resolves the basename; selected-asset and
+    static-registry admission independently verify the byte/address closure.
     """
     return {"type": "Script", "scriptPath": path}
 
@@ -68,10 +68,9 @@ def text(txt, size, anchor, offset, size_wh, rgb, align=0):
     ax, ay = anchor
     # fontPath is deliberately EMPTY.  An empty path means "this machine's
     # UI font": the engine resolves the platform's own UI face and only
-    # falls back to its bundled fonts/JCE.ttf if none is readable.  JCE.ttf
-    # is a hand-drawn glyph set that ships with the sample content -- it is
-    # artwork, not a UI face -- and naming it here is how a scene copied
-    # from a sample inherits a decorative font for its HUD.
+    # falls back to the stock Aileron Latin subset if none is readable.
+    # A project can explicitly name a custom font; an unspecified HUD font
+    # does not opt into user-authored handwriting.
     return {"type": "UIText", "text": txt, "fontPath": "",
             "fontSize": size, "alignment": align,
             "colorR": rgb[0], "colorG": rgb[1], "colorB": rgb[2],

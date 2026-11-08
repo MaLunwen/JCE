@@ -101,8 +101,8 @@ typedef struct {
        that should mirror a shipped build. */
     bool run_dev_mode;
 
-    /* Font overrides (empty -> default lookup: try system Ink Free /
-       KaiTi by name, fall back to ImGui built-in proggy). */
+    /* Font overrides (empty -> default lookup: system UI Sans first,
+       then the bundled Latin fallback / ImGui built-in default). */
     char font_en_path[512];
     char font_zh_path[512];
 

@@ -1,0 +1,10 @@
+{
+  "schema": 3,
+  "name": "Trigger Graph Lab",
+  "version": "0.1.0",
+  "target": "TriggerGraphLab",
+  "exe": "TriggerGraphLab.exe",
+  "source_assets": "resources",
+  "startup_scene": "scenes/trigger_graph_lab.scene.json",
+  "required_languages": ["lua"]
+}

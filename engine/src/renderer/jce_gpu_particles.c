@@ -28,6 +28,7 @@
 #include <bgfx/c99/bgfx.h>
 
 #include <math.h>
+#include <float.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -85,6 +86,7 @@ struct JceGpuParticleSystem {
     /* Compute uniforms. */
     bgfx_uniform_handle_t u_emit_params;
     bgfx_uniform_handle_t u_emit_origin;
+    bgfx_uniform_handle_t u_emit_box;
     bgfx_uniform_handle_t u_emit_v_min;
     bgfx_uniform_handle_t u_emit_v_max;
     bgfx_uniform_handle_t u_emit_life_size;
@@ -92,6 +94,8 @@ struct JceGpuParticleSystem {
 
     bgfx_uniform_handle_t u_particle_misc;  /* .x = textured flag (render) */
     bgfx_uniform_handle_t u_particle_soft;  /* (1/w, 1/h, near, far)        */
+    bgfx_uniform_handle_t u_particle_cover; /* optional weather roof triangles */
+    bgfx_uniform_handle_t u_particle_rain, s_particle_rain;
     bgfx_uniform_handle_t s_scene_depth;    /* pre-pass depth, stage 1      */
     bgfx_uniform_handle_t s_particle_tex;   /* billboard texture sampler   */
 
@@ -151,12 +155,16 @@ JceGpuParticleSystem *jce_gpu_particles_create(
     sys->reset_program.idx = UINT16_MAX;
     sys->u_emit_params.idx = UINT16_MAX;
     sys->u_emit_origin.idx = UINT16_MAX;
+    sys->u_emit_box.idx = UINT16_MAX;
     sys->u_emit_v_min.idx = UINT16_MAX;
     sys->u_emit_v_max.idx = UINT16_MAX;
     sys->u_emit_life_size.idx = UINT16_MAX;
     sys->u_emit_color.idx = UINT16_MAX;
     sys->u_particle_misc.idx = UINT16_MAX;
     sys->u_particle_soft.idx = UINT16_MAX;
+    sys->u_particle_cover.idx = UINT16_MAX;
+    sys->u_particle_rain.idx = UINT16_MAX;
+    sys->s_particle_rain.idx = UINT16_MAX;
     sys->s_scene_depth.idx = UINT16_MAX;
     sys->s_particle_tex.idx = UINT16_MAX;
     sys->u_update_params.idx = UINT16_MAX;
@@ -194,12 +202,17 @@ JceGpuParticleSystem *jce_gpu_particles_create(
     sys->u_counter_reset = bgfx_create_uniform("u_cull_reset_params", BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_params    = bgfx_create_uniform("u_emit_params",    BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_origin    = bgfx_create_uniform("u_emit_origin",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_emit_box       = bgfx_create_uniform("u_emit_box",       BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_v_min     = bgfx_create_uniform("u_emit_v_min",     BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_v_max     = bgfx_create_uniform("u_emit_v_max",     BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_life_size = bgfx_create_uniform("u_emit_life_size", BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_emit_color     = bgfx_create_uniform("u_emit_color",     BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_particle_misc  = bgfx_create_uniform("u_particle_misc",  BGFX_UNIFORM_TYPE_VEC4, 1);
     sys->u_particle_soft  = bgfx_create_uniform("u_particle_soft",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    sys->u_particle_cover = bgfx_create_uniform("u_particle_cover", BGFX_UNIFORM_TYPE_VEC4,
+                                               3u * JCE_PARTICLE_COVER_MAX);
+    sys->u_particle_rain = bgfx_create_uniform("u_particle_rain", BGFX_UNIFORM_TYPE_VEC4, 2);
+    sys->s_particle_rain = bgfx_create_uniform("s_particle_rain", BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sys->s_scene_depth    = bgfx_create_uniform("s_sceneDepth",     BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sys->s_particle_tex   = bgfx_create_uniform("s_particleTex",    BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sys->u_update_params  = bgfx_create_uniform("u_update_params",  BGFX_UNIFORM_TYPE_VEC4, 1);
@@ -291,6 +304,7 @@ JceGpuParticleSystem *jce_gpu_particles_create(
         sys->u_counter_reset.idx == UINT16_MAX ||
         sys->u_emit_params.idx == UINT16_MAX ||
         sys->u_emit_origin.idx == UINT16_MAX ||
+        sys->u_emit_box.idx == UINT16_MAX ||
         sys->u_emit_v_min.idx == UINT16_MAX ||
         sys->u_emit_v_max.idx == UINT16_MAX ||
         sys->u_emit_life_size.idx == UINT16_MAX ||
@@ -332,12 +346,16 @@ void jce_gpu_particles_destroy(JceGpuParticleSystem *sys)
     if (sys->reset_program.idx != UINT16_MAX) bgfx_destroy_program(sys->reset_program);
     if (sys->u_emit_params.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_params);
     if (sys->u_emit_origin.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_origin);
+    if (sys->u_emit_box.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_box);
     if (sys->u_emit_v_min.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_v_min);
     if (sys->u_emit_v_max.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_v_max);
     if (sys->u_emit_life_size.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_life_size);
     if (sys->u_emit_color.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_emit_color);
     if (sys->u_particle_misc.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_particle_misc);
     if (sys->u_particle_soft.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_particle_soft);
+    if (sys->u_particle_cover.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_particle_cover);
+    if (sys->u_particle_rain.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_particle_rain);
+    if (sys->s_particle_rain.idx != UINT16_MAX) bgfx_destroy_uniform(sys->s_particle_rain);
     if (sys->s_scene_depth.idx != UINT16_MAX) bgfx_destroy_uniform(sys->s_scene_depth);
     if (sys->s_particle_tex.idx != UINT16_MAX) bgfx_destroy_uniform(sys->s_particle_tex);
     if (sys->u_update_params.idx != UINT16_MAX) bgfx_destroy_uniform(sys->u_update_params);
@@ -417,10 +435,49 @@ static bool particle_config_valid(float dt, const JceGpuParticleEmitConfig *cfg)
         cfg->velocity_max.z >= cfg->velocity_min.z;
 }
 
-void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
-                                uint16_t                 view,
-                                float                    dt,
-                                const JceGpuParticleEmitConfig *cfg)
+/* CPU box sampling is symmetric even for a signed authored width. Ignore
+ * malformed widths and bounds that would overflow a GPU position. */
+static float particle_box_extent(float width, float origin)
+{
+    float extent = fabsf(width);
+    return isfinite(extent) && extent * 0.5f <= FLT_MAX - fabsf(origin) ? extent : 0.0f;
+}
+
+static void particle_bind_cover(const JceGpuParticleSystem *sys, const JceParticleCover *cover)
+{
+    if (!BGFX_HANDLE_IS_VALID(sys->u_particle_cover)) return;
+    static const float no_cover[4] = {0};
+    if (cover && cover->count && cover->count <= JCE_PARTICLE_COVER_MAX)
+        bgfx_set_uniform(sys->u_particle_cover, cover->triangles, 3u * cover->count);
+    else
+        bgfx_set_uniform(sys->u_particle_cover, no_cover, 1);
+}
+
+static void particle_bind_rain_surface(const JceGpuParticleSystem *sys,
+                                       const JceParticleRainSurface *rain)
+{
+    if (!BGFX_HANDLE_IS_VALID(sys->u_particle_rain)) return;
+    static const float no_rain[8] = {0};
+    if (rain && rain->texture.idx != UINT16_MAX &&
+        BGFX_HANDLE_IS_VALID(sys->s_particle_rain) &&
+        BGFX_HANDLE_IS_VALID(sys->u_particle_cover)) {
+        bgfx_set_uniform(sys->u_particle_rain, rain->params, 2);
+        bgfx_set_texture(2, sys->s_particle_rain,
+                         (bgfx_texture_handle_t){rain->texture.idx}, UINT32_MAX);
+    } else {
+        bgfx_set_uniform(sys->u_particle_rain, no_rain, 2);
+    }
+}
+
+void jce_gpu_particles_update(JceGpuParticleSystem *sys, uint16_t view,
+    float dt, const JceGpuParticleEmitConfig *cfg)
+{
+    jce_gpu_particles_update_box(sys, view, dt, cfg, jce_v3(0.0f, 0.0f, 0.0f), NULL, NULL);
+}
+
+void jce_gpu_particles_update_box(JceGpuParticleSystem *sys, uint16_t view,
+    float dt, const JceGpuParticleEmitConfig *cfg, jce_vec3 spawn_box,
+    const JceParticleRainSurface *rain, const JceParticleCover *cover)
 {
     if (!sys) return;
     sys->debug_valid = false;
@@ -448,6 +505,8 @@ void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
         bgfx_set_uniform(sys->u_size_lerp,     size,   1);
         bgfx_set_uniform(sys->u_color_start,   c0,     1);
         bgfx_set_uniform(sys->u_color_end,     c1,     1);
+        particle_bind_rain_surface(sys, rain);
+        particle_bind_cover(sys, rain ? cover : NULL);
 
         bgfx_set_compute_dynamic_vertex_buffer(0, sys->pool, BGFX_ACCESS_READWRITE);
         uint32_t groups = (sys->max_particles + UPDATE_THREADS_X - 1)
@@ -479,6 +538,9 @@ void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
         ++frame_seed;
         float origin[4] = { cfg->origin.x, cfg->origin.y, cfg->origin.z,
                             (float)frame_seed };
+        float box[4] = { particle_box_extent(spawn_box.x, cfg->origin.x),
+                         particle_box_extent(spawn_box.y, cfg->origin.y),
+                         particle_box_extent(spawn_box.z, cfg->origin.z), 0.0f };
         float vmn[4] = { cfg->velocity_min.x, cfg->velocity_min.y,
                          cfg->velocity_min.z, 0.0f };
         float vmx[4] = { cfg->velocity_max.x, cfg->velocity_max.y,
@@ -490,6 +552,7 @@ void jce_gpu_particles_update(JceGpuParticleSystem    *sys,
 
         bgfx_set_uniform(sys->u_emit_params,    params,    1);
         bgfx_set_uniform(sys->u_emit_origin,    origin,    1);
+        bgfx_set_uniform(sys->u_emit_box,       box,       1);
         bgfx_set_uniform(sys->u_emit_v_min,     vmn,       1);
         bgfx_set_uniform(sys->u_emit_v_max,     vmx,       1);
         bgfx_set_uniform(sys->u_emit_life_size, life_size, 1);
@@ -551,6 +614,14 @@ void jce_gpu_particles_render_soft(JceGpuParticleSystem *sys, uint16_t view,
                                    JceTextureHandle texture, bool blend_alpha,
                                    const JceGpuParticleSoft *soft)
 {
+    jce_gpu_particles_render_stretched(sys, view, texture, blend_alpha, soft, 0.0f, NULL, NULL);
+}
+
+void jce_gpu_particles_render_stretched(JceGpuParticleSystem *sys, uint16_t view,
+    JceTextureHandle texture, bool blend_alpha, const JceGpuParticleSoft *soft,
+    float velocity_stretch, const JceParticleCover *cover,
+    const JceParticleRainSurface *rain)
+{
     if (!sys || !sys->supported) return;
     /* Never draw an un-reset / not-yet-warmed pool: the instance buffer is
      * uninitialized GPU memory until cs_particle_reset runs AND a full frame
@@ -573,9 +644,13 @@ void jce_gpu_particles_render_soft(JceGpuParticleSystem *sys, uint16_t view,
      * so stage 1 stays unbound and unread on every path that has no depth. */
     const bool soft_on = soft && soft->fade_distance > 0.0f &&
                          soft->depth_texture.idx != UINT16_MAX;
-    float misc[4] = { textured ? 1.0f : 0.0f, 0.0f,
-                      soft_on ? soft->fade_distance : 0.0f, 0.0f };
+    const bool stretched = isfinite(velocity_stretch) && velocity_stretch > 0.0f;
+    float misc[4] = { textured ? 1.0f : 0.0f, stretched ? 1.0f : 0.0f,
+                      soft_on ? soft->fade_distance : 0.0f,
+                      stretched ? velocity_stretch : 0.0f };
     bgfx_set_uniform(sys->u_particle_misc, misc, 1);
+    particle_bind_cover(sys, cover);
+    particle_bind_rain_surface(sys, rain);
     if (textured)
         bgfx_set_texture(0, sys->s_particle_tex, tex, UINT32_MAX);
     if (soft_on) {

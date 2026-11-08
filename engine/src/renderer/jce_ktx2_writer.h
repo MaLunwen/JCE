@@ -5,10 +5,9 @@
  *
  * NOTE: bimg only ships a KTX1 writer (see `bimg::imageWriteKtx`); the
  * on-disk container is therefore the legacy KTX1 format. `path` should
- * use the `.ktx` extension — KTX1 is parseable by bgfx and the vast
- * majority of texture tooling (RenderDoc, KTXSoftware, NVIDIA Texture
- * Tools, etc.). A future upgrade to KTX2 / supercompression would land
- * here without touching callers.
+ * use the `.ktx` extension. The first-party bridge supplies typed KTX1
+ * headers for its uncompressed RGBA8/RGBA16F payloads. Compatibility with
+ * individual external tools still requires their actual validation.
  *
  * NOT in the public API (`engine/include/jce/...`). Renderer-internal.
  */
@@ -29,20 +28,22 @@ JCE_EXTERN_C_BEGIN
  *   face_size        edge length in pixels (square faces)
  *   mip_count        mip levels packed in `faces` (>= 1, top first)
  *   faces            contiguous source bytes — cubemap face order
- *                    +X,-X,+Y,-Y,+Z,-Z. With mip_count > 1 the per-face
- *                    mip chain follows immediately after each face.
+ *                    +X,-X,+Y,-Y,+Z,-Z. MIP-MAJOR: all six faces of mip 0,
+ *                    then all six faces of mip 1, and so on.
  *   bytes_per_pixel  4 → RGBA8, 8 → RGBA16F.  The second exists because an
  *                    8-bit container clamps every value above 1.0, and the
  *                    values above 1.0 are what a reflection probe is for.
  *
- * Returns true on success. */
+ * A single mip or the full chain is supported, matching the backend's
+ * hasMips upload contract. Dimensions/bytes fit uint16/uint32 and the
+ * encoder's signed result limit. Returns true on success. */
 bool jce__ktx2_write_cubemap(const char    *path,
                               uint32_t       face_size,
                               uint32_t       mip_count,
                               const uint8_t *faces,
                               uint32_t       bytes_per_pixel);
 
-/* Load a cubemap from a host-path KTX/DDS file into a bgfx cube texture.
+/* Load a cubemap from a host-path KTX1 file into a bgfx cube texture.
  *
  *   path  host-path file (read via jce_fs_host_read_all)
  *
@@ -56,7 +57,7 @@ bool jce__ktx2_write_cubemap(const char    *path,
  * the handle matters (the single-mip irradiance sidecar). */
 uint16_t jce__ktx_load_cubemap(const char *path, uint32_t *out_mips);
 
-/* Parse a KTX1 RGBA8 cubemap from memory into the layout bgfx wants.
+/* Parse a KTX1 RGBA8/RGBA16F cubemap into the layout bgfx wants.
  *
  * KTX1 stores MIP-MAJOR (each mip: an imageSize, then its 6 faces);
  * bgfx_create_texture_cube wants SIDE-MAJOR (each face followed by that
@@ -66,7 +67,9 @@ uint16_t jce__ktx_load_cubemap(const char *path, uint32_t *out_mips);
  *
  * On success *out_data is a jce_malloc'd side-major buffer the caller frees,
  * and *out_size is its length.  Returns false and touches nothing else on a
- * malformed or unsupported container. */
+ * malformed or unsupported container. out_data is required. The complete
+ * payload is preflighted before allocation. Legacy pinned-bimg (type=0,
+ * typeSize=1, format=0) files remain readable; other mixed headers fail. */
 /* `out_bpp` receives 4 (RGBA8) or 8 (RGBA16F), read from the container's own
  * glType/glInternalFormat rather than assumed. */
 bool jce__ktx_parse_cubemap(const void *bytes, size_t len,

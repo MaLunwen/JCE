@@ -12,6 +12,7 @@
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/renderer/jce_skinned_mesh.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_path.h>   /* jce_path_asset_key (PAK-miss retry) */
@@ -89,6 +90,9 @@ typedef struct {
 typedef struct {
     JcePbrMaterial base;       /* factors/alpha/flags; map handles INVALID */
     uint32_t albedo, mr, normal, ao, emissive;
+    uint32_t toon_atlas;
+    int16_t toon_head_joint;
+    bool toon_hair_caster;
 } JceModelMatCpu;
 
 /* One imported morph-weight track: keyframed all-target weights for the model
@@ -314,6 +318,41 @@ static uint32_t find_material_index(const cgltf_data *data,
 /* Extract PBR materials                                               */
 /* ================================================================== */
 
+/* JCE_toon_atlas reuses the emissive sampler only in the toon draw. A
+ * material using standard emission retains its original shader inputs. */
+static void extract_toon_atlas_cpu(const JcePakArchive *pak, const char *path,
+    const cgltf_data *data, const cgltf_material *src, JceModelTexturePool *pool,
+    JceModelMatCpu *out)
+{
+    if (src->emissive_texture.texture || src->emissive_factor[0] != 0.0f ||
+        src->emissive_factor[1] != 0.0f || src->emissive_factor[2] != 0.0f)
+        return;
+    for (cgltf_size i = 0; i < src->extensions_count; ++i) {
+        const cgltf_extension *extension = &src->extensions[i];
+        if (!extension->name || strcmp(extension->name, "JCE_toon_atlas") != 0)
+            continue;
+        JceJson *spec = extension->data ? jce_json_parse_strict(extension->data, 0) : NULL;
+        if (jce_json_is_object(spec)) {
+            const double texture = jce_json_get_number(spec, "texture", -1.0);
+            const double joint = jce_json_has(spec, "headJoint")
+                ? jce_json_get_number(spec, "headJoint", -2.0) : -1.0;
+            if (texture >= 0.0 && texture < (double)data->textures_count &&
+                texture == (double)(cgltf_size)texture &&
+                joint >= -1.0 && joint <= 255.0 && joint == (double)(int16_t)joint &&
+                (joint < 0.0 || (data->skins_count &&
+                                  joint < (double)data->skins[0].joints_count))) {
+                out->toon_atlas = load_gltf_texture_cpu(pak, path,
+                    data->textures[(cgltf_size)texture].image, data, false, pool);
+                out->toon_head_joint = (int16_t)joint;
+                out->toon_hair_caster = joint < 0 &&
+                    jce_json_get_bool(spec, "hairCaster", false);
+            }
+        }
+        jce_json_free(spec);
+        return;
+    }
+}
+
 /* Extract materials to CPU staging: factors + flags into `base` (with
  * INVALID map handles), and each texture decoded to a JceTextureCpu for
  * later GPU upload.  No bgfx — safe on a worker thread. */
@@ -402,6 +441,7 @@ static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
         dst->emissive_factor[0] = src->emissive_factor[0];
         dst->emissive_factor[1] = src->emissive_factor[1];
         dst->emissive_factor[2] = src->emissive_factor[2];
+        extract_toon_atlas_cpu(pak, model_path, data, src, pool, m);
 
         /* Alpha mode. */
         switch (src->alpha_mode) {
@@ -1689,6 +1729,18 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                 dst->normal_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->normal);
                 dst->ao_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->ao);
                 dst->emissive_map = jce_model_texture_pool_upload(cpu->texture_pool, mc->emissive);
+                if (mc->toon_atlas) {
+                    if (!model->toon_atlases)
+                        model->toon_atlases = JCE_CALLOC(cpu->num_materials, sizeof(*model->toon_atlases));
+                    if (model->toon_atlases) {
+                        JceTexture atlas = jce_model_texture_pool_upload(cpu->texture_pool, mc->toon_atlas);
+                        uint32_t w = 0, h = 0;
+                        if (jce_texture_valid(atlas)) jce_texture_get_size(atlas, &w, &h);
+                        if (w == 128 && h == 128)
+                            model->toon_atlases[i] = (JceModelToonAtlas){
+                                atlas, mc->toon_head_joint, true, mc->toon_hair_caster};
+                    }
+                }
             }
             model->texture_pool = cpu->texture_pool;
             cpu->texture_pool = NULL;

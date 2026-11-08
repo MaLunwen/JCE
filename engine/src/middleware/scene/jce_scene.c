@@ -5,8 +5,17 @@
 #include <jce/middleware/scene/jce_str_intern.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
+#include <jce/middleware/scene/jce_scene_water_spectrum.h>
 #include <jce/middleware/scene/jce_water_field.h>
 #include <jce/middleware/scene/jce_water_ripple.h>
+#include "jce_water_field_internal.h"
+#include "jce_water_crest.h"
+#include "jce_water_caustic_config.h"
+#include "jce_water_nearshore_config.h"
+#include "jce_water_motion_config.h"
+#include "jce_water_optics_config.h"
+#include "jce_water_caustic_detail_config.h"
+#include "jce_water_normal_detail_config.h"
 #include <jce/middleware/world/jce_environment.h>
 #include "jce_terrain_cache.h"
 #include <stdio.h>   /* snprintf (entity-name uniquify) */
@@ -17,16 +26,20 @@
 #include <jce/os/core/jce_timer.h>
 #include "jce_component_registry_internal.h"
 #include "jce_scene_internal.h"   /* entity-name scope rule (jce_scene_names.c) */
+#include "jce_scene_flecs_os.h"
 /* jce_scene_normalise_mesh_renderer, called by the SET macro below.  It was
  * named only in a COMMENT there, so the call went through an implicit
  * declaration -- C99 assumes int(*)() and the real function returns void, which
  * this ABI happens to survive and another need not. */
 #include "jce_scene_component_normalise.h"
 #include "os/core/jce_memory.h"
+#include "os/platform/jce_native_atomic_word_internal.h"
 
 #include <flecs.h>
 #include "jce_scene_component_membership.h"
+#include "jce_scene_point_light_write_internal.h"
 #include "jce_scene_stress_internal.h"
+#include "jce_scene_order_internal.h"
 #include <string.h>
 #include <stdlib.h>   /* getenv — JCE_DISABLE_XGEN kill-switch */
 #include <math.h>     /* sinf/cosf — bounded orbit for the #4 entity-count spin */
@@ -45,9 +58,6 @@ void jce_scene_video_install_hooks(ecs_world_t *world, ecs_entity_t comp_id);
  * SequencePlayer component, whose runtime blob owns an open JceSequencer
  * (freed on remove / entity delete / scene destroy via the dtor hook). */
 void jce_scene_sequencer_install_hooks(ecs_world_t *world, ecs_entity_t comp_id);
-
-/* Defined in jce_scene_particles.c — releases the lazy particle system. */
-void jce_scene_particles_shutdown(JceScene *s);
 
 /* ── Component IDs (registered once per world) ─────────────────────── */
 
@@ -82,10 +92,13 @@ typedef struct { uint64_t driven[4]; } JceCompScriptDriven;
  * scene string pool, so it is stable across flecs table moves and is owned by
  * the pool rather than by the component. */
 typedef struct { const char *v; } JceCompAuthoredName;
+/* Storage/table identity does not define authored traversal order. */
+typedef struct { uint64_t value; } JceCompAuthoredOrder;
 
 static ECS_COMPONENT_DECLARE(JceCompEnableState);
 static ECS_COMPONENT_DECLARE(JceCompScriptDriven);
 static ECS_COMPONENT_DECLARE(JceCompAuthoredName);
+static ECS_COMPONENT_DECLARE(JceCompAuthoredOrder);
 static ECS_COMPONENT_DECLARE(JceTransform);
 static ECS_COMPONENT_DECLARE(JcePivotComponent);
 static ECS_COMPONENT_DECLARE(JceMeshRenderer);
@@ -186,6 +199,15 @@ static ECS_COMPONENT_DECLARE(JceVehicleComponent);
 static ECS_COMPONENT_DECLARE(JceSoftBodyComponent);
 static ECS_COMPONENT_DECLARE(JceSimLodComponent);
 static ECS_COMPONENT_DECLARE(JceSceneFullscreenEffect);
+static ECS_COMPONENT_DECLARE(JceWaterSpectrumComponent);
+static ECS_COMPONENT_DECLARE(JceWaterFoamComponent);
+static ECS_COMPONENT_DECLARE(JceWaterCrestComponent);
+static ECS_COMPONENT_DECLARE(JceWaterCausticsComponent);
+static ECS_COMPONENT_DECLARE(JceWaterNearshoreComponent);
+static ECS_COMPONENT_DECLARE(JceWaterMotionComponent);
+static ECS_COMPONENT_DECLARE(JceWaterOpticsComponent);
+static ECS_COMPONENT_DECLARE(JceWaterCausticDetailComponent);
+static ECS_COMPONENT_DECLARE(JceWaterNormalDetailComponent);
 
 /* ── Internal world-matrix cache (side table) ──────────────────────────
  *
@@ -224,8 +246,10 @@ typedef struct {
 
 struct JceScene {
     ecs_world_t *world;
+    uint64_t instance_id;
     JceSceneRenderingSettings rendering_settings;
     bool has_rendering_settings;
+    JceSceneRenderLook render_look;
     /* Lazily heap-allocated (~70 KB with the full chunk table); NULL until
        authored.  Presence of the pointer == "has streaming settings". */
     JceSceneStreamingSettings *streaming_settings;
@@ -261,25 +285,13 @@ struct JceScene {
     JceSceneStressState stress; /* diagnostic motion is scene-owned */
     uint64_t      world_epoch;  /* bumped per frame to invalidate the world-matrix cache */
     JceWorldCache world_cache;  /* per-entity world matrix memo (side table) */
-    /* Structural epoch: bumped ONLY on real structural edits (a set_transform /
-     * set_pivot / reparent / component add-remove that changes a world matrix),
-     * NOT on the per-frame world-cache drops in jce_scene_update / the renderer /
-     * the pick pass.  Lets a cross-frame consumer (the scene renderer's persistent
-     * static world-matrix + AABB cache, large-world-opt M1 #2) keep its cached
-     * value for a STATIC entity across frames and recompute only when this changes.
-     * In-place transform mutation that bypasses jce_scene_set_transform (the
-     * runtime physics write-back rt_sync_transforms) does NOT bump this — those
-     * entities are excluded from the persistent cache by a per-entity dynamic
-     * predicate instead, so the epoch staying put for them is intentional. */
+    /* Structural edits invalidate retained static world matrices and AABBs.
+     * Per-frame world-cache drops do not bump this epoch. Physics write-back
+     * also leaves it unchanged because dynamic entities bypass that cache. */
     uint64_t      structural_epoch;
-    /* Per-entity transform generation (dynamic-scene opt): set_transform /
-     * set_pivot bump ONLY the moved entity's gen + its subtree instead of the
-     * global structural_epoch, so a moving camera / script-animated entity no
-     * longer invalidates the renderer's persistent static world-cache for the
-     * WHOLE scene (measured ~+27% cpu/frame at 10k entities when it did).  Open-
-     * addressing hash (entity→gen), grown on demand.  xgen_active gates the
-     * renderer's per-entity check, so a scene that never set_transforms an entity
-     * stays on the cheap epoch-only fast path (zero per-entity lookup cost). */
+    /* Transform and pivot edits bump only the moved subtree. This avoided
+     * ~27% CPU/frame overhead at 10k entities. The on-demand hash stays
+     * inactive until the first entity generation bump. */
     struct JceXGenSlot { uint64_t entity; uint64_t gen; uint64_t mat_gen; } *xgen; /* entity==0: empty */
     uint32_t      xgen_cap, xgen_count;
     bool          xgen_active;
@@ -287,20 +299,13 @@ struct JceScene {
      * roster_epoch: create/destroy; enable_gen: EditorMeta.enabled flips;
      * xform_counter: every per-entity world invalidation + physics write-back. */
     uint64_t      roster_epoch;
+    uint64_t      authored_order_counter; /* Never reset/reuse while scene lives. */
     uint64_t      enable_gen;
-    /* Number of entities carrying a JceCompEnableState row.  Maintained at
-     * the only two write sites (jce_scene_set_comp_enabled) so the read
-     * side is a plain load.  jce_scene_comp_enabled used to ask flecs
-     * (ecs_count_id) on EVERY call for the same all-clear answer; that is
-     * documented as O(1) but iterates the id's table cache and costs ~220
-     * cycles even when it returns 0 - measured as 27% of the scene
-     * renderer's submit loop, 4x the component fetch it guards.
-     *
-     * Deleting an entity drops its row without passing through the setter,
-     * so this can drift HIGH.  That direction is safe: it only falls back
-     * to the per-entity ecs_get, which is always correct.  It must never
-     * drift low, hence the increment sits on the branch that actually adds
-     * a row (cur == NULL) rather than on every write. */
+    /* Count of disable rows maintained by jce_scene_set_comp_enabled.
+     * A plain read avoids the old ecs_count_id call (~220 cycles even when
+     * empty, measured at 27% of the scene submit loop). Deletion can leave
+     * an overcount, which safely falls back to ecs_get. An undercount could
+     * hide a disabled component, so increment only on new rows. */
     /* Owns every interned component asset path (see jce_str_intern.h).
      * Scene-scoped: the pointers live inside components and must not outlive
      * the world that holds them. */
@@ -346,19 +351,18 @@ struct JceScene {
     JceEntity     dirty_ring[1024];
     uint32_t      dirty_count;
     bool          dirty_overflow;
-    void         *particles;    /* JceParticleSystem* (lazy; owned by jce_scene_particles.c) */
+    uint64_t      dirty_drained_xform;
+    JceSceneParticleState particles;
 };
 
-/* Internal storage hooks for jce_scene_particles.c (same translation unit
- * cannot see `struct JceScene`).  Kept off the public API surface. */
-void  *jce_scene_internal_particles_get(const JceScene *s)
+const JceSceneParticleState *jce_scene_internal_particle_state(const JceScene *s)
 {
-    return s ? s->particles : NULL;
+    return s ? &s->particles : NULL;
 }
 
-void jce_scene_internal_particles_set(JceScene *s, void *sys)
+JceSceneParticleState *jce_scene_internal_particle_state_mut(JceScene *s)
 {
-    if (s) s->particles = sys;
+    return s ? &s->particles : NULL;
 }
 
 static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
@@ -625,7 +629,19 @@ void jce_scene_clear_rendering_settings(JceScene *s)
 {
     if (!s) return;
     s->rendering_settings = jce_scene_rendering_settings_default();
+    s->particles.precipitation = (JceScenePrecipitationSettings){0};
     s->has_rendering_settings = false;
+    s->render_look = (JceSceneRenderLook){0};
+}
+
+JceSceneRenderLook *jce_scene_internal_render_look(JceScene *s)
+{
+    return s ? &s->render_look : NULL;
+}
+
+const JceSceneRenderLook *jce_scene_internal_get_render_look(const JceScene *s)
+{
+    return s ? &s->render_look : NULL;
 }
 
 /* ── Scene-level world-streaming settings ──────────────────────────── */
@@ -736,71 +752,6 @@ JceEnvironmentState *jce_scene_environment(JceScene *s)
     return &s->env;
 }
 
-/* Fill a water-field descriptor for `e` from its Water component, its WORLD
- * transform and this scene's environment.
- *
- * ONE function because there were two hand-written descs for one field, and
- * they disagreed about three things at once. The renderer published
- * `base_height = wc->base_height` -- which is ENTITY-LOCAL, as the comment
- * twenty lines above its own shader uniform says -- so on hidden_cove the CPU
- * water surface sat at y = 0.000 while the water everyone could see was drawn
- * at 14.99. It also left center_x/center_z at zero, putting the body's centre
- * 40 m from where the body is. Buoyancy, shoreline and every gameplay query
- * read that field.
- *
- * Taking the entity rather than the component is what makes the mistake
- * unrepresentable: the caller no longer does the local-to-world mapping, so it
- * can no longer get it wrong.
- *
- * `waves` points into the component and is borrowed for the acquire call only,
- * exactly as jce_water_field.h requires. */
-bool jce_scene_water_field_desc(JceScene *s, JceEntity e,
-                                JceWaterFieldDesc *out)
-{
-    if (!s || !out) return false;
-    JceWaterComponent *wc = jce_scene_get_water(s, e);
-    if (!wc) return false;
-
-    const jce_mat4 m = jce_scene_get_world_matrix(s, e);
-    const JceEnvironmentState *env = jce_scene_environment(s);
-
-    memset(out, 0, sizeof *out);
-    out->model          = (JceWaterFieldModel)wc->water_mode;
-    out->base_height    = wc->base_height + m.col[3].y;
-    out->center_x       = m.col[3].x;
-    out->center_z       = m.col[3].z;
-    out->size_x         = wc->size_x;
-    out->size_z         = wc->size_z;
-    out->waves          = wc->waves;
-    out->wave_count     = wc->wave_count;
-    out->fft_resolution = wc->fft_resolution;
-    out->fft_patch_size = wc->fft_patch_size;
-    /* U4: the authored value is a MULTIPLIER of the one wind, and this is the
-     * only place that applies it -- when the renderer applied it alone, the
-     * runtime's desc differed by exactly this factor and every frame of
-     * weather rebuilt the whole Tessendorf spectrum twice. */
-    /* SUSTAINED, not instantaneous. Two independent reasons, either of which
-     * alone settles it:
-     *
-     *   Physics -- the Phillips spectrum this feeds is parameterised by the
-     *   wind that has blown over the fetch for hours. A seven-second gust does
-     *   not restructure a developed sea; it puts ripples on one.
-     *
-     *   Cost -- spectrum_differs() in jce_water_field.c keys the spectrum
-     *   cache on exactly this number, so a value that moves every frame
-     *   re-solves the whole Tessendorf spectrum every frame. That is the same
-     *   trap the comment above describes, arrived at from the other side. */
-    out->fft_wind_speed = wc->fft_wind_speed *
-                          jce_environment_wind_speed_sustained(env);
-    out->fft_wind_dir_x = wc->fft_wind_dir_x;
-    out->fft_wind_dir_z = wc->fft_wind_dir_z;
-    out->fft_amplitude  = wc->fft_amplitude;
-    out->fft_seed       = JCE_WATER_FIELD_SEED(e);
-    out->fft_fetch      = wc->fft_fetch;
-    out->fft_swell      = wc->fft_swell;
-    return true;
-}
-
 JceWaterFieldSet *jce_scene_water_fields(JceScene *s)
 {
     if (!s) return NULL;
@@ -896,10 +847,34 @@ static void jce__mr_ctor(void *ptr, int32_t count, const ecs_type_info_t *ti)
 }
 
 
+static uint64_t scene_reserve_instance_id(void)
+{
+    static JceNativeAtomicWord next;
+    /* Never wrap into an ID a retained cache may still hold. */
+    for (size_t used = jce_native_atomic_word_load(&next); used != SIZE_MAX;
+         used = jce_native_atomic_word_load(&next)) {
+        if (jce_native_atomic_word_compare_exchange(&next, used, used + 1u))
+            return (uint64_t)(used + 1u);
+    }
+    return 0;
+}
+
 JceScene *jce_scene_create(void)
 {
+#if defined(FLECS_NO_OS_API_IMPL)
+    if (!jce_scene_flecs_os_prepare()) {
+        LOG_ERROR(LOG_TAG, "ECS operating-system callbacks are unavailable");
+        return NULL;
+    }
+#endif
     JceScene *s = (JceScene *)JCE_CALLOC(1, sizeof(*s));
     if (!s) return NULL;
+    s->instance_id = scene_reserve_instance_id();
+    if (!s->instance_id) {
+        LOG_ERROR(LOG_TAG, "scene instance IDs exhausted");
+        JCE_FREE(s);
+        return NULL;
+    }
 
     /* Populate the dense component-type registry exactly once per
      * process (idempotent) — serializer, editor surfaces and the
@@ -913,11 +888,8 @@ JceScene *jce_scene_create(void)
     }
     s->rendering_settings = jce_scene_rendering_settings_default();
     s->has_rendering_settings = false;
-    /* Start at 1 so a freshly zeroed cache slot (epoch 0) is always seen as
-       stale on first access. world_cache stays zero-init until first use. */
+    /* Epoch zero identifies unpublished cache state. */
     s->world_epoch = 1;
-    /* Start at 1 so a freshly zeroed persistent-cache slot (epoch 0) is always
-       seen as stale on first access. */
     s->structural_epoch = 1;
     s->roster_epoch     = 1;
     s->enable_gen       = 1;
@@ -928,6 +900,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceCompEnableState);
     ECS_COMPONENT_DEFINE(s->world, JceCompScriptDriven);
     ECS_COMPONENT_DEFINE(s->world, JceCompAuthoredName);
+    ECS_COMPONENT_DEFINE(s->world, JceCompAuthoredOrder);
     ECS_COMPONENT_DEFINE(s->world, JceTransform);
     ECS_COMPONENT_DEFINE(s->world, JcePivotComponent);
     ECS_COMPONENT_DEFINE(s->world, JceMeshRenderer);
@@ -1054,6 +1027,15 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceSoftBodyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSimLodComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSceneFullscreenEffect);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterSpectrumComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterFoamComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterCrestComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterCausticsComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterNearshoreComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterMotionComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterOpticsComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterCausticDetailComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterNormalDetailComponent);
 
     /* VideoPlayer owns a live decoder handle + a GPU texture; install
      * lifecycle hooks so those resources follow correct ownership across
@@ -1185,8 +1167,14 @@ int jce_scene_clear(JceScene *s)
 JceEntity jce_scene_create_entity(JceScene *s, const char *name)
 {
     if (!s) return JCE_ENTITY_INVALID;
-
+    if (s->authored_order_counter == UINT64_MAX) {
+        LOG_ERROR(LOG_TAG, "scene: authored entity order exhausted");
+        return JCE_ENTITY_INVALID;
+    }
     ecs_entity_t e = ecs_new(s->world);
+    if (!e) return JCE_ENTITY_INVALID;
+    JceCompAuthoredOrder order = {++s->authored_order_counter};
+    ecs_set_ptr(s->world, e, JceCompAuthoredOrder, &order);
     if (name && name[0]) {
         /* flecs's name index is unique per scope, so ecs_set_name on a name
          * already taken in this (root) scope ABORTS the process.  Spawning the
@@ -1216,6 +1204,14 @@ JceEntity jce_scene_create_entity(JceScene *s, const char *name)
 
     s->roster_epoch++;
     return (JceEntity)e;
+}
+
+uint64_t jce_scene_internal_authored_order(const JceScene *s, JceEntity e)
+{
+    if (!s || !e || !ecs_is_alive(s->world, (ecs_entity_t)e)) return 0;
+    const JceCompAuthoredOrder *order =
+        ecs_get(s->world, (ecs_entity_t)e, JceCompAuthoredOrder);
+    return order ? order->value : 0;
 }
 
 void jce_scene_destroy_entity(JceScene *s, JceEntity e)
@@ -1555,7 +1551,18 @@ uint32_t jce_scene_take_dirty_entities(JceScene *s, JceEntity *out,
     if (out_overflow) *out_overflow = ovf;
     s->dirty_count    = 0;
     s->dirty_overflow = false;
+    s->dirty_drained_xform = s->xform_counter;
     return n;
+}
+
+uint64_t jce_scene_internal_instance_id(const JceScene *s)
+{
+    return s ? s->instance_id : 0;
+}
+
+bool jce_scene_internal_dirty_base_matches(const JceScene *s, uint64_t xform)
+{
+    return s && xform != 0 && s->dirty_drained_xform == xform;
 }
 
 /* ── Per-entity transform generation (dynamic-scene world-cache) ─────────── */
@@ -2140,6 +2147,8 @@ JceEntity jce_scene_entity_from_index(const JceScene *s, uint32_t index)
  * and check_cull_gen_consumers.py fails the build if that file grows a read
  * whose component was declared with the no-op form. */
 #define JCE_COMP_CULL_BUMP(s)   ((void)0)
+#define JCE_COMP_CULL_PREPARE(s, re, TYPE, v) ((void)0)
+#define JCE_COMP_CULL_APPLY(s) JCE_COMP_CULL_BUMP(s)
 
 #define JCE_COMP_IMPL(TYPE, NAME)                                       \
 void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
@@ -2147,8 +2156,9 @@ void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
     if (!s || !v) return;                                               \
     ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
     if (!re) return;                                                     \
-    JCE_SCENE_COMPONENT_SET(s, re, TYPE, v);                                 \
-    JCE_COMP_CULL_BUMP(s);                                              \
+    JCE_COMP_CULL_PREPARE(s, re, TYPE, v);                               \
+    JCE_SCENE_COMPONENT_SET(s, re, TYPE, v);                             \
+    JCE_COMP_CULL_APPLY(s);                                             \
 }                                                                       \
                                                                         \
 TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
@@ -2539,11 +2549,20 @@ void jce_scene_each_light_probe_group(JceScene *s, JceEntityCallback cb, void *u
 
 JCE_COMP_IMPL(JceCameraComponent,             camera)
 JCE_COMP_IMPL(JceDirectionalLight,            dir_light)
-/* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
- * write has to invalidate the entity-cull freeze. */
+/* PointLight keeps historical invalidation except proven intensity-only writes. */
 #undef  JCE_COMP_CULL_BUMP
 #define JCE_COMP_CULL_BUMP(s)   ((s)->cull_data_gen++)
+/* ecull retains light membership, not intensity. Selection/gather/shadows
+ * read current parameters each frame; all other fields keep historical bumps. */
+#undef JCE_COMP_CULL_PREPARE
+#define JCE_COMP_CULL_PREPARE(s, re, TYPE, v) const bool _point_light_cull_changed = scene_point_light_cull_changed(ecs_get((s)->world, (re), TYPE), (v))
+#undef JCE_COMP_CULL_APPLY
+#define JCE_COMP_CULL_APPLY(s) do { if (_point_light_cull_changed) JCE_COMP_CULL_BUMP(s); } while (0)
 JCE_COMP_IMPL(JcePointLight,                  point_light)
+#undef JCE_COMP_CULL_PREPARE
+#define JCE_COMP_CULL_PREPARE(s, re, TYPE, v) ((void)0)
+#undef JCE_COMP_CULL_APPLY
+#define JCE_COMP_CULL_APPLY(s) JCE_COMP_CULL_BUMP(s)
 #undef  JCE_COMP_CULL_BUMP
 #define JCE_COMP_CULL_BUMP(s)   ((void)0)
 /* Cull-relevant: jce_sr_cull.c reads fields of this component, so a
@@ -2669,6 +2688,123 @@ JCE_COMP_IMPL(JceVehicleComponent,            vehicle)
 JCE_COMP_IMPL(JceSoftBodyComponent,           soft_body)
 JCE_COMP_IMPL(JceSimLodComponent,             sim_lod)
 JCE_COMP_IMPL(JceSceneFullscreenEffect,       fullscreen_effect)
+void JCE_CALL jce_scene_set_water_spectrum(JceScene *s, JceEntity e,
+    const JceWaterSpectrumComponent *v)
+{
+    if (!s || !v || v->struct_size < sizeof(*v) ||
+        v->version != JCE_WATER_SPECTRUM_COMPONENT_VERSION ||
+        v->model < JCE_WATER_FFT_SPECTRUM_JONSWAP ||
+        v->model > JCE_WATER_FFT_SPECTRUM_TMA ||
+        !isfinite(v->depth) || !(v->depth > 0.0f) ||
+        !isfinite(v->directional_blend) || v->directional_blend < 0.0f ||
+        v->directional_blend > 1.0f ||
+        (v->shading_flags & ~JCE_WATER_SPECTRUM_FILTER_NORMALS)) return;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    if (re) {
+        JceWaterSpectrumComponent stored = *v;
+        stored.struct_size = sizeof(stored);
+        JCE_SCENE_COMPONENT_SET(s, re, JceWaterSpectrumComponent, &stored);
+    }
+}
+
+JceWaterSpectrumComponent *JCE_CALL jce_scene_get_water_spectrum(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    return re ? (JceWaterSpectrumComponent *)ecs_get_mut(s->world, re,
+        JceWaterSpectrumComponent) : NULL;
+}
+
+bool JCE_CALL jce_scene_has_water_spectrum(const JceScene *s, JceEntity e)
+{
+    if (!s) return false;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    return re && ecs_has(s->world, re, JceWaterSpectrumComponent);
+}
+
+void JCE_CALL jce_scene_remove_water_spectrum(JceScene *s, JceEntity e)
+{
+    if (!s) return;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    if (re) JCE_SCENE_COMPONENT_REMOVE(s, re, JceWaterSpectrumComponent);
+}
+
+void JCE_CALL jce_scene_set_water_foam(JceScene *s, JceEntity e,
+    const JceWaterFoamComponent *v)
+{
+    if (!s || !jce_water_foam_valid(v)) return;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    if (re) {
+        JceWaterFoamComponent stored = *v;
+        stored.struct_size = sizeof(stored);
+        JCE_SCENE_COMPONENT_SET(s, re, JceWaterFoamComponent, &stored);
+    }
+}
+
+JceWaterFoamComponent *JCE_CALL jce_scene_get_water_foam(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    return re ? (JceWaterFoamComponent *)ecs_get_mut(s->world, re,
+        JceWaterFoamComponent) : NULL;
+}
+
+bool JCE_CALL jce_scene_has_water_foam(const JceScene *s, JceEntity e)
+{
+    if (!s) return false;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    return re && ecs_has(s->world, re, JceWaterFoamComponent);
+}
+
+void JCE_CALL jce_scene_remove_water_foam(JceScene *s, JceEntity e)
+{
+    if (!s) return;
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);
+    if (re) {
+        (void)jce_water_field_set_configure_foam(s->water_fields, (uint64_t)e, NULL);
+        JCE_SCENE_COMPONENT_REMOVE(s, re, JceWaterFoamComponent);
+    }
+}
+
+/* These optional water components share validated, versioned ECS storage. */
+#define JCE_WATER_COMP_IMPL(TYPE, NAME, VALIDATE)                                \
+void JCE_CALL jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)        \
+{                                                                               \
+    if (!s || !VALIDATE(v)) return;                                              \
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);                       \
+    if (re) {                                                                   \
+        TYPE stored = *v;                                                       \
+        stored.struct_size = sizeof(stored);                                     \
+        JCE_SCENE_COMPONENT_SET(s, re, TYPE, &stored);                            \
+    }                                                                           \
+}                                                                               \
+TYPE *JCE_CALL jce_scene_get_##NAME(JceScene *s, JceEntity e)                       \
+{                                                                               \
+    if (!s) return NULL;                                                        \
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);                       \
+    return re ? (TYPE *)ecs_get_mut(s->world, re, TYPE) : NULL;                     \
+}                                                                               \
+bool JCE_CALL jce_scene_has_##NAME(const JceScene *s, JceEntity e)                 \
+{                                                                               \
+    if (!s) return false;                                                       \
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);                       \
+    return re && ecs_has(s->world, re, TYPE);                                     \
+}                                                                               \
+void JCE_CALL jce_scene_remove_##NAME(JceScene *s, JceEntity e)                    \
+{                                                                               \
+    if (!s) return;                                                             \
+    const ecs_entity_t re = jce_scene_resolve_entity(s, e);                       \
+    if (re) JCE_SCENE_COMPONENT_REMOVE(s, re, TYPE);                              \
+}
+
+JCE_WATER_COMP_IMPL(JceWaterCrestComponent, water_crest, jce_water_crest_valid)
+JCE_WATER_COMP_IMPL(JceWaterCausticsComponent, water_caustics, jce_water_caustics_valid)
+JCE_WATER_COMP_IMPL(JceWaterNearshoreComponent, water_nearshore, jce_water_nearshore_valid)
+JCE_WATER_COMP_IMPL(JceWaterMotionComponent, water_motion, jce_water_motion_valid)
+JCE_WATER_COMP_IMPL(JceWaterOpticsComponent, water_optics, jce_water_optics_valid)
+JCE_WATER_COMP_IMPL(JceWaterCausticDetailComponent, water_caustic_detail, jce_water_caustic_detail_valid)
+JCE_WATER_COMP_IMPL(JceWaterNormalDetailComponent, water_normal_detail, jce_water_normal_detail_valid)
+#undef JCE_WATER_COMP_IMPL
 
 #undef JCE_COMP_IMPL_WORLD
 #undef JCE_COMP_IMPL

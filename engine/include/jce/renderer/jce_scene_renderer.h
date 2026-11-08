@@ -372,6 +372,11 @@ typedef struct JceModel JceModel;
 
 typedef struct {
     JceMesh    *(*load_mesh)(const char *path, void *ud);
+    /* Success transfers one independently owned model to the calling cache.
+     * The scene renderer (or standalone pick cache) destroys it on reset or
+     * teardown. Never return a shared/borrowed pointer; the same instance must
+     * not be transferred to another path/cache. Called on the render/main
+     * thread. NULL means failed admission, cached until explicit invalidation. */
     JceModel   *(*load_model)(const char *path, void *ud);
     /* Returns a texture with idx==UINT16_MAX on failure. `material_path`
      * is the primary lookup key (component's albedoTex or .mat.json). If
@@ -475,6 +480,21 @@ JCE_API bool jce_scene_renderer_has_fullscreen_effect(JceScene *scene);
 
 /* ── Per-frame rendering ──────────────────────────────────────────── */
 
+/* Prepare completed video/texture/model resources on the render-owner thread.
+ * Uses the existing upload owners; may create/update/retire resources but never
+ * submits scene colour, shadow or compute passes. No dt, animation, water or
+ * simulation advancement is performed. This is not complete scene maintenance.
+ * Repeated calls in one admitted backend CPU round reuse preparation, unless
+ * the scene/cache changes or new decode/video work arrives. A failed video
+ * upload remains retryable. The backend frame index is not GPU completion.
+ * Returns false for invalid inputs or unavailable device/context admission;
+ * true means the preparation call was admitted, not that every asset is ready.
+ * Legacy render() calls this automatically. Hosts may call it before rendering
+ * or on a frame retaining its previous colour target. Keep normal render calls
+ * continuous until all time-dependent scene work has an independent owner. */
+JCE_API bool jce_scene_renderer_prepare_resources(
+    JceSceneRenderer *sr, JceScene *scene);
+
 /*
  * Render the scene from the given camera into bgfx views starting at
  * view_id_base.  Shadow cascades use view_id_base+10..+13.
@@ -488,6 +508,20 @@ JCE_API bool jce_scene_renderer_has_fullscreen_effect(JceScene *scene);
  * editor and runtime can each provide their own frame timing.
  */
 JCE_API uint16_t jce_scene_renderer_render(
+    JceSceneRenderer           *sr,
+    JceScene                   *scene,
+    const JceCamera            *camera,
+    uint16_t                    view_id_base,
+    float                       dt_sec,
+    const JceSceneRenderConfig *config);
+
+/* Render with a linear SHADED PBR output tail, skipping its display gamma/dither.
+ * Reuses the ordinary render and returns its unchanged final view. Other
+ * passes follow config; diagnostic/material-preview view modes keep their own
+ * output policy. Hosts remain responsible for composition and custom shaders.
+ * Private output flags are restored on every return, including early returns
+ * and nested calls. Scene/PostFX authoring and the config ABI are unchanged. */
+JCE_API uint16_t jce_scene_renderer_render_linear(
     JceSceneRenderer           *sr,
     JceScene                   *scene,
     const JceCamera            *camera,
@@ -565,8 +599,11 @@ JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
  *   post-fx motion blur wants the same pair, and behind the TAA gate it
  *   silently required TAA to be on.  THEN, when r.taa is ON, it advances the
  *   jitter sequence, writes the JITTERED projection into *out_jittered_proj
- *   (use THAT for the colour pass), and enables TAA on the pipeline.
- *   Returns true iff TAA is active this frame (caller uses
+ *   (use THAT for the colour pass), and enables TAA on the pipeline. Newly
+ *   applied pipeline policy is synchronized before jitter; unsupported target
+ *   formats and zero dimensions retain the clean projection. Shader, input,
+ *   allocation and GPU completion admission remain in PostFX.
+ *   Returns true iff TAA projection jitter is active this frame (caller uses
  *   *out_jittered_proj); returns false and leaves *out_jittered_proj ==
  *   clean_proj when r.taa is OFF, so the OFF path is byte-identical to a
  *   build without TAA.  Drive the SAME pipeline you then call
@@ -578,6 +615,12 @@ JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
  *   and DISABLES TAA on the engine PostFX pipeline so it never leaks into
  *   the editor's pick / preview / thumbnail postfx invocations.  Safe to
  *   call unconditionally. */
+/* Synchronize a newly applied pipeline's TAA request before a caller chooses
+ * its colour projection. Stable pipeline values preserve explicit r.taa
+ * console overrides. This query does not advance jitter or mutate PostFX;
+ * custom viewport drivers must also check jce_postfx_taa_supported(). */
+JCE_API bool jce_scene_renderer_taa_requested(JceSceneRenderer *sr);
+
 JCE_API bool jce_scene_renderer_taa_begin_frame(JceSceneRenderer *sr,
                                                 uint32_t target_w,
                                                 uint32_t target_h,
@@ -837,11 +880,11 @@ JCE_API void jce_scene_renderer_invalidate_terrain_region(
 JCE_API void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
                                                     const char *path);
 
-/* Drop EVERY cached model (the model cache never evicts and caches load
- * FAILURES) so the next frame reloads all models from disk. Editors call this
- * on scene-switch so a stale failed/path flag from the previous scene cannot
- * block a model that exists in the new scene. Joins any in-flight async decode
- * and destroys each GPU model; safe to call between frames. */
+/* Drop every cached model, including negative/pending entries, so subsequent
+ * requests reload through their configured loader. Editors call this on
+ * scene-switch so a stale failed/path flag cannot block an available asset.
+ * Joins in-flight async decodes and destroys each cache-owned GPU model,
+ * including successful load_model callback results. Call between frames. */
 JCE_API void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr);
 
 /* Forget the cached graph PROGRAM for one .mat.json (NULL = all of them).
@@ -871,9 +914,11 @@ JCE_API void jce_scene_renderer_invalidate_custom_program(JceSceneRenderer *sr,
  * AND (b) no live skeletal-animation instance still references it.  Eviction is
  * driven at the START of jce_scene_renderer_render (after the async upload poll,
  * before any draw resolves a model), so no in-flight draw on this frame's view
- * list can reference a destroyed handle.  RUNTIME MODE ONLY: in editor mode the
- * asset-cache callback owns the models, so the renderer never frees them and
- * these calls are no-ops for eviction (the budget setter still records intent).
+ * list can reference a destroyed handle. The current budget/eviction path
+ * covers built-in async loads only. With load_model configured, eviction is a
+ * no-op and model VRAM accounting remains zero; callback results still transfer
+ * ownership and are destroyed on explicit cache invalidation or teardown.
+ * The budget setter still records intent in either mode.
  */
 
 /* Set the model-VRAM ceiling in bytes (0 = unlimited / no eviction, the
@@ -884,18 +929,18 @@ JCE_API void jce_scene_renderer_set_model_vram_budget(JceSceneRenderer *sr,
 
 /* Free unreferenced models until resident model VRAM <= budget_bytes (or no
  * eligible victim remains).  Normally driven automatically by the render loop;
- * exposed for tools / tests.  No-op in editor mode.  Returns the number of
- * models freed. */
+ * exposed for tools / tests. No-op while load_model is configured. Returns
+ * the number of models freed. */
 JCE_API uint32_t jce_scene_renderer_evict_models(JceSceneRenderer *sr,
                                                  uint64_t budget_bytes);
 
-/* Total resident model VRAM (sum of jce_model_gpu_bytes over every loaded model
- * cache slot) — the real GPU bytes the streaming budget should account for.
- * 0 in editor mode (models are owned/sized by the asset cache, not here). */
+/* Sum of tracked GPU payload bytes in loaded built-in async model slots.
+ * Callback-loaded slots currently have zero charges despite cache ownership;
+ * zero does not establish their physical GPU residency or memory cost. */
 JCE_API uint64_t jce_scene_renderer_model_vram_bytes(const JceSceneRenderer *sr);
 
 /* Resident GPU bytes of ONE model path (0 if not resident / still decoding /
- * editor mode).  The world streamer sums this across a chunk's entities to
+ * callback-loaded). The world streamer sums this across a chunk's entities to
  * report real per-chunk residency to the streaming budget. */
 JCE_API uint64_t jce_scene_renderer_model_path_vram_bytes(
     const JceSceneRenderer *sr, const char *path);
@@ -905,8 +950,8 @@ JCE_API uint64_t jce_scene_renderer_model_path_vram_bytes(
  * path and add jce_scene_renderer_model_path_vram_bytes.  A model shared by
  * several of the entities is counted once.  This is exactly the
  * JceWorldStreamerResidencyFn shape the world streamer wants — wire it as the
- * residency query so per-chunk residency reflects real VRAM.  Returns 0 in
- * editor mode (the renderer doesn't own/size models there). */
+ * residency query for tracked model payload bytes. Returns zero while
+ * load_model is configured; callback-slot GPU charges are not tracked here. */
 JCE_API uint64_t jce_scene_renderer_entities_vram_bytes(
     JceSceneRenderer *sr, JceScene *scene,
     const uint64_t *entity_ids, uint32_t count);
@@ -941,6 +986,13 @@ JCE_API struct JceAnimSmBinding *jce_scene_renderer_get_anim_sm(
 /* Look up the JceModel cached by the renderer for a given path. */
 JCE_API struct JceModel *jce_scene_renderer_get_model(
     JceSceneRenderer *sr, const char *skeleton_path);
+
+/* Draw the model's wireframe overlay using the latest prepared pose for this
+ * scene, entity, and model. Without a matching pose, draw the bind pose. The
+ * caller supplies the world transform and the overlay's material bindings. */
+JCE_API void jce_scene_renderer_submit_model_wireframe(
+    JceSceneRenderer *sr, JceScene *scene, uint64_t entity,
+    const struct JceModel *model, uint16_t view_id, const jce_mat4 *world);
 
 /* Per-frame LOD pick stats. picks[i] = number of entities drawn at level i. */
 typedef struct {

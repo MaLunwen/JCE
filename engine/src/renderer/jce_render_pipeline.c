@@ -24,6 +24,7 @@
 #include <stdlib.h>
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
 
 #include <string.h>
 
@@ -322,11 +323,13 @@ static JceRpQuality quality_from_str(const char *s)
  * build behaving differently in two hosts.  Anything that changes the
  * effective tier calls this so the floor is a property of the tier, not of
  * call order.  No-op before the first apply. */
+static void rp_apply_impl(const JceRenderPipelineDesc *desc, bool replace_pending);
+
 void jce_render_pipeline_notify_tier_changed(void)
 {
     if (!s_requested_set) return;
     JceRenderPipelineDesc again = s_requested;
-    jce_render_pipeline_apply(&again);
+    rp_apply_impl(&again, false);
 }
 
 /* Defined with the rest of the JCE_RP_FORCE parsing below; declared here
@@ -334,8 +337,12 @@ void jce_render_pipeline_notify_tier_changed(void)
  * the only place a force can outrank every other source. */
 static void rp_force_apply_numeric(JceRenderPipelineDesc *d);
 
-void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
+static void rp_apply_impl(const JceRenderPipelineDesc *desc, bool replace_pending)
 {
+    /* A newer complete request supersedes queued edits. A tier notification
+     * only re-resolves costs and must retain the following frame's request.
+     * Clear before observers so their newly queued work always survives. */
+    if (replace_pending) s_pending_set = false;
     JceRenderPipelineDesc tmp;
     if (!desc) {
         jce_render_pipeline_preset_low(&tmp);
@@ -447,6 +454,39 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
      * already have, and the reason an ablation can be trusted. */
     rp_force_apply_numeric(&s_active);
 
+    /* Publish exactly at application, after tier/backend/numeric resolution.
+     * Boolean getters include existing QA forces. This records CPU policy,
+     * not GPU execution. Close before observers can publish a newer policy. */
+    if (jce_trace_enabled()) {
+        JceTraceScope scope = jce_trace_scope_begin("render_pipeline.publish");
+#define RP_COUNTER(name_, value_) jce_trace_counter_scoped_internal( \
+        JCE_TRACE_CATEGORY_CORE, name_, (int64_t)(value_), scope.id, scope.id)
+        RP_COUNTER("rp.volfog", jce_render_pipeline_is_feature_enabled("volumetric_fog"));
+        RP_COUNTER("rp.csm", jce_render_pipeline_is_feature_enabled("csm"));
+        RP_COUNTER("rp.ssao", jce_render_pipeline_is_feature_enabled("ssao"));
+        RP_COUNTER("rp.ssr", jce_render_pipeline_is_feature_enabled("ssr"));
+        RP_COUNTER("rp.taa", jce_render_pipeline_is_feature_enabled("taa"));
+        RP_COUNTER("rp.bloom", jce_render_pipeline_is_feature_enabled("bloom"));
+        RP_COUNTER("rp.mblur", jce_render_pipeline_is_feature_enabled("motion_blur"));
+        /* Public descriptors can carry invalid scale; mirror the bounded
+         * scale interpretation used by scene_extent, without float-to-int UB. */
+        float scale = s_active.render_scale;
+        if (!(scale > 0.0f)) scale = 1.0f;
+        if (scale < 0.25f) scale = 0.25f;
+        if (scale > 2.0f) scale = 2.0f;
+        RP_COUNTER("rp.scale_milli", scale * 1000.0f + 0.5f);
+        RP_COUNTER("rp.shadow", s_active.shadow_resolution);
+        RP_COUNTER("rp.cascades", s_active.csm_cascade_count);
+        RP_COUNTER("rp.shadow_filter", s_active.shadow_filter_quality);
+        RP_COUNTER("rp.backbuffer_msaa", s_active.msaa_samples);
+        RP_COUNTER("rp.post_quality", s_active.post_quality);
+        RP_COUNTER("rp.hdr", jce_render_pipeline_is_feature_enabled("hdr_color"));
+        RP_COUNTER("rp.depth_prepass", jce_render_pipeline_is_feature_enabled("depth_prepass"));
+        RP_COUNTER("rp.ssgi", jce_render_pipeline_is_feature_enabled("ssgi"));
+#undef RP_COUNTER
+        jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
+    }
+
     /* P3-C.4 — fan out to any registered observer (cloth HW gate).  Fan out the
      * APPLIED descriptor (post GLES clamp) so observers see what actually runs. */
     if (s_observer) s_observer(&s_active, s_observer_ud);
@@ -522,6 +562,11 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
         (int)s_active.hdr_color, (int)s_active.depth_prepass);
 }
 
+void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
+{
+    rp_apply_impl(desc, true);
+}
+
 void jce_render_pipeline_get(JceRenderPipelineDesc *out)
 {
     if (!out) return;
@@ -530,6 +575,13 @@ void jce_render_pipeline_get(JceRenderPipelineDesc *out)
         return;
     }
     *out = s_active;
+}
+
+void JCE_CALL jce_render_pipeline_get_requested(JceRenderPipelineDesc *out)
+{
+    if (!out) return;
+    if (s_requested_set) *out = s_requested;
+    else jce_render_pipeline_preset_low(out);
 }
 
 /* JCE_RP_FORCE="ssao=1,volumetric_fog=0" -- force feature flags for a
@@ -748,25 +800,32 @@ bool jce_render_pipeline_is_feature_enabled(const char *feature)
     if (strcmp(feature, "cloth")          == 0) return s_active.enable_cloth;
     if (strcmp(feature, "soft_body")      == 0) return s_active.enable_cloth;
     if (strcmp(feature, "stylized_sky")   == 0) return s_active.enable_stylized_sky;
-    /* Stylized look profile (plan 02): no dedicated feature bool — gated by
-     * the render quality profile.  LOW tier force-OFF (decision #4) collapses
-     * the whole Look Profile back to the neutral baseline regardless of the
-     * authored values.  HIGH/ULTRA (and MID) honor the authored look. */
+    /* Material look follows the requested quality, before a hardware/GLES
+     * clamp budgets bloom to one mip. That cost clamp must not discard cheap
+     * authored hemisphere/wrap/rim lighting. An explicit LOW request remains
+     * neutral; the boolean QA force above still has highest precedence. */
     if (strcmp(feature, "stylized_look") == 0)
-        return s_active.post_quality != JCE_RP_QUALITY_LOW;
+        return (s_requested_set ? s_requested.post_quality : s_active.post_quality)
+               != JCE_RP_QUALITY_LOW;
     return false;
 }
 
 /* ── P4-E.2: deferred feature toggles ────────────────────────────── */
 
+/* Pending changes are USER REQUESTS, never a copy of the cost-clamped
+ * active descriptor. Cold setters use the same LOW defaults as get/apply. */
+static void rp_pending_begin(void)
+{
+    if (s_pending_set) return;
+    if (s_requested_set) s_pending = s_requested;
+    else jce_render_pipeline_preset_low(&s_pending);
+    s_pending_set = true;
+}
+
 void jce_render_pipeline_set_feature_enabled(const char *feature, bool enabled)
 {
     if (!feature) return;
-    /* Bootstrap pending from active so unmodified fields stay correct. */
-    if (!s_pending_set) {
-        s_pending     = s_active_set ? s_active : (JceRenderPipelineDesc){0};
-        s_pending_set = true;
-    }
+    rp_pending_begin();
     if (strcmp(feature, "csm")            == 0) { s_pending.enable_csm          = enabled; return; }
     if (strcmp(feature, "ssao")           == 0) { s_pending.enable_ssao         = enabled; return; }
     if (strcmp(feature, "ssr")            == 0) { s_pending.enable_ssr          = enabled; return; }
@@ -794,10 +853,7 @@ void jce_render_pipeline_set_feature_enabled(const char *feature, bool enabled)
 void jce_render_pipeline_set_knob(const char *name, float value)
 {
     if (!name) return;
-    if (!s_pending_set) {
-        s_pending     = s_active_set ? s_active : (JceRenderPipelineDesc){0};
-        s_pending_set = true;
-    }
+    rp_pending_begin();
     if (strcmp(name, "shadow_resolution") == 0) {
         int v = (int)value;
         if (v < 256) v = 256; if (v > 8192) v = 8192;
@@ -829,18 +885,17 @@ void jce_render_pipeline_set_knob(const char *name, float value)
     }
 }
 
-/* Promote s_pending → s_active at a safe point (end of frame). */
+/* Commit the requested descriptor at the frame boundary through the sole
+ * apply owner. Clear pending BEFORE notification so an observer can enqueue
+ * the following frame's request without having it overwritten or discarded. */
 void jce_render_pipeline_end_frame(void)
 {
     if (!s_pending_set) return;
-    bool changed = !s_active_set ||
-                   (memcmp(&s_pending, &s_active, sizeof(s_pending)) != 0);
-    if (changed) {
-        s_active     = s_pending;
-        s_active_set = true;
-        if (s_observer) s_observer(&s_active, s_observer_ud);
-    }
+    JceRenderPipelineDesc requested = s_pending;
+    bool changed = !s_requested_set ||
+                   (memcmp(&requested, &s_requested, sizeof(requested)) != 0);
     s_pending_set = false;
+    if (changed) jce_render_pipeline_apply(&requested);
 }
 
 /* ── JSON I/O ─────────────────────────────────────────────────────── */
@@ -850,10 +905,11 @@ void jce_render_pipeline_end_frame(void)
 static bool rp_parse_buffer(const char *buf, size_t sz,
                             const char *origin, JceRenderPipelineDesc *out)
 {
-    JceJson *root = jce_json_parse(buf, sz);
-    if (!root) {
+    JceJson *root = jce_json_parse_strict(buf, sz);
+    if (!jce_json_is_object(root)) {
         LOG_WARN(LOG_TAG, "invalid JSON in render pipeline asset: %s",
                  origin ? origin : "(buffer)");
+        jce_json_free(root);
         return false;
     }
     out->enable_csm            = jce_json_get_bool(root, "enable_csm",            out->enable_csm);
@@ -888,10 +944,14 @@ static bool rp_parse_buffer(const char *buf, size_t sz,
     if (sfq > 2) sfq = 2;
     out->shadow_filter_quality = (uint8_t)sfq;
 
-    int ms = jce_json_get_int(root, "msaa_samples",
-                              (int)out->msaa_samples);
-    if (ms != 1 && ms != 2 && ms != 4 && ms != 8) ms = 1;
-    out->msaa_samples = (uint8_t)ms;
+    /* Missing canonical MSAA keeps the boot fallback, including the legacy
+     * 16-sample setting. An explicit canonical value still wins, including
+     * explicit 1 (off), and retains the asset's existing validation. */
+    if (jce_json_get(root, "msaa_samples")) {
+        int ms = jce_json_get_int(root, "msaa_samples", 1);
+        if (ms != 1 && ms != 2 && ms != 4 && ms != 8) ms = 1;
+        out->msaa_samples = (uint8_t)ms;
+    }
 
     double rs = jce_json_get_number(root, "render_scale",
                                     (double)out->render_scale);
@@ -933,11 +993,12 @@ static bool rp_parse_buffer(const char *buf, size_t sz,
     return true;
 }
 
-bool jce_render_pipeline_load(const char *host_path,
-                              JceRenderPipelineDesc *out)
+static bool rp_load_host_seeded(const char *host_path,
+                               JceRenderPipelineDesc *out, uint8_t msaa_fallback)
 {
     if (!host_path || !out) return false;
     jce_render_pipeline_preset_low(out);
+    out->msaa_samples = msaa_fallback;
 
     uint64_t sz = 0;
     char *buf = (char *)jce_fs_host_read_all(host_path, &sz);
@@ -954,11 +1015,35 @@ bool jce_render_pipeline_load(const char *host_path,
     return ok;
 }
 
+bool jce_render_pipeline_load(const char *host_path,
+                              JceRenderPipelineDesc *out)
+{
+    return rp_load_host_seeded(host_path, out, 1);
+}
+
+bool JCE_CALL jce_render_pipeline_load_fs(const struct JceFileSystem *fs,
+                                         const char *key,
+                                         JceRenderPipelineDesc *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    void *buffer = NULL;
+    uint64_t size = 0;
+    if (jce_fs_read_pak_bounded(fs, key, 1u << 20, &buffer, &size) != JCE_FS_PAK_READ_OK)
+        return false;
+    JceRenderPipelineDesc parsed;
+    jce_render_pipeline_preset_low(&parsed);
+    bool ok = size != 0 && rp_parse_buffer((const char *)buffer, (size_t)size, key, &parsed);
+    jce_fs_buffer_free(buffer);
+    if (ok) *out = parsed;
+    return ok;
+}
+
 /* Load from a mounted PAK/bundle (the shipped single-exe path — the host-fs
  * loader above never fires there because nothing stages loose Settings/). */
-bool jce_render_pipeline_load_pak(const struct JcePakArchive *pak,
-                                  const char *pak_key,
-                                  JceRenderPipelineDesc *out)
+static bool rp_load_pak_seeded(const struct JcePakArchive *pak,
+                              const char *pak_key, JceRenderPipelineDesc *out,
+                              uint8_t msaa_fallback)
 {
     if (!pak || !pak_key || !out) return false;
     const JcePakAsset *a = jce_pak_find((const JcePakArchive *)pak, pak_key);
@@ -967,11 +1052,19 @@ bool jce_render_pipeline_load_pak(const struct JcePakArchive *pak,
     char *buf = (char *)JCE_MALLOC((size_t)a->original_size);
     if (!buf) return false;
     jce_render_pipeline_preset_low(out);
+    out->msaa_samples = msaa_fallback;
     bool ok = jce_pak_decompress(a, buf, (size_t)a->original_size) ==
                   (size_t)a->original_size &&
               rp_parse_buffer(buf, (size_t)a->original_size, pak_key, out);
     JCE_FREE(buf);
     return ok;
+}
+
+bool jce_render_pipeline_load_pak(const struct JcePakArchive *pak,
+                                  const char *pak_key,
+                                  JceRenderPipelineDesc *out)
+{
+    return rp_load_pak_seeded(pak, pak_key, out, 1);
 }
 
 /* Re-run boot resolution AFTER the game's PAKs/bundles are mounted (mounting
@@ -984,10 +1077,12 @@ void jce_render_pipeline_apply_boot_mounted(const struct JcePakArchive *pak,
                                             const char *pak_key)
 {
     JceRenderPipelineDesc desc;
+    JceRenderPipelineDesc fallback;
+    jce_render_pipeline_get_requested(&fallback);
 
     if (host_path && host_path[0]) {
         if (jce_fs_host_exists_file(host_path) &&
-            jce_render_pipeline_load(host_path, &desc)) {
+            rp_load_host_seeded(host_path, &desc, fallback.msaa_samples)) {
             LOG_INFO(LOG_TAG, "render pipeline: loaded asset '%s' (cwd)",
                      host_path);
             jce_render_pipeline_apply(&desc);
@@ -998,7 +1093,7 @@ void jce_render_pipeline_apply_boot_mounted(const struct JcePakArchive *pak,
             char full[1024];
             snprintf(full, sizeof full, "%s%s", base, host_path);
             if (jce_fs_host_exists_file(full) &&
-                jce_render_pipeline_load(full, &desc)) {
+                rp_load_host_seeded(full, &desc, fallback.msaa_samples)) {
                 LOG_INFO(LOG_TAG,
                          "render pipeline: loaded asset '%s' (exe dir)", full);
                 jce_render_pipeline_apply(&desc);
@@ -1007,7 +1102,7 @@ void jce_render_pipeline_apply_boot_mounted(const struct JcePakArchive *pak,
         }
     }
     if (pak && pak_key && pak_key[0] &&
-        jce_render_pipeline_load_pak(pak, pak_key, &desc)) {
+        rp_load_pak_seeded(pak, pak_key, &desc, fallback.msaa_samples)) {
         LOG_INFO(LOG_TAG, "render pipeline: loaded asset 'pak:%s'", pak_key);
         jce_render_pipeline_apply(&desc);
         return;
@@ -1069,7 +1164,7 @@ bool jce_render_pipeline_save(const char *host_path,
     if (!json_str) return false;
 
     size_t len = strlen(json_str);
-    bool ok = jce_fs_host_write_all(host_path, json_str, len);
+    bool ok = jce_fs_host_write_all_atomic(host_path, json_str, len);
     jce_json_free_string(json_str);
     if (!ok) {
         LOG_WARN(LOG_TAG, "cannot write render pipeline asset: %s",

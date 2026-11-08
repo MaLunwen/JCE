@@ -55,7 +55,7 @@ static void quiet_log(JceBundlePackLogLevel level, const char *message,
     (void)user;
 }
 
-static void make_bundle(const char *id)
+static void make_bundle_target(const char *id, int target)
 {
     char scene[1024];
     const char *scenes[1];
@@ -74,8 +74,14 @@ static void make_bundle(const char *id)
     options.single_file_mode = true;
     options.single_bundle_id = id;
     options.zstd_level = 1;
+    if (target >= 0) { options.cook_assets = true; options.target_platform = target; }
     TEST_ASSERT_EQUAL_INT(0,
         jce_bundle_pack_run(&options, quiet_log, NULL));
+}
+
+static void make_bundle(const char *id)
+{
+    make_bundle_target(id, -1);
 }
 
 static void bundle_facts(const char *file, uint64_t *size, char hash[17])
@@ -496,6 +502,32 @@ static void test_env_catalog_mounts_scene_closure(void)
     jce_fs_destroy(fs);
 }
 
+static void test_offline_inspection_exact_target_preserves_runtime_admission(void)
+{
+    make_bundle_target("web", 5);
+    char path[1024]; path_join(path, sizeof(path), "web.jbundle");
+    uint64_t size = 0; void *data = jce_fs_host_read_all(path, &size);
+    TEST_ASSERT_NOT_NULL(data);
+    JceBundleFile *inspected = jce_bundle_file_inspect_memory(data, (size_t)size, "web");
+    TEST_ASSERT_NOT_NULL(inspected);
+    TEST_ASSERT_EQUAL_STRING("web", jce_bundle_file_id(inspected));
+    jce_bundle_file_close(inspected);
+    inspected = jce_bundle_file_inspect_file(path, "web");
+    TEST_ASSERT_NOT_NULL(inspected); jce_bundle_file_close(inspected);
+    TEST_ASSERT_NULL(jce_bundle_file_inspect_memory(data, (size_t)size, "windows"));
+    TEST_ASSERT_NULL(jce_bundle_file_inspect_file(path, "linux"));
+    TEST_ASSERT_NULL(jce_bundle_file_inspect_memory(data, (size_t)size, "auto"));
+    TEST_ASSERT_NULL(jce_bundle_file_inspect_file(path, "desktop"));
+    TEST_ASSERT_NULL(jce_bundle_file_inspect_file(path, NULL));
+    JceFileSystem *fs = jce_fs_create(); TEST_ASSERT_NOT_NULL(fs);
+#if !JCE_PLATFORM_WEB
+    TEST_ASSERT_NULL(jce_bundle_file_open_memory(fs, data, (size_t)size, "runtime"));
+    TEST_ASSERT_NULL(jce_bundle_file_open(fs, path, "runtime"));
+#endif
+    TEST_ASSERT_FALSE(jce_fs_exists(fs, "base.scene"));
+    jce_fs_destroy(fs); jce_fs_buffer_free(data);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -511,6 +543,7 @@ int main(void)
     RUN_TEST(test_standalone_sidecar_detects_archive_tampering);
     RUN_TEST(test_standalone_requires_bundle_manifest);
     RUN_TEST(test_standalone_rejects_invalid_dependency_edge_id);
+    RUN_TEST(test_offline_inspection_exact_target_preserves_runtime_admission);
     RUN_TEST(test_env_catalog_mounts_scene_closure);
     return UNITY_END();
 }

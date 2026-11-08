@@ -155,6 +155,18 @@ bool jce_draw_path_input(const char *label,
 
     Slot &slot = slot_for(label);
 
+    char changed_before[sizeof(slot.last_seen)] = {0};
+    if (opts->changed_before) {
+        if (opts->changed_before_size < buf_size || buf_size > sizeof(slot.last_seen))
+            return false;
+        /* Without a pending browse result, buf is the current authoritative
+         * value (including selection changes and Undo). A pending result has
+         * already overwritten buf, so preserve the prior slot value instead. */
+        if (!slot.browse_ready)
+            snprintf(slot.last_seen, sizeof(slot.last_seen), "%s", buf);
+        snprintf(changed_before, sizeof(changed_before), "%s", slot.last_seen);
+    }
+
     /* Stable unique ids for the buttons.  We append the label's ImGuiID
      * hash so multiple path inputs on the same panel don't collide
      * (ImGui's "##" rule uses only the suffix after the last ##). */
@@ -340,5 +352,7 @@ bool jce_draw_path_input(const char *label,
 
     /* Suppress unused glyph warning when only browse is shown. */
     (void)kBrowseGlyph; (void)kClearGlyph;
+    if (changed && opts->changed_before)
+        snprintf(opts->changed_before, opts->changed_before_size, "%s", changed_before);
     return changed;
 }

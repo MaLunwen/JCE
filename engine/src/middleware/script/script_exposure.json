@@ -35,12 +35,12 @@
     "read."
   ],
   "declared_totals": {
-    "host_members": 112,
-    "expose": 108,
+    "host_members": 113,
+    "expose": 109,
     "hand_written": 8,
     "constants": 1,
-    "table_keys": 117,
-    "members_reached_by_generated": 107,
+    "table_keys": 118,
+    "members_reached_by_generated": 108,
     "members_reached_only_by_hand_written": 5
   },
   "hand_written": [
@@ -390,7 +390,7 @@
       "vtable": "pointer_position",
       "shape": "void_out_array",
       "since": 1,
-      "doc": "Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime."
+      "doc": "Viewport-local Canvas pixel x, y, width, height (native drawable or Editor GameView FBO after render_scale); zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime."
     },
     {
       "name": "get_pointer_wheel",
@@ -855,6 +855,13 @@
       "vtable": "stat_flush",
       "shape": "value_return",
       "since": 1
+    },
+    {
+      "name": "get_viewport_size",
+      "vtable": "viewport_size",
+      "shape": "void_out_array",
+      "since": 1,
+      "doc": "Host presentation width and height in Canvas pixels (native drawable or Editor GameView FBO after render_scale), independent of pointer availability, focus or hover. Persistent until the host replaces or clears it; unavailable or absent sized-host callbacks return zero, zero."
     }
   ]
 }

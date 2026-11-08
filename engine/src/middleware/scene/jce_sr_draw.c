@@ -22,12 +22,14 @@
 #include "jce_sr_sprites.h"
 #include "jce_sr_radix_sort.h"
 #include "jce_sr_prim_material_memo.h"
-#include "renderer/jce_render_encoder.h"   /* jce_enc_set_stencil */
+#include "renderer/jce_render_encoder.h"
+#include "renderer/jce_model_deform_internal.h"
 
 #include <jce/os/core/jce_timer.h>      /* jce_time_perf_counter / _to_ms */
 #include <jce/os/core/jce_perf_phase.h> /* jce_perf_phase_add (sub-phase timing) */
 #include <jce/os/core/jce_profiler.h>   /* Tracy zones, paired with the phases */
 #include <jce/os/core/jce_trace.h>
+#include <jce/os/core/jce_env.h>
 
 /* Paired zone begin/end.
  *
@@ -350,6 +352,7 @@ bool sr_try_submit_skinned_shadow(JceSceneRenderer *sr, JceScene *scene,
                        : jce_scene_get_world_matrix(scene, e);
 
     SrAnimInstance *ai = sr_find_anim_instance(sr, e);
+    if (ai && ai->model != mc->model) ai = NULL;
     const jce_mat4 *pal = (ai && ai->skin_palette_count > 0) ? ai->skin_palette : NULL;
     uint32_t pal_n = ai ? ai->skin_palette_count : 0;
 
@@ -393,12 +396,11 @@ bool sr_try_submit_skinned_shadow(JceSceneRenderer *sr, JceScene *scene,
         }
     }
 
-    /* FEATURE 3.1: shadow MUST consume the SAME per-instance morph VBs as the
-     * color pass (same callback + same ai) so the cast silhouette matches the
-     * morphed mesh; else the plain shadow draw (byte-identical). */
-    if (ai && ai->morph_vb_count > 0)
-        jce_model_draw_morphed_shadow(mc->model, sr->renderer, view_id, &model,
-                                      pal, pal_n, sr_morph_vb_cb, ai);
+    /* Use the same prepared geometry as the colour pass. */
+    JceModelMorphVbCb deform = sr_anim_geometry_vb_cb(ai);
+    if (deform)
+        jce_model_draw_shadow_deformed(mc->model, sr->renderer, view_id, &model,
+                                       pal, pal_n, deform, ai);
     else
         jce_model_draw_shadow(mc->model, sr->renderer, view_id, &model, pal, pal_n);
     return true;
@@ -1997,6 +1999,56 @@ static bool sr_try_draw_meshlet_culled(JceSceneRenderer *sr, JceEntity e,
 }
 
 
+typedef struct SrWireframeDraw {
+    JceSceneRenderer *sr;
+    uint16_t view;
+    bool overlay;
+} SrWireframeDraw;
+
+static void sr_bind_wireframe_color(void *user, bool pbr)
+{
+    const SrWireframeDraw *draw = user;
+    JceSceneRenderer *sr = draw->sr;
+    const float color = draw->overlay ? 0.08f : 0.85f;
+    if (pbr) {
+        JcePbrMaterial material = jce_pbr_material_default();
+        material.base_color_factor[0] = color;
+        material.base_color_factor[1] = color;
+        material.base_color_factor[2] = color;
+        const float ibl[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+        jce_enc_set_uniform(sr->u_ibl_params, ibl, 1);
+        jce_pbr_material_set_view_mode(JCE_SCENE_VIEW_TEXTURED);
+        jce_pbr_material_bind(&material, sr->renderer, draw->view);
+        jce_pbr_material_set_view_mode(draw->overlay
+            ? JCE_SCENE_VIEW_WIREFRAME_TEXTURED : JCE_SCENE_VIEW_WIREFRAME);
+    } else {
+        const float direction[4] = {0.0f, 1.0f, 0.0f, -1.0f};
+        const float rgba[4] = {color, color, color, 1.0f};
+        JceUniformHandle sampler = jce_renderer_get_tex_uniform(sr->renderer);
+        jce_enc_set_uniform(sr->u_light_dir, direction, 1);
+        jce_enc_set_uniform(sr->u_light_color, rgba, 1);
+        jce_enc_set_texture(0, (bgfx_uniform_handle_t){sampler.idx}, sr->white_tex, UINT32_MAX);
+    }
+}
+
+void sr_draw_mesh_view_wireframe(JceSceneRenderer *sr, const JceMesh *mesh,
+    uint16_t view, const jce_mat4 *world, bool overlay)
+{
+    SrWireframeDraw draw = {sr, view, overlay};
+    bgfx_set_transform(world->raw[0], 1);
+    sr_bind_wireframe_color(&draw, false);
+    jce_mesh_submit_view_wireframe(mesh, sr->renderer, view, overlay);
+}
+
+static void sr_draw_model_view_wireframe(JceSceneRenderer *sr, const JceModel *model,
+    uint16_t view, const jce_mat4 *world, const jce_mat4 *palette,
+    uint32_t joints, JceModelMorphVbCb deform, void *deform_user, bool overlay)
+{
+    SrWireframeDraw draw = {sr, view, overlay};
+    jce_model_submit_view_wireframe(model, sr->renderer, view, world, palette,
+        joints, deform, deform_user, overlay, sr_bind_wireframe_color, &draw);
+}
+
 static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
                                             JceScene *scene,
                                             JceEntity e,
@@ -2008,9 +2060,18 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
 {
     const JceMeshRenderer *mr = resolved_mr;
     const char *path = NULL;
-    /* Static-batch member runs, armed here and applied at the bottom by
-     * jce_model_draw_program -- see jce_sr_batch.c for why not at a draw. */
-    sr_arm_batch_runs(sr, scene, e, mr);
+    const bool lines_only = cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME;
+    const bool overlay = cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED;
+    const bool wireframe = lines_only || overlay;
+    /* The retained edge buffer describes the base triangle mesh. Inspect both
+     * against that mesh instead of pairing base edges with a different LOD. */
+    if (wireframe) {
+        jce_model_set_draw_index_runs(NULL, NULL, 0);
+        entity_lod = 0;
+        lod_fade = 1.0f;
+    } else {
+        sr_arm_batch_runs(sr, scene, e, mr);
+    }
     if (mr) {
         if (mr->visible && mr->mesh_path[0] &&
             sr_is_gltf_model_path(mr->mesh_path))
@@ -2023,8 +2084,13 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
     if (!path) return false;
 
     SrModelCache *mc = sr_get_model(sr, path, (uint32_t)e);
-    const bool maps_ready = sr_mr_authored_maps_ready(sr, mr);
-    if (!mc || !mc->model || !maps_ready) return true;
+    if (!mc || !mc->model) return true;
+    if (lines_only) {
+        sr_draw_model_view_wireframe(sr, mc->model, view_id, model, NULL,
+            0, NULL, NULL, false);
+        return true;
+    }
+    if (!sr_mr_authored_maps_ready(sr, mr)) return true;
     sr->model_receiver_layer = jce_scene_get_entity_layer(scene, e);
 
     /* ── Streaming LOD cross-fade (Direction B; dithered detail fade-in) ──
@@ -2111,14 +2177,14 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
                                  * state, and additive is not alpha. */
                                 (mr->alpha_mode == 2 && mr->blend_mode > 1));
 
-    if (sr_mlcull_enabled() && !have_custom && !have_ov && !have_uv && !checker && !fading && !lod_xfade &&
+    if (!wireframe && sr_mlcull_enabled() && !have_custom && !have_ov && !have_uv && !checker && !fading && !lod_xfade &&
         !have_tint && entity_lod == 0 &&
         sr->foliage_gpu_cull_frame && sr->gpu_frame_planes_valid &&
         jce_gpu_scene_meshlet_supported(sr->gpu_scene) &&
         sr_try_draw_meshlet_culled(sr, e, mc->model, view_id, model))
         return true;
 
-    if (sr->model_receiver_layer == 0 &&
+    if (!wireframe && sr->model_receiver_layer == 0 &&
         !have_custom && !have_ov && !have_uv && !checker && !fading && !lod_xfade &&
         jce_model_is_instanceable(mc->model)) {
         if (sr_inst_batch_add(sr, mc->model, model, (uint16_t)entity_lod,
@@ -2191,6 +2257,9 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
     if (checker) jce_model_set_albedo_checker(false);
     if (have_uv) jce_pbr_material_set_uv_override(NULL, NULL);
     if (have_ov) jce_model_set_material_override(NULL);
+    if (overlay)
+        sr_draw_model_view_wireframe(sr, mc->model, view_id, model, NULL,
+            0, NULL, NULL, true);
     return true;
 }
 
@@ -2215,19 +2284,7 @@ static void sr_model_presubmit_cb(void *user, uint16_t view_id)
     sr_inline_bind_pbr_global(sr, NULL, view_id, NULL, NULL,
                              sr->model_receiver_layer);
     if (sr->fp_active_frame)
-        jce_forwardplus_bind(sr->forwardplus);
-}
-
-/* Set toon uniforms before each toon-character primitive submit (mirrors the
- * fwdplus cluster-bind pre-submit hook: bgfx clears uniform state per submit). */
-static void sr_model_toon_presubmit_cb(void *user, uint16_t view_id)
-{
-    JceSceneRenderer *sr = (JceSceneRenderer *)user;
-    if (!sr) return;
-    sr_inline_bind_pbr_global(sr, NULL, view_id, NULL, NULL,
-                             sr->model_receiver_layer);
-    bgfx_set_uniform(sr->u_toon_params,    sr->toon_params_frame,    1);
-    bgfx_set_uniform(sr->u_toon_rim_color, sr->toon_rim_color_frame, 1);
+        jce_forwardplus_bind(sr->fp_storage.module);
 }
 
 /* ── Parallel color gather (concurrent-ECS, charter opt-in JCE_PARALLEL_GATHER) ─
@@ -3508,17 +3565,26 @@ JCE_INLINE bool sr_layer_masked_out(JceScene *scene, JceEntity e,
     return (mask & (1u << (jce_scene_get_entity_layer(scene, e) & 31u))) == 0u;
 }
 
+#include "jce_sr_colour_special_internal.h"
+
 void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                              const JceCamera *camera, EntityList *list,
-                             uint16_t view_id, float dt_sec,
+                             uint16_t view_id, uint16_t transparent_view, float dt_sec,
                              const JceSceneRenderConfig *cfg)
 {
     SR_ZONE_BEGIN(_z_pre, "SceneDraw::Prepare");
     uint64_t _t0_pre = jce_time_perf_counter();   /* sr_pre: head -> main loop */
     double   _vis_ms = 0.0;                       /* nested sr_vis, subtracted below */
+    const bool lines_only = cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME;
+    const bool line_overlay = cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED;
+    const bool wireframe = lines_only || line_overlay;
 
     /* Animation is advanced in sr_update_skinned_anims (before the shadow
        pass); the color pass only consumes the cached palette. */
+    SrGrassGatePass grass_gate_pass;
+    SrGrassGatePass *const grass_gate_pass_ptr = sr_grass_gate_pass_begin(
+        &grass_gate_pass, scene, cfg->draw_opaque);
+    SrColourSpecialPass colour_special_pass = {0};
 
     /* Water phase: OFFER to advance the scene's shared clock, then read it.
      *
@@ -3535,13 +3601,6 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
     sr->water_time =
         (float)jce_water_field_set_get_time(jce_scene_water_fields(scene));
 
-    /* Advance the grass wind phase clock (drives vs_grass's u_grass_time).
-     * Mirrors the water clock: 0 in still editor previews, animates in Play. */
-    if (dt_sec > 0.0f) {
-        sr->grass_time += dt_sec;
-        if (sr->grass_time > 100000.0f) sr->grass_time -= 100000.0f;
-    }
-
     /* Advance the streaming cross-fade phase clock (Direction B).  GATED on a
      * streaming scene (enabled + chunks): the dithered detail fade-in is only for
      * cells streaming in, so in every non-streaming scene fade_time stays 0 and
@@ -3555,7 +3614,22 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             sr->fade_time += dt_sec;
     }
 
-    if (list->count == 0) return;
+    /* Resolve one request per color view. Admit both parallel arrays and the
+     * cluster before collection, including the first enabled view. Missing
+     * camera/light environment or failed admission uses fixed-light programs. */
+    const bool fp_requested = sr->cv_forwardplus &&
+        jce_cvar_get_bool(sr->cv_forwardplus);
+    const bool fp_collect = sr_forwardplus_storage_prepare(&sr->fp_storage,
+        fp_requested && list->count > 0 && sr->light_env && camera, NULL);
+    if (list->count == 0) {
+        sr->fp_active_frame = false;
+        if (sr->renderer)
+            jce_renderer_set_forwardplus_program_active(sr->renderer, false);
+        sr_grass_gate_pass_publish(&sr->grass_gate_trace, grass_gate_pass_ptr,
+            sr, view_id, sr->grass_resource_generation);
+        SR_ZONE_END(_z_pre);
+        return;
+    }
 
     /* Gather lights. */
     uint64_t _t0_lights = jce_time_perf_counter();
@@ -3563,15 +3637,13 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         jce_light_env_clear(sr->light_env);
         /* Forward+ (ROUND A): accumulate the same point+spot lights into the
          * cluster scratch arrays as we add them to light_env.  Counts up to
-         * fp_max_lights (256), independent of the brute-force env caps. */
+         * the retained capacity (256), independent of the brute-force env caps. */
         uint32_t fp_n = 0;
         /* Round B: collect EVERY visible point/spot light into the cluster
-         * scratch (up to fp_max_lights), decoupled from the brute-force top-N
+         * scratch (up to the retained capacity), decoupled from the brute-force top-N
          * selection below — that decoupling is what actually lifts the 16-light
          * cap.  Only fill when Forward+ is on this frame (when off the cluster
          * is never uploaded, so skip the work to stay byte-identical/cheap). */
-        bool fp_collect = sr->cv_forwardplus
-                       && jce_cvar_get_bool(sr->cv_forwardplus);
         /* Resolve the ambient ONCE, then apply the procedural-sky fill to
          * whatever it resolved to.
          *
@@ -3774,10 +3846,10 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
 
                     /* Forward+ cluster: every visible point light up to capacity,
                      * decoupled from the 16-cap selection (Round B). */
-                    if (fp_collect && sr->fp_proxies && fp_n < sr->fp_max_lights &&
+                    if (fp_collect && sr->fp_storage.proxies && fp_n < sr->fp_storage.capacity &&
                         sr_fp_admits(sr->frame_sel_point, sr->frame_sel_point_n, e)) {
-                        JceLightProxy *gp = &sr->fp_proxies[fp_n];
-                        JceForwardPlusLightParam *pp = &sr->fp_params[fp_n];
+                        JceLightProxy *gp = &sr->fp_storage.proxies[fp_n];
+                        JceForwardPlusLightParam *pp = &sr->fp_storage.params[fp_n];
                         gp->position_ws = pl.position;
                         gp->radius      = pl.radius;
                         gp->user_id     = fp_n;
@@ -3880,10 +3952,10 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                      * cluster broad-phase treats the spot as a bounding sphere
                      * (radius); the per-light cone params let the shader evaluate
                      * the cone afterwards. */
-                    if (fp_collect && sr->fp_proxies && fp_n < sr->fp_max_lights &&
+                    if (fp_collect && sr->fp_storage.proxies && fp_n < sr->fp_storage.capacity &&
                         sr_fp_admits(sr->frame_sel_spot, sr->frame_sel_spot_n, e)) {
-                        JceLightProxy *gp = &sr->fp_proxies[fp_n];
-                        JceForwardPlusLightParam *pp = &sr->fp_params[fp_n];
+                        JceLightProxy *gp = &sr->fp_storage.proxies[fp_n];
+                        JceForwardPlusLightParam *pp = &sr->fp_storage.params[fp_n];
                         gp->position_ws = sl.position;
                         gp->radius      = sl.radius;
                         gp->user_id     = fp_n;
@@ -3900,6 +3972,8 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             }
         }
 
+        /* Colour-pass light preparation changes CPU inputs only. The admitted
+         * material/model/grass binder owns its complete uniform update range. */
         if (sr->tod_active)
             jce_light_env_set_ambient(sr->light_env, sr->tod_state.ambient_color, 1.0f);
 
@@ -3907,21 +3981,14 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             jce_vec3 cp = jce_camera_get_position(camera);
             jce_light_env_set_camera_pos(sr->light_env, cp);
         }
-        jce_light_env_apply(sr->light_env, sr->renderer);
 
-        /* Forward+ clustered lighting (ROUND B): read the r.forwardplus cvar
+        /* Forward+ clustered lighting: use the admitted color-view request
          * (default off), drive the module's enable + the renderer's program
          * swap, build the froxel cluster from the gathered point+spot lights,
          * and upload it to the SINGLE combined GPU data texture.  When the
          * cvar is off everything below is skipped and the renderer keeps the
          * non-variant programs -> byte-identical to the brute-force path. */
-        bool fp_on = sr->cv_forwardplus
-                  ? jce_cvar_get_bool(sr->cv_forwardplus) : false;
-        if (sr->forwardplus)
-            jce_forwardplus_set_enabled(sr->forwardplus, fp_on);
-
-        if (fp_on && sr->forwardplus && jce_forwardplus_is_enabled(sr->forwardplus)
-            && camera) {
+        if (fp_collect) {
             float aspect = (cfg->viewport_width > 0 && cfg->viewport_height > 0)
                 ? (float)cfg->viewport_width / (float)cfg->viewport_height
                 : 16.0f / 9.0f;
@@ -3931,8 +3998,8 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                                                sr->homogeneous_depth);
             float fp_near = jce_camera_get_near(camera);
             float fp_far  = jce_camera_get_far(camera);
-            jce_forwardplus_update(sr->forwardplus,
-                                   sr->fp_proxies, sr->fp_params, fp_n,
+            jce_forwardplus_update(sr->fp_storage.module,
+                                   sr->fp_storage.proxies, sr->fp_storage.params, fp_n,
                                    &fp_inv_view, &fp_proj,
                                    fp_near, fp_far, sr->renderer);
         }
@@ -3946,8 +4013,6 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
      * the renderer returns the non-variant programs and the bind callbacks
      * skip jce_forwardplus_bind -> nothing touches sampler stage 14. */
     {
-        bool fp_on = sr->cv_forwardplus
-                  ? jce_cvar_get_bool(sr->cv_forwardplus) : false;
         bool variant_ok = sr->renderer &&
             jce_shader_valid(jce_renderer_get_program_pbr_fwdplus(sr->renderer));
         /* Rendering layers no longer turn Forward+ off.  They used to: the
@@ -3966,8 +4031,8 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
          * ONE light layer cost the whole clustered path, which is a
          * performance cliff on exactly the hardware clustered lighting exists
          * for. */
-        sr->fp_active_frame = fp_on && sr->forwardplus &&
-            jce_forwardplus_is_enabled(sr->forwardplus) && variant_ok;
+        sr->fp_active_frame = fp_collect && sr->fp_storage.module &&
+            jce_forwardplus_is_enabled(sr->fp_storage.module) && variant_ok;
         if (sr->renderer)
             jce_renderer_set_forwardplus_program_active(sr->renderer,
                                                         sr->fp_active_frame);
@@ -3991,21 +4056,6 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         float raw_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         bgfx_set_uniform(sr->u_light_dir, raw_dir, 1);
         bgfx_set_uniform(sr->u_light_color, raw_color, 1);
-    }
-
-    /* WIREFRAME_TEXTURED debug view: trigger fs_mesh.sc hue-Lambert branch by
-     * setting u_lightDir.w = 0.25 (matches 0.5.7 behaviour). Done after
-     * jce_lighting_apply since that overwrites these uniforms. */
-    if (cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED &&
-        sr->has_cbs && sr->cbs.load_texture)
-    {
-        jce_vec3 sd = legacy_has_dir ? legacy_dir : jce_v3(0.0f, 1.0f, 0.0f);
-        float len = sqrtf(sd.x * sd.x + sd.y * sd.y + sd.z * sd.z);
-        if (len > 1e-6f) { sd.x /= len; sd.y /= len; sd.z /= len; }
-        float wf_dir[4]   = { sd.x, sd.y, sd.z, 0.25f };
-        float wf_color[4] = { 1.0f, 1.0f, 1.0f, 0.2f };
-        bgfx_set_uniform(sr->u_light_dir,   wf_dir,   1);
-        bgfx_set_uniform(sr->u_light_color, wf_color, 1);
     }
 
     /* Begin sprite batch.  Unconditional: billboards (draw_opaque-gated) add to
@@ -4299,7 +4349,8 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         const char *v = getenv("JCE_USE_RQ");
         s_use_rq_env = (v && v[0] == '0') ? 0 : 1;
     }
-    bool use_rq = s_use_rq_env && sr->render_queue && prog_pbr_inst_h.idx != UINT16_MAX;
+    bool use_rq = !wireframe && s_use_rq_env && sr->render_queue &&
+                  prog_pbr_inst_h.idx != UINT16_MAX;
     if (use_rq) {
         sr_reset_material_cache(sr);
         jce_rq_clear(sr->render_queue);
@@ -4343,6 +4394,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
     if (sr->crowd_sh_group_count > 0)
         sr_crowd_shadow_flush(sr, sr->crowd_sh_view);
 
+
     /* Reset the per-model GPU-instancing batch; batchable static glTF entities
      * accumulate during the loop and flush once after it. */
     sr->inst_batch_count = 0;
@@ -4384,12 +4436,9 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         bgfx_set_uniform(sr->u_lod_fade, lf_off, 1);
     }
 
-    /* GI uniforms: pass-start upload (same persistence rationale as the
-     * u_lodFade default above).  Most pixels come from draw paths that never
-     * run the material funnel (instanced/crowd/GPU-driven) and INHERIT the
-     * last-written bgfx uniform values — without this write they latch
-     * whatever the funnel uploaded at boot (z=0 forever = dynamic GI dead). */
-    sr_upload_gi_uniforms(sr);
+    /* Colour-pass GI preparation records no draw commands. Each admitted
+     * material/model binder publishes its current GI parameters and SH9;
+     * an upfront upload would duplicate that first draw's uniform writes. */
 
     /* Parallel color gather (concurrent-ECS, charter opt-in JCE_PARALLEL_GATHER).
      * Eligible entities (factor-only shape primitives, SHADED+opaque) defer their
@@ -4428,7 +4477,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
     static int s_dc_verify = -1;
     if (s_dc_verify < 0) { const char *v = getenv("JCE_DRAWCMD_VERIFY");
                            s_dc_verify = (v && v[0] && v[0] != '0') ? 1 : 0; }
-    const bool dc_cache_on = dc_enabled && !pg_active && sr->render_queue &&
+    const bool dc_cache_on = !wireframe && dc_enabled && !pg_active && sr->render_queue &&
                              prog_pbr_inst_h.idx != UINT16_MAX;
 
     /* ── Factor-only primitive tint-instancing (opt-in JCE_PRIM_INSTANCE) ──
@@ -4649,17 +4698,9 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                             tpbr.base_color_factor[1] *= tc->tint[1];
                             tpbr.base_color_factor[2] *= tc->tint[2];
                         }
-                        bgfx_texture_handle_t tlayers[4];
-                        for (int li = 0; li < 4; li++) tlayers[li] = sr->white_tex;
-                        for (int li = 0; li < 4; li++) {
-                            if (!tc->layer_albedo_path[li][0]) continue;
-                            JceTexture lt =
-                                sr_resolve_texture_srgb(sr, tc->layer_albedo_path[li]);
-                            if (jce_texture_valid(lt)) tlayers[li].idx = lt.idx;
-                        }
-                        sr_draw_terrain_chunks(sr, scene, list, camera, view_id,
-                                            tslot, tc, &tmodel, &tpbr, tlayers,
-                                            sr->ecull[i].layer);
+                        sr_draw_terrain_chunks(sr, scene, list, e, camera, view_id,
+                                            tslot, tc, &tmodel, &tpbr,
+                                            sr->ecull[i].layer, cfg->view_mode);
                     }
                 }
                 continue;  /* terrain fully handled (or skipped) */
@@ -4719,121 +4760,60 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 static int s_veg_cid = -2;
                 if (s_veg_cid == -2) s_veg_cid = jce_component_find("VegetationScatter");
                 if (s_veg_cid < 0 || jce_scene_comp_enabled(scene, e, s_veg_cid)) {
-                    /* Gate the TIMESTAMP, not just the accumulate.
-                     * jce_perf_phase_add returns early when phases are off, but
-                     * this site sits INSIDE the per-entity submit loop, so the
-                     * two QueryPerformanceCounter calls ran for every foliage
-                     * entity every frame regardless of whether anyone was
-                     * measuring. The sampler put RtlQueryPerformanceCounter at
-                     * 2.1% of graveyard's frame -- roughly 3000 calls, which is
-                     * what a per-entity timer looks like in a scene with
-                     * foliage. A phase counter must cost nothing when off. */
-                    const int _pp_f = jce_perf_phase_enabled();
-                    uint64_t _t0_fol = _pp_f ? jce_time_perf_counter() : 0u;
-                    sr_draw_foliage(sr, scene, list, e, view_id, camera);
-                    if (_pp_f)
-                        jce_perf_phase_add("sr_foliage",
-                            jce_time_perf_to_ms(_t0_fol, jce_time_perf_counter()));
+                    sr_colour_special_defer(&colour_special_pass,
+                        &sr->ecull[i].colour_special, SR_COLOUR_SCATTER);
                 }
                 continue;
             }
 
-            /* ── Line Renderer (polyline; reuses the color program + PT_LINES) ──
-            * Bypasses the per-entity AABB (segments may be large/scattered).
-            * Drawn additively — does NOT `continue`, so an entity may carry both a
-            * mesh and a line renderer. */
-            /* Transparent pass, not opaque: the ribbon depth-TESTS but does
-             * not depth-WRITE, so anything opaque submitted after it covers
-             * it regardless of true depth -- an orbit line clearly in front
-             * of the planet vanished behind it. Drawing after all opaque
-             * geometry makes the depth test mean what it says. */
+            /* Additive lines bypass the entity AABB and coexist with a mesh.
+             * Defer their depth-test/no-depth-write draw until after opaque. */
             if (cfg->draw_transparent && jce_scene_has_line_renderer(scene, e)) {
                 static int s_line_cid = -2;
                 if (s_line_cid == -2) s_line_cid = jce_component_find("LineRenderer");
                 if (s_line_cid < 0 || jce_scene_comp_enabled(scene, e, s_line_cid))
-                    sr_draw_line_renderer(sr, scene, list, e, camera, view_id);
+                    sr_colour_special_defer(&colour_special_pass,
+                        &sr->ecull[i].colour_special, SR_COLOUR_LINE);
             }
 
-            /* ── Trail Renderer (open ribbon over the captured point buffer) ──
-            * Same camera-facing ribbon as Line; world-space captured points.
-            * Bypasses the AABB + does NOT continue (mesh + trail can coexist). */
+            /* Trails retain the same coexistence and deferred blend policy. */
             if (cfg->draw_transparent && jce_scene_has_trail_renderer(scene, e)) {
                 static int s_trail_cid = -2;
                 if (s_trail_cid == -2) s_trail_cid = jce_component_find("TrailRenderer");
                 if (s_trail_cid < 0 || jce_scene_comp_enabled(scene, e, s_trail_cid))
-                    sr_draw_trail_renderer(sr, scene, list, e, camera, view_id);
+                    sr_colour_special_defer(&colour_special_pass,
+                        &sr->ecull[i].colour_special, SR_COLOUR_TRAIL);
             }
 
-            /* ── Water surface (Gerstner, roadmap 2.3) ───────────────────
-            * Translucent animated plane.  Sized to size_x*size_z and centred
-            * on the entity, so (like terrain/foliage) it bypasses the per-
-            * entity visibility AABB.  Drawn alpha-blended in the color view. */
+            /* Water owns its surface bounds and claims this entity's draw. */
             if (cfg->draw_transparent && jce_scene_has_water(scene, e)) {
                 static int s_water_cid = -2;
                 if (s_water_cid == -2) s_water_cid = jce_component_find("Water");
                 if (s_water_cid < 0 || jce_scene_comp_enabled(scene, e, s_water_cid))
-                    sr_draw_water(sr, scene, camera, list, e, view_id);
+                    sr_colour_special_defer(&colour_special_pass,
+                        &sr->ecull[i].colour_special, SR_COLOUR_WATER);
                 continue;
             }
 
-            /* ── Grass Field (GPU-instanced blades + wind, Stage 1b.6) ────
-            * Dedicated module; bypasses the per-entity AABB like foliage/water.
-            * Three-layer gate: hardware instancing + GPU tier >= HIGH +
-            * project-level grass_enabled (JceRenderSettings).  Opaque, so
-            * dispatched in the cfg->draw_opaque branch. */
-            /* ── Foliage Cluster (billboard canopy/bush, alpha-test) ─────
-            * Dedicated module like grass; bypasses the per-entity AABB (the
-            * shell extends past the entity origin). Opaque-pass discard. */
+            /* Foliage cutouts and opaque grass keep producer-owned bounds.
+             * Grass request/admission runs once in the deferred opaque stage. */
             if (cfg->draw_opaque && jce_scene_has_foliage_cluster(scene, e)) {
                 /* JCE_NO_FOLIAGE: perf-bisect kill switch (web GPU triage). */
                 static int s_no_fol = -1;
                 if (s_no_fol < 0)
-                    s_no_fol = (getenv("JCE_NO_FOLIAGE") != NULL) ? 1 : 0;
+                    s_no_fol = jce_env_flag_enabled(getenv("JCE_NO_FOLIAGE"));
                 if (s_no_fol) continue;
                 static int s_fol_cid = -2;
                 if (s_fol_cid == -2) s_fol_cid = jce_component_find("FoliageCluster");
                 if (s_fol_cid < 0 || jce_scene_comp_enabled(scene, e, s_fol_cid))
-                    sr_draw_foliage_cluster(sr, scene, list, e, view_id);
+                    sr_colour_special_defer(&colour_special_pass,
+                        &sr->ecull[i].colour_special, SR_COLOUR_CLUSTER);
                 continue;
             }
 
             if (cfg->draw_opaque && jce_scene_has_grass_field(scene, e)) {
-                /* JCE_NO_GRASS: perf-bisect kill switch (web GPU triage —
-                 * an authored field is ~1.5M vertices/frame of essl vertex
-                 * shading, resolution-independent). */
-                static int s_no_grass = -1;
-                if (s_no_grass < 0)
-                    s_no_grass = (getenv("JCE_NO_GRASS") != NULL) ? 1 : 0;
-                if (s_no_grass) continue;
-                static int s_grass_cid = -2;
-                if (s_grass_cid == -2) s_grass_cid = jce_component_find("GrassField");
-                bool enabled  = (s_grass_cid < 0) ||
-                                jce_scene_comp_enabled(scene, e, s_grass_cid);
-                bool caps_ok  = (jce_renderer_get_caps() & JCE_CAP_INSTANCING) != 0;
-                /* Floor at MEDIUM (was HIGH): integrated GPUs are auto-capped to
-                 * MEDIUM (they can't sustain the HIGH postfx/shadow budget), but
-                 * they ARE instancing-capable and can render an authored grass
-                 * field just fine — the HIGH floor silently deleted ALL grass on
-                 * every iGPU once the cap landed, the same class of regression as
-                 * the WebGL2/ANGLE case below.  grass_enabled (project opt-in) is
-                 * the real switch; the tier floor only protects the truly-weak
-                 * LOW tier (which also gets a density floor elsewhere).
-                 * WebGL2 exemption: ANGLE masks the adapter as "Unknown" -> the
-                 * tier heuristic lands on LOW, but behind ANGLE there is almost
-                 * always a real desktop GPU and instancing is ES3-core, so let
-                 * grass_enabled make the call there regardless of tier. */
-                bool tier_ok  = jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM
-                             || jce_renderer_get_active_backend()
-                                    == JCE_BACKEND_OPENGLES;
-                bool proj_ok  = sr->grass_enabled;
-                if (enabled && caps_ok && tier_ok && proj_ok) {
-                    const int _pp_g = jce_perf_phase_enabled();
-                    uint64_t _t0_gr = _pp_g ? jce_time_perf_counter() : 0u;
-                    sr_draw_grass(sr, scene, list, e, view_id, camera, cfg);
-                    if (_pp_g)
-                        jce_perf_phase_add("sr_grass",
-                            jce_time_perf_to_ms(_t0_gr, jce_time_perf_counter()));
-                }
+                sr_colour_special_defer(&colour_special_pass,
+                    &sr->ecull[i].colour_special, SR_COLOUR_GRASS);
                 continue;
             }
         } /* end if(!kc_prim): PRIM_MESH skips the whole type-dispatch ladder */
@@ -4860,7 +4840,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
              * LODGroup leave on the first probe, so a scene that authors no
              * impostors pays one component test per visible entity and is
              * otherwise unchanged. */
-            if (sr_try_impostor_card(sr, scene, e, cfg, camera, &model))
+            if (!wireframe && sr_try_impostor_card(sr, scene, e, cfg, camera, &model))
                 continue;
             if (slp) {   /* Calibration: an empty span, so every bucket below
                           * can be read NET of the two counter calls it costs.
@@ -5020,7 +5000,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             uint64_t egen = jce_scene_entity_xform_gen(scene, e);
             uint64_t mgen = jce_scene_entity_material_gen(scene, e);
             SrWorldCacheEntry *wc =
-                sr_wcache_find(sr, (uint32_t)e, dc_struct_epoch, egen);
+                sr_wcache_find(sr, e, dc_struct_epoch, egen);
             SrPgCmd built;
             /* ... and still on the layer the cached key was built for: moving
              * layers edits a component VALUE and bumps neither epoch nor
@@ -5067,7 +5047,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     bgfx_set_transform(built.cmd.transform.raw[0], 1);
                     sr_inline_bind_pbr_global(sr, &built.pbr, view_id, scene, list,
                                               built.layer);
-                    if (sr->fp_active_frame) jce_forwardplus_bind(sr->forwardplus);
+                    if (sr->fp_active_frame) jce_forwardplus_bind(sr->fp_storage.module);
                     if (built.cmd.stencil)
                         jce_enc_set_stencil(built.cmd.stencil, BGFX_STENCIL_NONE);
                     jce_mesh_submit_pbr_state(built.mesh, sr->renderer, view_id,
@@ -5087,7 +5067,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
          * card sampling its pre-baked octahedral atlas — a forest of distant
          * trees collapses to a handful of instanced quads.  Skinned entities
          * never impostor.  No impostor authored => byte-identical to before. */
-        if (sr_try_impostor_card(sr, scene, e, cfg, camera, &model))
+        if (!wireframe && sr_try_impostor_card(sr, scene, e, cfg, camera, &model))
             continue;
 
         /* ── Per-entity LOD group (P1 #6) ─────────────────────────────
@@ -5120,8 +5100,12 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                         /* Distinct per-level mesh override: draw that model. */
                         SrModelCache *lmc = sr_get_model(sr, lpath, (uint32_t)e);
                         if (lmc && lmc->model) {
-                            jce_model_draw(lmc->model, sr->renderer,
-                                           view_id, &model, NULL, 0);
+                            if (!lines_only)
+                                jce_model_draw(lmc->model, sr->renderer, view_id,
+                                               &model, NULL, 0);
+                            if (wireframe)
+                                sr_draw_model_view_wireframe(sr, lmc->model, view_id,
+                                    &model, NULL, 0, NULL, NULL, line_overlay);
                             continue;  /* drew LOD level model; skip base */
                         }
                     }
@@ -5169,9 +5153,19 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 if (mc && mc->model) {
                     sr->model_receiver_layer = jce_scene_get_entity_layer(scene, e);
                     SrAnimInstance *ai = sr_find_anim_instance(sr, e);
+                    if (ai && ai->model != mc->model) ai = NULL;
                     const jce_mat4 *pal =
                         (ai && ai->skin_palette_count > 0) ? ai->skin_palette : NULL;
                     uint32_t pal_n = ai ? ai->skin_palette_count : 0;
+                    JceModelMorphVbCb deform = sr_anim_geometry_vb_cb(ai);
+                    if (wireframe) {
+                        if (line_overlay)
+                            jce_model_draw_deformed(mc->model, sr->renderer, view_id,
+                                                    &model, pal, pal_n, deform, ai);
+                        sr_draw_model_view_wireframe(sr, mc->model, view_id, &model,
+                            pal, pal_n, deform, ai, line_overlay);
+                        continue;
+                    }
 
                     /* GPU crowd instancing: route this character into the shared
                      * instanced batch when eligible — its palette was packed into
@@ -5212,11 +5206,9 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                             continue;
                     }
 
-                    if (ai && ai->morph_vb_count > 0) {
-                        /* Morph path unchanged (v1: toon not applied to morphed). */
-                        jce_model_draw_morphed(mc->model, sr->renderer, view_id,
-                                               &model, pal, pal_n,
-                                               sr_morph_vb_cb, ai);
+                    if (deform) {
+                        jce_model_draw_deformed(mc->model, sr->renderer, view_id,
+                                                &model, pal, pal_n, deform, ai);
                     } else {
                         /* Toon decision: sibling MeshRenderer.toon + frame gate. */
                         JceMeshRenderer *smr = jce_scene_has_mesh_renderer(scene, e)
@@ -5287,8 +5279,8 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                             jce_model_set_pre_submit_cb(sr_model_toon_presubmit_cb, sr);
                         }
 
-                        jce_model_draw_program(mc->model, sr->renderer, view_id,
-                                               &model, pal, pal_n, toon_override);
+                        sr_toon_hair_draw(sr, mc->model, view_id, &model,
+                                          pal, pal_n, toon_override);
 
                         if (want_toon) {
                             /* Restore complete frame globals for subsequent
@@ -5330,21 +5322,14 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
          * unconditional set here was a wasted per-entity bgfx call (10k+/frame).
          * The inline-submit and simple-mesh paths below set it just-in-time. */
 
-        /* ── PBR mesh path ───────────────────────────────────────── */
-        /* ── View-mode dispatch (mirrors the 0.5.7 editor exactly):
-         *      SHADED                : PBR factors (no textures), full lighting
-         *      TEXTURED              : PBR + all textures, checker fallback
-         *      WIREFRAME             : simple-mesh shader, white tint, flat Lambert
-         *      WIREFRAME_TEXTURED    : simple-mesh shader, albedo tint, hue-Lambert
-         *
-         * Only the editor (callback mode) uses these debug modes; runtime
-         * always renders PBR with whatever textures the asset specifies. */
-        bool editor_mode = (sr->has_cbs && sr->cbs.load_texture);
-        bool wireframe_path = editor_mode &&
-            (cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME ||
-             cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED);
+        if (lines_only) {
+            sr_draw_mesh_view_wireframe(sr, mesh, view_id, &model, false);
+            continue;
+        }
 
-        if (!wireframe_path) {
+        /* PBR fill. A wire overlay uses the same material view and depth. */
+        {
+            const bool editor_mode = sr->has_cbs && sr->cbs.load_texture;
             JcePbrMaterial pbr = jce_pbr_material_default();
             bool use_checker_fallback = false;
 
@@ -5477,6 +5462,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             const uint64_t mat_state = jce_pbr_material_render_state(&pbr);
             const uint32_t mat_stencil = jce_pbr_material_stencil(&pbr);
             const bool is_transparent = jce_pbr_material_is_transparent(&pbr);
+            const uint16_t material_view = is_transparent ? transparent_view : view_id;
 
             /* Shader Graph custom shader: a .mat.json may persist a graph-
              * generated program (customProgramVs/Fs).  When present, route
@@ -5508,7 +5494,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 if (reg_key && target_q) {
                     JceDrawCmd cmd;
                     memset(&cmd, 0, sizeof(cmd));
-                    cmd.view_id      = view_id;
+                    cmd.view_id      = material_view;
                     if (has_custom) {
                         /* Single-submit only: no instance variant for graph
                          * shaders.  program_single drives the n=1 path. */
@@ -5560,11 +5546,11 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
 
             /* ── Inline path (queue overflow or queue disabled) ── */
             bgfx_set_transform(model.raw[0], 1);   /* JIT: only the inline submit needs it */
-            sr_inline_bind_pbr_global(sr, &pbr, view_id, scene, list,
+            sr_inline_bind_pbr_global(sr, &pbr, material_view, scene, list,
                                       sr->ecull[i].layer);
             if (has_custom)
                 jce_mesh_submit_pbr_with_program(mesh, sr->renderer,
-                                                 view_id, custom_prog);
+                                                 material_view, custom_prog);
             else {
                 /* Forward+ cluster bind (stage 14 = s_cluster + uniforms) only
                  * for the default PBR program path (a custom graph shader has
@@ -5572,44 +5558,13 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                  * from jce_renderer_get_program_pbr, which returns the
                  * fs_pbr_fwdplus variant while fp_active_frame is set. */
                 if (sr->fp_active_frame)
-                    jce_forwardplus_bind(sr->forwardplus);
+                    jce_forwardplus_bind(sr->fp_storage.module);
                 if (mat_stencil)
                     jce_enc_set_stencil(mat_stencil, BGFX_STENCIL_NONE);
-                jce_mesh_submit_pbr_state(mesh, sr->renderer, view_id, mat_state);
+                jce_mesh_submit_pbr_state(mesh, sr->renderer, material_view, mat_state);
             }
-        } else {
-            /* Simple mesh shader path. Used for:
-             *   - WIREFRAME / WIREFRAME_TEXTURED (editor debug views)
-             *   - entities without a MeshRenderer component (white blob) */
-            bgfx_texture_handle_t bind_tex = sr->white_tex;
-
-            if (cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED && mr_comp)
-            {
-                JceTexture t = { UINT16_MAX };
-                if (mr_comp->albedo_tex[0])
-                    t = sr_resolve_texture(sr, mr_comp->albedo_tex);
-                if (!jce_texture_valid(t) &&
-                    (mr_comp->material_path[0] || mr_comp->mesh_path[0]))
-                    t = sr_resolve_texture2(sr,
-                        mr_comp->material_path[0] ? mr_comp->material_path : NULL,
-                        mr_comp->mesh_path[0]     ? mr_comp->mesh_path     : NULL);
-                if (jce_texture_valid(t)) bind_tex.idx = t.idx;
-            }
-
-            /* TEXTURED mode + entity with no MR component (or no albedo path):
-             * fall back to the magenta/yellow checker so missing assets are
-             * visually obvious. */
-            if (editor_mode && cfg->view_mode == JCE_SCENE_VIEW_TEXTURED &&
-                !mr_comp && BGFX_HANDLE_IS_VALID(sr->checker_tex))
-            {
-                bind_tex = sr->checker_tex;
-            }
-
-            JceUniformHandle uh = jce_renderer_get_tex_uniform(sr->renderer);
-            bgfx_uniform_handle_t su = { uh.idx };
-            bgfx_set_texture(0, su, bind_tex, UINT32_MAX);
-            bgfx_set_transform(model.raw[0], 1);   /* JIT: simple-mesh single submit */
-            jce_mesh_submit(mesh, sr->renderer, view_id);
+            if (line_overlay)
+                sr_draw_mesh_view_wireframe(sr, mesh, material_view, &model, true);
         }
 
         /* (Occlusion proxy query already submitted right after the visibility
@@ -5689,7 +5644,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 bgfx_set_transform(o->cmd.transform.raw[0], 1);
                 sr_inline_bind_pbr_global(sr, &o->pbr, view_id, scene, list,
                                           o->layer);
-                if (sr->fp_active_frame) jce_forwardplus_bind(sr->forwardplus);
+                if (sr->fp_active_frame) jce_forwardplus_bind(sr->fp_storage.module);
                 if (o->cmd.stencil)
                     jce_enc_set_stencil(o->cmd.stencil, BGFX_STENCIL_NONE);
                 jce_mesh_submit_pbr_state(o->mesh, sr->renderer, view_id, o->cmd.state);
@@ -5871,6 +5826,15 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         JCE_FLUSH_MARK("f_rq_collect");
     }
 
+    /* Delayed special stages: one capture/admission, no scratch queue. */
+    sr_colour_special_submit_opaque(sr, scene, camera, list, view_id, cfg,
+        &colour_special_pass, grass_gate_pass_ptr);
+    sr_grass_gate_pass_publish(&sr->grass_gate_trace, grass_gate_pass_ptr,
+        sr, view_id, sr->grass_resource_generation);
+    sr_colour_special_submit_transparent(sr, scene, camera, list, transparent_view,
+        &colour_special_pass);
+    JCE_FLUSH_MARK("f_special");
+
     /* ── Transparent queue flush ───────────────────────────────────────
      * Alpha-blended materials, sorted back-to-front by real view-space
      * depth, flushed AFTER the opaque pass so they composite over solid
@@ -5891,7 +5855,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
     /* Flush sprite batch whenever it has content — billboards add even when
      * draw_sprites is off, so gate on count, not draw_sprites. */
     if (sr->sprite_batch && jce_sprite_batch_count(sr->sprite_batch) > 0)
-        jce_sprite_batch_flush(sr->sprite_batch, sr->renderer, view_id);
+        jce_sprite_batch_flush(sr->sprite_batch, sr->renderer, transparent_view);
     JCE_FLUSH_MARK("f_sprite");
     jce_perf_phase_add("sr_flush", jce_time_perf_to_ms(_t0_flush, jce_time_perf_counter()));
     SR_ZONE_END(_z_flush);

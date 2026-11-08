@@ -26,6 +26,139 @@ uint32_t read_le32(const uint8_t *p)
            (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
 
+/* Keep this OS-owned DLL list identical to tools/build/standalone.py.
+ * API-set prefixes below retain that owner's exact acceptance semantics. */
+constexpr const char *system_dlls[] = {
+    "advapi32", "bcrypt", "cabinet", "cfgmgr32", "comctl32", "comdlg32", "crypt32",
+    "cryptbase", "d3d11", "d3d12", "d3dcompiler_47", "dbghelp", "dnsapi", "dwmapi",
+    "dwrite", "dxgi", "gdi32", "gdiplus", "hid", "imm32", "iphlpapi", "kernel32",
+    "kernelbase", "mpr", "msimg32", "msvcrt", "ncrypt", "netapi32", "normaliz", "ntdll",
+    "ole32", "oleaut32", "opengl32", "powrprof", "psapi", "rpcrt4", "secur32",
+    "setupapi", "shell32", "shlwapi", "user32", "userenv", "usp10", "uxtheme",
+    "version", "winhttp", "wininet", "winmm", "winspool", "wintrust", "wldap32",
+    "ws2_32", "wsock32", "wtsapi32"
+};
+
+bool system_import(const std::string &name)
+{
+    if (name.compare(0, 16, "api-ms-win-core-") == 0 ||
+        name.compare(0, 11, "ext-ms-win-") == 0)
+        return true;
+    if (name.size() < 5u || name.compare(name.size() - 4u, 4, ".dll") != 0)
+        return false;
+    const std::string stem = name.substr(0, name.size() - 4u);
+    return std::find(std::begin(system_dlls), std::end(system_dlls), stem) !=
+           std::end(system_dlls);
+}
+
+/* A mapped range cannot run into another section, an overlay or the embedded
+ * PAK. All additions use file-bounded subtraction or 64-bit RVA arithmetic. */
+bool pe_imports(const uint8_t *data, size_t size, uint16_t *machine,
+                std::vector<std::string> &imports, std::string &error)
+{
+    auto invalid = [&](const char *reason) {
+        error = reason;
+        return false;
+    };
+    if (size < 0x40u || data[0] != 'M' || data[1] != 'Z')
+        return invalid("not a PE executable");
+    const size_t pe = read_le32(data + 0x3cu);
+    if (pe > size || size - pe < 24u || std::memcmp(data + pe, "PE\0\0", 4) != 0)
+        return invalid("invalid or truncated PE signature");
+    *machine = read_le16(data + pe + 4u);
+    const size_t section_count = read_le16(data + pe + 6u);
+    const size_t optional_size = read_le16(data + pe + 20u);
+    const size_t optional = pe + 24u;
+    if (optional_size < 2u || optional_size > size - optional)
+        return invalid("truncated PE optional header");
+    const uint16_t magic = read_le16(data + optional);
+    if (!((*machine == 0x8664u || *machine == 0xaa64u) && magic == 0x20bu) &&
+        !(*machine == 0x014cu && magic == 0x10bu))
+        return invalid("unsupported PE architecture");
+    const size_t directory_base = magic == 0x20bu ? 112u : 96u;
+    if (optional_size < directory_base)
+        return invalid("truncated PE data directories");
+    const uint32_t directory_count = read_le32(data + optional + directory_base - 4u);
+    if (directory_count > (optional_size - directory_base) / 8u)
+        return invalid("PE data directories exceed optional header");
+    const size_t section_table = optional + optional_size;
+    if (section_count > (size - section_table) / 40u)
+        return invalid("truncated PE section table");
+    const uint64_t image_base = magic == 0x20bu
+        ? (uint64_t)read_le32(data + optional + 24u) |
+          (uint64_t)read_le32(data + optional + 28u) << 32u
+        : read_le32(data + optional + 28u);
+    auto map_rva = [&](uint64_t rva, size_t *offset, size_t *available) {
+        for (size_t i = 0; i < section_count; ++i) {
+            const uint8_t *section = data + section_table + i * 40u;
+            const uint64_t virtual_size = read_le32(section + 8u);
+            const uint64_t address = read_le32(section + 12u);
+            const uint64_t raw_size = read_le32(section + 16u);
+            const uint64_t raw = read_le32(section + 20u);
+            const uint64_t extent = std::max(virtual_size, raw_size);
+            if (rva < address || rva - address >= extent || rva - address >= raw_size)
+                continue;
+            const uint64_t delta = rva - address;
+            if (raw > size || raw_size > size - raw)
+                return false;
+            *offset = (size_t)(raw + delta);
+            *available = (size_t)(raw_size - delta);
+            return true;
+        }
+        return false;
+    };
+    for (unsigned directory : {1u, 13u}) {
+        if (directory_count <= directory) continue;
+        const uint8_t *entry = data + optional + directory_base + directory * 8u;
+        const uint32_t rva = read_le32(entry);
+        const size_t declared_size = read_le32(entry + 4u);
+        if (rva == 0 && declared_size == 0) continue;
+        size_t pos = 0, available = 0;
+        const size_t width = directory == 1u ? 20u : 32u;
+        if (rva == 0 || !map_rva(rva, &pos, &available) ||
+            declared_size < width || declared_size > available)
+            return invalid("PE import directory outside mapped file section");
+        const size_t end = pos + declared_size;
+        bool terminated = false;
+        while (width <= end - pos) {
+            bool empty = true;
+            for (size_t field = 0; field < width; field += 4u)
+                empty = empty && read_le32(data + pos + field) == 0;
+            if (empty) {
+                terminated = true;
+                break;
+            }
+            uint64_t name_rva = read_le32(data + pos + (directory == 1u ? 12u : 4u));
+            if (directory == 13u && !(read_le32(data + pos) & 1u)) {
+                if (name_rva < image_base)
+                    return invalid("PE delayed import VA precedes image base");
+                name_rva -= image_base;
+            }
+            size_t name_offset = 0, name_available = 0;
+            if (!map_rva(name_rva, &name_offset, &name_available))
+                return invalid("PE import name outside mapped file section");
+            const size_t name_limit = std::min(name_available, (size_t)260u);
+            size_t length = 0;
+            std::string name;
+            while (length < name_limit && data[name_offset + length] != 0) {
+                const uint8_t value = data[name_offset + length++];
+                if (value > 0x7fu)
+                    return invalid("PE import name is not ASCII");
+                name.push_back((char)(value >= 'A' && value <= 'Z' ? value + 'a' - 'A' : value));
+            }
+            if (length == name_limit || name.empty())
+                return invalid("empty or unterminated PE import name");
+            if (std::find(imports.begin(), imports.end(), name) == imports.end())
+                imports.push_back(name);
+            pos += width;
+        }
+        if (!terminated)
+            return invalid("unterminated PE import table");
+    }
+    std::sort(imports.begin(), imports.end());
+    return true;
+}
+
 size_t find_bytes_from(const uint8_t *data, size_t size,
                        const uint8_t *needle, size_t needle_size,
                        size_t start)
@@ -95,7 +228,9 @@ bool count_file(const char *, bool is_dir, void *user)
 
 bool write_report(const JceDistAuditInput &input,
                   const JceDistAuditResult &r,
-                  const std::vector<std::string> &leaks)
+                  const std::vector<std::string> &leaks,
+                  const std::vector<std::string> &observed_addresses,
+                  const std::vector<std::string> &imports)
 {
     if (!input.report_path || !input.report_path[0]) return true;
     std::string json;
@@ -107,7 +242,17 @@ bool write_report(const JceDistAuditInput &input,
     json += "\",\n";
     json += "  \"pe\": {\"valid\": ";
     json += r.pe_valid ? "true" : "false";
-    json += ", \"subsystem\": " + std::to_string(r.pe_subsystem) + "},\n";
+    json += ", \"subsystem\": " + std::to_string(r.pe_subsystem);
+    json += ", \"machine\": " + std::to_string(r.pe_machine);
+    json += ", \"expected_machine\": " + std::to_string(input.expected_pe_machine);
+    json += ", \"imports_verified\": ";
+    json += r.pe_imports_verified ? "true" : "false";
+    json += ", \"imports\": [";
+    for (size_t i = 0; i < imports.size(); ++i) {
+        if (i) json += ", ";
+        json += "\"" + json_escape(imports[i]) + "\"";
+    }
+    json += "]},\n";
     json += "  \"embedded_pak\": {\"exactly_once\": ";
     json += r.pak_embedded_exactly_once ? "true" : "false";
     json += ", \"offset\": ";
@@ -136,6 +281,14 @@ bool write_report(const JceDistAuditInput &input,
         json += "\"";
     }
     json += leaks.empty() ? "],\n" : "\n  ],\n";
+    json += "  \"address_literals_outside_project_pak\": [";
+    for (size_t i = 0; i < observed_addresses.size(); ++i) {
+        json += i ? ",\n    \"" : "\n    \"";
+        json += json_escape(observed_addresses[i]);
+        json += "\"";
+    }
+    json += observed_addresses.empty() ? "],\n" : "\n  ],\n";
+    json += "  \"address_literal_scope\": \"selected non-confidential address bytes outside the project PAK; does not prove plaintext payload leakage or runtime use\",\n";
     json += "  \"error\": ";
     if (r.error[0]) json += "\"" + json_escape(r.error) + "\"\n";
     else json += "null\n";
@@ -187,6 +340,8 @@ bool jce_dist_audit_run(const JceDistAuditInput &input,
     if (!out_result) return false;
     JceDistAuditResult r{};
     std::vector<std::string> leaks;
+    std::vector<std::string> observed_addresses;
+    std::vector<std::string> imports;
     uint64_t exe_size_u64 = 0;
     uint64_t pak_size_u64 = 0;
     uint8_t *exe = (uint8_t *)jce_fs_host_read_all(input.executable_path,
@@ -214,6 +369,23 @@ bool jce_dist_audit_run(const JceDistAuditInput &input,
                                                   &r.pe_subsystem);
         if (input.require_gui && (!r.pe_valid || r.pe_subsystem != 2u))
             set_error(r, "Windows dist executable is not GUI subsystem");
+        if (input.expected_pe_machine != 0u) {
+            std::string pe_error;
+            if (!pe_imports(exe, exe_size, &r.pe_machine, imports, pe_error)) {
+                r.pe_valid = false;
+                set_error(r, pe_error);
+            } else {
+                r.pe_import_count = (uint32_t)imports.size();
+                if (input.expected_pe_machine != r.pe_machine)
+                    set_error(r, "Windows dist PE machine does not match requested architecture");
+                r.pe_imports_verified = !imports.empty();
+                for (const std::string &name : imports)
+                    r.pe_imports_verified = r.pe_imports_verified && system_import(name);
+                if (!r.pe_imports_verified)
+                    set_error(r, imports.empty() ? "PE artifact has no imports; cannot verify delivery"
+                              : "single EXE still requires external DLLs");
+            }
+        }
 
         JceArchive *archive = jce_archive_open(pak, pak_size);
         if (!archive && input.key) {
@@ -303,9 +475,23 @@ bool jce_dist_audit_run(const JceDistAuditInput &input,
                     r.pak_offset, pak_size);
                 if (found != SIZE_MAX) leaks.emplace_back(normalized.data(), len);
             }
+            for (size_t i = 0; i < input.graph_asset_count; ++i) {
+                const char *path = input.graph_assets[i].address;
+                if (!path || !path[0]) continue;
+                std::vector<char> normalized(std::strlen(path) + 1u);
+                const size_t len = jce_archive_normalize_path(path, normalized.data(), normalized.size());
+                if (len == 0) continue;
+                const std::string name(normalized.data(), len);
+                if (std::find(leaks.begin(), leaks.end(), name) != leaks.end()) continue;
+                if (jce_dist_audit_find_outside_range(exe, exe_size,
+                        (const uint8_t *)normalized.data(), len, r.pak_offset, pak_size) != SIZE_MAX &&
+                    std::find(observed_addresses.begin(), observed_addresses.end(), name) == observed_addresses.end())
+                    observed_addresses.push_back(name);
+            }
         }
         r.leaked_path_count = (uint32_t)leaks.size();
-        if (!leaks.empty()) set_error(r, "asset virtual paths leaked outside PAK");
+        r.observed_address_literal_count = (uint32_t)observed_addresses.size();
+        if (!leaks.empty()) set_error(r, "confidential asset names are visible outside project PAK");
     }
 
     if (input.package_dir && input.package_dir[0]) {
@@ -329,7 +515,7 @@ finish:
     if (exe) jce_fs_buffer_free(exe);
     if (pak) jce_fs_buffer_free(pak);
     r.passed = r.error[0] == '\0';
-    if (!write_report(input, r, leaks) && r.passed) {
+    if (!write_report(input, r, leaks, observed_addresses, imports) && r.passed) {
         set_error(r, "cannot write dist audit report");
         r.passed = false;
     }

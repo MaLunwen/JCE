@@ -91,6 +91,117 @@ static bool img_is_gray16_png(const void *data, uint64_t size)
            b[25] == 0  /* colour type: greyscale */;
 }
 
+/* TGA has no required magic, so SDL_image only loads it with a type hint.
+ * Admit only the supported header/payload structure before supplying that hint.
+ * This is a bounds/packet admission check, not another pixel decoder: SDL_image
+ * still owns colour conversion, orientation, palette and RLE pixel decoding. */
+static bool img_tga_reject(const char **reason, const char *detail)
+{
+    if (reason)
+        *reason = detail;
+    return false;
+}
+
+static bool img_tga_admitted(const void *data, size_t size, const char **reason)
+{
+    const uint8_t *b = (const uint8_t *)data;
+    if (reason)
+        *reason = NULL;
+    if (size < 18u)
+        return false;
+    const unsigned type = b[2];
+    const bool indexed = type == 1u || type == 9u;
+    const bool colour = type == 2u || type == 10u;
+    const bool grey = type == 3u || type == 11u;
+    const bool rle = type == 9u || type == 10u || type == 11u;
+    const unsigned depth = b[16];
+    const unsigned attributes = b[17] & 15u;
+    const unsigned palette_first = (unsigned)b[3] | ((unsigned)b[4] << 8);
+    const unsigned palette_count = (unsigned)b[5] | ((unsigned)b[6] << 8);
+    const unsigned width = (unsigned)b[12] | ((unsigned)b[13] << 8);
+    const unsigned height = (unsigned)b[14] | ((unsigned)b[15] << 8);
+    if (!indexed && !colour && !grey)
+        return false;
+    if (b[1] > 1u || !width || !height || (b[17] & 0xD0u))
+        return img_tga_reject(reason, "TGA header/origin/interleave unsupported");
+    const uint64_t rgba_bytes = (uint64_t)width * height * 4u;
+    const uint64_t rgba_pitch = (uint64_t)width * 4u;
+    /* Before palette/RLE scan or decoder allocation: SDL surfaces use int
+     * pitches, and the public byte decoder already limits input to INT_MAX. */
+    if (rgba_bytes > (uint64_t)INT_MAX || rgba_pitch > (uint64_t)INT_MAX ||
+        rgba_bytes > (uint64_t)SIZE_MAX)
+        return img_tga_reject(reason, "TGA decoded RGBA bytes/pitch exceeds INT_MAX");
+    /* The pinned SDL XRGB1555 path discards the attribute alpha bit. */
+    if (colour && (depth == 15u || depth == 16u) && attributes != 0u)
+        return img_tga_reject(reason, "TGA 15/16-bit attribute alpha unsupported");
+    if ((indexed && (b[1] != 1u || depth != 8u || attributes != 0u)) ||
+        (grey && (b[1] != 0u || depth != 8u || attributes != 0u)) ||
+        (colour && !((depth == 15u || depth == 16u) ? attributes <= 1u :
+                     depth == 24u ? attributes == 0u :
+                     depth == 32u && (attributes == 0u || attributes == 8u))))
+        return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+    if (b[1]) {
+        if (!palette_count || (b[7] != 15u && b[7] != 16u &&
+                               b[7] != 24u && b[7] != 32u))
+            return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        /* The shipped SDL palette loader starts at entry zero. Nonzero starts
+         * are not a supported subset; do not return silently shifted colours. */
+        if (indexed && (palette_first != 0u || palette_count > 256u))
+            return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+    } else if (palette_first || palette_count || b[7]) {
+        return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+    }
+    size_t cursor = 18u;
+    if ((size_t)b[0] > size - cursor)
+        return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+    cursor += b[0];
+    const size_t palette_bytes = b[1] ? (size_t)palette_count * ((b[7] + 7u) / 8u) : 0u;
+    if (palette_bytes > size - cursor)
+        return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+    if (indexed && b[7] == 32u) {
+        /* SDL reduces palette alpha to one binary colourkey. Fully opaque
+         * palettes are faithful; any authored transparency must fail closed. */
+        for (unsigned i = 0; i < palette_count; ++i)
+            if (b[cursor + (size_t)i * 4u + 3u] != 255u)
+                return img_tga_reject(reason, "TGA 32-bit palette alpha unsupported");
+    }
+    cursor += palette_bytes;
+    const size_t pixel_bytes = (depth + 7u) / 8u;
+    uint64_t remaining = (uint64_t)width * height;
+    if (remaining > (uint64_t)SIZE_MAX / 4u)
+        return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+    if (!rle) {
+        if (remaining > (uint64_t)(size - cursor) / pixel_bytes)
+            return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        if (indexed) {
+            for (uint64_t i = 0; i < remaining; ++i)
+                if (b[cursor + (size_t)i] >= palette_count)
+                    return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        }
+        return true;
+    }
+    while (remaining) {
+        if (cursor == size)
+            return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        const unsigned packet = b[cursor++];
+        const unsigned count = (packet & 127u) + 1u;
+        if ((uint64_t)count > remaining)
+            return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        const unsigned stored_pixels = (packet & 128u) ? 1u : count;
+        const size_t packet_bytes = (size_t)stored_pixels * pixel_bytes;
+        if (packet_bytes > size - cursor)
+            return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        if (indexed) {
+            for (unsigned i = 0; i < stored_pixels; ++i)
+                if (b[cursor + i] >= palette_count)
+                    return img_tga_reject(reason, "TGA structure/payload invalid or truncated");
+        }
+        cursor += packet_bytes;
+        remaining -= count;
+    }
+    return true;
+}
+
 uint8_t *jce_image_load_rgba8_from_memory(const void *data, uint64_t size, int *out_w, int *out_h)
 {
     if (!data || size == 0 || size > (uint64_t)INT_MAX)
@@ -127,9 +238,29 @@ uint8_t *jce_image_load_rgba8_from_memory(const void *data, uint64_t size, int *
     SDL_IOStream *io = SDL_IOFromConstMem(data, (size_t)size);
     if (!io)
         return NULL;
-    SDL_Surface *surf = IMG_Load_IO(io, true);   /* true = auto-close io */
+    /* Preserve auto-detection priority for every signature-bearing format.
+     * IMG_Load_IO closes its stream even on failure; a typed retry owns a new
+     * stream and also closes it exactly once through SDL_image. */
+    SDL_Surface *surf = IMG_Load_IO(io, true);
+    const char *decode_stage = "auto";
+    const char *tga_reason = NULL;
+    const bool tga_admitted = !surf && img_tga_admitted(data, (size_t)size, &tga_reason);
+    if (tga_reason)
+        decode_stage = "tga-admission";
+    if (tga_admitted) {
+        decode_stage = "tga-typed";
+        io = SDL_IOFromConstMem(data, (size_t)size);
+        if (!io) {
+            LOG_ERROR(LOG_TAG, "image stream failed: stage=%s bytes=%llu reason=%s",
+                      decode_stage, (unsigned long long)size, SDL_GetError());
+            return NULL;
+        }
+        surf = IMG_LoadTyped_IO(io, true, "TGA");
+    }
     if (!surf) {
-        LOG_ERROR(LOG_TAG, "IMG_Load_IO failed: %s", SDL_GetError());
+        LOG_ERROR(LOG_TAG, "image decode failed: stage=%s bytes=%llu reason=%s",
+                  decode_stage, (unsigned long long)size,
+                  tga_reason ? tga_reason : SDL_GetError());
         return NULL;
     }
     if (surf->format != SDL_PIXELFORMAT_RGBA32) {

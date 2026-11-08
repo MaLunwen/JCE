@@ -20,12 +20,15 @@
 #include "jce_editor_component_registry.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_scene_rendering_defaults.h"
+#include "jce_editor_default_camera.h"
+#include <jce/middleware/scene/jce_scene_camera.h>
 #include "jce_editor_state_internal.h"
 #include "jce_editor_root_set.h"
 #include "core/jce_editor_project_state.h"   /* per-project view mode / grid */
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 
+#include <jce/os/core/jce_env.h>
 #include <jce/os/core/jce_perf_phase.h>   /* benchmark: capture CPU phases */
 #include <jce/renderer/jce_lowlevel.h>    /* stress: runtime albedo textures */
 
@@ -47,6 +50,7 @@
 extern "C" void jce_editor_scene_set_scene_dir(const char *dir);
 extern "C" void jce_editor_scene_render_streaming_teardown(void);
 extern "C" void jce_editor_scene_render_streaming_rebuild(void);
+extern "C" void jce_editor_scene_render_cancel_probe_capture(void);
 extern "C" struct JceWorldStreamer *jce_editor_get_world_streamer(void);
 
 /* ── Global State Definitions ─────────────────────────────────────── */
@@ -185,6 +189,7 @@ void update_scene_dir_from_path(const char *scene_path)
 
 void clear_scene_entities(void)
 {
+    jce_editor_scene_render_cancel_probe_capture();
     g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
 
@@ -233,6 +238,7 @@ static void build_demo_scene(void)
     uint32_t cam = jce_state_create_entity("Main Camera", root);
     demo_set_position(cam, 0.0f, 5.0f, 10.0f);
     jce_state_add_component(cam, JCE_COMP_FLAG_CAMERA);
+    (void)jce_editor_seed_default_camera(s.scene, jce_state_to_ecs_entity(cam), false);
 
     uint32_t lights = jce_state_create_entity("Lights", root);
     uint32_t dir_light = jce_state_create_entity("Directional Light", lights);
@@ -736,10 +742,28 @@ void jce_editor_state_init(bool with_demo_scene)
 
 bool jce_state_new_default_scene(void)
 {
+    return jce_state_new_default_scene_for_project(false);
+}
+
+static bool build_default_2d_scene(void)
+{
+    HistorySuspendScope no_undo;
+    uint32_t root = jce_state_create_entity("Scene Root", 0);
+    uint32_t camera = jce_state_create_entity("Main Camera", root);
+    if (!root || !camera) return false;
+    jce_state_add_component(camera, JCE_COMP_FLAG_CAMERA);
+    if (!jce_editor_seed_default_camera(s.scene, jce_state_to_ecs_entity(camera), true))
+        return false;
+    uint32_t ui = jce_state_create_entity("UI", root);
+    return ui && jce_state_create_entity("Canvas", ui);
+}
+
+bool jce_state_new_default_scene_for_project(bool is_2d)
+{
     /* If Play is running it holds the current JceScene; recreating /
      * clearing it here would be a use-after-free.  Tear the runtime down
      * first. */
-    stop_play_before_scene_swap();
+    if (!stop_play_before_scene_swap()) return false;
 
     /* The streaming-preview streamer holds entity handles into the old
      * scene — destroy it BEFORE the entities go away. */
@@ -747,7 +771,22 @@ bool jce_state_new_default_scene(void)
 
     /* New Scene is not a file load, so explicitly leave read-only Bundle
      * Preview before constructing project-backed default content. */
-    jce_state_close_bundle_preview();
+    if (!jce_state_close_bundle_preview()) return false;
+
+    /* Detach the old scene identity before any destructive scene operation.
+       Failed construction leaves an unsaved partial scene, never A's file or
+       history available for B's Save/Undo. */
+    set_current_scene_path_internal(NULL);
+    jce_editor_scene_set_scene_dir("");
+    jce_state_history_clear();
+    s.scene_modified = true;
+    s_history_edit_nesting = 0;
+    s_history_outer_edit_pushed_snapshot = false;
+    s_history_manual_batch_depth = 0;
+    s_transaction.active = false;
+    s_transaction.label[0] = '\0';
+    s_transaction.before.scene_json.clear();
+    s_transaction.before.scene_path.clear();
 
     if (!s.scene)
         s.scene = jce_scene_create();
@@ -763,22 +802,19 @@ bool jce_state_new_default_scene(void)
         HistorySuspendScope suspend;
         bool prev_suppress = s_suppress_add_component_log;
         s_suppress_add_component_log = true;
-        build_demo_scene();
+        const bool built = is_2d ? build_default_2d_scene() : (build_demo_scene(), true);
         s_suppress_add_component_log = prev_suppress;
+        JceSceneCameraPose primary;
+        if (!built || jce_scene_camera_resolve_primary(s.scene, &primary) !=
+                      JCE_SCENE_CAMERA_RESOLVE_OK) {
+            LOG_ERROR(LOG_TAG, "new default scene failed: missing or invalid primary camera");
+            return false;
+        }
         jce_editor_scene_ensure_rendering_settings(s.scene);
     }
 
-    set_current_scene_path_internal(NULL);
-    jce_editor_scene_set_scene_dir("");
-    jce_state_history_clear();
+    jce_state_set_2d_mode(is_2d);
     s.scene_modified = false;
-    s_history_edit_nesting = 0;
-    s_history_outer_edit_pushed_snapshot = false;
-    s_history_manual_batch_depth = 0;
-    s_transaction.active = false;
-    s_transaction.label[0] = '\0';
-    s_transaction.before.scene_json.clear();
-    s_transaction.before.scene_path.clear();
 
     /* New scene has no streaming settings — this is effectively a teardown
      * no-op, but keeps the swap contract uniform across all loaders. */
@@ -791,6 +827,8 @@ bool jce_state_new_default_scene(void)
 
 void jce_editor_state_shutdown(void)
 {
+    jce_editor_scene_render_cancel_probe_capture();
+    jce_editor_play_finish_shutdown();
     jce_state_close_bundle_preview();
     g_entity_order.clear(); g_entity_order_gen++; jce_roots_invalidate();
     g_entity_sidecar.clear();
@@ -1585,7 +1623,8 @@ extern "C" void jce_state_benchmark_clear(void)
     /* Restore the JCE_PERF_LOG latch instead of hard-off: a plain 0 here
      * permanently silenced the log's phase line for the rest of the session
      * (the env latch never re-arms). */
-    jce_perf_phase_set_enabled(std::getenv("JCE_PERF_LOG") != NULL);
+    jce_perf_phase_set_enabled(
+        jce_env_flag_enabled(std::getenv("JCE_PERF_LOG")));
 }
 
 extern "C" uint32_t jce_state_benchmark_spawned(void) { return s_bench_spawned; }
@@ -1653,7 +1692,8 @@ extern "C" void jce_state_benchmark_spawn(int kind, int count)
             jce_scene_stress_motion(s.scene, result.root, true);
     }
     s_bench_kind = kind;
-    LOG_INFO(LOG_TAG, "benchmark-spawn: kind=%d requested=%d spawned=%u",
+    jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+             "benchmark-spawn: kind=%d requested=%d spawned=%u",
              kind, count, (unsigned)s_bench_spawned);
     jce_perf_phase_set_enabled(1);
 }

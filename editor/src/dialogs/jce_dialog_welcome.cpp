@@ -26,7 +26,7 @@
 
 /* Forward-declared in jce_editor_dialogs_internal.h: */
 extern char s_current_project_root[512];
-void set_current_project_root(const char *path);
+bool set_current_project_root(const char *path);
 bool is_valid_project_dir(const char *path);
 
 /* These three flags live in jce_editor_layout.cpp.  We expose tiny
@@ -154,8 +154,8 @@ void jce_editor_dialog_welcome(bool *p_open)
     if (s_welcome.sample_path[0]) {
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("welcome.openSample"),
-                          ImVec2(bw, 36))) {
-            set_current_project_root(s_welcome.sample_path);
+                          ImVec2(bw, 36)) &&
+            set_current_project_root(s_welcome.sample_path)) {
             JceEditorConfig cfg{};
             jce_editor_config_load(&cfg);
             jce_editor_config_add_recent(&cfg, s_welcome.sample_path);
@@ -193,8 +193,8 @@ void jce_editor_dialog_welcome(bool *p_open)
             if (ImGui::Selectable(label, false,
                                   ImGuiSelectableFlags_AllowDoubleClick,
                                   ImVec2(ImGui::GetContentRegionAvail().x - 30, 0))) {
-                if (exists && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    set_current_project_root(p);
+                if (exists && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+                    set_current_project_root(p)) {
                     jce_editor_config_add_recent(&s_welcome.cfg, p);
                     jce_editor_config_save(&s_welcome.cfg);
                     *p_open = false;

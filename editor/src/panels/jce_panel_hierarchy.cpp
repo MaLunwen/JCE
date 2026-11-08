@@ -22,7 +22,7 @@
 /* Tag-filter combo entries; the i18n ids double as the stable tokens the
  * per-project store persists the filter under (indices could drift if the
  * palette ever changes). */
-static const char *kTagFilter[] = {
+const char *const s_tag_filter_keys[JCE_TAG_COLOR_COUNT] = {
     "tagColor.all", "tagColor.red", "tagColor.orange", "tagColor.yellow",
     "tagColor.green", "tagColor.blue", "tagColor.purple", "tagColor.gray"
 };
@@ -65,7 +65,7 @@ void jce_editor_panel_hierarchy_content(void)
         char tag[32];
         if (jce_editor_pstate_get_str("hierarchy.tag_filter", tag, sizeof(tag))) {
             for (int i = 0; i < 8; i++) {
-                if (strcmp(tag, kTagFilter[i]) == 0) { s_hier.tag_filter = i; break; }
+                if (strcmp(tag, s_tag_filter_keys[i]) == 0) { s_hier.tag_filter = i; break; }
             }
         }
     }
@@ -85,9 +85,9 @@ void jce_editor_panel_hierarchy_content(void)
 
     ImGui::PushItemWidth(100);
     if (ImGui::Combo("##tag_filter", &s_hier.tag_filter,
-                     jce_editor_i18n_combo(kTagFilter, 8)))
+                     jce_editor_i18n_combo(s_tag_filter_keys, 8)))
         jce_editor_pstate_set_str("hierarchy.tag_filter",
-                                  kTagFilter[s_hier.tag_filter]);
+                                  s_tag_filter_keys[s_hier.tag_filter]);
     ImGui::SameLine();
     {
         static const char *kSort[] = {

@@ -61,13 +61,6 @@ ALLOW = {
      "middleware/animation/jce_morph.h"),
     ("engine/src/renderer/jce_model_internal.h",
      "middleware/animation/jce_morph.h"),
-    # JNI bridge is a platform shim that intentionally bridges to the
-    # application API to dispatch lifecycle events from Android.
-    ("engine/src/os/platform/jce_jni_bridge.c",
-     "application/jce_app_interface.h"),
-    ("engine/src/os/platform/jce_jni_bridge.c",
-     "application/jce_engine.h"),
-
     # ── engine/src/resource/ (L3) -> middleware (L4), 13 edges ──────────
     # PRE-EXISTING when the resource rule was added on 2026-08-31, and
     # recorded here so the rule could be turned on at all.  Each is a real

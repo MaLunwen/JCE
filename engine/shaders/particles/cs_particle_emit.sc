@@ -15,6 +15,7 @@
  *   b_counts        : (actual free count, actual accepted emissions)
  *   u_emit_params   : (emit_count, reserved, pool_size, dt)
  *   u_emit_origin   : (ox, oy, oz, frame_seed)
+ *   u_emit_box      : full world-space box widths (zero = point emission)
  *   u_emit_v_min    : initial linear velocity, min
  *   u_emit_v_max    : initial linear velocity, max
  *   u_emit_life_size: (life_min, life_max, size_start, size_end)
@@ -29,6 +30,7 @@ BUFFER_RW(b_counts, uint, 2);
 
 uniform vec4 u_emit_params;
 uniform vec4 u_emit_origin;
+uniform vec4 u_emit_box;
 uniform vec4 u_emit_v_min;
 uniform vec4 u_emit_v_max;
 uniform vec4 u_emit_life_size;
@@ -69,7 +71,12 @@ void main()
     if (!(life > 0.0)) return;
     float size = u_emit_life_size.z;
 
-    b_particles[slot * 4u + 0u] = vec4(u_emit_origin.xyz, 0.0);
+    vec3 position = u_emit_origin.xyz;
+    if (u_emit_box.x > 0.0 || u_emit_box.y > 0.0 || u_emit_box.z > 0.0) {
+        vec3 box_random = hash33(vec3(seed_base + 11.3, seed_base + 13.7, seed_base + 19.1));
+        position += (box_random - vec3_splat(0.5)) * u_emit_box.xyz;
+    }
+    b_particles[slot * 4u + 0u] = vec4(position, 0.0);
     b_particles[slot * 4u + 1u] = vec4(vel, life);
     b_particles[slot * 4u + 2u] = u_emit_color;
     b_particles[slot * 4u + 3u] = vec4(size, seed_base, 0.0, 0.0);

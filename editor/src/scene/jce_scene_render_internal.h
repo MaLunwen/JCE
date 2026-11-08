@@ -23,6 +23,7 @@ extern "C" {
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_thread.h>           /* async chunk-load thread pool */
+#include <jce/application/jce_lifecycle.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lighting.h>
@@ -39,6 +40,7 @@ extern "C" {
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_taa.h>
 #include <jce/renderer/jce_views.h>
 #include <jce/resource/jce_world_streamer.h>
 }
@@ -57,6 +59,19 @@ struct PosColorVertex {
 };
 
 /* ── Internal state (single instance, defined in jce_editor_scene_render.cpp) */
+
+/* CPU camera/admission state only. PostFX retains the sole GPU history owner. */
+struct SceneTsrHistory {
+    JceTaaState jitter;
+    jce_mat4 previous_view_projection;
+    jce_mat4 previous_projection;
+    const JceScene *scene;
+    uint64_t context_generation;
+    uint32_t frame_index;
+    uint32_t render_width, render_height, output_width, output_height;
+    bool play_active;
+    bool valid;
+};
 
 struct SceneRenderState {
     bool                    initialized;
@@ -122,6 +137,8 @@ struct SceneRenderState {
 
     /* PostFX output (from engine pipeline, applied by frame()). */
     uint16_t                postfx_output_tex;
+    SceneTsrHistory         tsr_history;
+    JceLifecycleHandle      temporal_listener;
 
     /* Ghost (drag-preview) model state. */
     bool         ghost_active;

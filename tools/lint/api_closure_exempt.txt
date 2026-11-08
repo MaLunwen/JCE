@@ -23,3 +23,7 @@ application/jce_default_main.inc.h  # a consumer main() TEMPLATE, not a declarat
 jce.h  # an ALIAS for <jce/api.h>, kept under the conventional library name so rust-bindgen / cgo / p-invoke find a header at the predictable path. api.h including it would be a cycle; it includes api.h, which is the direction that makes it useful.
 
 middleware/ui/jce_game_hud.h  # functional (it draws, via jce_primitives on JCE_VIEW_UI) but not part of api.h's promise: engine/src/middleware/ui/AGENTS.md gives SCENE UI including the HUD to the ECS Canvas (middleware/scene/jce_ui_canvas.h), and aggregating a second HUD would read as the engine offering two. It entered api_ui.h on 2026-08-31 as a side effect of completing this very closure -- the gate asks whether a header is REACHABLE, never whether it belongs -- and nothing in the tree, including caged_kingdom, calls any of its 11 symbols. A user who wants it includes it directly; it still ships in the SDK.
+
+application/jce_runtime_host_policy.inc.h  # shared static implementation for executable hosts and Editor Play, not a declaration header; opt-in inclusion keeps runtime/focus policy storage local to each host and avoids injecting implementation types through api.h.
+
+application/jce_default_frame_observation.inc.h  # static implementation used only by the opt-in default main() template; it defines per-host observation helpers, declares no exported API and must not inject implementation into every api.h translation unit.

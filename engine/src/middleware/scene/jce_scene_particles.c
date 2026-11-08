@@ -24,6 +24,7 @@
 
 #include <jce/renderer/jce_particles.h>
 #include <jce/renderer/jce_render_pipeline.h>
+#include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/resource/jce_pak_loader.h>   /* PAK-first .particles.json (single-exe) */
 #include <jce/os/core/jce_allocator.h>
@@ -51,43 +52,38 @@ static bool s_gpu_particles_blocked = false;
 void jce_scene_internal_gpu_particles_set_blocked(void)
 {
     if (!s_gpu_particles_blocked)
-        LOG_WARN(LOG_TAG, "GPU particle system unavailable "
-                 "(compute unsupported or shaders missing); "
+        LOG_WARN(LOG_TAG, "GPU particle resources unavailable; "
                  "all emitters fall back to CPU simulation");
     s_gpu_particles_blocked = true;
 }
 
-bool jce_scene_internal_gpu_particles_blocked(void)
+bool jce_scene_weather_uses_emitters(const JceScene *s)
 {
-    return s_gpu_particles_blocked;
+    const JceSceneParticleState *state = jce_scene_internal_particle_state(s);
+    return state && state->precipitation.use_emitters;
 }
 
-bool jce_scene_particle_emitter_uses_gpu(const JceParticleEmitterComponent *c)
+bool jce_scene_particle_emitter_uses_gpu(const JceScene *s,
+                                        const JceParticleEmitterComponent *c)
 {
     if (!c || !c->gpu) return false;
     if (s_gpu_particles_blocked) return false;
     if (!jce_render_pipeline_is_feature_enabled("gpu_particles")) return false;
     /* jce_renderer_get_caps() is NULL-safe pre-bgfx-init (returns 0). */
-    if ((jce_renderer_get_caps() & JCE_CAP_COMPUTE) == 0) return false;
-    /* Routing: default to the CPU particle path on EVERY backend.  The GPU
-     * compute pool is a dynamic VB used as both a compute UAV and instance
-     * data — bgfx 1.129 mis-renders that dual use on Vulkan/D3D12 (over-bright
-     * blob / device-removed; exhaustively investigated — even the official
-     * nbody same-view pattern didn't fix it, and Conan Center has no newer
-     * bgfx).  Rather than keep two divergent-looking paths, the CPU path now
-     * renders with the SAME vs/fs_particle sprite shaders (sr_draw_particles),
-     * so a single, backend-consistent soft-circle billboard covers all four
-     * backends.  JCE_GPU_PARTICLES_FORCE=1 opts an emitter back onto the GPU
-     * compute pool (for A/B / large-count testing on D3D11/GL). */
-    {
-        static int s_force = -1;
-        if (s_force < 0) {
-            const char *v = getenv("JCE_GPU_PARTICLES_FORCE");
-            s_force = (v && v[0] && v[0] != '0') ? 1 : 0;
-        }
-        if (!s_force) return false;   /* CPU path everywhere */
+    const uint32_t required = JCE_CAP_COMPUTE | JCE_CAP_INSTANCING;
+    if ((jce_renderer_get_caps() & required) != required) return false;
+    /* The compute pool is also the draw's instance VB. Keep the experimental
+     * route to D3D11; this dual use has mis-rendered on Vulkan
+     * and caused device removal on D3D12. Both scene routes use this gate. */
+    const JceRendererBackend backend = jce_renderer_get_backend(NULL);
+    if (backend != JCE_BACKEND_D3D11) return false;
+    /* An explicit 0 requests the CPU control; absence follows scene policy. */
+    static int s_force = -2;
+    if (s_force == -2) {
+        const char *v = getenv("JCE_GPU_PARTICLES_FORCE");
+        s_force = v && v[0] ? v[0] != '0' : -1;
     }
-    return true;
+    return s_force < 0 ? jce_scene_weather_uses_emitters(s) : s_force != 0;
 }
 
 /* ── Asset-change marker ───────────────────────────────────────────────
@@ -217,16 +213,19 @@ typedef struct {
 
 /* ── Emitter (re)build from authoring data ─────────────────────────── */
 
-static void sp_build_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
+static void sp_drop_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
 {
-    /* Drop any previous emitter for this component first. */
     if (c->loaded && c->emitter_handle_idx != UINT32_MAX) {
         JceEmitterHandle old = { c->emitter_handle_idx };
         jce_particles_emitter_remove(ctx->sys, old);
     }
     c->loaded             = false;
     c->emitter_handle_idx = UINT32_MAX;
+}
 
+static void sp_build_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
+{
+    sp_drop_emitter(ctx, c);
     JceParticleEmitterDesc desc;
     jce_scene_particle_emitter_desc(c, &desc);
 
@@ -254,18 +253,11 @@ static void sp_each(JceScene *s, JceEntity e, void *ud)
     SpCtx *ctx = (SpCtx *)ud;
     JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
     if (!c) return;
-    if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
-
-    /* GPU-routed this frame: the scene renderer owns the compute-driven
-     * system.  Drop any CPU emitter we previously built and do NOT mark it
-     * referenced — the sweep below reaps it. */
-    if (jce_scene_particle_emitter_uses_gpu(c)) {
-        if (c->loaded && c->emitter_handle_idx != UINT32_MAX) {
-            JceEmitterHandle old = { c->emitter_handle_idx };
-            jce_particles_emitter_remove(ctx->sys, old);
-        }
-        c->loaded             = false;
-        c->emitter_handle_idx = UINT32_MAX;
+    /* Disable and GPU handoff both retire the old CPU handle. Re-enabling
+     * must rebuild even if a different emitter has reused the freed index. */
+    if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER) ||
+        jce_scene_particle_emitter_uses_gpu(s, c)) {
+        sp_drop_emitter(ctx, c);
         return;
     }
 
@@ -291,11 +283,10 @@ static void sp_each(JceScene *s, JceEntity e, void *ud)
  * empty system — and step debug-draw — for scenes that have none). */
 void jce_scene_particles_update(JceScene *s, float dt)
 {
-    if (!s) return;
+    JceSceneParticleState *state = jce_scene_internal_particle_state_mut(s);
+    if (!state) return;
 
-    JceParticleSystem *sys =
-        (JceParticleSystem *)jce_scene_internal_particles_get(s);
-
+    JceParticleSystem *sys = state->cpu;
     if (!sys) {
         /* O(1) holder count instead of a full-entity probe walk: on a
          * particle-free 150k-entity world the old walk burned a full scan
@@ -304,7 +295,7 @@ void jce_scene_particles_update(JceScene *s, float dt)
             return;         /* nothing to do; stay allocation-free */
         sys = jce_particles_create(jce_allocator_default());
         if (!sys) return;
-        jce_scene_internal_particles_set(s, sys);
+        state->cpu = sys;
     }
 
     SpCtx ctx;
@@ -341,9 +332,10 @@ static JceParticleSystem *sp_resolve(JceScene *s, JceEntity e,
                                      JceEmitterHandle *out)
 {
     if (!s) return NULL;
-    JceParticleSystem *sys =
-        (JceParticleSystem *)jce_scene_internal_particles_get(s);
-    if (!sys) return NULL;
+    const JceSceneParticleState *state = jce_scene_internal_particle_state(s);
+    JceParticleSystem *sys = state ? state->cpu : NULL;
+    if (!sys || !jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER))
+        return NULL;
     JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
     if (!c || !c->loaded || c->emitter_handle_idx == UINT32_MAX) return NULL;
     JceEmitterHandle h = { c->emitter_handle_idx };
@@ -396,11 +388,8 @@ void jce_scene_particle_set_color(JceScene *s, JceEntity e,
 
 void jce_scene_particles_shutdown(JceScene *s)
 {
-    if (!s) return;
-    JceParticleSystem *sys =
-        (JceParticleSystem *)jce_scene_internal_particles_get(s);
-    if (sys) {
-        jce_particles_destroy(sys);
-        jce_scene_internal_particles_set(s, NULL);
-    }
+    JceSceneParticleState *state = jce_scene_internal_particle_state_mut(s);
+    if (!state || !state->cpu) return;
+    jce_particles_destroy(state->cpu);
+    state->cpu = NULL;
 }

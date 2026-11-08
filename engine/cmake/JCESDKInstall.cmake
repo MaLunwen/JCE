@@ -372,6 +372,14 @@ function(jce_register_sdk_install)
 	include(GNUInstallDirs)
 	include(CMakePackageConfigHelpers)
 
+	include("${CMAKE_SOURCE_DIR}/cmake/JCESDKTarget.cmake")
+	jce_sdk_generate_target_metadata("${_merge_dir}" "${_jce_sdk_TARGETS}"
+		_jce_target_metadata _jce_target_check)
+	# Verify the actual archive owners before publishing this configuration.
+	# Each metadata file travels with its own archive; additive installs cannot
+	# let a new Release stamp admit an old Debug library.
+	install(SCRIPT "${_jce_target_check}")
+
 	# ai_dispatch is a PRIVATE module (spec C.8): its headers must never ride
 	# an SDK/editor package unless this build explicitly enabled the module.
 	# Without these excludes the directory GLOB below ships the full ABI
@@ -400,6 +408,8 @@ function(jce_register_sdk_install)
 		DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/jce")
 
 	install(FILES "${_fat_lib_core}" "${_fat_lib_deps}"
+		DESTINATION "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>")
+	install(FILES "${_jce_target_metadata}"
 		DESTINATION "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>")
 
 	if(TARGET jce_msvc_stl_shims)
@@ -481,6 +491,9 @@ include([==[${CMAKE_SOURCE_DIR}/cmake/JCEStageShaderStock.cmake]==])
 		install(DIRECTORY "${CMAKE_SOURCE_DIR}/engine/templates/"
 			DESTINATION "${_engine_share_root}/templates")
 	endif()
+	# The same declaration admits built-in stock at cook and runtime load.
+	install(FILES "${CMAKE_SOURCE_DIR}/engine/shaders/stock_profiles.json"
+		DESTINATION "${_engine_share_root}")
 	if(EXISTS "${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md")
 		install(FILES "${CMAKE_SOURCE_DIR}/THIRD_PARTY_LICENSES.md"
 			DESTINATION "${_engine_share_root}")
@@ -502,7 +515,11 @@ include([==[${CMAKE_SOURCE_DIR}/cmake/JCEStageShaderStock.cmake]==])
 				"${CMAKE_CURRENT_BINARY_DIR}/JCEConfig.cmake"
 				"${CMAKE_CURRENT_BINARY_DIR}/JCEConfigVersion.cmake"
 				"${CMAKE_SOURCE_DIR}/cmake/JCESDKHelpers.cmake"
+				"${CMAKE_SOURCE_DIR}/cmake/JCESDKTarget.cmake"
+				"${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_webgl_interop.js"
 				"${CMAKE_SOURCE_DIR}/tools/shader_lint.py"
+			DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE")
+		install(FILES "${CMAKE_SOURCE_DIR}/tools/shader_stock_policy.cmake"
 			DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE")
 		install(FILES "${CMAKE_SOURCE_DIR}/tools/compile_shaders.cmake"
 			DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE"

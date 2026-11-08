@@ -146,6 +146,11 @@ _jce_add_layer(jce_platform
 	LINK_PRIVATE
 		sdl::sdl
 		SDL3_image::SDL3_image)
+if(APPLE)
+	# Installed-family lookup uses local CoreText metadata, not font activation.
+	target_link_libraries(jce_platform PRIVATE
+		"-framework CoreText" "-framework CoreFoundation")
+endif()
 if(WIN32)
 	# jce_tcp.c (minimal TCP client for the ai_dispatch HTTP transport)
 	target_link_libraries(jce_platform PRIVATE ws2_32)
@@ -575,10 +580,8 @@ target_compile_definitions(jce_pak_key_defaults PRIVATE
 target_link_libraries(jce_application PUBLIC jce_pak_key_defaults)
 
 if(JCE_BUILD_JNI)
-	# jce_jni_bridge.c lives in jce_platform (os/platform/) and is guarded by
-	# JCE_BUILD_JNI — both the definition and JNI headers must be on that target.
-	target_include_directories(jce_platform PRIVATE ${JNI_INCLUDE_DIRS})
-	target_compile_definitions(jce_platform PRIVATE JCE_BUILD_JNI=1)
+	# Desktop JNI is an Application host beside the SDL entry point. Platform
+	# owns OS services only and must not acquire an Application dependency.
 	target_include_directories(jce_application PRIVATE ${JNI_INCLUDE_DIRS})
 	target_compile_definitions(jce_application PRIVATE JCE_BUILD_JNI=1)
 endif()

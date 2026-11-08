@@ -2,13 +2,15 @@
  * jce_imgui_renderer.cpp  ImGui renderer backend implementation (bgfx).
  *
  * Renders ImGui draw lists using bgfx transient vertex/index buffers.
- * Each draw command is submitted on JCE_VIEW_IMGUI (view 255).
+ * Each draw command is submitted on JCE_VIEW_IMGUI (view 250).
  */
 
 #include <jce/ui/jce_imgui_renderer.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <jce/tools/jce_imgui.hpp>
+#include "jce_imgui_texture_upload_internal.h"
+#include "jce_imgui_clip_internal.h"
 #include <string.h>
 
 extern "C" {
@@ -33,9 +35,56 @@ static struct {
     bgfx_vertex_layout_t   vertex_layout;
     uint8_t                view_id;
     bool                   initialized;
+    uint16_t               framebuffer_width, framebuffer_height;
 } s_ctx;
 
 /* Ortho projection now delegates to engine API (jce_m4_ortho). */
+
+/* The target owns one texture reference separately from the FBO's attachment
+ * reference. Passing false on create keeps rollback ownership unambiguous
+ * even if bgfx exhausts FBO handles after validating the attachment. */
+template<class Capture>
+static void release_capture_target(Capture &capture, uint16_t view)
+{
+    if (BGFX_HANDLE_IS_VALID(capture.fb)) {
+        bgfx_set_view_frame_buffer(view, { UINT16_MAX });
+        bgfx_destroy_frame_buffer(capture.fb);
+    }
+    if (BGFX_HANDLE_IS_VALID(capture.tex))
+        bgfx_destroy_texture(capture.tex);
+    capture.fb.idx = UINT16_MAX;
+    capture.tex.idx = UINT16_MAX;
+    capture.w = capture.h = 0;
+}
+
+template<class Capture>
+static bool prepare_capture_target(Capture &capture, uint16_t view,
+                                   uint16_t width, uint16_t height)
+{
+    if (BGFX_HANDLE_IS_VALID(capture.fb) && capture.w == width && capture.h == height)
+        return true;
+    release_capture_target(capture, view);
+    if (width == 0 || height == 0)
+        return false;
+
+    const bgfx_texture_handle_t texture = bgfx_create_texture_2d(width, height, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA16F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+    if (!BGFX_HANDLE_IS_VALID(texture))
+        return false;
+
+    const bgfx_frame_buffer_handle_t framebuffer =
+        bgfx_create_frame_buffer_from_handles(1, &texture, false);
+    if (!BGFX_HANDLE_IS_VALID(framebuffer)) {
+        bgfx_destroy_texture(texture);
+        return false;
+    }
+    capture.tex = texture;
+    capture.fb = framebuffer;
+    capture.w = width;
+    capture.h = height;
+    return true;
+}
 
 /* ── Whole-window capture (F12 screenshot / F9 recording) ────────────────────
  * The D3D flip-model swap chain cannot be screen-shot reliably: bgfx presents
@@ -82,8 +131,8 @@ extern "C" void jce_imgui_renderer_set_recording(bool on) { s_rec.active = on; }
  * ImDrawData::Textures.  This removes the ~hundreds-of-ms startup cost of
  * baking every CJK/Korean glyph that the editor might never draw — they are
  * now rasterized only when first displayed.  The bgfx texture handle index
- * is stored verbatim in ImTextureData::TexID (same encoding the editor uses
- * for app textures via ImGui::Image), so the draw loop binding is unchanged. */
+ * is encoded as idx+1 in ImTextureData::TexID, matching editor app textures.
+ * A pending or invalid atlas is rejected before draw-command ID resolution. */
 
 /* ImGui 1.92 stores a bgfx texture handle idx in ImTextureID, but
  * ImTextureID_Invalid == 0 collides with the perfectly valid bgfx idx 0
@@ -92,88 +141,51 @@ extern "C" void jce_imgui_renderer_set_recording(bool on) { s_rec.active = on; }
  * landing on idx 0 would leak (never freed), corrupt bgfx handle 0 on update,
  * or trip ImGui's GetTexID assert (audit Round-3 P2-B).  Editor ImGui::Image()
  * producers apply the same +1 at their end. */
-static inline ImTextureID imtex_from_bgfx(uint16_t idx)
-{
-    return (ImTextureID)(uintptr_t)((uint32_t)idx + 1u);
-}
-static inline uint16_t imtex_to_bgfx(ImTextureID id)
-{
-    return id == ImTextureID_Invalid ? (uint16_t)UINT16_MAX
-                                     : (uint16_t)((uintptr_t)id - 1u);
-}
-
-static void destroy_imgui_texture(ImTextureData *tex)
-{
-    bgfx_texture_handle_t h;
-    h.idx = imtex_to_bgfx(tex->GetTexID());
-    if (h.idx != UINT16_MAX)
-        bgfx_destroy_texture(h);
-    tex->SetTexID(ImTextureID_Invalid);
-    tex->SetStatus(ImTextureStatus_Destroyed);
-}
-
-static void update_imgui_texture(ImTextureData *tex)
-{
-    if (tex->Status == ImTextureStatus_WantCreate) {
-        /* Re-create path (e.g. the atlas grew to fit more on-demand glyphs):
-           free the previous GPU texture first. */
-        if (tex->GetTexID() != ImTextureID_Invalid) {
-            bgfx_texture_handle_t old;
-            old.idx = imtex_to_bgfx(tex->GetTexID());
-            if (old.idx != UINT16_MAX) bgfx_destroy_texture(old);
-            tex->SetTexID(ImTextureID_Invalid);
-        }
-        /* Create the atlas texture MUTABLE (_mem == NULL): a bgfx texture
-           created WITH _mem is IMMUTABLE and cannot be updated, which would
-           leave every glyph rasterized AFTER this first upload (on-demand
-           WantUpdates: menus, dialogs, newly shown text) blank.  Create empty,
-           then upload the full current contents via an update.  ImGui's
-           default font format is RGBA32 → bgfx RGBA8. */
-        bgfx_texture_handle_t h = bgfx_create_texture_2d(
-            (uint16_t)tex->Width, (uint16_t)tex->Height,
-            false, 1,
-            BGFX_TEXTURE_FORMAT_RGBA8,
-            BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
-            BGFX_SAMPLER_MIP_POINT,
-            NULL, 0);
-        const bgfx_memory_t *mem =
-            bgfx_copy(tex->GetPixels(), (uint32_t)tex->GetSizeInBytes());
-        bgfx_update_texture_2d(h, 0, 0, 0, 0,
-            (uint16_t)tex->Width, (uint16_t)tex->Height, mem, UINT16_MAX);
-        tex->SetTexID(imtex_from_bgfx(h.idx));
-        tex->SetStatus(ImTextureStatus_OK);
-    } else if (tex->Status == ImTextureStatus_WantUpdates) {
-        /* Re-upload the bounding box of all queued sub-rect updates (glyphs
-         * newly rasterized this frame).  Pack the rect's rows tightly into a
-         * bgfx buffer (the source Pixels are full-atlas-width strided). */
-        bgfx_texture_handle_t h;
-        h.idx = imtex_to_bgfx(tex->GetTexID());
-        const ImTextureRect &r = tex->UpdateRect;
-        if (h.idx != UINT16_MAX && r.w > 0 && r.h > 0) {
-            const uint32_t bpp   = (uint32_t)tex->BytesPerPixel;
-            const uint32_t pitch = (uint32_t)r.w * bpp;
-            const bgfx_memory_t *mem = bgfx_alloc(pitch * (uint32_t)r.h);
-            for (int row = 0; row < r.h; ++row) {
-                memcpy(mem->data + (uint32_t)row * pitch,
-                       tex->GetPixelsAt(r.x, r.y + row),
-                       pitch);
-            }
-            bgfx_update_texture_2d(h, 0, 0,
-                (uint16_t)r.x, (uint16_t)r.y,
-                (uint16_t)r.w, (uint16_t)r.h, mem, UINT16_MAX);
-        }
-        tex->SetStatus(ImTextureStatus_OK);
-    } else if (tex->Status == ImTextureStatus_WantDestroy &&
-               tex->UnusedFrames > 0) {
-        destroy_imgui_texture(tex);
+static const JceImGuiTextureCodes s_texture_codes = {
+    ImTextureStatus_OK, ImTextureStatus_WantCreate, ImTextureStatus_WantUpdates,
+    ImTextureStatus_WantDestroy, ImTextureStatus_Destroyed, ImTextureFormat_RGBA32
+};
+struct ImGuiTextureGpu {
+    uint32_t max_dimension() const {
+        const bgfx_caps_t *caps = bgfx_get_caps();
+        return caps ? caps->limits.maxTextureSize : 0;
     }
-}
+    uint16_t create(uint16_t width, uint16_t height) const {
+        return bgfx_create_texture_2d(width, height, false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT | BGFX_SAMPLER_MIP_POINT,
+            NULL, 0).idx;
+    }
+    const bgfx_memory_t *copy(const void *pixels, uint32_t bytes) const { return bgfx_copy(pixels, bytes); }
+    const bgfx_memory_t *alloc(uint32_t bytes) const { return bgfx_alloc(bytes); }
+    void upload(uint16_t handle, uint16_t x, uint16_t y, uint16_t width,
+                uint16_t height, const bgfx_memory_t *memory) const {
+        bgfx_texture_handle_t texture = {handle};
+        // Packed rows use bgfx's automatic pitch, without uint16 narrowing.
+        bgfx_update_texture_2d(texture, 0, 0, x, y, width, height, memory, UINT16_MAX);
+    }
+    void destroy(uint16_t handle) const { bgfx_texture_handle_t texture = {handle}; bgfx_destroy_texture(texture); }
+    void warning(const char *stage, const char *reason, int owner, int status,
+                 int width, int height, uint64_t bytes) const {
+        LOG_WARN(LOG_TAG, "atlas phase=%s owner=%d status=%d dims=%dx%d logical_request_bytes=%llu staging_accepted_bytes=0 reason=%s retry=%s",
+            stage, owner, status, width, height, (unsigned long long)bytes, reason,
+            strcmp(stage, "destroy") ? "pending" : "unowned_id_cleared");
+    }
+    void recovered(const char *stage, int owner) const {
+        LOG_INFO(LOG_TAG, "atlas phase=%s owner=%d recovered=cpu_transaction_accepted", stage, owner);
+    }
+};
+static ImGuiTextureGpu s_texture_gpu;
+static void destroy_imgui_texture(ImTextureData *tex)
+{ (void)jce_imgui_texture_destroy(tex, s_texture_gpu, s_texture_codes); }
+static void update_imgui_texture(ImTextureData *tex)
+{ (void)jce_imgui_texture_update(tex, s_texture_gpu, s_texture_codes); }
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
 bool jce_imgui_renderer_init(const JcePakArchive *pak, uint8_t view_id)
 {
     s_ctx.view_id = view_id;
+    bgfx_set_view_name(view_id, "UI/ImGui", INT32_MAX);
 
     /* Load shader program from PAK. */
     JceShaderHandle sh = shader_load_program(pak, "imgui");
@@ -221,6 +233,16 @@ void jce_imgui_renderer_shutdown(void)
 {
     if (!s_ctx.initialized) return;
 
+    /* Cancel only UI intent that has not reached the readback owner. Submitted
+     * blits precede these bgfx destroy commands. Staging and pixels stay with
+     * the readback owner until its existing shutdown completes. */
+    s_cap.request = false;
+    s_cap.readback_pending = false;
+    s_cap.path[0] = '\0';
+    s_rec.active = false;
+    release_capture_target(s_cap, s_ctx.view_id);
+    release_capture_target(s_rec, (uint16_t)(s_ctx.view_id + 1));
+
     /* Destroy any GPU textures ImGui created (font atlas + any others on its
        texture list).  Guarded on a live context. */
     if (ImGui::GetCurrentContext() != NULL) {
@@ -247,6 +269,8 @@ void jce_imgui_renderer_shutdown(void)
 void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
 {
     if (!s_ctx.initialized) return;
+    s_ctx.framebuffer_width = width;
+    s_ctx.framebuffer_height = height;
 
     /* ── Whole-window capture state machine (see s_cap) ──────────────────
      * Default: render ImGui to the backbuffer (display path, unchanged).
@@ -269,18 +293,7 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
                                              bgfx_get_caps()->originBottomLeft ? 1 : 0);
         s_cap.readback_pending = false;
     } else if (s_cap.request) {
-        if (s_cap.fb.idx == UINT16_MAX || s_cap.w != width || s_cap.h != height) {
-            if (s_cap.fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s_cap.fb);
-            /* RGBA16F so the existing readback (RGBA16F staging -> RGBA8) applies. */
-            s_cap.tex = bgfx_create_texture_2d(width, height, false, 1,
-                BGFX_TEXTURE_FORMAT_RGBA16F,
-                BGFX_TEXTURE_RT |
-                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
-            bgfx_texture_handle_t ths[1] = { s_cap.tex };
-            s_cap.fb = bgfx_create_frame_buffer_from_handles(1, ths, true);
-            s_cap.w = width; s_cap.h = height;
-        }
-        if (BGFX_HANDLE_IS_VALID(s_cap.fb)) {
+        if (prepare_capture_target(s_cap, s_ctx.view_id, width, height)) {
             target                 = s_cap.fb;
             clear_flags            = BGFX_CLEAR_COLOR;
             clear_rgba             = 0x1e1e1effu;  /* editor bg behind any UI gaps */
@@ -307,26 +320,59 @@ void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
     /* Recording: set up the parallel offscreen pass (view+1 -> s_rec.fb).  The
      * draws are double-submitted there in jce_imgui_renderer_draw, and the FBO is
      * read back into the video sink.  Display path (view, above) is unchanged. */
+    const uint16_t rv = (uint16_t)(s_ctx.view_id + 1);
     if (s_rec.active) {
-        if (s_rec.fb.idx == UINT16_MAX || s_rec.w != width || s_rec.h != height) {
-            if (s_rec.fb.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s_rec.fb);
-            s_rec.tex = bgfx_create_texture_2d(width, height, false, 1,
-                BGFX_TEXTURE_FORMAT_RGBA16F,
-                BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
-            bgfx_texture_handle_t ths[1] = { s_rec.tex };
-            s_rec.fb = bgfx_create_frame_buffer_from_handles(1, ths, true);
-            s_rec.w = width; s_rec.h = height;
-        }
-        const uint16_t rv = (uint16_t)(s_ctx.view_id + 1);
+        if (!prepare_capture_target(s_rec, rv, width, height))
+            return;
+        bgfx_set_view_name(rv, "UI/Recording", INT32_MAX);
         bgfx_set_view_frame_buffer(rv, s_rec.fb);
         bgfx_set_view_clear(rv, BGFX_CLEAR_COLOR, 0x1e1e1effu, 1.0f, 0);
         bgfx_set_view_rect(rv, 0, 0, width, height);
         bgfx_set_view_mode(rv, BGFX_VIEW_MODE_SEQUENTIAL);
         bgfx_set_view_transform(rv, NULL, &ortho);
+    } else if (BGFX_HANDLE_IS_VALID(s_rec.fb)) {
+        /* Setup is the next UI frame boundary after Stop. Prior-frame draw
+         * commands still refer to the old target until bgfx retires them. */
+        release_capture_target(s_rec, rv);
     }
 }
 
-void jce_imgui_renderer_draw(void)
+struct ImGuiDrawObservationState {
+    JceImGuiDrawObservation value;
+    uint16_t watched_texture;
+    bool overflow;
+};
+
+static void imgui_observation_increment(ImGuiDrawObservationState *observation,
+                                        uint32_t *count)
+{
+    if (*count == UINT32_MAX)
+        observation->overflow = true;
+    else
+        ++*count;
+}
+
+static void imgui_observe_queue(const ImDrawData *draw_data,
+                                ImGuiDrawObservationState *observation)
+{
+    observation->value.flags = JCE_IMGUI_DRAW_QUEUE_OBSERVED |
+        JCE_IMGUI_DRAW_SUBMISSIONS_OBSERVED;
+    for (int n = 0; n < draw_data->CmdListsCount; ++n) {
+        const ImDrawList *list = draw_data->CmdLists[n];
+        for (int i = 0; i < list->CmdBuffer.Size; ++i) {
+            const ImDrawCmd *command = &list->CmdBuffer[i];
+            /* Pending font creation/destruction must never reach GetTexID's
+             * assertion; reuse the exact draw admission decoder. */
+            if (!command->UserCallback && command->ElemCount != 0 &&
+                jce_imgui_texture_draw_handle(command->TexRef, s_texture_codes) ==
+                    observation->watched_texture)
+                imgui_observation_increment(observation,
+                    &observation->value.queued_commands);
+        }
+    }
+}
+
+static void imgui_renderer_draw(ImGuiDrawObservationState *observation)
 {
     if (!s_ctx.initialized) return;
 
@@ -345,9 +391,14 @@ void jce_imgui_renderer_draw(void)
         }
     }
 
+    if (observation)
+        imgui_observe_queue(draw_data, observation);
+
     if (draw_data->TotalVtxCount == 0)
         return;
 
+    uint32_t atlas_draw_rejected = 0;
+    uint32_t clip_draw_rejected = 0;
     for (int n = 0; n < draw_data->CmdListsCount; n++) {
         const ImDrawList *cmd_list = draw_data->CmdLists[n];
 
@@ -401,26 +452,22 @@ void jce_imgui_renderer_draw(void)
                 continue;
             }
 
-            /* Scissor rect — clamp to [0, 65535] like the official bgfx
-               ImGui example.  Negative clip-rect coords happen when
-               ImGui extends a clip rect beyond the viewport (e.g. the
-               modal dim overlay uses viewport ± 1 px). */
-            ImVec2 clip_off = draw_data->DisplayPos;
-            float clip_min_x = pcmd->ClipRect.x - clip_off.x;
-            float clip_min_y = pcmd->ClipRect.y - clip_off.y;
-            float clip_max_x = pcmd->ClipRect.z - clip_off.x;
-            float clip_max_y = pcmd->ClipRect.w - clip_off.y;
-            if (clip_max_x <= clip_min_x || clip_max_y <= clip_min_y)
+            /* Reject nonfinite or framebuffer-empty clips before any draw
+             * state/texture/submit. The private owner checks integer narrowing. */
+            JceImGuiClipRect clip;
+            if (!jce_imgui_clip_intersect(pcmd->ClipRect.x, pcmd->ClipRect.y,
+                    pcmd->ClipRect.z, pcmd->ClipRect.w,
+                    draw_data->DisplayPos.x, draw_data->DisplayPos.y,
+                    s_ctx.framebuffer_width, s_ctx.framebuffer_height, &clip)) {
+                ++clip_draw_rejected;
                 continue;
-            uint16_t sx = (uint16_t)(clip_min_x > 0.0f ? clip_min_x : 0.0f);
-            uint16_t sy = (uint16_t)(clip_min_y > 0.0f ? clip_min_y : 0.0f);
-            uint16_t sw = (uint16_t)((clip_max_x < 65535.0f ? clip_max_x : 65535.0f) - (float)sx);
-            uint16_t sh = (uint16_t)((clip_max_y < 65535.0f ? clip_max_y : 65535.0f) - (float)sy);
-            bgfx_set_scissor(sx, sy, sw, sh);
+            }
+            bgfx_set_scissor(clip.x, clip.y, clip.width, clip.height);
 
             /* Bind texture. */
             bgfx_texture_handle_t tex;
-            tex.idx = imtex_to_bgfx(pcmd->GetTexID());
+            tex.idx = jce_imgui_texture_draw_handle(pcmd->TexRef, s_texture_codes);
+            if (tex.idx == UINT16_MAX) { ++atlas_draw_rejected; continue; }
             bgfx_set_texture(
                 0, s_ctx.tex_uniform, tex, UINT32_MAX);
 
@@ -443,16 +490,29 @@ void jce_imgui_renderer_draw(void)
                 num_vertices - pcmd->VtxOffset);
             bgfx_set_transient_index_buffer(
                 &tib, pcmd->IdxOffset, pcmd->ElemCount);
-            if (s_rec.active) {
+            const bool watched = observation && pcmd->ElemCount != 0 &&
+                tex.idx == observation->watched_texture;
+            if (s_rec.active && BGFX_HANDLE_IS_VALID(s_rec.fb)) {
                 /* Display pass (keep bound state) + recording pass into the FBO. */
                 bgfx_submit(s_ctx.view_id, s_ctx.program, 0, BGFX_DISCARD_NONE);
+                if (watched)
+                    imgui_observation_increment(observation, &observation->value.main_submits);
                 bgfx_submit((uint16_t)(s_ctx.view_id + 1), s_ctx.program,
                             0, BGFX_DISCARD_ALL);
+                if (watched)
+                    imgui_observation_increment(observation, &observation->value.recording_submits);
             } else {
                 bgfx_submit(s_ctx.view_id, s_ctx.program, 0, BGFX_DISCARD_ALL);
+                if (watched)
+                    imgui_observation_increment(observation, &observation->value.main_submits);
             }
         }
     }
+
+    if (atlas_draw_rejected)
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "ui.atlas.draw.rejected", atlas_draw_rejected);
+    if (clip_draw_rejected)
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "ui.clip.draw.rejected", clip_draw_rejected);
 
     /* Recording: read the offscreen UI FBO back into the video sink (BGRA8).
        The renderer keeps a small FIFO ring of readbacks in flight; if all
@@ -489,6 +549,28 @@ void jce_imgui_renderer_draw(void)
                 s_last_cap_ms = now;
         }
     }
+}
+
+void jce_imgui_renderer_draw(void)
+{
+    imgui_renderer_draw(NULL);
+}
+
+bool jce_imgui_renderer_draw_observed(uint16_t watched_texture,
+    JceImGuiDrawObservation *out, size_t out_size)
+{
+    if (!out || out_size < sizeof(*out) || watched_texture == UINT16_MAX) {
+        imgui_renderer_draw(NULL);
+        return false;
+    }
+    ImGuiDrawObservationState observation = {};
+    observation.value.struct_size = (uint32_t)sizeof(observation.value);
+    observation.watched_texture = watched_texture;
+    imgui_renderer_draw(&observation);
+    if (observation.overflow)
+        return false;
+    memcpy(out, &observation.value, sizeof(observation.value));
+    return true;
 }
 
 void jce_imgui_renderer_rebuild_fonts(void)

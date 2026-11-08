@@ -38,6 +38,10 @@
 
 /* Phase 3: stb_vorbis implementation. */
 #undef STB_VORBIS_HEADER_ONLY
+#if defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY == 1
+#define JCE_WINDOWS_XP_STDIO_PORT 1
+#include "../../os/platform/compatibility/jce_windows_xp_stdio_internal.h"
+#endif
 #include <extras/stb_vorbis.c>
 
 #ifdef __GNUC__

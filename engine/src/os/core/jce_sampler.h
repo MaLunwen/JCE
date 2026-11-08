@@ -14,23 +14,35 @@
  * every iteration, and nothing has to be predicted in advance -- the answer
  * includes work nobody thought to bracket.
  *
- * Windows-only and debug-only: enabled with JCE_SAMPLER=<hz>, reported to
+ * Windows-only, including Release: enabled with JCE_SAMPLER=<hz>, reported to
  * JCE_SAMPLER_OUT (default the log) at shutdown. Off costs one branch at init.
  */
 
 #ifndef JCE_SAMPLER_H
 #define JCE_SAMPLER_H
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Start sampling the CALLING thread if JCE_SAMPLER is set. Safe to call twice;
- * the second call is a no-op. */
+/* Start sampling the CALLING thread if JCE_SAMPLER is set. Init/shutdown belong
+ * to the same host owner. Repeated init is a no-op, including while shutdown
+ * awaits a join/recovery retry. JCE_SAMPLER_ALL selects a bounded process sweep:
+ * 128 retained thread lifetimes per session, with skipped coverage reported. */
 void jce_sampler_init(void);
 
-/* Stop sampling and write the report. Safe when init did nothing. */
-void jce_sampler_shutdown(void);
+/* Stop sampling and write the report. True means all sampler ownership was
+ * released (also true when disabled). False retains handles, samples and any
+ * acquired suspend for an owner retry; callers must defer dependent teardown.
+ * Worker join waits at most 2000 ms per call. Native suspend/context/recovery
+ * operations and report IO have no local deadline; total shutdown is not a
+ * bounded OS operation. No shared state is released before a confirmed join.
+ * Failed resume retains its acquired obligation unless a zero-duration wait
+ * on the same held thread handle confirms termination. A live/failed query
+ * stays retryable; same-host sampling does not promise automatic recovery. */
+bool jce_sampler_shutdown(void);
 
 #ifdef __cplusplus
 }

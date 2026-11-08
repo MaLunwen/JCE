@@ -1,0 +1,24 @@
+{
+  "$schema": "jce.rp.v2",
+  "enable_csm": true,
+  "enable_ssao": false,
+  "enable_ssr": false,
+  "enable_taa": false,
+  "enable_bloom": false,
+  "enable_volumetric_fog": false,
+  "enable_gpu_particles": false,
+  "enable_motion_blur": false,
+  "enable_stylized_sky": false,
+  "shadow_resolution": 512,
+  "csm_cascade_count": 1,
+  "msaa_samples": 1,
+  "render_scale": 1.0,
+  "hdr_color": false,
+  "depth_prepass": false,
+  "perf": {
+    "gpu_scene": false,
+    "prim_instance": false,
+    "tex_instance": false
+  },
+  "post_quality": "mid"
+}

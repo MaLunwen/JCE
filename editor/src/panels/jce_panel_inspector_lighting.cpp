@@ -6,6 +6,8 @@
 
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_tip.h"
+#include "scene/jce_editor_scene_render.h"
+#include <jce/middleware/scene/jce_scene_probe_capture.h>
 
 #include <unordered_map>
 
@@ -798,6 +800,7 @@ void draw_comp_reflection_probe(JceScene *scene, JceEntity e,
 
     static JceReflectionProbeBakeHandle s_active_handle = 0;
     static JceReflectionProbeComponent *s_active_target = nullptr;
+    static uint64_t s_capture_request = 0;
     static bool s_include_dynamic = true;
 
     /* The bake-size combo that used to live here is GONE, and with it a
@@ -840,6 +843,9 @@ void draw_comp_reflection_probe(JceScene *scene, JceEntity e,
         }
     }
 
+    const bool capturing = s_active_target == r && s_active_handle == 0 &&
+        jce_editor_scene_render_probe_capture_matches(s_capture_request, scene, e);
+    active = active || capturing;
     if (active) {
         const char *status_key = "inspector.reflection_probe.status.rendering_faces";
         switch (prog.status) {
@@ -851,10 +857,14 @@ void draw_comp_reflection_probe(JceScene *scene, JceEntity e,
             status_key = "inspector.reflection_probe.status.encoding"; break;
         default: break;
         }
-        ImGui::ProgressBar(prog.overall, ImVec2(-1, 0));
+        if (!capturing) ImGui::ProgressBar(prog.overall, ImVec2(-1, 0));
         ImGui::TextUnformatted(jce_editor_i18n(status_key));
         if (ImGui::Button(jce_editor_i18n("inspector.reflection_probe.cancel"))) {
-            jce_reflection_probe_bake_cancel(s_active_handle);
+            if (capturing) {
+                jce_editor_scene_render_cancel_probe_capture();
+                s_capture_request = 0;
+                s_active_target = nullptr;
+            } else jce_reflection_probe_bake_cancel(s_active_handle);
         }
     } else {
         if (ImGui::Button(jce_editor_i18n("inspector.reflection_probe.bake"))) {
@@ -869,12 +879,14 @@ void draw_comp_reflection_probe(JceScene *scene, JceEntity e,
              * every probe used to contain is the fallback for a host that has
              * no renderer, not the plan.  Both produce the same artefact
              * path, so the component records it either way. */
-            if (jce_scene_reflection_probe_capture(scene, e, out,
-                                                   (int)sizeof out)) {
+            const uint64_t request = jce_editor_scene_render_begin_probe_capture(scene, e, out,
+                (int)sizeof out);
+            if (request) {
                 snprintf(r->baked_cubemap_path,
                          sizeof r->baked_cubemap_path, "%s", out);
                 s_active_handle = 0u;   /* the capture submits its own bake */
                 s_active_target = r;
+                s_capture_request = request;
             } else {
                 JceReflectionProbeBakeHandle h =
                     jce_scene_reflection_probe_bake(scene, e, s_include_dynamic,
@@ -884,6 +896,7 @@ void draw_comp_reflection_probe(JceScene *scene, JceEntity e,
                              sizeof r->baked_cubemap_path, "%s", out);
                     s_active_handle = h;
                     s_active_target = r;
+                    s_capture_request = 0;
                 }
             }
         }

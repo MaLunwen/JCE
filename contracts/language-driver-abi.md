@@ -231,9 +231,10 @@ CHANGED 并让门变红**,作者必须显式面对。预先翻倍 14 个 API 表
 
 ### Java / JNI(消费者 + 桥接)
 - `JCE_BUILD_JNI` 仅 CMake 开关(无虚构 Conan option,已核实)。
-- **已知问题**(P1,OPEN):(a) 桥接编入 `jce_platform`(L2)却调 `jce_engine_*`(L6)= 层级倒置 +
-  硬编码 `ck_app_get_desc` 消费者符号(`JNI-01/02`);(b) 3 态结果坍缩 bool(`C6-JNI-DRIFT-01`);
-  (c) 无版本握手(`JNI-04`)。规范目标:桥接重定位到独立 consumer target、保真错误码、加版本握手。
+- **当前源码**:桌面宿主位于 `engine/src/application/jce_jni_bridge.c`，编入
+  `jce_application`，与 SDL 宿主同层；Platform 不再包含该宿主或其逆向 include 豁免。
+  它通过通用 `jce_app_get_desc` 取得应用描述，保留 `JceAppResult` 三态，提供版本握手，
+  并在延迟清理时保留 Engine/Java 句柄。签名及 CPU 宿主控制不代替实际 JVM/平台链接验证。
 
 ### 绑定一致性(parity)
 - `check_binding_parity.py`:C ABI = 事实来源;核心 6 概念(entity create/destroy、transform set/get、

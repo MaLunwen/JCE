@@ -1,6 +1,6 @@
 import unittest
 import numpy as np
-from particle_suite import particle_asset, scene, validate, alive_records, validate_alive_controls
+from particle_suite import particle_asset, scene, validate, alive_records, validate_alive_controls, component_population, validate_burst_records
 
 
 class ParticleControls(unittest.TestCase):
@@ -33,6 +33,28 @@ class ParticleControls(unittest.TestCase):
             self.assertEqual(1000,asset["lifetimeMin"])
             self.assertEqual(0,particle_asset(emitters,False,mode="burst")["emitBurst"])
 
+    def test_component_population_missing_duplicates_and_wrong_route_rejected(self):
+        log = "benchmark-particles: frame=50 components=8 loaded=8 cpu_handles=8 gpu_requested=0"
+        self.assertEqual(component_population(log, 8, True), (8, 8, 8, 0))
+        for bad in ("", log + "\n" + log, log.replace("components=8", "components=7"),
+                    log.replace("gpu_requested=0", "gpu_requested=8"),
+                    log.replace("loaded=8", "loaded=0"), log.replace("cpu_handles=8", "cpu_handles=0")):
+            with self.subTest(log=bad), self.assertRaises(ValueError):
+                component_population(bad, 8, True)
+        self.assertEqual(component_population(log.replace("gpu_requested=0", "gpu_requested=8"), 8, False)[3], 8)
+        with self.assertRaises(ValueError):
+            component_population(log, 8, False)
+
+    def test_equal_gpu_burst_distribution_and_zero_control(self):
+        good = {"total_alive": 256, "records": [{"alive": 32} for _ in range(8)]}
+        validate_burst_records(good, 8, 256, True, False)
+        bad = {"total_alive": 256, "records": [{"alive": count} for count in (0, 64, 32, 32, 32, 32, 32, 32)]}
+        with self.assertRaises(ValueError):
+            validate_burst_records(bad, 8, 256, True, False)
+        validate_burst_records({"total_alive": 0, "records": [{"alive": 0} for _ in range(8)]}, 8, 256, False, False)
+        with self.assertRaises(ValueError):
+            validate_burst_records(good, 8, 256, False, False)
+
     def test_stress_capacity_and_billboard_size(self):
         for count in (256,32768,1048576):
             for emitters in (1,8):
@@ -63,6 +85,32 @@ class ParticleControls(unittest.TestCase):
             wrong[label] = active.copy() if label == "changed" else zero.copy()
             with self.assertRaises(ValueError):
                 validate(wrong)
+
+
+    def test_full_background_changes_cannot_count_as_particle_liveness(self):
+        zero = np.full((720, 1280, 4), 118, np.uint8)
+        zero[:, :, 3] = 255
+        active, changed = zero.copy(), zero.copy()
+        active[100:150, 100:150, 0] = 220
+        changed[100:150, 100:150, 2] = 220
+        good = dict(zero=zero, active=active, changed=changed, repeat=active.copy())
+        self.assertEqual(validate(good)["background_corner_max_rgb8_delta"],
+                         dict(active=0, changed=0, repeat=0))
+        wrong = {name: pixels.copy() for name, pixels in good.items()}
+        for name in ("active", "changed", "repeat"):
+            wrong[name][:, :, :3] = 34
+        wrong["active"][100:150, 100:150, 0] = 220
+        wrong["changed"][100:150, 100:150, 2] = 220
+        wrong["repeat"] = wrong["active"].copy()
+        with self.assertRaisesRegex(ValueError, "background/postfx"):
+            validate(wrong)
+        for name in ("active", "changed", "repeat"):
+            for y, x in ((0, 0), (0, -1), (-1, 0), (-1, -1)):
+                wrong = dict(good)
+                wrong[name] = good[name].copy()
+                wrong[name][y, x, 1] -= 3
+                with self.subTest(name=name, corner=(y, x)), self.assertRaises(ValueError):
+                    validate(wrong)
 
 
 if __name__ == "__main__":

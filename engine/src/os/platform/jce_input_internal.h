@@ -27,4 +27,9 @@
 #include <jce/os/platform/jce_input_device.h>   /* JceInputBackend,
                                                    jce_input_set_backend */
 
+/* Only the real JIRC replay owner may publish replay origin. Neither helper
+ * changes the public frame wire format or creates another input state store. */
+void jce_input_clear_snapshot_replayed(JceInput *input);
+bool jce_input_apply_replayed(JceInput *input, const JceInputFrame *frame);
+
 #endif /* JCE_INPUT_INTERNAL_H */

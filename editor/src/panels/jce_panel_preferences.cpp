@@ -21,7 +21,8 @@
  *                                     input / paths / general (autosave,
  *                                     startup, recent_max); toolchain
  *                                     overrides as "toolchain.<kind>" KV
- *   ~/.jce/editor-session.json      — last-state keys (view mode, recents…)
+ *   ~/.jce/editor-session.json      — last-state keys (view mode, recents,
+ *                                     Preferences category…)
  * plus hotkeys.json via the hotkey registry.  The former stores prefs.json
  * and editor-config.json are RETIRED: jce_editor_config_load merges them
  * forward one time and the next flush renames them *.migrated (hand-edits
@@ -41,11 +42,15 @@
  */
 
 #include "panels/jce_panel_preferences.h"
+#include "jce_panel_hotkey_search.h"
 
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_style.h"
+#include "ui/jce_editor_font_picker.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_cadence.h"
+#include "core/jce_editor_renderer_startup.h"
 #include "core/jce_editor_defaults.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_hotkeys.h"
@@ -56,6 +61,7 @@
 
 #include <jce/tools/jce_imgui.hpp>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -103,8 +109,20 @@ struct UserPrefs {
 UserPrefs        s_prefs;
 JceEditorConfig  s_cfg;       /* mirror of the canonical config for live editing */
 bool             s_loaded = false;
-int              s_active_tab = 0;   /* 0=General, 1=Appearance, 2=Fonts,
-                                        3=Viewport, 4=Input, 5=Paths, 6=Hotkeys */
+int              s_active_tab = 0;
+
+constexpr const char kActiveTabKey[] = "preferences.active_tab";
+struct TabSpec { int id; const char *key; };
+static const TabSpec kTabs[] = {
+    { 0, "panel.preferences.tab.general"    },
+    { 1, "panel.preferences.tab.appearance" },
+    { 2, "panel.preferences.tab.fonts"      },
+    { 3, "panel.preferences.tab.viewport"   },
+    { 4, "panel.preferences.tab.input"      },
+    { 5, "panel.preferences.tab.paths"      },
+    { 6, "panel.preferences.tab.hotkeys"    },
+    { 7, "panel.preferences.tab.toolchains" },
+};
 
 int clamp_int(int v, int lo, int hi)
 {
@@ -243,6 +261,21 @@ void ensure_loaded()
      * then mirror the general fields + toolchains out of it. */
     if (!jce_editor_config_load(&s_cfg))
         jce_editor_config_defaults(&s_cfg);
+    s_active_tab = 0;
+    int saved_tab = 0;
+    if (jce_editor_config_get_ui_int(&s_cfg, kActiveTabKey, &saved_tab)) {
+        bool valid = false;
+        for (const auto &tab : kTabs) {
+            if (saved_tab == tab.id) {
+                s_active_tab = tab.id;
+                valid = true;
+                break;
+            }
+        }
+        if (!valid)
+            LOG_WARN(LOG_TAG, "Invalid saved Preferences category key=%s value=%d; "
+                     "using General", kActiveTabKey, saved_tab);
+    }
     load_from_disk();
     /* Push the user's recent-list cap into the config layer so add_recent
      * honors it from startup (previously recent_max was inert). */
@@ -321,7 +354,62 @@ void draw_tab_general()
         if (cfg_trimmed) jce_editor_config_save(&s_cfg);
         dirty = true;
     }
-    if (dirty) save_to_disk();
+    if (dirty) {
+        save_to_disk();
+        (void)jce_editor_config_load(&s_cfg);
+    }
+    ImGui::Separator();
+    const auto rates = jce_editor_cadence_rates(s_cfg);
+    int values[] = {rates.active, rates.idle, rates.background, rates.play};
+    const char *keys[] = {JCE_EDITOR_CADENCE_ACTIVE, JCE_EDITOR_CADENCE_IDLE,
+                          JCE_EDITOR_CADENCE_BACKGROUND, JCE_EDITOR_CADENCE_PLAY};
+    const char *labels[] = {"panel.preferences.frame_rate_active",
+                            "panel.preferences.frame_rate_idle",
+                            "panel.preferences.frame_rate_background",
+                            "panel.preferences.frame_rate_play"};
+    bool cadence_dirty = false;
+    for (int i = 0; i < 4; ++i) {
+        ImGui::PushID(keys[i]);
+        ImGui::TextUnformatted(jce_editor_i18n(labels[i]));
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::InputInt("##rate", &values[i])) {
+            values[i] = clamp_int(values[i], 0, 1000);
+            cadence_dirty |= jce_editor_config_set_ui_int(&s_cfg, keys[i], values[i]);
+        }
+        ImGui::PopID();
+    }
+    if (cadence_dirty) jce_editor_config_save(&s_cfg);
+    ImGui::TextWrapped("%s", jce_editor_i18n("panel.preferences.frame_rate_help"));
+}
+
+/* Picker-only BCP-47-style labels. Never rename locale files or persisted
+ * identifiers: legacy "en" and "zh_cn" remain stable disk/API codes.
+ * Distinguish same-name translations by their actual code; DO NOT assume
+ * generic "en" means US English when no region is declared. */
+static void prefs_locale_display_tag(const char *code, char out[32])
+{
+    if (!code || !*code) { std::snprintf(out, 32, "und"); return; }
+    std::size_t n = std::strlen(code);
+    if (n > 31) n = 31;
+    for (std::size_t i = 0; i < n; ++i)
+        out[i] = (code[i] == '_') ? '-' : code[i];
+    out[n] = '\0';
+    std::size_t start = 0;
+    while (start < n) {
+        std::size_t end = start;
+        while (end < n && out[end] != '-') ++end;
+        /* Region subtags uppercase; scripts title case, e.g. zh_hans_cn
+         * -> zh-Hans-CN. A generic en stays en (never invent en-US). */
+        if (start > 0 && end - start == 2) {
+            for (std::size_t i = start; i < end; ++i)
+                if (out[i] >= 'a' && out[i] <= 'z') out[i] -= 'a' - 'A';
+        } else if (start > 0 && end - start == 4) {
+            if (out[start] >= 'a' && out[start] <= 'z') out[start] -= 'a' - 'A';
+            for (std::size_t i = start+1; i < end; ++i)
+                if (out[i] >= 'A' && out[i] <= 'Z') out[i] += 'a' - 'A';
+        }
+        start = end + 1;
+    }
 }
 
 void draw_tab_appearance()
@@ -344,15 +432,18 @@ void draw_tab_appearance()
     {
         const int  n_loc   = jce_editor_i18n_locale_count();
         const int  cur_loc = (int)jce_editor_i18n_get_locale();
-        const char *cur_label = jce_editor_i18n_lookup_locale(
-            (JceLocale)cur_loc, "language.native_name");
+        const char *cur_label = jce_editor_i18n_locale_native_name((JceLocale)cur_loc);
         if (!cur_label) cur_label = "?";
+        char cur_tag[32], cur_display[192];
+        prefs_locale_display_tag(
+            jce_editor_i18n_locale_code((JceLocale)cur_loc), cur_tag);
+        std::snprintf(cur_display, sizeof(cur_display), "%s [%s]",
+                      cur_label, cur_tag);
 
         if (ImGui::BeginCombo(jce_editor_i18n("preferences.language"),
-                              cur_label)) {
+                              cur_display)) {
             for (int i = 0; i < n_loc; ++i) {
-                const char *lbl = jce_editor_i18n_lookup_locale(
-                    (JceLocale)i, "language.native_name");
+                const char *lbl = jce_editor_i18n_locale_native_name((JceLocale)i);
                 if (!lbl || !*lbl) lbl = "?";
                 /* Defensive: append a per-index suffix so any future
                  * collision between two locales sharing the same
@@ -360,9 +451,11 @@ void draw_tab_appearance()
                  * locale and falling back to "English") can't ever
                  * blow up ImGui's "2 visible items with conflicting
                  * ID" assert. */
-                char unique[96];
-                std::snprintf(unique, sizeof(unique), "%s##loc_%d",
-                              lbl, i);
+                char tag[32], unique[192];
+                prefs_locale_display_tag(
+                    jce_editor_i18n_locale_code((JceLocale)i), tag);
+                std::snprintf(unique, sizeof(unique), "%s [%s]##loc_%d",
+                              lbl, tag, i);
                 bool sel = (i == cur_loc);
                 if (ImGui::Selectable(unique, sel) && i != cur_loc) {
                     jce_editor_i18n_set_locale((JceLocale)i);
@@ -463,6 +556,36 @@ void draw_tab_appearance()
         cfg_dirty = true;
     }
     {
+        int gpu_choice = 0;
+        const bool gpu_saved = jce_editor_config_get_ui_int(
+            &s_cfg, JCE_EDITOR_GPU_ADAPTER_KEY, &gpu_choice);
+        const char *gpu_names[] = {
+            jce_editor_i18n("panel.preferences.gpu_adapter_auto"), "Intel", "NVIDIA", "AMD"};
+        const bool valid_gpu_choice = jce_editor_gpu_adapter_name(gpu_choice) != nullptr;
+        const char *preview = valid_gpu_choice
+            ? gpu_names[gpu_choice] : jce_editor_i18n("panel.preferences.gpu_adapter_invalid");
+        ImGui::TextUnformatted(jce_editor_i18n("panel.preferences.gpu_adapter"));
+        ImGui::SetNextItemWidth(-1.0f);
+        if (ImGui::BeginCombo("##gpu_adapter", preview)) {
+            for (int choice = 0; choice < 4; ++choice) {
+                const bool selected = gpu_saved && valid_gpu_choice && gpu_choice == choice;
+                if (ImGui::Selectable(gpu_names[choice], selected)) {
+                    // Explicitly clicking Auto stores 0 even when no setting existed.
+                    // Never reconfigure the running device from a Preferences draw.
+                    if (jce_editor_store_gpu_adapter_choice(&s_cfg, choice))
+                        cfg_dirty = true;
+                    else
+                        jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                            "GPU preference save refused: key=%s choice=%d phase=ui_int_admission",
+                            JCE_EDITOR_GPU_ADAPTER_KEY, choice);
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextWrapped("%s", jce_editor_i18n("panel.preferences.gpu_adapter_help"));
+    }
+    {
         /* The RUNNING backend, version included -- jce_renderer_get_backend_name
          * returns bgfx's name, whose OpenGL spelling is a compile-time string
          * built from the build floor, so it said 3.1 while we ran at 4.6. */
@@ -526,57 +649,32 @@ void draw_tab_fonts()
 
     enum { JCE_FONT_PICKER_MAX = 512 };
     static JceFontEntry  s_entries[JCE_FONT_PICKER_MAX];
-    static const char   *s_labels[JCE_FONT_PICKER_MAX + 1];
-    static int           s_count = -1;
-    if (s_count < 0) {
-        s_count = jce_editor_enumerate_fonts(s_entries, JCE_FONT_PICKER_MAX);
-        for (int i = 0; i < s_count; ++i)
-            s_labels[i + 1] = s_entries[i].display_name;
-    }
-    s_labels[0] = jce_editor_i18n("preferences.fonts.auto");
-
-    auto find_idx = [](const char *path) -> int {
-        if (!path || !*path) return 0;
-        for (int i = 0; i < s_count; ++i)
-            if (jce_strcasecmp(s_entries[i].path, path) == 0) return i + 1;
-        return 0;
-    };
-
-    int en_idx = find_idx(s_cfg.font_en_path);
-    int zh_idx = find_idx(s_cfg.font_zh_path);
-
-    ImGui::PushItemWidth(-160);
-    if (ImGui::Combo(jce_editor_i18n("preferences.fonts.latin"),
-                     &en_idx, s_labels, s_count + 1)) {
-        if (en_idx <= 0) s_cfg.font_en_path[0] = '\0';
-        else jce_strlcpy(s_cfg.font_en_path, s_entries[en_idx - 1].path,
-                         sizeof(s_cfg.font_en_path));
-        cfg_dirty = true;
-    }
-    if (ImGui::Combo(jce_editor_i18n("preferences.fonts.cjk"),
-                     &zh_idx, s_labels, s_count + 1)) {
-        if (zh_idx <= 0) s_cfg.font_zh_path[0] = '\0';
-        else jce_strlcpy(s_cfg.font_zh_path, s_entries[zh_idx - 1].path,
-                         sizeof(s_cfg.font_zh_path));
-        cfg_dirty = true;
-    }
-    ImGui::PopItemWidth();
-
-    if (en_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s: %s",
-                           jce_editor_i18n("fonts.latin"),
-                           s_entries[en_idx - 1].path);
-    if (zh_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s:   %s",
-                           jce_editor_i18n("fonts.cjk"),
-                           s_entries[zh_idx - 1].path);
+    static int s_count = -1;
+    if (s_count < 0) s_count = jce_editor_enumerate_fonts(s_entries, JCE_FONT_PICKER_MAX);
+    const char *automatic = jce_editor_i18n("preferences.fonts.auto");
+    ImGui::TextUnformatted(jce_editor_i18n("preferences.fonts.latin"));
+    ImGui::SetNextItemWidth(-1.0f);
+    cfg_dirty |= jce_editor_draw_font_picker("##LatinFont",
+        s_cfg.font_en_path, sizeof s_cfg.font_en_path, s_entries, s_count, automatic);
+    ImGui::TextUnformatted(jce_editor_i18n("preferences.fonts.cjk"));
+    ImGui::SetNextItemWidth(-1.0f);
+    cfg_dirty |= jce_editor_draw_font_picker("##CjkFont",
+        s_cfg.font_zh_path, sizeof s_cfg.font_zh_path, s_entries, s_count, automatic);
+    if (s_cfg.font_en_path[0]) ImGui::TextWrapped("%s: %s",
+        jce_editor_i18n("fonts.latin"), s_cfg.font_en_path);
+    if (s_cfg.font_zh_path[0]) ImGui::TextWrapped("%s: %s",
+        jce_editor_i18n("fonts.cjk"), s_cfg.font_zh_path);
 
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s (%d %s)",
                        jce_editor_i18n("preferences.fonts.scanned"),
                        s_count,
                        jce_editor_i18n("preferences.fonts.fontsFound"));
 
-    if (cfg_dirty) jce_editor_config_save(&s_cfg);
+    if (cfg_dirty) {
+        jce_editor_config_save(&s_cfg);
+        jce_editor_request_font_reload((float)s_cfg.font_size,
+            s_cfg.font_en_path, s_cfg.font_zh_path);
+    }
 }
 
 void draw_tab_viewport()
@@ -613,13 +711,27 @@ void draw_tab_viewport()
         cfg_dirty = true;
     }
 
-    const char *view_modes[] = { jce_editor_i18n("panel.preferences.viewMode.shaded"), jce_editor_i18n("panel.preferences.viewMode.wireframe"), jce_editor_i18n("panel.preferences.viewMode.textured") };
-    int vm = s_cfg.view_mode;
-    if (vm < 0 || vm > 2) vm = 0;
+    /* Enum order is the stored scene view-mode contract. */
+    const char *const view_modes[] = {
+        jce_editor_i18n("sceneView.shaded"),
+        jce_editor_i18n("scene.wireframe"),
+        jce_editor_i18n("sceneView.textured"),
+        jce_editor_i18n("scene.wireframeTextured"),
+        jce_editor_i18n("sceneView.normals"),
+        jce_editor_i18n("sceneView.roughness"),
+        jce_editor_i18n("sceneView.metallic"),
+        jce_editor_i18n("sceneView.ao"),
+        jce_editor_i18n("sceneView.sceneDepth"),
+        jce_editor_i18n("sceneView.shadowCascades"),
+        jce_editor_i18n("sceneView.shadowMask"),
+    };
+    static_assert(IM_ARRAYSIZE(view_modes) == JCE_VIEW_SHADOW_MASK + 1);
+    int vm = static_cast<int>(jce_state_get_view_mode());
+    if (vm < 0 || vm >= IM_ARRAYSIZE(view_modes)) vm = JCE_VIEW_SHADED;
     if (ImGui::Combo(jce_editor_i18n("preferences.editor.viewMode"),
-                     &vm, view_modes, 3)) {
+                     &vm, view_modes, IM_ARRAYSIZE(view_modes))) {
+        jce_state_set_view_mode(static_cast<JceSceneViewMode>(vm));
         s_cfg.view_mode = vm;
-        cfg_dirty = true;
     }
 
     const char *asset_view[] = { jce_editor_i18n("panel.preferences.assetView.grid"), jce_editor_i18n("panel.preferences.assetView.details") };
@@ -830,7 +942,6 @@ void draw_tab_toolchains()
 void draw_tab_hotkeys()
 {
     static char s_filter[64] = {0};
-    static int  s_capturing  = -1;       /* JceHotkeyId being captured */
 
     ImGui::SetNextItemWidth(220.0f);
     ImGui::InputTextWithHint("##hk_filter",
@@ -838,15 +949,15 @@ void draw_tab_hotkeys()
                              s_filter, sizeof(s_filter));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("panel.hotkeys.reset_all"))) {
+        jce_hotkeys_capture_cancel();
         jce_hotkeys_reset_all();
         jce_hotkeys_save();
     }
 
-    /* Cancel capture if the panel loses focus or the user hits Esc. */
-    if (s_capturing >= 0 &&
-        ImGui::IsKeyPressed(ImGuiKey_Escape, /*repeat=*/false)) {
-        s_capturing = -1;
-    }
+    /* The registry owns edge/modifier capture and the completion barrier.
+     * Poll once even when the captured row is filtered out. */
+    if (jce_hotkeys_capture_poll())
+        jce_hotkeys_save();
 
     const ImGuiTableFlags tflags =
         ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -868,32 +979,9 @@ void draw_tab_hotkeys()
 
     const int total = jce_hotkeys_count();
     for (int i = 0; i < total; ++i) {
-        const char *name = jce_hotkey_name((JceHotkeyId)i);
-        if (s_filter[0]) {
-            /* case-insensitive substring filter on display name + id */
-            const char *id_str = jce_hotkey_id_string((JceHotkeyId)i);
-            const char *sources[2] = { name, id_str };
-            bool match = false;
-            for (int si = 0; si < 2 && !match; ++si) {
-                const char *src = sources[si];
-                if (!src) continue;
-                size_t flen = std::strlen(s_filter);
-                size_t slen = std::strlen(src);
-                if (flen == 0) { match = true; break; }
-                if (flen > slen) continue;
-                for (size_t k = 0; k + flen <= slen && !match; ++k) {
-                    size_t j = 0;
-                    for (; j < flen; ++j) {
-                        char a = src[k + j], b = s_filter[j];
-                        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
-                        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
-                        if (a != b) break;
-                    }
-                    if (j == flen) match = true;
-                }
-            }
-            if (!match) continue;
-        }
+        const auto id = static_cast<JceHotkeyId>(i);
+        if (!jce_panel_hotkey_matches_filter(id, s_filter)) continue;
+        const char *name = jce_hotkey_name(id);
 
         ImGui::PushID(i);
         ImGui::TableNextRow();
@@ -910,7 +998,7 @@ void draw_tab_hotkeys()
         char clabel[64];
         jce_hotkey_chord_label(cur, clabel, sizeof(clabel));
 
-        if (s_capturing == i) {
+        if (jce_hotkeys_capture_id() == (JceHotkeyId)i) {
             ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%s",
                 jce_editor_i18n("panel.hotkeys.capturing"));
         } else if (conflict < JCE_HK_COUNT) {
@@ -937,45 +1025,13 @@ void draw_tab_hotkeys()
         /* Column 3: [Bind] [Reset]. */
         ImGui::TableSetColumnIndex(3);
         if (ImGui::SmallButton(jce_editor_i18n("panel.hotkeys.bind"))) {
-            s_capturing = i;
+            jce_hotkeys_capture_begin((JceHotkeyId)i);
         }
         ImGui::SameLine();
         if (ImGui::SmallButton(jce_editor_i18n("panel.hotkeys.reset"))) {
+            jce_hotkeys_capture_cancel();
             jce_hotkey_reset((JceHotkeyId)i);
             jce_hotkeys_save();
-        }
-
-        /* Capture loop: when this row is being bound, watch for the
-         * next non-modifier key press and commit. */
-        if (s_capturing == i) {
-            ImGuiIO &io = ImGui::GetIO();
-            uint8_t mods = 0;
-            if (io.KeyCtrl)  mods |= JCE_HKM_CTRL;
-            if (io.KeyShift) mods |= JCE_HKM_SHIFT;
-            if (io.KeyAlt)   mods |= JCE_HKM_ALT;
-            if (io.KeySuper) mods |= JCE_HKM_SUPER;
-
-            for (int k = ImGuiKey_NamedKey_BEGIN;
-                 k < ImGuiKey_NamedKey_END; ++k) {
-                ImGuiKey kk = (ImGuiKey)k;
-                /* Skip pure modifier keys and Esc (Esc cancels above). */
-                if (kk == ImGuiKey_LeftCtrl  || kk == ImGuiKey_RightCtrl  ||
-                    kk == ImGuiKey_LeftShift || kk == ImGuiKey_RightShift ||
-                    kk == ImGuiKey_LeftAlt   || kk == ImGuiKey_RightAlt   ||
-                    kk == ImGuiKey_LeftSuper || kk == ImGuiKey_RightSuper ||
-                    kk == ImGuiKey_ReservedForModCtrl  ||
-                    kk == ImGuiKey_ReservedForModShift ||
-                    kk == ImGuiKey_ReservedForModAlt   ||
-                    kk == ImGuiKey_ReservedForModSuper ||
-                    kk == ImGuiKey_Escape) continue;
-                if (ImGui::IsKeyPressed(kk, /*repeat=*/false)) {
-                    JceHotkeyChord chord = { k, mods };
-                    jce_hotkey_set((JceHotkeyId)i, chord);
-                    jce_hotkeys_save();
-                    s_capturing = -1;
-                    break;
-                }
-            }
         }
 
         ImGui::PopID();
@@ -1051,7 +1107,10 @@ extern "C" void jce_editor_prefs_set_startup_behavior(
 extern "C" void jce_editor_panel_user_preferences(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_USER_PREFERENCES);
-    if (!vis) return;
+    if (!vis) {
+        jce_hotkeys_capture_cancel();
+        return;
+    }
 
     /* P8-C: Preferences is a modal popup (non-dockable). When the
      * visibility flag is toggled to true (menu / hotkey / search), we
@@ -1070,7 +1129,10 @@ extern "C" void jce_editor_panel_user_preferences(void)
         ensure_loaded();
         ImGui::OpenPopup("###UserPreferences");
     }
-    if (!s_modal_open) return;
+    if (!s_modal_open) {
+        jce_hotkeys_capture_cancel();
+        return;
+    }
 
     ensure_loaded();
 
@@ -1091,9 +1153,11 @@ extern "C" void jce_editor_panel_user_preferences(void)
 
     /* Center on the main viewport (no docking, no save settings). */
     const ImGuiViewport *vp = ImGui::GetMainViewport();
-    ImVec2 size(720.0f, 480.0f);
-    ImVec2 pos(vp->Pos.x + (vp->Size.x - size.x) * 0.5f,
-               vp->Pos.y + (vp->Size.y - size.y) * 0.5f);
+    /* Fit the work area and leave room for translated captions at large fonts. */
+    ImVec2 size(std::min(920.0f, vp->WorkSize.x * 0.95f),
+                std::min(660.0f, vp->WorkSize.y * 0.90f));
+    ImVec2 pos(vp->WorkPos.x + (vp->WorkSize.x - size.x) * 0.5f,
+               vp->WorkPos.y + (vp->WorkSize.y - size.y) * 0.5f);
     ImGui::SetNextWindowPos(pos, ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
 
@@ -1106,30 +1170,28 @@ extern "C" void jce_editor_panel_user_preferences(void)
                                ImGuiWindowFlags_NoSavedSettings |
                                ImGuiWindowFlags_NoCollapse)) {
 
+        if (!ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows))
+            jce_hotkeys_capture_cancel();
+
         const float left_w = 160.0f * ImGui::GetIO().FontGlobalScale;
 
         ImGui::BeginChild("##prefs_tabs", ImVec2(left_w, -ImGui::GetFrameHeightWithSpacing()), true);
-        struct TabSpec { int id; const char *key; };
-        static const TabSpec kTabs[] = {
-            { 0, "panel.preferences.tab.general"    },
-            { 1, "panel.preferences.tab.appearance" },
-            { 2, "panel.preferences.tab.fonts"      },
-            { 3, "panel.preferences.tab.viewport"   },
-            { 4, "panel.preferences.tab.input"      },
-            { 5, "panel.preferences.tab.paths"      },
-            { 6, "panel.preferences.tab.hotkeys"    },
-            { 7, "panel.preferences.tab.toolchains" },
-        };
+        bool cfg_dirty = false;
         for (const auto &t : kTabs) {
             bool sel = (s_active_tab == t.id);
-            if (ImGui::Selectable(jce_editor_i18n(t.key), sel))
+            if (ImGui::Selectable(jce_editor_i18n(t.key), sel)) {
                 s_active_tab = t.id;
+                cfg_dirty |= jce_editor_config_set_ui_int(&s_cfg, kActiveTabKey, t.id);
+            }
         }
+        if (cfg_dirty) jce_editor_config_save(&s_cfg);
         ImGui::EndChild();
 
         ImGui::SameLine();
 
         ImGui::BeginChild("##prefs_content", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true);
+        if (s_active_tab != 6)
+            jce_hotkeys_capture_cancel();
         switch (s_active_tab) {
         case 0: draw_tab_general();    break;
         case 1: draw_tab_appearance(); break;
@@ -1146,9 +1208,12 @@ extern "C" void jce_editor_panel_user_preferences(void)
         ImGui::Separator();
         if (ImGui::Button(jce_editor_i18n_or("dialog.close", "Close"),
                           ImVec2(120, 0))) {
+            jce_hotkeys_capture_cancel();
             s_modal_open = false;
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
+    } else {
+        jce_hotkeys_capture_cancel();
     }
 }

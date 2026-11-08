@@ -98,7 +98,7 @@ bool has_valid_gizmo_target(void)
 
     JceScene *scene = jce_state_get_scene();
     if (!scene) return false;
-    return jce_scene_has_transform(scene, (JceEntity)focused);
+    return jce_scene_has_transform(scene, jce_state_to_ecs_entity(focused));
 }
 
 /* ── Camera scene icon ───────────────────────────────────────────── */
@@ -482,7 +482,7 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
         JceTransform *xform = jce_scene_get_transform(scene, e);
         if (!xform) continue;
 
@@ -580,7 +580,7 @@ static void scene_helper_icons_each(const JceGizmoCamera *cam, Fn fn)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
-        JceEntity e = (JceEntity)id;
+        JceEntity e = jce_state_to_ecs_entity(id);
         JceTransform *xform = jce_scene_get_transform(scene, e);
         if (!xform) continue;
 
@@ -664,7 +664,7 @@ void set_entity_mesh_shape(uint32_t entity_id, int mesh_shape)
     JceScene *scene = jce_state_get_scene();
     if (!scene) return;
 
-    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, (JceEntity)entity_id);
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, jce_state_to_ecs_entity(entity_id));
     if (!mr) return;
 
     mr->mesh_shape = mesh_shape;

@@ -72,7 +72,9 @@ void jce_ibl_convolve_cube_irradiance_rgba8(const uint8_t *src_faces,
                                             uint8_t *out_faces);
 
 /* Mip count and byte size of the specular chain for a given face size --
- * ask before allocating for jce_ibl_convolve_cube_specular_rgba8. */
+ * ask before allocating for jce_ibl_convolve_cube_specular_rgba8. The chain
+ * includes 1x1. Both return zero if the edge exceeds the backend uint16 range
+ * or the full chain exceeds convolution count/address limits. */
 uint32_t jce_ibl_cube_mip_count(uint32_t face_size);
 size_t   jce_ibl_cube_mipchain_bytes(uint32_t face_size);
 

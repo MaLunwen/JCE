@@ -8,11 +8,53 @@
 
 #include <stdio.h>
 
-#include <jce/os/core/jce_path.h>
-
+#include <jce/os/core/jce_alloc.h>
+#include <stdbool.h>
 #include <string.h>
 
-void setUp(void)    { }
+static unsigned g_allocations, g_frees;
+static size_t g_allocated_size;
+static bool g_fail_allocation;
+
+static void *controlled_path_malloc(size_t size)
+{
+    ++g_allocations;
+    g_allocated_size = size;
+    return g_fail_allocation ? NULL : jce_malloc(size);
+}
+static void controlled_path_free(void *pointer)
+{
+    if (pointer) ++g_frees;
+    jce_free(pointer);
+}
+
+/* Exact production owner and real allocator forwarding. All original controls
+ * remain; only the rare temporary-allocation outcome is injected. */
+#define jce_malloc controlled_path_malloc
+#define jce_free controlled_path_free
+#define jce_path_to_canonical controlled_jce_path_to_canonical
+#define jce_path_canonicalise_inplace controlled_jce_path_canonicalise_inplace
+#define jce_path_is_canonical controlled_jce_path_is_canonical
+#define jce_path_is_absolute controlled_jce_path_is_absolute
+#define jce_path_asset_key controlled_jce_path_asset_key
+#define jce_path_parent controlled_jce_path_parent
+#define jce_path_basename controlled_jce_path_basename
+#define jce_path_stem controlled_jce_path_stem
+#define jce_path_extension controlled_jce_path_extension
+#define jce_path_join controlled_jce_path_join
+#define jce_path_replace_extension controlled_jce_path_replace_extension
+#define jce_path_normalize controlled_jce_path_normalize
+#define jce_path_relative controlled_jce_path_relative
+#include "os/core/jce_path.c"
+#undef jce_malloc
+#undef jce_free
+
+void setUp(void)
+{
+    g_allocations = g_frees = 0;
+    g_allocated_size = 0;
+    g_fail_allocation = false;
+}
 void tearDown(void) { }
 
 /* ---- canonical / classification ------------------------------------- */
@@ -40,6 +82,11 @@ static void test_is_absolute(void)
 {
     TEST_ASSERT_TRUE (jce_path_is_absolute("/usr/bin"));
     TEST_ASSERT_TRUE (jce_path_is_absolute("C:/x"));
+    TEST_ASSERT_TRUE (jce_path_is_absolute("C:\\x"));
+    TEST_ASSERT_TRUE (jce_path_is_absolute("//server/share/game"));
+    TEST_ASSERT_FALSE(jce_path_is_absolute("C:"));
+    TEST_ASSERT_FALSE(jce_path_is_absolute("C:game"));
+    TEST_ASSERT_FALSE(jce_path_is_absolute("D:project"));
     TEST_ASSERT_FALSE(jce_path_is_absolute("foo/bar"));
     TEST_ASSERT_FALSE(jce_path_is_absolute(""));
     TEST_ASSERT_FALSE(jce_path_is_absolute(NULL));
@@ -481,6 +528,138 @@ static void test_in_place_and_two_buffer_agree(void)
     }
 }
 
+/* Alias, capacity and depth controls consume the same production normalizer. */
+static void test_normalize_in_place_preserves_real_input(void)
+{
+    const char *inputs[] = {"a/./b/../c", "C:\\proj\\tmp\\..\\scene",
+                            "/a//./b/../c", "/", "a/.."};
+    const char *expected[] = {"a/c", "C:/proj/scene", "/a/c", "/", "."};
+    for (unsigned i = 0; i < sizeof inputs / sizeof inputs[0]; ++i) {
+        char buffer[128];
+        snprintf(buffer, sizeof buffer, "%s", inputs[i]);
+        TEST_ASSERT_TRUE(jce_path_normalize(buffer, sizeof buffer, buffer));
+        TEST_ASSERT_EQUAL_STRING(expected[i], buffer);
+    }
+    TEST_ASSERT_EQUAL_UINT(0, g_allocations);
+    TEST_ASSERT_EQUAL_UINT(0, g_frees);
+}
+
+static void test_normalize_backward_overlap_needs_no_temporary(void)
+{
+    char buffer[128] = {0};
+    snprintf(buffer + 16, sizeof buffer - 16, "%s", "a/./b/../c");
+    TEST_ASSERT_TRUE(jce_path_normalize(buffer, sizeof buffer, buffer + 16));
+    TEST_ASSERT_EQUAL_STRING("a/c", buffer);
+    TEST_ASSERT_EQUAL_UINT(0, g_allocations);
+}
+
+static void test_normalize_forward_overlap_releases_temporary_once(void)
+{
+    char buffer[128] = "a/./b/../c";
+    const size_t original_size = strlen(buffer) + 1;
+    TEST_ASSERT_TRUE(jce_path_normalize(buffer + 2, sizeof buffer - 2, buffer));
+    TEST_ASSERT_EQUAL_STRING("a/c", buffer + 2);
+    TEST_ASSERT_EQUAL_UINT(1, g_allocations);
+    TEST_ASSERT_EQUAL_UINT(1, g_frees);
+    TEST_ASSERT_EQUAL_UINT(original_size, g_allocated_size);
+}
+
+static void test_normalize_forward_overlap_small_final_buffer_is_accepted(void)
+{
+    char buffer[64] = "a////b//../c";
+    const size_t original_size = strlen(buffer) + 1;
+    TEST_ASSERT_TRUE(original_size > 4);
+    TEST_ASSERT_TRUE(jce_path_normalize(buffer + 1, 4, buffer));
+    TEST_ASSERT_EQUAL_STRING("a/c", buffer + 1);
+    TEST_ASSERT_EQUAL_UINT(1, g_allocations);
+    TEST_ASSERT_EQUAL_UINT(1, g_frees);
+    TEST_ASSERT_EQUAL_UINT(original_size, g_allocated_size);
+}
+
+static void test_normalize_forward_overlap_oom_preserves_source(void)
+{
+    char buffer[64] = "a/./b/../c";
+    char before[64];
+    memcpy(before, buffer, sizeof buffer);
+    g_fail_allocation = true;
+    TEST_ASSERT_FALSE(jce_path_normalize(buffer + 1, sizeof buffer - 1, buffer));
+    TEST_ASSERT_EQUAL_MEMORY(before, buffer, sizeof buffer);
+    TEST_ASSERT_EQUAL_UINT(1, g_allocations);
+    TEST_ASSERT_EQUAL_UINT(0, g_frees);
+}
+
+static void test_normalize_forward_overlap_bad_capacity_and_underflow_release(void)
+{
+    char short_buffer[64] = "a/b/c";
+    const char canary = short_buffer[4];
+    TEST_ASSERT_FALSE(jce_path_normalize(short_buffer + 1, 3, short_buffer));
+    TEST_ASSERT_EQUAL_INT(canary, short_buffer[4]);
+    TEST_ASSERT_EQUAL_UINT(1, g_allocations);
+    TEST_ASSERT_EQUAL_UINT(1, g_frees);
+    char underflow[64] = "/a/../../escape";
+    TEST_ASSERT_FALSE(jce_path_normalize(underflow + 1, sizeof underflow - 1,
+                                         underflow));
+    TEST_ASSERT_EQUAL_UINT(2, g_allocations);
+    TEST_ASSERT_EQUAL_UINT(2, g_frees);
+}
+
+static void test_normalize_empty_and_zero_capacity_do_not_allocate(void)
+{
+    char empty[4] = "";
+    TEST_ASSERT_TRUE(jce_path_normalize(empty, sizeof empty, empty));
+    TEST_ASSERT_EQUAL_STRING("", empty);
+    TEST_ASSERT_TRUE(jce_path_normalize(empty, sizeof empty, NULL));
+    TEST_ASSERT_EQUAL_STRING("", empty);
+    char buffer[16] = "a/./b";
+    TEST_ASSERT_FALSE(jce_path_normalize(buffer, 0, buffer));
+    TEST_ASSERT_EQUAL_STRING("a/./b", buffer);
+    TEST_ASSERT_FALSE(jce_path_normalize(NULL, 0, buffer));
+    TEST_ASSERT_EQUAL_UINT(0, g_allocations);
+}
+
+static void test_normalize_relative_parents_do_not_cancel_each_other(void)
+{
+    char result[128];
+    TEST_ASSERT_TRUE(jce_path_normalize(result, sizeof result, "../../a"));
+    TEST_ASSERT_EQUAL_STRING("../../a", result);
+    TEST_ASSERT_TRUE(jce_path_normalize(result, sizeof result, "a/../../../b"));
+    TEST_ASSERT_EQUAL_STRING("../../b", result);
+    char inplace[128] = "../../a/../b";
+    TEST_ASSERT_TRUE(jce_path_normalize(inplace, sizeof inplace, inplace));
+    TEST_ASSERT_EQUAL_STRING("../../b", inplace);
+    TEST_ASSERT_EQUAL_UINT(0, g_allocations);
+}
+
+static void test_normalize_more_than_256_segments_pop_actual_tail(void)
+{
+    char input[2048] = "";
+    char expected[2048] = "";
+    char result[2048];
+    for (unsigned i = 0; i < 300; ++i) strcat(input, "a/");
+    strcat(input, "../..");
+    for (unsigned i = 0; i < 298; ++i) strcat(expected, i ? "/a" : "a");
+    TEST_ASSERT_TRUE(jce_path_normalize(result, sizeof result, input));
+    TEST_ASSERT_EQUAL_STRING(expected, result);
+    TEST_ASSERT_TRUE(jce_path_normalize(input, sizeof input, input));
+    TEST_ASSERT_EQUAL_STRING(expected, input);
+    TEST_ASSERT_EQUAL_UINT(0, g_allocations);
+}
+
+static void test_normalize_existing_prefix_rules_are_preserved(void)
+{
+    char drive[128] = "C:\\a\\.\\b\\..\\c";
+    TEST_ASSERT_TRUE(jce_path_normalize(drive, sizeof drive, drive));
+    TEST_ASSERT_EQUAL_STRING("C:/a/c", drive);
+    char unc_shape[128] = "\\\\server\\share\\a\\..\\b";
+    TEST_ASSERT_TRUE(jce_path_normalize(unc_shape, sizeof unc_shape, unc_shape));
+    /* Existing normalizer collapses leading separators. This preserves that
+     * policy; it is not UNC host-resolution certification. */
+    TEST_ASSERT_EQUAL_STRING("/server/share/b", unc_shape);
+    char underflow[32] = "C:/../escape";
+    TEST_ASSERT_FALSE(jce_path_normalize(underflow, sizeof underflow, underflow));
+    TEST_ASSERT_EQUAL_UINT(0, g_allocations);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -524,5 +703,15 @@ int main(void)
     RUN_TEST(test_stem_in_place);
     RUN_TEST(test_extension_in_place);
     RUN_TEST(test_in_place_and_two_buffer_agree);
+    RUN_TEST(test_normalize_in_place_preserves_real_input);
+    RUN_TEST(test_normalize_backward_overlap_needs_no_temporary);
+    RUN_TEST(test_normalize_forward_overlap_releases_temporary_once);
+    RUN_TEST(test_normalize_forward_overlap_small_final_buffer_is_accepted);
+    RUN_TEST(test_normalize_forward_overlap_oom_preserves_source);
+    RUN_TEST(test_normalize_forward_overlap_bad_capacity_and_underflow_release);
+    RUN_TEST(test_normalize_empty_and_zero_capacity_do_not_allocate);
+    RUN_TEST(test_normalize_relative_parents_do_not_cancel_each_other);
+    RUN_TEST(test_normalize_more_than_256_segments_pop_actual_tail);
+    RUN_TEST(test_normalize_existing_prefix_rules_are_preserved);
     return UNITY_END();
 }

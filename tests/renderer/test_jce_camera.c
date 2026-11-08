@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_alloc.h>
 
 #include "unity.h"
 
@@ -329,10 +330,103 @@ static void test_projection_diagnostics_are_opt_in(void)
     TEST_ASSERT_EQUAL_UINT(0u, projection_nonwarn_count);
 }
 
+/* The generated private struct + complete clone body come from the actual
+ * camera owner. Only its allocation spelling is a typed counted port; the
+ * source and successful clones use the real shared tracked heap. */
+static unsigned clone_owner_alloc_calls;
+static bool clone_owner_fail;
+static void *clone_owner_alloc_port(size_t count, size_t size)
+{
+    ++clone_owner_alloc_calls;
+    if (clone_owner_fail || (size && count > SIZE_MAX / size)) return NULL;
+    void *memory = jce_malloc(count * size);
+    if (memory) memset(memory, 0, count * size);
+    return memory;
+}
+#define JCE_CALLOC(count, size) clone_owner_alloc_port((count), (size))
+#define jce_camera_clone camera_clone_actual_owner
+#include JCE_CAMERA_CLONE_OWNER
+#undef jce_camera_clone
+#undef JCE_CALLOC
+
+static void test_clone_preserves_complete_public_projection_and_independent_pose(void)
+{
+    for (int projection = 0; projection < 3; ++projection) {
+        JceCameraDesc desc = default_persp_desc();
+        JceCamera *source = jce_camera_create(&desc);
+        TEST_ASSERT_NOT_NULL(source);
+        jce_camera_set_fov(source, 79.0f);
+        jce_camera_set_near_far(source, 0.23f, 487.0f);
+        jce_camera_set_mode(source, projection ? JCE_CAMERA_ORTHO : JCE_CAMERA_PERSPECTIVE);
+        if (projection == 1) jce_camera_set_ortho_size(source, 17.0f, 11.0f);
+        if (projection == 2) jce_camera_set_ortho_height(source, 19.0f);
+        TEST_ASSERT_TRUE(jce_camera_set_pose(source, jce_v3(2, 4, 6),
+            jce_v3(0, -1, 0), jce_v3(1, 0, 0)));
+        const jce_mat4 view = jce_camera_view(source);
+        const jce_mat4 wide = jce_camera_proj(source, 16.0f / 9.0f, false);
+        const jce_mat4 square = jce_camera_proj(source, 1.0f, true);
+        JceCamera *copy = jce_camera_clone(source);
+        TEST_ASSERT_NOT_NULL(copy);
+        const bool distinct = copy != source;
+        jce_mat4 actual = jce_camera_view(copy);
+        const bool same_view = memcmp(&view, &actual, sizeof actual) == 0;
+        actual = jce_camera_proj(copy, 16.0f / 9.0f, false);
+        const bool same_wide = memcmp(&wide, &actual, sizeof actual) == 0;
+        actual = jce_camera_proj(copy, 1.0f, true);
+        const bool same_square = memcmp(&square, &actual, sizeof actual) == 0;
+        jce_camera_move_right(copy, 3);
+        actual = jce_camera_view(source);
+        const bool source_unchanged = memcmp(&view, &actual, sizeof actual) == 0;
+        jce_camera_destroy(source);
+        const float copied_fov = jce_camera_get_fov(copy);
+        jce_camera_destroy(copy);
+        TEST_ASSERT_TRUE(distinct);
+        TEST_ASSERT_TRUE(same_view);
+        TEST_ASSERT_TRUE(same_wide);
+        TEST_ASSERT_TRUE(same_square);
+        TEST_ASSERT_TRUE(source_unchanged);
+        TEST_ASSERT_FLOAT_WITHIN(EPS, 79.0f, copied_fov);
+    }
+    TEST_ASSERT_NULL(jce_camera_clone(NULL));
+}
+
+static void test_actual_clone_allocation_failure_and_full_state_retry(void)
+{
+    clone_owner_alloc_calls = 0; clone_owner_fail = false;
+    TEST_ASSERT_NULL(camera_clone_actual_owner(NULL));
+    TEST_ASSERT_EQUAL_UINT(0, clone_owner_alloc_calls);
+    JceCameraDesc desc = default_persp_desc();
+    JceCamera *source = jce_camera_create(&desc);
+    TEST_ASSERT_NOT_NULL(source);
+    jce_camera_set_mode(source, JCE_CAMERA_ORTHO);
+    jce_camera_set_ortho_height(source, 31.0f);
+    jce_camera_set_near_far(source, 0.4f, 641.0f);
+    jce_camera_set_fov(source, 47.0f);
+    TEST_ASSERT_TRUE(jce_camera_set_pose(source, jce_v3(7, 8, 9),
+        jce_v3(0, 0, -1), jce_v3(1, 1, 0)));
+    const JceCamera before = *source;
+    clone_owner_fail = true;
+    JceCamera *failed = camera_clone_actual_owner(source);
+    const bool unchanged = memcmp(&before, source, sizeof before) == 0;
+    clone_owner_fail = false;
+    JceCamera *retried = camera_clone_actual_owner(source);
+    const bool complete = retried && memcmp(source, retried, sizeof *source) == 0;
+    const bool independent = retried && retried != source;
+    jce_camera_destroy(retried);
+    jce_camera_destroy(source);
+    TEST_ASSERT_NULL(failed);
+    TEST_ASSERT_EQUAL_UINT(2, clone_owner_alloc_calls);
+    TEST_ASSERT_TRUE(unchanged);
+    TEST_ASSERT_TRUE(complete);
+    TEST_ASSERT_TRUE(independent);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_projection_diagnostics_are_opt_in);
+    RUN_TEST(test_clone_preserves_complete_public_projection_and_independent_pose);
+    RUN_TEST(test_actual_clone_allocation_failure_and_full_state_retry);
     RUN_TEST(test_create_null_desc_returns_null);
     RUN_TEST(test_create_destroy_persp);
     RUN_TEST(test_create_applies_defaults);

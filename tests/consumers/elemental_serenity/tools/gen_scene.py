@@ -85,7 +85,13 @@ entities.append(ent("CampfireLight2", [transform(p=(-5.5,0.5,-7.0)),
     light_point((0.97,0.5,0.18), 2.0, 1.0), meta("CampfireLight2")]))
 
 # ---------------------------------------------------------------- camera ----
-entities.append(ent("BeautyCam", [transform(p=(18.25,10.69,27.32)),
+# The VirtualCamera selects the shot; the Camera is the rendered primary output.
+_beauty_pos = (18.25,10.69,27.32)
+_beauty_rot = (-math.degrees(math.atan2(_beauty_pos[1],math.hypot(_beauty_pos[0],_beauty_pos[2]))),
+               math.degrees(math.atan2(_beauty_pos[0],_beauty_pos[2])),0)
+entities.append(ent("BeautyCam", [transform(p=_beauty_pos, r=_beauty_rot),
+    {"type":"Camera","primary":True,"orthographic":False,"fov":25,
+     "nearClip":0.1,"farClip":1000,"clearMode":0},
     {"type":"VirtualCamera","name":"BeautyCam","priority":100,"active":True,"trackMode":0,
      "posX":18.25,"posY":10.69,"posZ":27.32,"lookX":0,"lookY":0,"lookZ":0,
      "fov":25,"offX":0,"offY":0,"offZ":0,"damping":0,"followTarget":0,"lookAtTarget":0},
@@ -371,7 +377,7 @@ rendering = {
   "fog": { "enabled": True, "mode": 1, "color": [0.0,0.011,0.039], "density": 0.0,
            "start": 47, "end": 57, "heightFalloff": 0.0, "heightOrigin": 0 },
   "shadows": { "distance": 300, "cascades": 4, "splitLambda": 0.7, "resolution": 4096, "soft": 1 },
-  "postfx": { "tonemap": True, "bloom": True, "fxaa": False, "vignette": False,
+  "postfx": { "tonemap": True, "bloom": True, "fxaa": True, "vignette": False,
               "exposure": 0.92, "gamma": 2.2, "bloomThreshold": 1.15, "bloomIntensity": 0.24,
               "ssao": False, "ssaoIntensity": 0.0, "ssaoRadius": 0.85, "ssr": False },
   "environment": {
@@ -535,7 +541,7 @@ for bname, blabel, bhandler, bx in BTNS:
          "normalR": 0.08, "normalG": 0.10, "normalB": 0.12, "normalA": 0.72,
          "highlightR": 0.16, "highlightG": 0.19, "highlightB": 0.22, "highlightA": 0.85,
          "pressedR": 0.04, "pressedG": 0.05, "pressedB": 0.06, "pressedA": 0.9},
-        {"type": "UIText", "text": blabel, "fontPath": "fonts/LXGWWenKai-Regular.ttf",
+        {"type": "UIText", "text": blabel, "fontPath": "",
          "fontSize": 16, "alignment": 1,
          "colorR": 0.93, "colorG": 0.93, "colorB": 0.90, "colorA": 1.0,
          "anchorMinX": 0.5, "anchorMinY": 1.0, "anchorMaxX": 0.5, "anchorMaxY": 1.0,
@@ -545,7 +551,7 @@ for bname, blabel, bhandler, bx in BTNS:
 # Music "Now Playing" indicator (reference MusicControlUI) — bottom-left; the
 # director rewrites its text on each track change.  A Skip button advances.
 entities.append(ent("NowPlaying", parent=hud_id, comps=[transform(),
-    {"type": "UIText", "text": "♪ Forest Dreams", "fontPath": "fonts/LXGWWenKai-Regular.ttf",
+    {"type": "UIText", "text": "♪ Forest Dreams", "fontPath": "",
      "fontSize": 15, "alignment": 0,
      "colorR": 0.90, "colorG": 0.90, "colorB": 0.82, "colorA": 0.9,
      "anchorMinX": 0.0, "anchorMinY": 0.0, "anchorMaxX": 0.0, "anchorMaxY": 0.0,
@@ -560,20 +566,23 @@ entities.append(ent("BtnSkip", parent=hud_id, comps=[transform(),
      "normalR": 0.08, "normalG": 0.10, "normalB": 0.12, "normalA": 0.72,
      "highlightR": 0.16, "highlightG": 0.19, "highlightB": 0.22, "highlightA": 0.85,
      "pressedR": 0.04, "pressedG": 0.05, "pressedB": 0.06, "pressedA": 0.9},
-    {"type": "UIText", "text": "Skip ⏭", "fontPath": "fonts/LXGWWenKai-Regular.ttf",
+    {"type": "UIText", "text": "Skip ⏭", "fontPath": "",
      "fontSize": 13, "alignment": 1,
      "colorR": 0.93, "colorG": 0.93, "colorB": 0.90, "colorA": 1.0,
      "anchorMinX": 0.0, "anchorMinY": 0.0, "anchorMaxX": 0.0, "anchorMaxY": 0.0,
      "pivotX": 0.0, "pivotY": 0.0, "anchoredX": 20, "anchoredY": 50, "sizeW": 60, "sizeH": 20},
     meta("BtnSkip")]))
 entities.append(ent("IntroTitle", parent=hud_id, comps=[transform(),
-    {"type": "UIText", "text": "ELEMENTAL SERENITY", "fontPath": "fonts/LXGWWenKai-Regular.ttf",
+    {"type": "UIText", "text": "ELEMENTAL SERENITY", "fontPath": "",
      "fontSize": 42, "alignment": 1,
      "colorR": 0.95, "colorG": 0.93, "colorB": 0.88, "colorA": 1.0,
      "anchorMinX": 0.5, "anchorMinY": 0.5, "anchorMaxX": 0.5, "anchorMaxY": 0.5,
      "pivotX": 0.5, "pivotY": 0.5, "anchoredX": 0, "anchoredY": -40,
      "sizeW": 720, "sizeH": 60},
     meta("IntroTitle")]))
+
+from es_mood_scene import append_mood_nodes
+append_mood_nodes(entities)
 
 scene = {
   "contract": { "name": "jce.scene", "major": 1, "minor": 0 },

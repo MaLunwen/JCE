@@ -1128,7 +1128,7 @@ int jce_tool_main(int argc, char **argv)
            level, or toggling preserve-names invalidates the cache without a
            manual clean.
            Disabled for --dry-run (nothing is written) and --no-incremental. */
-        JceCookCatalog catalog;
+        JceCookCatalog catalog = {0};
         char           catalog_buf[1280];
         bool           use_cache = !dry_run && !no_incremental;
         if (use_cache) {
@@ -1162,7 +1162,7 @@ int jce_tool_main(int argc, char **argv)
                      * REVISION rather than the per-file flag because the salt
                      * is computed once for the run while the flag is derived
                      * per path. */
-                    uint8_t sv = 2u;   /* mip + block-alignment revision */
+                    uint8_t sv = 3u;   /* mips + alignment + portable Web revision */
                     XXH3_64bits_update(ss, &pf, sizeof(pf));
                     XXH3_64bits_update(ss, &tf, sizeof(tf));
                     XXH3_64bits_update(ss, &eq, sizeof(eq));

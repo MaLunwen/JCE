@@ -3,7 +3,7 @@
   "enable_csm": true,
   "enable_ssao": false,
   "enable_ssr": false,
-  "enable_taa": true,
+  "enable_taa": false,
   "enable_bloom": true,
   "enable_volumetric_fog": false,
   "enable_gpu_particles": true,

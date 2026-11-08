@@ -73,12 +73,26 @@ void jce_build_manager_poll(void);
  * call sites still compile and gracefully degrade. */
 bool jce_build_manager_repack_game_assets(const char *preset);
 
-/* Request graceful stop (SIGINT / Ctrl+C semantics).  Falls back to
- * force-kill after ~5 s if the child does not exit. */
+/* Request graceful stop (SIGINT / Ctrl+C semantics). Falls back to
+ * force-kill after ~5 s if the child does not exit. A stopped tool remains
+ * non-success even when it exits zero: FAILED plus an explicit cancellation
+ * diagnostic, preserving the real child exit_code and existing status ABI. */
 void jce_build_manager_request_stop(void);
 
 bool jce_build_manager_is_running(void);
 void jce_build_manager_get_status(JceBuildStatus *out);
+
+/* Borrowed owner-thread snapshot, valid until the next log modification,
+ * reset or shutdown. Consume immediately on the owner thread.
+ * Text is normalized owner-observed phase/stdout/stderr lines, not byte-exact
+ * child streams or cross-channel chronological ordering. No public SDK ABI. */
+enum { JCE_BUILD_LOG_CAPACITY = 1024 * 1024 };
+typedef struct {
+    const char *text;
+    size_t size;
+    bool available, truncated, incomplete;
+} JceBuildLogView;
+void jce_build_manager_get_log(JceBuildLogView *out);
 
 /* Set the default working directory used by all spawned tool
  * processes (run_script + tool probes).  Pass NULL or "" to clear
@@ -160,9 +174,9 @@ typedef struct {
     const char *cooked_assets;  /* cooked dir rel to project (optional) */
     const char *bundles;        /* ';'-joined .jbundle paths (optional) */
     bool        clean;          /* wipe the project build/ subdir first */
-    /* When non-NULL and non-empty: after a successful build the built
-     * exe (+ cooked assets + a VERSION.txt) are staged into this
-     * directory, replacing package-game.bat.  NULL = plain build. */
+    /* Nonempty: publish after build verification. Dist uses the verified
+     * single-executable publisher; explicit Release/Debug retain development
+     * staging with companion files. NULL = executable in the build cache. */
     const char *package_out_dir;
     /* Optional metadata written into the staged VERSION.txt.  When
      * NULL the staging step falls back to target/arch/variant only. */
@@ -174,8 +188,14 @@ typedef struct {
  * Returns false if a build is already running, required fields are
  * missing, or the toolchain cannot be located.  On Windows, requires a
  * detectable MSVC install (jce_toolchain) unless cl.exe is already on
- * PATH. */
+ * PATH. Idle refusals publish FAILED with no prior output identity; busy
+ * refusals preserve the in-flight state, diagnostics and outputs. */
 bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg);
+
+/* Editor-only preflight refusal. Always returns false. Idle requests publish
+ * FAILED and discard previous output identities; busy refusal preserves the
+ * complete in-flight request. Uses the same admission as both start entries. */
+bool jce_build_manager_reject_request(const char *label, const char *error);
 
 /* ---------------------------------------------------------------- *
  * Tool availability probe                                            *
@@ -190,7 +210,7 @@ typedef struct {
     char ninja_version[64];
 } JceBuildToolStatus;
 
-/* Probe PATH for cmake/conan/ninja by spawning `<tool> --version`
+/* Probe discovered/overridden toolchain paths and host PATH with `<tool> --version`
  * with a short blocking timeout.  Safe to call from the UI thread;
  * each tool gets ~2 s wall-clock budget.  Never spawns anything if a
  * build is already running (returns the previously cached result). */

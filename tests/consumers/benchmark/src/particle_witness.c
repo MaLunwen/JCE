@@ -3,6 +3,10 @@
 #include <jce/api_core.h>
 #include <stdlib.h>
 
+/* Finite opt-in evidence must survive DIST without enabling ordinary chatter. */
+#define PARTICLE_DIAGNOSTIC(...) \
+    jce_log_write(JCE_LOG_LEVEL_INFO, "benchmark_particles", __FILE__, __LINE__, __VA_ARGS__)
+
 typedef struct ParticlePopulation {
     unsigned components;
     unsigned loaded;
@@ -25,9 +29,10 @@ void bench_particle_observe(JceScene *scene, unsigned frame)
 {
     const char *enabled = getenv("JCE_BENCH_PARTICLE_OBSERVE");
     if (!enabled || enabled[0] != '1' || frame != 50) return;
+    jce_log_set_level(JCE_LOG_LEVEL_INFO);
     ParticlePopulation population = {0};
     jce_scene_each_particle_emitter(scene, observe_emitter, &population);
-    LOG_INFO("benchmark_particles",
+    PARTICLE_DIAGNOSTIC(
         "benchmark-particles: frame=%u components=%u loaded=%u cpu_handles=%u gpu_requested=%u",
         frame, population.components, population.loaded,
         population.cpu_handles, population.gpu_requested);
@@ -46,6 +51,9 @@ bool bench_particle_readback_create(BenchParticleReadback *state, JceRenderer *r
     if (!cv || !renderer) return false;
     jce_cvar_set_bool(cv, true);
     state->enabled = true;
+    jce_log_set_level(JCE_LOG_LEVEL_INFO);
+    PARTICLE_DIAGNOSTIC("benchmark-particle-backend: reported=%s",
+        jce_renderer_running_backend_name());
     const char *until = getenv("JCE_BENCH_PARTICLE_STATS_UNTIL_FRAME");
     if (until && until[0]) {
         char *end = NULL;
@@ -78,7 +86,7 @@ void bench_particle_readback_tick(BenchParticleReadback *state, JceSceneRenderer
             info.byte_size != 4 || !jce_render_readback_copy(queue, state->tickets[i], rgba, 4) ||
             rgba[3] != 255) goto failed;
         unsigned alive = (unsigned)rgba[0] | ((unsigned)rgba[1] << 8) | ((unsigned)rgba[2] << 16);
-        LOG_INFO("benchmark_particles",
+        PARTICLE_DIAGNOSTIC(
             "benchmark-particle-alive: source_frame=50 completed_frame=%u ready_engine_frame=%u index=%u name=%s rgba=%02x%02x%02x%02x alive=%u",
             frame, info.ready_frame, i, state->names[i], rgba[0], rgba[1], rgba[2], rgba[3], alive);
         jce_render_readback_release(queue, state->tickets[i]);
@@ -92,7 +100,7 @@ void bench_particle_readback_tick(BenchParticleReadback *state, JceSceneRenderer
         if (!cv) goto failed;
         jce_cvar_set_bool(cv, false);
         state->stats_disabled = true;
-        LOG_INFO("benchmark_particles", "benchmark-particle-stats-disabled: frame=%u requested=%u completed=%u",
+        PARTICLE_DIAGNOSTIC( "benchmark-particle-stats-disabled: frame=%u requested=%u completed=%u",
             frame, state->requested, state->completed);
     }
     if (frame != 50) return;
@@ -115,7 +123,7 @@ void bench_particle_readback_tick(BenchParticleReadback *state, JceSceneRenderer
                 &desc, &state->tickets[i])) goto failed;
         ++state->requested;
     }
-    LOG_INFO("benchmark_particles", "benchmark-particle-requests: source_frame=50 count=%u", state->requested);
+    PARTICLE_DIAGNOSTIC( "benchmark-particle-requests: source_frame=50 count=%u", state->requested);
     if (!state->requested || (state->cpu && state->requested != 2)) goto failed;
     return;
 failed:

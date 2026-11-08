@@ -145,12 +145,15 @@ void jce_anim_clip_sample(const JceAnimClip *clip, float time,
    constants in lock-step. */
 JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 
-/* Per-path model cache slots.  Must exceed the number of DISTINCT model files a
- * scene references (a full-load city uses ~60: commercial + skyscraper + house
- * variants + cars + trees + props).  Was 32 — which silently OVERFLOWED past 32
- * unique models (33rd+ resolved to NULL -> never rendered).  Looked up O(1) via
- * an open-addressing path hash (sr_get_model). */
-#define SR_MODEL_CACHE_MAX     256
+/* Model-cache admission is an adaptively-sized open-addressing table of
+ * stable heap entries, not a fixed array embedded in each renderer.
+ * 256 initial buckets, doubled on demand to a bounded 8192.  The bound is an
+ * ENTRY count ceiling, independent of the existing GPU-VRAM eviction budget;
+ * a refused admission is reported rather than silently dropping geometry.
+ * Stable entry addresses protect in-flight rendering/animation consumers from
+ * table rehashes.  Idle editors no longer pay for an eager fixed 8192 slots. */
+#define SR_MODEL_CACHE_INITIAL 256u
+#define SR_MODEL_CACHE_MAX     8192u
 #define SR_MODEL_MAX_INFLIGHT  3    /* concurrent async model decodes */
 #define SR_MODEL_UPLOADS_PER_FRAME 1 /* GPU uploads; CPU decode stays parallel */
 /* 千万 S4: max distance-LOD bands for the model scatter (LOD0..LODn + impostor
@@ -402,6 +405,8 @@ typedef struct {
 typedef struct {
     char            path[256];
     uint32_t        path_hash; /* FNV-1a of path — open-addressing key (sr_get_model) */
+    uint32_t        request_entity; /* original async admission, not a sole model owner */
+    uint32_t        failure_reason; /* private JceSrModelFailure, retained until reset */
     JceModel       *model;
     bool            used;
     bool            failed;   /* load was attempted and failed; do not retry */
@@ -418,8 +423,9 @@ typedef struct {
      * by any LIVE entity and can be freed (jce_scene_renderer_evict_models).
      * vram_bytes caches jce_model_gpu_bytes(model) at upload so the budget +
      * LRU victim selection read real GPU bytes, not a flat estimate.  Both are
-     * meaningful ONLY in runtime mode (SR owns the model); in editor mode the
-     * asset-cache callback owns models and SR never frees them. */
+     * tracked only for built-in async loads. Successful model callbacks also
+     * transfer ownership into this cache, but their GPU charge remains zero
+     * and the existing callback-mode VRAM eviction policy is disabled. */
     uint64_t        last_used_frame;
     uint64_t        vram_bytes;
 
@@ -447,6 +453,8 @@ typedef struct {
      * looks like. */
     bool                  batch_cull_logged;
 } SrModelCache;
+
+typedef struct SrCpuDeformState SrCpuDeformState;
 
 /* Per-ENTITY skeletal-animation instance. The model above is shared by path;
    each entity gets its OWN player, playback state, and skin palette so multiple
@@ -587,6 +595,7 @@ typedef struct {
      * jce_morph_apply on one would upload into nothing and show the LAST
      * deform forever -- a stuck face, not an error. */
     uint32_t          morph_vb_gpu_mask;
+    SrCpuDeformState *cpu_deform;  /* compatibility geometry owned by this instance */
     float             morph_last_weights[JCE_MORPH_MAX_WEIGHTS];
     int               morph_last_count;   /* -1 = never uploaded (force first) */
     /* Warn once per instance, not once per frame: a clip that animates
@@ -686,17 +695,17 @@ typedef struct {
     bool             used;
 } SrSpriteAnim;
 
-/* TAA per-object motion: previous-frame world matrix per static/model entity.
-   Looked up before drawing into the velocity G-buffer, written back AFTER the
-   prepass.  A small open-addressed table keyed by entity id; LRU-ish: dead
-   entries are pruned each frame (touched flag).  Only maintained while TAA is
-   on (taa_want_velocity), so it costs nothing when TAA is off. */
+/* Velocity world history uses full entity generations. The first store in a
+ * host generation latches previous <- current; later viewports preserve that
+ * previous value. New entities have no previous value until the next round. */
 #define SR_PREV_XFORM_MAX 512
 typedef struct {
-    uint32_t entity;
-    jce_mat4 prev_world;
+    JceEntity entity;
+    jce_mat4 prev_world, current_world;
+    uint32_t frame_gen;
     bool     used;
-    bool     touched;   /* set when looked-up/updated this frame; prune untouched */
+    bool     touched;   /* union of actual velocity views in the host round */
+    bool     prev_valid;
 } SrPrevXform;
 
 /* Per-frame color-pass GPU-instancing accumulator entry: a static, non-skinned,
@@ -883,6 +892,9 @@ typedef struct {
      * and the miss path -- unlike render_kind beside it.  A layer edit changes
      * a component VALUE and bumps no epoch, so a cached one would go stale. */
     uint8_t  layer;
+    /* Colour-call scratch. Each stage consumes/clears its captured bits before
+     * calling producers; complete calls leave zero, never a cross-view key. */
+    uint8_t  colour_special;
 } SrEntityCull;
 
 /* SrEntityCull.render_kind values.  PRIM_MESH = a plain mesh-renderer with a
@@ -925,7 +937,7 @@ typedef struct {
  * cached here and always recomputed).  Entries untouched for a frame are pruned
  * so the table can't grow without bound in a streaming world. */
 typedef struct {
-    uint32_t entity;          /* 0 = empty slot */
+    JceEntity entity;         /* Full identity, including generation. */
     uint64_t structural_epoch;/* scene structural epoch this entry was valid for */
     uint64_t xform_gen;       /* per-entity transform gen at cache time (dynamic-opt:
                                * a hit requires BOTH epoch AND this to match, so a

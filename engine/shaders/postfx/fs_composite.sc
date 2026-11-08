@@ -23,7 +23,12 @@ $input v_texcoord0
 
 SAMPLER2D(s_texColor,  0);  /* scene color (HDR) */
 SAMPLER2D(s_texBloom,  1);  /* blurred bloom     */
+#ifndef JCE_SHADER_COMPATIBILITY
+#define JCE_SHADER_COMPATIBILITY 0
+#endif
+#if !JCE_SHADER_COMPATIBILITY
 SAMPLER3D(s_texLUT,    2);  /* 3D colour-grading LUT (N×N×N RGBA8) */
+#endif
 SAMPLER2D(s_texDepth,  4);  /* scene depth, for depth of field.
                              * Stage 4: 0 colour, 1 bloom, 2 the 3D grade
                              * LUT, 3 motion vectors are all taken.
@@ -158,6 +163,9 @@ float dofCoc(vec2 uv)
 
 vec3 sceneSample(vec2 uv)
 {
+    // Bound the stock desktop GL 2.1 program to a single scene sample.
+    // Tone mapping and bloom still run in the same composite pass.
+#if !defined(JCE_POSTFX_GL21_STOCK)
     if (u_compositeFlags2.y > 0.5)
     {
         vec2 mv = texture2D(s_texMotion, uv).rg * 2.0 - 1.0;
@@ -243,6 +251,7 @@ vec3 sceneSample(vec2 uv)
             return acc / max(wsum, 1e-6);
         }
     }
+#endif
     return texture2D(s_texColor, uv).rgb;
 }
 
@@ -293,6 +302,7 @@ void main()
         col = vec3_splat(g);
     }
 
+#if !JCE_SHADER_COMPATIBILITY
     /* 3D-LUT colour grade (post-tonemap, post-gamma LDR; half-texel trilinear).
      * Algebraic no-op when u_gradeParams.x < 0.5 (disabled or no LUT handle).
      * The grade is inside the tonemap path only (showcased with tonemap on). */
@@ -305,6 +315,8 @@ void main()
         vec3 graded = texture3D(s_texLUT, uvw).rgb;
         col = mix(col, graded, u_gradeParams.y);
     }
+
+#endif
 
     /* Dither: break up 8-bit banding of smooth tonemapped gradients — when
        this pass tonemaps it IS the final quantization point, so the

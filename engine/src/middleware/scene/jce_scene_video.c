@@ -2,19 +2,18 @@
  * jce_scene_video.c  VideoPlayer component system (video-as-texture).
  *
  * Drives every entity carrying a JceVideoPlayerComponent: opens the clip on
- * first play, advances the engine video decoder one frame per call, and
- * uploads the freshest decoded RGBA8 frame into the component's output_tex.
- * The scene renderer then binds output_tex as the entity's mesh albedo.
+ * first play and advances the decoder against elapsed time. Scene rendering
+ * prepares the freshest published frame once, independently of transport state.
+ * The compatibility update entry still advances and prepares in one call.
  *
- * The upload path mirrors the editor file viewer (editor/src/viewers/
- * jce_fv_video.cpp): a zero-copy ref update when dimensions are unchanged,
- * falling back to a fresh allocation when they differ — promoted here so a
- * shipping runtime (no editor) gets the same proven path.
+ * Texture updates copy pixels into backend-owned storage. A decoder frame may
+ * therefore be replaced or unloaded without lending its storage to the backend.
  *
  * Layer: Middleware/scene.  Consumes middleware/video + renderer/texture.
  */
 
-#include <jce/middleware/scene/jce_scene.h>
+#include "jce_scene_video_internal.h"
+#include "os/core/jce_trace_scope_internal.h"
 #include <jce/middleware/scene/jce_component_registry.h>  /* per-component disable gate */
 #include <jce/middleware/video/jce_video.h>
 #include <jce/renderer/jce_texture.h>
@@ -55,11 +54,31 @@ static void sv_clear_runtime(JceVideoPlayerComponent *c)
 
 static void sv_release_one(JceVideoPlayerComponent *c)
 {
+    JceTraceScope scope = {0};
+    if (jce_texture_valid(c->output_tex) || c->video != JCE_VIDEO_INVALID) {
+        scope = jce_trace_scope_begin("scene.video.retire");
+        if (scope.id) {
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "scene.video.owner", (int64_t)(uintptr_t)c, scope.id, scope.parent);
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "scene.video.texture", c->output_tex.idx, scope.id, scope.parent);
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "scene.video.decoder", c->video, scope.id, scope.parent);
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "scene.video.texture.retired", jce_texture_valid(c->output_tex) ? 1 : 0,
+                scope.id, scope.parent);
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "scene.video.decoder.retired", c->video != JCE_VIDEO_INVALID ? 1 : 0,
+                scope.id, scope.parent);
+        }
+    }
+    /* Retirement commands and CPU decoder release are not a GPU fence. */
     if (jce_texture_valid(c->output_tex))
         jce_texture_destroy(c->output_tex);
     if (c->video != JCE_VIDEO_INVALID)
         jce_video_unload(c->video);
     sv_clear_runtime(c);
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
 }
 
 static void sv_hook_ctor(void *ptr, int32_t count, const ecs_type_info_t *ti)
@@ -127,12 +146,17 @@ void jce_scene_video_install_hooks(ecs_world_t *world, ecs_entity_t comp_id)
 
 /* ── Frame upload (mirrors the editor viewer's upload_latest_frame) ── */
 
+static uint64_t sv_pending_counter(const JceVideoPlayerComponent *c)
+{
+    if (!c || c->video == JCE_VIDEO_INVALID) return 0;
+    const uint64_t counter = jce_video_get_frame_counter(c->video);
+    return counter != c->uploaded_counter ? counter : 0;
+}
+
 static void sv_upload_latest_frame(JceVideoPlayerComponent *c)
 {
-    if (!c || c->video == JCE_VIDEO_INVALID) return;
-
-    uint64_t counter = jce_video_get_frame_counter(c->video);
-    if (counter == 0 || counter == c->uploaded_counter) return;
+    const uint64_t counter = sv_pending_counter(c);
+    if (!counter) return;
 
     int    w = 0, h = 0;
     double frame_time = 0.0;
@@ -142,24 +166,45 @@ static void sv_upload_latest_frame(JceVideoPlayerComponent *c)
     const uint32_t uw = (uint32_t)w;
     const uint32_t uh = (uint32_t)h;
 
-    /* Zero-copy ref update when the dimensions match the existing texture:
-     * bgfx borrows the decoder's display buffer until the frame ends, which
-     * is safe because the buffer is only repopulated on the next
-     * jce_video_advance() (which runs before the next upload). */
+    JceTraceScope scope = jce_trace_scope_begin("scene.video.prepare");
+    bool accepted = false;
+    bool retired = false;
+    const JceTexture previous = c->output_tex;
     if (jce_texture_valid(c->output_tex) && c->tex_w == w && c->tex_h == h) {
-        if (jce_texture_update_rgba_ref(c->output_tex, rgba, uw, uh)) {
-            c->uploaded_counter = counter;
-            return;
+        accepted = jce_texture_update_rgba_ref(c->output_tex, rgba, uw, uh);
+    }
+    if (!accepted) {
+        /* Stage the replacement before retiring the old owned texture. A
+         * failed upload keeps both its last image and the retryable counter. */
+        JceTexture candidate = jce_texture_from_rgba(rgba, uw, uh);
+        if (jce_texture_valid(candidate)) {
+            if (jce_texture_valid(c->output_tex)) {
+                jce_texture_destroy(c->output_tex);
+                retired = true;
+            }
+            c->output_tex = candidate;
+            c->tex_w = w;
+            c->tex_h = h;
+            accepted = true;
         }
     }
-
-    if (jce_texture_valid(c->output_tex))
-        jce_texture_destroy(c->output_tex);
-
-    c->output_tex        = jce_texture_from_rgba(rgba, uw, uh);
-    c->tex_w             = w;
-    c->tex_h             = h;
-    c->uploaded_counter  = counter;
+    if (accepted) c->uploaded_counter = counter;
+    if (scope.id) {
+#define VIDEO_COUNTER(name, value) jce_trace_counter_scoped_internal( \
+        JCE_TRACE_CATEGORY_RENDER, "scene.video." name, (int64_t)(value), scope.id, scope.parent)
+        VIDEO_COUNTER("owner", (uintptr_t)c);
+        VIDEO_COUNTER("decoder", c->video);
+        VIDEO_COUNTER("frame.hi", counter >> 32);
+        VIDEO_COUNTER("frame.lo", counter & UINT32_MAX);
+        VIDEO_COUNTER("texture", c->output_tex.idx);
+        VIDEO_COUNTER("texture.previous", previous.idx);
+        VIDEO_COUNTER("texture.retired", retired ? 1 : 0);
+        VIDEO_COUNTER("width", w);
+        VIDEO_COUNTER("height", h);
+        VIDEO_COUNTER("upload.accepted", accepted ? 1 : 0);
+#undef VIDEO_COUNTER
+    }
+    jce_trace_scope_end(scope, accepted ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
 }
 
 /* ── Per-entity tick ──────────────────────────────────────────────── */
@@ -168,6 +213,7 @@ typedef struct {
     double                dt;
     JceVideoResolvePathFn resolve;
     void                 *resolve_ud;
+    uint32_t              advances;
 } SvCtx;
 
 static void *sv_read_clip_bytes(const SvCtx *ctx, const char *virtual_path,
@@ -270,17 +316,16 @@ static void sv_each(JceScene *s, JceEntity e, void *ud)
     if (!c->loop && jce_video_has_ended(c->video)) {
         /* One-shot finished: hold the last frame and stop advancing. */
         c->playing = false;
-        sv_upload_latest_frame(c);
         return;
     }
 
     double dt = ctx->dt;
     if (dt > 0.25) dt = 0.25;   /* clamp long frames (mirror viewer) */
     jce_video_advance(c->video, dt);
-    sv_upload_latest_frame(c);
+    ++ctx->advances;
 }
 
-void jce_scene_video_update(JceScene *s, double dt,
+void jce_scene_video_advance(JceScene *s, double dt,
                             JceVideoResolvePathFn resolve_path,
                             void *resolve_ud)
 {
@@ -289,7 +334,51 @@ void jce_scene_video_update(JceScene *s, double dt,
     ctx.dt         = dt;
     ctx.resolve    = resolve_path;
     ctx.resolve_ud = resolve_ud;
+    ctx.advances   = 0;
     /* Component-filtered walk (O(#players)); O(1) all-clear gate. */
-    if (jce_scene_count_video_players(s) == 0) return;
+    const int players = jce_scene_count_video_players(s);
+    if (players == 0) return;
+    JceTraceScope scope = jce_trace_scope_begin("scene.video.advance");
     jce_scene_each_video_player(s, sv_each, &ctx);
+    if (scope.id) {
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_TASK,
+            "scene.video.players", players, scope.id, scope.parent);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_TASK,
+            "scene.video.decoder.advances", ctx.advances, scope.id, scope.parent);
+    }
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
+}
+
+
+static void sv_prepare_each(JceScene *s, JceEntity e, void *ud)
+{
+    JceVideoPlayerComponent *c = jce_scene_get_video_player(s, e);
+    if (!c) return;
+    static int s_vp_cid = -2;
+    if (s_vp_cid == -2) s_vp_cid = jce_component_find("VideoPlayer");
+    if (s_vp_cid >= 0 && !jce_scene_comp_enabled(s, e, s_vp_cid)) return;
+    if (ud) { *(bool *)ud |= sv_pending_counter(c) != 0; return; }
+    /* A stopped one-shot may own the last newly published frame. */
+    sv_upload_latest_frame(c);
+}
+
+bool jce_scene_video_prepare_pending(JceScene *s)
+{
+    if (!s || jce_scene_count_video_players(s) == 0) return false;
+    bool pending = false;
+    jce_scene_each_video_player(s, sv_prepare_each, &pending);
+    return pending;
+}
+
+void jce_scene_video_prepare_render(JceScene *s)
+{
+    if (!s || jce_scene_count_video_players(s) == 0) return;
+    jce_scene_each_video_player(s, sv_prepare_each, NULL);
+}
+
+void jce_scene_video_update(JceScene *s, double dt,
+                            JceVideoResolvePathFn resolve_path, void *resolve_ud)
+{
+    jce_scene_video_advance(s, dt, resolve_path, resolve_ud);
+    jce_scene_video_prepare_render(s);
 }

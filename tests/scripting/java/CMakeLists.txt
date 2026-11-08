@@ -1,3 +1,5 @@
+jce_register_test_directory()
+
 cmake_minimum_required(VERSION 3.20)
 
 # ----------------------------------------------------------------------- #
@@ -64,7 +66,7 @@ target_include_directories(jce_script_java_lua_reference PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_SOURCE_DIR}/engine/include")
 target_link_libraries(jce_script_java_lua_reference PRIVATE
 	jce_core jce_script)
-add_dependencies(jce_tests jce_script_java_lua_reference)
+jce_test_build_dependencies(jce_script_java_lua_reference)
 
 # ── The Java side's test-only natives: the SAME mock host, a second time ──
 #
@@ -88,7 +90,7 @@ target_include_directories(jce_script_java_diff PRIVATE
 	"${CMAKE_SOURCE_DIR}/engine/include"
 	"${JCE_JNI_INCLUDE_DIR}" "${JCE_JNI_MD_INCLUDE_DIR}")
 target_link_libraries(jce_script_java_diff PRIVATE jce_core)
-add_dependencies(jce_tests jce_script_java_diff jce_script_java)
+jce_test_build_dependencies(jce_script_java_diff jce_script_java)
 
 # ── The comparison ──
 add_test(NAME test_jce_script_java_differential
@@ -108,7 +110,7 @@ add_test(NAME test_jce_script_java_differential
 # done here explicitly.
 set_tests_properties(test_jce_script_java_differential PROPERTIES
 	TIMEOUT     300
-	LABELS      "unit"
+	LABELS      "unit" JCE_TEST_KIND integration
 	ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
 set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
 	test_jce_script_java_differential)

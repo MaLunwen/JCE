@@ -134,6 +134,11 @@ static void test_low_sun_travels_through_more_cloud(void)
     TEST_ASSERT_NOT_NULL(low);
 
     JceCloudShadowDesc d = base_desc();
+    /* Keep this geometry test in the observable optical-depth range. At
+     * 50/km the denser independent-coverage field saturates T below the
+     * logarithm's epsilon, clipping the measured slanted/noon ratio. */
+    d.extinction = 0.002f;
+    d.world_extent_m = 4096.0f; /* one complete periodic weather domain */
     TEST_ASSERT_TRUE(jce_cloud_shadow_bake(&d, high));   /* straight up */
 
     const float elev = 0.35f;                            /* ~20 degrees */
@@ -337,10 +342,38 @@ static void test_shipping_parameters_do_not_saturate(void)
     free(map);
 }
 
+/* A rigid vertical translation changes the ground footprint only by the
+ * geometric sun projection. It must never change the cloud noise phase. */
+static void test_layer_translation_preserves_density_and_sun_projection(void)
+{
+    JceCloudNoiseParams noise = noise_with_bias(0.10f);
+    JceCloudShadowDesc d = base_desc();
+    float a[16 * 16], b[16 * 16];
+    d.resolution = 16;
+    d.noise = &noise;
+    d.extinction = 0.002f;
+    for (int oblique = 0; oblique < 2; ++oblique) {
+        d.layer_bottom_m = 620.0f;
+        d.layer_top_m = 1420.0f;
+        d.center_x = d.center_z = 0.0f;
+        d.sun_dir[0] = oblique ? 0.6f : 0.0f;
+        d.sun_dir[1] = 0.8f;
+        d.sun_dir[2] = 0.0f;
+        TEST_ASSERT_TRUE(jce_cloud_shadow_bake(&d, a));
+        d.layer_bottom_m += 128.0f;
+        d.layer_top_m += 128.0f;
+        d.center_x -= 128.0f * d.sun_dir[0] / d.sun_dir[1];
+        TEST_ASSERT_TRUE(jce_cloud_shadow_bake(&d, b));
+        for (unsigned i = 0; i < 16u * 16u; ++i)
+            TEST_ASSERT_FLOAT_WITHIN(2e-5f, a[i], b[i]);
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_bake_varies_and_stays_in_range);
+    RUN_TEST(test_layer_translation_preserves_density_and_sun_projection);
     RUN_TEST(test_more_coverage_means_less_light);
     RUN_TEST(test_shipping_parameters_do_not_saturate);
     RUN_TEST(test_low_sun_travels_through_more_cloud);

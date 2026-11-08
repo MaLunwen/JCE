@@ -54,6 +54,7 @@ static size_t jce_profile_strlen(const char *s)
 
 typedef struct {
     uint64_t    span_id;
+    uint64_t    parent_id;
     uint64_t    t0_ns;
     const char *name;
 } JceProfSpan;
@@ -100,9 +101,12 @@ JceProfileZone jce_profile_zone_begin(const char *name, uint32_t color,
                           : ((function && function[0]) ? function : "zone");
         if (s_prof_depth < JCE_PROF_SPAN_DEPTH) {
             JceProfSpan *sp = &s_prof_spans[s_prof_depth];
+            sp->parent_id = jce_trace_task_current_id();
             sp->span_id = jce_trace_next_id();
             sp->t0_ns   = jce_prof_now_ns();
             sp->name    = label;
+            jce_trace_task_submit(sp->span_id, sp->parent_id,
+                                  JCE_TRACE_TASK_SERVICE, label);
             jce_trace_task_begin(sp->span_id, sp->span_id, label, 0u);
         }
         ++s_prof_depth;
@@ -122,6 +126,7 @@ void jce_profile_zone_end(JceProfileZone zone)
             jce_trace_task_end(sp->span_id, sp->span_id, sp->name,
                                JCE_TRACE_TASK_SUCCEEDED,
                                (now > sp->t0_ns) ? (now - sp->t0_ns) : 0u);
+            jce_trace_task_restore_id(sp->parent_id);
         }
     }
 

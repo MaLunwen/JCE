@@ -163,6 +163,13 @@ class DeliveryControls(unittest.TestCase):
             with self.assertRaises((ValueError, FileNotFoundError)):
                 policy.shader_stock_root(sdk)
 
+    def test_darwin_alias_has_exact_macos_target(self):
+        try:
+            actual=policy.bundle_platform({'host':'darwin'})
+        except ValueError:
+            actual=None
+        self.assertEqual(actual,'macos')
+
     def test_smoke_shared_api_profile_contract_preserves_authoring(self):
         with tempfile.TemporaryDirectory() as directory:
             sdk=Path(directory); stamp=sdk/'delivery-profile.json'
@@ -221,14 +228,18 @@ class DeliveryControls(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root=Path(directory)
                 driver=SimpleNamespace(ROOT=root,HOST=host,DRY_RUN=True,
+                    host_arch=lambda: 'x86_64',
                     die=Mock(side_effect=ValueError),sync_conan_hooks=Mock(),
                     export_conan_recipes=Mock(),find_vs_install=Mock(return_value=None),
-                    host_build_profile=lambda:'native',bgfx_graphics_conan_args=lambda env:[],codec_overrides=lambda args:[],run=Mock())
+                    host_build_profile=lambda:'native',bgfx_graphics_conan_args=lambda env:[],codec_overrides=lambda args:[],
+                    build_jobs=lambda env:env['CMAKE_BUILD_PARALLEL_LEVEL'],run=Mock())
                 target={'host':host,'cross':False,'key':host+'-x64','arch':'x64','profile':'native'}
-                standalone._configure(driver,SimpleNamespace(variant='dist',clean=False),target,{})
+                standalone._configure(driver,SimpleNamespace(variant='dist',clean=False),target,
+                    {'CMAKE_BUILD_PARALLEL_LEVEL':'2'})
                 commands=[call.args[0] for call in driver.run.call_args_list]
                 conan=next(command for command in commands if command[0]=='conan')
                 self.assertIn('*:shared=False',conan)
+                self.assertEqual(conan[conan.index('-c:a')+1],'tools.build:jobs=2')
                 self.assertEqual('compiler.runtime=static' in conan,host=='windows')
                 configure=next(command for command in commands if command[0]=='cmake')
                 self.assertIn('-DJCE_DELIVERY_PROFILE=embedded',configure)
@@ -258,18 +269,47 @@ class DeliveryControls(unittest.TestCase):
         if not cmake:self.skipTest('CMake unavailable')
         root=ROOT/'build/tests/delivery-profile'; root.mkdir(parents=True,exist_ok=True)
         template=(ROOT/'cmake/JCEConfig.cmake.in').read_text(encoding='utf-8')
-        tail=template[template.index('# Shipping admission is checked'):].replace('@JCE_DELIVERY_PROFILE@','embedded')
-        for available,target,expected in (('js',True,True),('',True,False),('js',False,False)):
-            with tempfile.TemporaryDirectory(dir=root) as directory:
+        admission=template[template.index('# Target metadata travels'):
+                           template.index('# ---- Engine-side runtime resources')]
+        tail=template[template.index('# Shipping admission is checked'):]
+        # project(NONE): compiler identity is modeled; archive bytes only prove
+        # presence. Consume the real package admission/module and deferred-link
+        # block, with no VERSION/profile injection or native compiler execution.
+        controls=(('js',True,'embedded',True,True),
+                  ('',True,'embedded',True,False),
+                  ('js',False,'embedded',True,False),
+                  ('js',True,'authoring',True,False),
+                  ('js',True,'embedded',False,False))
+        for available,target,delivery,has_metadata,expected in controls:
+            with self.subTest(available=available,target=target,delivery=delivery,metadata=has_metadata), \
+                    tempfile.TemporaryDirectory(dir=root) as directory:
                 directory=Path(directory)
+                library=directory/'lib/Release'; library.mkdir(parents=True)
+                (library/'jce_engine_core.lib').write_bytes(b'PRESENCE_ONLY_NOT_ABI')
+                if has_metadata:
+                    metadata={'schema':1,'system':'Windows','arch':'x86_64','pointer_bits':64,
+                              'config':'Release','variant':'dist','delivery':delivery,
+                              'crt':'MultiThreaded' if delivery=='embedded' else 'MultiThreadedDLL',
+                              'archive':'jce_engine_core.lib'}
+                    (library/'jce-sdk-target.json').write_text(json.dumps(metadata),encoding='utf-8')
+                shutil.copyfile(ROOT/'cmake/JCESDKTarget.cmake',directory/'JCESDKTarget.cmake')
                 content=('cmake_minimum_required(VERSION 3.20)\nproject(DeliveryFixture NONE)\n'+
-                    'set(JCE_DELIVERY_PROFILE embedded)\nset(JCE_SCRIPT_LANGUAGES "'+available+'")\n'+
+                    'set(MSVC TRUE)\nset(CMAKE_SYSTEM_NAME Windows)\n'+
+                    'set(CMAKE_CXX_COMPILER_ARCHITECTURE_ID x64)\nset(CMAKE_SIZEOF_VOID_P 8)\n'+
+                    'set(CMAKE_BUILD_TYPE Release)\nset(CMAKE_CONFIGURATION_TYPES Release)\n'+
+                    'set(JCE_BUILD_VARIANT dist)\nset(JCE_DELIVERY_PROFILE embedded)\n'+
+                    'set(_jce_lib_dir "${CMAKE_CURRENT_SOURCE_DIR}/lib")\n'+
+                    'set(JCE_SCRIPT_LANGUAGES "'+available+'")\n'+
                     'set(JCE_REQUIRED_SCRIPT_LANGUAGES js)\nset(JCE_REQUIRED_SCRIPT_TARGET consumer)\n'+
-                    'function(jce_script_enable target)\nfile(WRITE "${CMAKE_BINARY_DIR}/linked.txt" "${target};${ARGN}")\nendfunction()\n'+tail+('\nadd_custom_target(consumer)\n' if target else ''))
+                    'function(jce_script_enable target)\nfile(WRITE "${CMAKE_BINARY_DIR}/linked.txt" "${target};${ARGN}")\nendfunction()\n'+
+                    admission+tail+('\nadd_custom_target(consumer)\n' if target else ''))
                 (directory/'CMakeLists.txt').write_text(content,encoding='utf-8')
-                result=subprocess.run([cmake,'-S',str(directory),'-B',str(directory/'configured')],capture_output=True,text=True)
-                self.assertEqual(result.returncode==0,expected,result.stderr)
-                if expected:self.assertEqual((directory/'configured/linked.txt').read_text(),'consumer;LANGUAGES;js;REQUIRED;NO_STAGE')
+                result=subprocess.run([cmake,'-S',str(directory),'-B',str(directory/'configured')],
+                                      capture_output=True,text=True,timeout=30)
+                self.assertEqual(result.returncode==0,expected,result.stdout+result.stderr)
+                linked=directory/'configured/linked.txt'
+                if expected:self.assertEqual(linked.read_text(),'consumer;LANGUAGES;js;REQUIRED;NO_STAGE')
+                else:self.assertFalse(linked.exists(),'rejected admission must not consume the link port')
 
     def test_authoring_flags_preserve_explicit_java_off(self):
         flags=policy.cmake_flags('authoring',java=False,restore_authoring=True)

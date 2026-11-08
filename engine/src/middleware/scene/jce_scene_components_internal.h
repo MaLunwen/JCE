@@ -19,6 +19,15 @@
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_fullscreen_effect.h>
+#include <jce/middleware/scene/jce_scene_water_spectrum.h>
+#include <jce/middleware/scene/jce_scene_water_foam.h>
+#include <jce/middleware/scene/jce_scene_water_crest.h>
+#include <jce/middleware/scene/jce_scene_water_caustics.h>
+#include <jce/middleware/scene/jce_scene_water_nearshore.h>
+#include "jce_water_motion_config.h"
+#include "jce_water_optics_config.h"
+#include "jce_water_caustic_detail_config.h"
+#include "jce_water_normal_detail_config.h"
 #include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
@@ -193,6 +202,10 @@ static inline cJSON *json_float3(const float v[3])
  * The per-component ser_<x> writers stay file-static inside their own domain
  * module (only their serw_<x> wrapper calls them). */
 
+/* camera domain (jce_scene_components_camera.c) */
+void parse_camera(JceScene *s, JceEntity e, const cJSON *c);
+void serw_camera(JceScene *s, JceEntity e, cJSON *arr);
+
 /* audio domain (jce_scene_components_audio.c) */
 void parse_audio_source(JceScene *s, JceEntity e, const cJSON *c);
 void parse_music_track(JceScene *s, JceEntity e, const cJSON *c);
@@ -272,6 +285,24 @@ void parse_terrain(JceScene *s, JceEntity e, const cJSON *c);
 void parse_vegetation_scatter(JceScene *s, JceEntity e, const cJSON *c);
 void parse_grass_field(JceScene *s, JceEntity e, const cJSON *c);
 void parse_foliage_cluster(JceScene *s, JceEntity e, const cJSON *c);
+void parse_water_foam(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_foam(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_crest(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_crest(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_caustics(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_caustics(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_nearshore(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_nearshore(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_motion(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_motion(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_optics(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_optics(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_caustic_detail(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_caustic_detail(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_normal_detail(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_normal_detail(JceScene *s, JceEntity e, cJSON *arr);
+void parse_water_spectrum(JceScene *s, JceEntity e, const cJSON *c);
+void serw_water_spectrum(JceScene *s, JceEntity e, cJSON *arr);
 void parse_water(JceScene *s, JceEntity e, const cJSON *c);
 void parse_virtual_camera(JceScene *s, JceEntity e, const cJSON *c);
 void parse_tilemap(JceScene *s, JceEntity e, const cJSON *c);

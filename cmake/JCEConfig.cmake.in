@@ -7,11 +7,25 @@
 #   target_link_libraries(MyGame PRIVATE JCE::JCE)
 
 set(JCE_VERSION "@PROJECT_VERSION@")
+# Producer shader policy travels with this SDK; consumers must not reuse a
+# previous SDK's stock selection in the same configure process.
+set(JCE_SHADER_COMPATIBILITY "@JCE_SHADER_COMPATIBILITY@")
 
 set(_jce_include_dir "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
 set(_jce_lib_dir     "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@")
 set(_jce_bin_dir     "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@")
 set(_jce_share_dir   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATAROOTDIR@/jce")
+set(JCE_SHADER_STOCK_CATALOG "${_jce_share_dir}/stock_profiles.json")
+
+# Target metadata travels with the producer/configuration's actual archive.
+# Reject mismatches before creating any imported targets or asset commands.
+foreach(_jce_policy JCE_BUILD_VARIANT JCE_DELIVERY_PROFILE)
+	if(NOT DEFINED ${_jce_policy} AND DEFINED ENV{${_jce_policy}})
+		set(${_jce_policy} "$ENV{${_jce_policy}}")
+	endif()
+endforeach()
+include("${CMAKE_CURRENT_LIST_DIR}/JCESDKTarget.cmake")
+jce_sdk_admit_consumer("${_jce_lib_dir}")
 
 # ---- Engine-side runtime resources shipped with the SDK. ----------- #
 # jce_target_embed_pak() prepends optional engine resources and the built-in
@@ -86,7 +100,6 @@ endif()
 # without force-loading application entry points. It is for native tools and
 # unit tests only; shipping applications must use JCE::JCE.
 # The SDK producer's CRT is part of its binary contract, not a consumer guess.
-set(JCE_MSVC_RUNTIME_LIBRARY "@CMAKE_MSVC_RUNTIME_LIBRARY@")
 if(MSVC AND JCE_MSVC_RUNTIME_LIBRARY)
 	set(CMAKE_MSVC_RUNTIME_LIBRARY "${JCE_MSVC_RUNTIME_LIBRARY}")
 endif()
@@ -295,6 +308,7 @@ elseif(APPLE)
 	set_property(TARGET JCE::JCE APPEND PROPERTY
 		INTERFACE_LINK_LIBRARIES
 			"-framework Cocoa" "-framework Metal" "-framework QuartzCore"
+			"-framework CoreText" "-framework CoreFoundation"
 			"-framework IOKit" "-framework CoreVideo" "-framework CoreAudio"
 			"-framework AudioToolbox" "-framework Carbon" "-framework ForceFeedback"
 			"-framework GameController" "-framework CoreHaptics")
@@ -416,7 +430,6 @@ foreach(_jce_delivery_variable JCE_DELIVERY_PROFILE JCE_REQUIRED_SCRIPT_LANGUAGE
 		set(${_jce_delivery_variable} "$ENV{${_jce_delivery_variable}}")
 	endif()
 endforeach()
-set(JCE_SDK_DELIVERY_PROFILE "@JCE_DELIVERY_PROFILE@")
 if(JCE_DELIVERY_PROFILE STREQUAL "embedded" AND NOT JCE_SDK_DELIVERY_PROFILE STREQUAL "embedded")
 	message(FATAL_ERROR "Embedded delivery requires an embedded static-dependency SDK")
 endif()
@@ -432,8 +445,20 @@ function(jce_delivery_link_required)
 		message(FATAL_ERROR "Required scripting target was not declared: ${JCE_REQUIRED_SCRIPT_TARGET}")
 	endif()
 	if(JCE_REQUIRED_SCRIPT_LANGUAGES)
+		# Reuse declarations admitted by the scripting owner. Required factory
+		# metadata checks a declaration; it must never manufacture one.
+		get_property(_jce_linked_languages TARGET ${JCE_REQUIRED_SCRIPT_TARGET}
+			PROPERTY _JCE_SCRIPT_ENABLED_LANGUAGES)
+		get_property(_jce_native_factories TARGET ${JCE_REQUIRED_SCRIPT_TARGET}
+			PROPERTY _JCE_SCRIPT_NATIVE_FACTORIES)
+		set(_jce_delivery_languages ${_jce_linked_languages} ${JCE_REQUIRED_SCRIPT_LANGUAGES})
+		list(REMOVE_DUPLICATES _jce_delivery_languages)
+		set(_jce_factory_args "")
+		if(_jce_native_factories)
+			set(_jce_factory_args NATIVE_FACTORIES ${_jce_native_factories})
+		endif()
 		jce_script_enable(${JCE_REQUIRED_SCRIPT_TARGET}
-			LANGUAGES ${JCE_REQUIRED_SCRIPT_LANGUAGES} REQUIRED NO_STAGE)
+			LANGUAGES ${_jce_delivery_languages} REQUIRED NO_STAGE ${_jce_factory_args})
 	endif()
 endfunction()
 if(JCE_REQUIRED_SCRIPT_TARGET AND JCE_REQUIRED_SCRIPT_LANGUAGES)

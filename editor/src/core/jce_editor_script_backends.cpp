@@ -134,6 +134,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/middleware/script/jce_script_vm.h>
 
 /* Generated into this target's binary dir by jce_script_enable(): the
@@ -238,11 +239,58 @@ std::string script_api_beside_exe(const char *libname)
  * module of the same name — so "is this one already loaded?" has to be
  * answerable, and the handle alone cannot answer it. */
 struct LoadedModule {
-    std::string   path;      /* the absolute path it was loaded from */
+    std::string   path;      /* original absolute asset/build identity */
+    std::string   image_path; /* exclusive same-directory running image */
     JceCppModule *handle;
 };
 
 std::vector<LoadedModule> g_cpp_modules;
+
+/* A refused unload retains both code and its image. A failed delete retains
+ * a closed lease in the same owner for a later project-close/reload retry. */
+bool release_native_module(LoadedModule &module)
+{
+    if (module.handle) {
+        if (!jce_script_vm_cpp_unload(module.handle)) return false;
+        module.handle = nullptr;
+    }
+    if (module.image_path.empty()) return true;
+    if (jce_fs_host_remove_file(module.image_path.c_str()) ||
+        jce_fs_probe_read(module.image_path.c_str()) == JCE_FS_PRESENCE_ABSENT) {
+        module.image_path.clear();
+        return true;
+    }
+    LOG_WARN(LOG_TAG, "native script module image cleanup pending for '%s': %s",
+             module.path.c_str(), module.image_path.c_str());
+    return false;
+}
+
+/* Same-directory copies preserve the platform loader's sibling dependency
+ * search. Exclusive creation, rather than a preceding existence query, owns
+ * the name. No failure falls back to mapping the mutable build output. */
+bool stage_native_module_image(LoadedModule &module)
+{
+    static uint64_t sequence = 0;
+    const uint64_t stamp = jce_time_perf_counter();
+    char extension[1024] = {};
+    (void)jce_path_extension(extension, sizeof extension, module.path.c_str());
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        if (++sequence == 0) ++sequence;
+        char candidate[2304];
+        const int length = std::snprintf(candidate, sizeof candidate,
+            "%s.jce-image-%llx-%llu%s", module.path.c_str(),
+            (unsigned long long)stamp, (unsigned long long)sequence, extension);
+        if (length < 0 || (size_t)length >= sizeof candidate) return false;
+        bool created = false;
+        const bool copied = jce_fs_host_copy_file_new(module.path.c_str(), candidate, &created);
+        if (!created) continue; /* Never delete an unowned collision/failure. */
+        module.image_path = candidate;
+        if (copied) return true; /* The shared copy owner closed both streams. */
+        (void)release_native_module(module); /* Only our partial image may be removed. */
+        return false;
+    }
+    return false;
+}
 
 /* The declared list, resolved to absolute paths against `root`.
  *
@@ -483,31 +531,42 @@ bool jce_editor_script_modules_reload_native(const char *project_root)
         return false;
     }
 
+    const auto want = declared_modules(project_root);
     /* Unload EVERYTHING before loading, because the load pass below skips a
      * path it already holds -- which is exactly the short-circuit that makes
      * the ordinary reload a no-op on the same project. */
-    const int had = (int)g_cpp_modules.size();
-    for (const LoadedModule &m : g_cpp_modules) {
-        if (jce_script_vm_cpp_unload(m.handle)) continue;
-        /* Cannot happen with live == 0, and handled anyway: a partially
-         * unloaded list would leave the editor holding handles to closed
-         * libraries.  Report and keep what is left rather than guess. */
-        LOG_ERROR(LOG_TAG,
-                  "native script module reload: '%s' refused to unload even "
-                  "with no live instances. The module set is now partial; "
-                  "close and reopen the project.",
-                  m.path.c_str());
-        g_cpp_modules.clear();
-        jce_editor_script_modules_reload(project_root);
+    int had = 0;
+    bool released = true;
+    std::vector<LoadedModule> kept;
+    for (LoadedModule &m : g_cpp_modules) {
+        if (m.handle) ++had;
+        if (release_native_module(m)) continue;
+        kept.push_back(m);
+        released = false;
+    }
+    g_cpp_modules.swap(kept);
+    if (!released) {
+        LOG_WARN(LOG_TAG, "native script module reload incomplete: an image lease is still owned");
         return false;
     }
-    g_cpp_modules.clear();
 
     /* REUSE, not a second loader.  With the list empty this takes the ordinary
      * load path, including the failure explanations and the build-timestamp
      * line that is the only cheap evidence a module which loaded cleanly is
      * nonetheless yesterday's build. */
     jce_editor_script_modules_reload(project_root);
+
+    bool complete = true;
+    for (const auto &path : want) {
+        bool loaded = false;
+        for (const auto &module : g_cpp_modules)
+            if (module.handle && module.path == path) { loaded = true; break; }
+        if (!loaded) complete = false;
+    }
+    if (!complete) {
+        LOG_WARN(LOG_TAG, "native script module reload incomplete: a declared module was not loaded");
+        return false;
+    }
 
     LOG_INFO(LOG_TAG,
              "native script modules reloaded from disk (%d were loaded, %d "
@@ -629,18 +688,18 @@ void jce_editor_script_modules_reload(const char *project_root)
      * just means reopening the same project is a no-op instead of a refusal. */
     {
         std::vector<LoadedModule> kept;
-        for (const LoadedModule &m : g_cpp_modules) {
+        for (LoadedModule &m : g_cpp_modules) {
             bool still_wanted = false;
             for (const std::string &w : want)
                 if (w == m.path) { still_wanted = true; break; }
-            if (still_wanted) { kept.push_back(m); continue; }
-            if (jce_script_vm_cpp_unload(m.handle)) {
+            if (still_wanted && m.handle) { kept.push_back(m); continue; }
+            if (release_native_module(m)) {
                 LOG_INFO(LOG_TAG, "native script module unloaded: %s",
                          m.path.c_str());
                 continue;
             }
             kept.push_back(m);
-            LOG_WARN(LOG_TAG,
+            if (m.handle) LOG_WARN(LOG_TAG,
                      "native script module '%s' could not be unloaded (reason "
                      "above; almost always live script instances). It stays "
                      "loaded and keeps its module name reserved.",
@@ -652,17 +711,35 @@ void jce_editor_script_modules_reload(const char *project_root)
     int loaded = 0;
     for (const std::string &abs : want) {
         bool already = false;
-        for (const LoadedModule &m : g_cpp_modules)
-            if (m.path == abs) { already = true; break; }
-        if (already) { ++loaded; continue; }
+        for (const LoadedModule &m : g_cpp_modules) {
+            if (m.path != abs) continue;
+            already = true;
+            if (m.handle) ++loaded;
+            break;
+        }
+        if (already) continue; /* A pending closed lease must clean up first. */
 
         /* THE LOAD IS TRIED FIRST AND EXPLAINED SECOND.  The probes in
          * explain_load_failure() each map and unmap the library, so paying for
          * them on the happy path would map every module twice for nothing. */
-        JceCppModule *m = jce_script_vm_cpp_load_library(abs.c_str());
-        if (!m) { explain_load_failure(abs.c_str()); continue; }
+        LoadedModule image{abs, {}, nullptr};
+        if (!stage_native_module_image(image)) {
+            LOG_WARN(LOG_TAG, "native script module image copy failed for '%s'", abs.c_str());
+            if (jce_fs_probe_read(abs.c_str()) == JCE_FS_PRESENCE_ABSENT)
+                explain_load_failure(abs.c_str());
+            if (!image.image_path.empty()) g_cpp_modules.push_back(image);
+            continue;
+        }
+        JceCppModule *m = jce_script_vm_cpp_load_library(image.image_path.c_str());
+        if (!m) {
+            LOG_WARN(LOG_TAG, "native script module image load failed for '%s'", abs.c_str());
+            explain_load_failure(image.image_path.c_str());
+            if (!release_native_module(image)) g_cpp_modules.push_back(image);
+            continue;
+        }
 
-        g_cpp_modules.push_back(LoadedModule{abs, m});
+        image.handle = m;
+        g_cpp_modules.push_back(image);
         ++loaded;
 
         /* The timestamp is the only cheap evidence that a module which loaded
@@ -671,12 +748,13 @@ void jce_editor_script_modules_reload(const char *project_root)
         int64_t mtime = 0;
         if (jce_fs_host_get_mtime(abs.c_str(), &mtime)) {
             LOG_INFO(LOG_TAG,
-                     "native script module loaded: '%s' from %s (built %lld epoch-s)",
+                     "native script module loaded: '%s' from %s image=%s (built %lld epoch-s)",
                      jce_script_vm_cpp_module_name(m), abs.c_str(),
+                     image.image_path.c_str(),
                      (long long)mtime);
         } else {
-            LOG_INFO(LOG_TAG, "native script module loaded: '%s' from %s",
-                     jce_script_vm_cpp_module_name(m), abs.c_str());
+            LOG_INFO(LOG_TAG, "native script module loaded: '%s' from %s image=%s",
+                     jce_script_vm_cpp_module_name(m), abs.c_str(), image.image_path.c_str());
         }
     }
 

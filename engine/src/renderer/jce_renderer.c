@@ -3,9 +3,11 @@
  */
 
 #include <jce/os/core/jce_config.h>   /* settings S5: machine_class */
+#include <jce/os/core/jce_env.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_str.h>   /* jce_strlcpy for the PNG writer job path */
 #include <jce/os/core/jce_timer.h>
@@ -15,6 +17,7 @@
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_gpu_capture.h>
 #include <jce/renderer/jce_impostor.h>
+#include "jce_impostor_internal.h"
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
@@ -25,12 +28,26 @@
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
 #include "os/platform/jce_window_internal.h"
+#include "os/platform/jce_gl_entry_native_internal.h"
 #include "jce_renderer_caps_internal.h"
+#include "jce_offscreen_retirement_internal.h"
+#include "jce_render_readback_internal.h"
 #include "jce_upload_metrics.h"
+#include "jce_instance_upload.h"
+#include "jce_renderer_lifecycle_internal.h"
+#include "jce_renderer_launch_policy_internal.h"
+#include "jce_renderer_snapshot_internal.h"
+#include "jce_renderer_submission_trace_internal.h"
+#include "jce_bgfx_allocator_trace_internal.h"
+#include "jce_renderer_budget_internal.h"
+#include "jce_shader_set_owned_internal.h"
+#include <jce/os/core/jce_trace.h>
 #include "jce_lighting_system_internal.h"
 
 #include <bgfx/c99/bgfx.h>
+#include "jce_renderer_reset_trace_internal.h"
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>   /* IMG_SavePNG for backbuffer screenshots */
 #include <stdarg.h>
@@ -44,23 +61,73 @@
 /* One authoritative owner for the singleton bgfx device lifecycle. The
  * borrowed upload target and generation share the existing frame owner;
  * neither the decode workers nor Android frame worker mutates this bridge. */
+#include "jce_renderer_admission_internal.h"
+
 typedef struct JceRendererDeviceState {
+    JceRenderer *owner;
+    JceRendererAdmission admission;
+    JceBgfxAllocatorTrace allocation_trace;
     uint32_t frame_index;
+    uint32_t offscreen_submission_index;
     JceUploadMetricsBridge payload;
     JceShaderDeferredState shader_deferred;
+    bool render_resource_diag;
 } JceRendererDeviceState;
 static JceRendererDeviceState s_device;
+/* Rejected duplicates reach neither bgfx_init nor mutable platform/caps state.
+ * Registered engine main-thread policy applies; unmarked standalone callers
+ * still own the documented bgfx API-thread lifecycle. */
+bool jce_renderer_backend_create_begin_internal(void)
+{
+    const bool main_owner = jce_thread_is_main();
+    if (main_owner && jce_renderer_admission_try_begin(&s_device.admission)) {
+        s_device.render_resource_diag = jce_env_flag_enabled(getenv("JCE_RENDER_RESOURCE_DIAG"));
+        return true;
+    }
+    /* One bounded counter for this refused call, correlated with its existing
+     * create scope; trace-off has no ring activity or per-frame log spam. */
+    const uint64_t owner = jce_trace_task_current_id();
+    jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_RENDER,
+        "renderer.create.rejection_reason",
+        main_owner ? JCE_RENDERER_ADMISSION_REFUSED_BUSY
+                   : JCE_RENDERER_ADMISSION_REFUSED_FOREIGN, owner, owner);
+    return false;
+}
+
+void jce_renderer_backend_create_end_internal(bool created)
+{
+    jce_renderer_admission_finish(&s_device.admission, created);
+}
+
+void jce_renderer_backend_destroy_end_internal(void)
+{
+    jce_renderer_admission_release_joined(&s_device.admission);
+}
+
+bool jce_renderer_shader_provenance_policy_internal(void)
+{ return !JCE_PLATFORM_WEB && s_device.render_resource_diag; }
 
 JceShaderDeferredState *jce_renderer_shader_deferred_state(void)
 {
     return &s_device.shader_deferred;
 }
 
-
-
 /* Read by jce_renderer_bgfx_callback.c: the trace callback stamps each line
  * with the frame it belongs to, and the frame counter is the renderer's. */
 uint32_t jce_rcb_host_frame_index(void) { return s_device.frame_index; }
+
+bool jce_renderer_gpu_observation_context_internal(uint64_t *generation,
+                                                    uint32_t *host_frame)
+{
+    if (generation) *generation = 0;
+    if (host_frame) *host_frame = 0;
+    const JceSubmittedPayloadStats *active = s_device.payload.active;
+    if (!active || !active->valid || !active->context_generation ||
+        !jce_renderer_caps_api_web_context_current()) return false;
+    if (generation) *generation = active->context_generation;
+    if (host_frame) *host_frame = s_device.frame_index;
+    return true;
+}
 
 #if JCE_PLATFORM_ANDROID
 /* ── Android bgfx-frame side thread ─────────────────────────────────────
@@ -171,6 +238,8 @@ bool jce_renderer_is_egl_hung(void) { return false; }
 #endif
 
 struct JceRenderer {
+    JceOffscreenTarget *offscreen_targets;
+    JceInstanceUploadOwner instance_upload;
     JceSubmittedPayloadStats submitted_payload;
     bool is_fallback;
     /* NullRHI: bgfx NOOP backend, no window (dedicated-server / headless).
@@ -227,11 +296,15 @@ struct JceRenderer {
     bgfx_uniform_handle_t u_light_dir;   /* vec4: xyz = light direction */
     bgfx_uniform_handle_t u_light_color; /* vec4: xyz = color, w = ambient */
     uint32_t reset_flags;
+    JceRendererLaunchVsync launch_vsync;
+    struct { char *root; bool bound; } shader_dev;
     uint32_t debug_flags;
     char gpu_name[128];
     uint16_t max_encoders;   /* effective bgfx encoder-pool cap (parallel submit) */
 };
 
+#include "jce_renderer_launch_policy.inc.h"
+#include "jce_renderer_shader_dev.inc.h"
 static bool s_dbg_text_enabled = false;
 
 /* Raise bgfx's per-frame TRANSIENT buffer pool above the game-tuned default
@@ -245,8 +318,8 @@ static bool s_dbg_text_enabled = false;
  * exhausted mid-frame bgfx's transient allocator clamps unevenly across its
  * consumers and a downstream copy overruns the ring, corrupting the heap (the
  * churn crash; ASAN caught a WRITE past the 6 MiB transient VB).  Sizing the
- * ring for the editor's peak removes the exhaustion that triggers it.  Headroom
- * only — unused capacity costs nothing at runtime. */
+ * ring for the editor's peak avoids that exhaustion. Capacity reserves fixed
+ * CPU/backend storage at initialization; per-frame usage is a separate metric. */
 /* ── bgfx → engine allocator bridge ─────────────────────────────────
  * Routes ALL bgfx heap traffic (frame buffers, transient pools, resource
  * tables, bgfx_alloc blobs) through the engine allocator, so it is visible
@@ -256,12 +329,19 @@ static bool s_dbg_text_enabled = false;
  * safe (render thread + encoders); the engine allocator (mimalloc) is.
  * The interface must outlive bgfx, hence static.  JCE_NO_ALLOC_HOOKS=1
  * keeps bgfx on the CRT heap (escape hatch shared by all bridge users). */
+static void *bgfx_reallocate_default(void *ptr, size_t size, size_t align, void *user)
+{
+    (void)user;
+    return jce_realloc_aligned(ptr, size, align);
+}
+
 static void *bgfx_alloc_bridge(bgfx_allocator_interface_t *self, void *ptr,
                                size_t size, size_t align,
                                const char *file, uint32_t line)
 {
-    (void)self; (void)file; (void)line;
-    return jce_realloc_aligned(ptr, size, align);   /* size 0 => free */
+    (void)self; (void)file; /* Never capture source paths, addresses or payload. */
+    return jce_bgfx_trace_reallocate(&s_device.allocation_trace, bgfx_reallocate_default,
+                                    NULL, ptr, size, align, line);
 }
 static const bgfx_allocator_vtbl_t s_jce_alloc_vtbl = { bgfx_alloc_bridge };
 static bgfx_allocator_interface_t  s_jce_alloc_iface = { &s_jce_alloc_vtbl };
@@ -273,117 +353,27 @@ static bgfx_allocator_interface_t *jce_bgfx_allocator(void)
         const char *v = getenv("JCE_NO_ALLOC_HOOKS");
         s_no_hooks = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
+    /* Each call precedes a new bgfx init attempt, after the old backend is
+     * quiescent. Opt-in is independent of general trace/debug defaults. */
+    jce_bgfx_trace_begin(&s_device.allocation_trace,
+        jce_env_flag_enabled(getenv("JCE_BGFX_ALLOC_TRACE")) != 0, !s_no_hooks);
     return s_no_hooks ? NULL : &s_jce_alloc_iface;
 }
 
-/* ── GPU adapter selection ──────────────────────────────────────────────
- *
- * A laptop with both an integrated and a discrete GPU otherwise gets whatever
- * the driver hands out, which is not always what the user wants: the discrete
- * part is faster but costs battery and can be unavailable on a docked/eGPU
- * setup, and testing the low-end path requires *forcing* the integrated one.
- * bgfx picks by PCI vendor id at init, so the preference has to be resolved
- * BEFORE bgfx_init -- it cannot be changed afterwards without a full restart.
- *
- * Resolution order: explicit vendor id, then the JCE_GPU_ADAPTER preference,
- * then the driver default.  Values: "auto" (default), "integrated", "discrete",
- * "intel", "nvidia", "amd", or a raw hex vendor id such as "0x10DE". */
-static uint16_t adapter_vendor_from_name(const char *v)
-{
-    if (!v || !v[0]) return BGFX_PCI_ID_NONE;
-    if (jce_strcasecmp(v, "auto") == 0)       return BGFX_PCI_ID_NONE;
-    if (jce_strcasecmp(v, "integrated") == 0 ||
-        jce_strcasecmp(v, "intel") == 0)      return BGFX_PCI_ID_INTEL;
-    if (jce_strcasecmp(v, "nvidia") == 0)     return BGFX_PCI_ID_NVIDIA;
-    if (jce_strcasecmp(v, "amd") == 0 ||
-        jce_strcasecmp(v, "ati") == 0)        return BGFX_PCI_ID_AMD;
-    /* "discrete": prefer NVIDIA, fall back to AMD if that adapter is absent.
-     * bgfx has no "any discrete" selector, so this is a best-effort hint --
-     * an unmatched vendor id makes bgfx fall back to the default adapter
-     * rather than fail, which is the behaviour we want. */
-    if (jce_strcasecmp(v, "discrete") == 0)   return BGFX_PCI_ID_NVIDIA;
-    if (v[0] == '0' && (v[1] == 'x' || v[1] == 'X'))
-        return (uint16_t)strtoul(v + 2, NULL, 16);
-    LOG_WARN(LOG_TAG, "unknown GPU adapter preference '%s'; using auto", v);
-    return BGFX_PCI_ID_NONE;
-}
-
-static uint16_t s_adapter_vendor_pref = BGFX_PCI_ID_NONE;
-static bool     s_adapter_pref_read;
-
-void jce_renderer_set_gpu_adapter_preference(const char *name)
-{
-    s_adapter_vendor_pref = adapter_vendor_from_name(name);
-    s_adapter_pref_read   = true;
-}
-
-/* Stamp the resolved preference onto an init struct.  Called from EVERY
- * bgfx_init_ctor site: the fallback chain must honour the same choice as the
- * primary path, or a backend fallback would silently move the user to a
- * different GPU. */
-static void apply_adapter_preference(bgfx_init_t *init)
-{
-    if (!s_adapter_pref_read) {
-        jce_renderer_set_gpu_adapter_preference(getenv("JCE_GPU_ADAPTER"));
-    }
-    init->vendorId = s_adapter_vendor_pref;
-    if (s_adapter_vendor_pref != BGFX_PCI_ID_NONE)
-        LOG_INFO(LOG_TAG, "GPU adapter preference: vendor 0x%04X",
-                 (unsigned)s_adapter_vendor_pref);
-}
-
-uint32_t jce_renderer_get_gpu_adapters(JceGpuAdapter *out, uint32_t cap)
-{
-    const bgfx_caps_t *caps = bgfx_get_caps();
-    if (!caps) return 0;
-    const uint32_t n = caps->numGPUs < cap ? caps->numGPUs : cap;
-    for (uint32_t i = 0; i < n && out; ++i) {
-        out[i].vendor_id = caps->gpu[i].vendorId;
-        out[i].device_id = caps->gpu[i].deviceId;
-    }
-    return caps->numGPUs;
-}
-
-/* Log what the driver actually offers.  Without this a user asking for a
- * specific GPU has no way to find out which ones exist, and no way to tell a
- * silently-ignored preference from an honoured one. */
-static void log_gpu_adapters(void)
-{
-    JceGpuAdapter list[8];
-    const uint32_t total = jce_renderer_get_gpu_adapters(list, 8);
-    if (total == 0) {
-        LOG_INFO(LOG_TAG, "GPU adapters: backend does not enumerate");
-        return;
-    }
-    const uint32_t shown = total < 8 ? total : 8;
-    for (uint32_t i = 0; i < shown; ++i) {
-        const char *vendor =
-            list[i].vendor_id == BGFX_PCI_ID_INTEL  ? "Intel"  :
-            list[i].vendor_id == BGFX_PCI_ID_NVIDIA ? "NVIDIA" :
-            list[i].vendor_id == BGFX_PCI_ID_AMD    ? "AMD"    : "other";
-        LOG_INFO(LOG_TAG,
-                 "GPU adapter %u/%u: %s (vendor 0x%04X device 0x%04X)%s",
-                 (unsigned)(i + 1), (unsigned)total, vendor,
-                 (unsigned)list[i].vendor_id, (unsigned)list[i].device_id,
-                 (s_adapter_vendor_pref != BGFX_PCI_ID_NONE &&
-                  s_adapter_vendor_pref == list[i].vendor_id)
-                     ? "  <- requested" : "");
-    }
-}
+/* Adapter policy remains compiled in this single renderer init TU. */
+#include "jce_renderer_adapter.inc.h"
 
 static void apply_transient_limits(bgfx_init_t *init)
 {
     init->allocator = jce_bgfx_allocator();   /* NULL => bgfx CRT default */
-    /* MACHINE-CLASS-SIZED pools (512MB charter): these limits are allocated
-     * up-front PER FRAME OBJECT, and multithreaded bgfx keeps TWO frames —
-     * so 32+8 MiB of transient pool costs 80MB resident and 16 encoders cost
-     * 32MB (1MB UniformBuffer each x 2 frames).  The full-size pools exist for
-     * the EDITOR's worst case on a developer box (200+ streamed chunk groups
-     * in the World-Streaming Hierarchy — the ImGui churn crash); a 512MB /
-     * low-core machine never renders that much transient geometry, and every
-     * consumer degrades cleanly today (rq re-reads idb.num after alloc; ImGui
-     * clamps).  GPU tier is not known before bgfx_init, so gate on physical
-     * RAM + core count — the same downgrade-only signals s_detect_tier uses. */
+    /* Startup pools belong to each bgfx Frame. Native multithreaded bgfx
+     * keeps two frames: the default 8/2 MiB pair therefore reserves 20 MiB
+     * of logical CPU transient storage before backend buffers are counted.
+     * This is capacity, not a process RSS measurement. Preserve native
+     * encoder headroom separately; larger geometry/UI workloads opt into
+     * explicit pool budgets. Machine-class detection selects the smaller
+     * 6/2 MiB path without changing authored material or asset quality.
+     * GPU tier is unavailable before bgfx_init, so use RAM and core count. */
     const int ram_mb = SDL_GetSystemRAM();            /* 0 if unknown */
     const int cores  = SDL_GetNumLogicalCPUCores();   /* >= 1 */
     bool low_mem = (ram_mb > 0 && ram_mb < 2048) || cores <= 1;
@@ -402,25 +392,31 @@ static void apply_transient_limits(bgfx_init_t *init)
         if (lm && lm[0]) low_mem = (lm[0] != '0');
     }
 
-    if (low_mem) {
-        /* 2x the bgfx defaults (6/2): headroom over a shipped game's HUD
-         * without the developer-box editor sizing.  Saves ~48MB vs 32/8. */
-        init->limits.maxTransientVbSize = 12u * 1024u * 1024u;
-        init->limits.maxTransientIbSize =  4u * 1024u * 1024u;
-    } else {
-        init->limits.maxTransientVbSize = 32u * 1024u * 1024u;  /* (default 6) */
-        init->limits.maxTransientIbSize =  8u * 1024u * 1024u;  /* (default 2) */
-    }
+    const char *vb_env = getenv("JCE_TRANSIENT_VB_MB");
+    const char *ib_env = getenv("JCE_TRANSIENT_IB_MB");
+    const uint32_t vb_override = jce_renderer_pool_mb(vb_env);
+    const uint32_t ib_override = jce_renderer_pool_mb(ib_env);
+    if (vb_env && vb_env[0] && !vb_override)
+        LOG_WARN(LOG_TAG, "JCE_TRANSIENT_VB_MB must be 1..256; using default");
+    if (ib_env && ib_env[0] && !ib_override)
+        LOG_WARN(LOG_TAG, "JCE_TRANSIENT_IB_MB must be 1..256; using default");
+    const JceRendererPoolBudget b = jce_renderer_pool_budget(
+        JCE_PLATFORM_WEB != 0, low_mem, cores, vb_override, ib_override);
+    init->limits.maxTransientVbSize = b.vertex_bytes;
+    init->limits.maxTransientIbSize = b.index_bytes;
+    init->limits.minUniformBufferSize = b.uniform_bytes;
+    init->limits.maxEncoders = b.encoders;
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                       "renderer.transient_vb_capacity_bytes", b.vertex_bytes);
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                       "renderer.transient_ib_capacity_bytes", b.index_bytes);
+    /* Initial command capacity per encoder per bgfx Frame; backend growth
+     * remains enabled. This counter is neither total heap bytes nor RSS. */
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                       "renderer.uniform_initial_encoder_frame_bytes", b.uniform_bytes);
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER,
+                       "renderer.encoder_capacity", b.encoders);
 
-    /* Encoder pool for multi-threaded command recording (JCE_PARALLEL_SUBMIT).
-     * bgfx defaults to 8; the occlusion culler uses 1, and the opt-in parallel
-     * shadow/color path uses up to worker_count(+main) concurrent encoders.
-     * Each encoder slot costs a 1MB UniformBuffer per frame object, so size
-     * the pool to the machine: a low-core box runs few/no workers (4 slots =
-     * main + culler + margin, -24MB vs 16); strong boxes keep 16 so ~15
-     * workers + main never exhaust the pool (bgfx_encoder_begin is
-     * null-checked with an inline-submit fallback either way). */
-    init->limits.maxEncoders = (low_mem || cores <= 2) ? 4u : 16u;  /* (default 8) */
 }
 
 /* ── Per-backend availability probe ──────────────────────────────── *
@@ -460,7 +456,7 @@ static bool s_probe_gl_version(bgfx_renderer_type_t type)
     const bool gles = (type == BGFX_RENDERER_TYPE_OPENGLES);
     const JceRendererBackend backend =
         gles ? JCE_BACKEND_OPENGLES : JCE_BACKEND_OPENGL;
-    const unsigned char *(*get_string)(unsigned) = NULL;
+    JceNativeGlGetStringFn get_string = NULL;
     SDL_Window    *win = NULL;
     SDL_GLContext  ctx = NULL;
     const char    *api = NULL, *shading = NULL;
@@ -515,10 +511,8 @@ static bool s_probe_gl_version(bgfx_renderer_type_t type)
         ctx = SDL_GL_CreateContext(win);
 
     if (ctx && SDL_GL_MakeCurrent(win, ctx)) {
-        /* 0x1F02 = GL_VERSION, 0x8B8C = GL_SHADING_LANGUAGE_VERSION.  Spelled
-         * as literals because the engine links no GL headers of its own. */
-        get_string = (const unsigned char *(*)(unsigned))
-            SDL_GL_GetProcAddress("glGetString");
+        /* Query only; the private native type preserves the GL entry ABI. */
+        get_string = (JceNativeGlGetStringFn)SDL_GL_GetProcAddress("glGetString");
         if (get_string) {
             api     = (const char *)get_string(0x1F02u);
             shading = (const char *)get_string(0x8B8Cu);
@@ -559,6 +553,10 @@ static bool s_probe_gl_version(bgfx_renderer_type_t type)
 
 static bool backend_probe(bgfx_renderer_type_t type)
 {
+#if defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+    if (!jce_renderer_caps_xp_backend_available(type)) return false;
+    return type != BGFX_RENDERER_TYPE_OPENGL || s_probe_gl_version(type);
+#else
     switch (type) {
     case BGFX_RENDERER_TYPE_VULKAN:
         /* Loader must export its entry point, not merely map — a stub
@@ -574,6 +572,7 @@ static bool backend_probe(bgfx_renderer_type_t type)
     default:
         return true;
     }
+#endif
 }
 
 #else /* POSIX: Linux, macOS, Android, … */
@@ -752,9 +751,8 @@ static void gl_ladder_acquire(bgfx_platform_data_t *pd)
          * without this the log and the editor would say 3.3 while the engine
          * ran at 4.6. */
         {
-            const unsigned char *(*gs)(unsigned) =
-                (const unsigned char *(*)(unsigned))
-                    SDL_GL_GetProcAddress("glGetString");
+            JceNativeGlGetStringFn gs =
+                (JceNativeGlGetStringFn)SDL_GL_GetProcAddress("glGetString");
             if (gs)
                 jce_renderer_caps_api_publish_probe(
                     JCE_BACKEND_OPENGL, (const char *)gs(0x1F02u),
@@ -795,19 +793,31 @@ static void gl_ladder_release(void)
 static bool init_backend_attempt(bgfx_renderer_type_t type,
                                  const bgfx_platform_data_t *pd,
                                  uint32_t width, uint32_t height,
-                                 uint32_t reset_flags, bool debug)
+                                 uint32_t reset_flags, bool debug,
+                                 JceWindow *window, JceRendererDisplayAdapterState *display_adapter,
+                                 JceRendererLaunchVsync *presentation, uint32_t *effective_reset_flags,
+                                 const JceRendererLaunchDiagnostics *launch)
 {
+    if (launch && launch->invalid) { renderer_launch_diagnostics_observe(launch, NULL, 0); return false; }
     bgfx_init_t init;
     JceRendererApiInfo api;
+    JceRendererLaunchVsync candidate = {0}; candidate.requested = (reset_flags & BGFX_RESET_VSYNC) != 0;
 
+retry_adapter:
     jce_renderer_caps_api_begin_attempt(from_bgfx_type(type));
     bgfx_init_ctor(&init);
-    apply_adapter_preference(&init);
-    apply_transient_limits(&init);
     init.type              = type;
+#if JCE_PLATFORM_WINDOWS && defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+    /* The JCE ladder, not the provider, admits each packaged candidate. */
+    init.fallback          = false;
+#endif
+    apply_adapter_preference(&init);
+    (void)jce_renderer_apply_display_adapter(&init,window,display_adapter,jce_window_observe_display_adapter,jce_window_observe_performance_adapter);
+    apply_transient_limits(&init);
     init.resolution.width  = width;
     init.resolution.height = height;
-    init.resolution.reset  = reset_flags;
+    init.resolution.reset  = renderer_presentation_vsync_refresh(&candidate, type, window, reset_flags);
+    renderer_launch_diagnostics_apply(launch, &init);
     init.platformData      = *pd;
     /* Desktop GL only: swap in a context at the highest core version this
      * driver grants at or above the floor.  A no-op for every other backend
@@ -818,16 +828,50 @@ static bool init_backend_attempt(bgfx_renderer_type_t type,
     init.debug             = debug;
 
     if (!bgfx_init(&init)) {
+        renderer_launch_diagnostics_observe(launch, &init, 1);
+        /* bgfx init(false) deletes its Context, joining any owned render thread,
+         * before returning. There is no admitted backend to shut down here. */
+        jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_INIT_FAILED);
+        jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_INIT_FAILED);
         /* Our context is useless to any other backend, and leaving it
          * current would have the next attempt inherit it. */
         gl_ladder_release();
-        return false;
+        goto retry_or_fail;
     }
-    if (jce_renderer_caps_api_accept_active_backend())
+    const char *backend_refusal = NULL;
+#if JCE_PLATFORM_WINDOWS && defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+    if (bgfx_get_renderer_type() != type) {
+        backend_refusal = "provider_selected_unrequested_backend";
+    } else if (type == BGFX_RENDERER_TYPE_DIRECT3D11) {
+        const bgfx_caps_t *caps = bgfx_get_caps();
+        /* In the pinned D3D11 provider this bit means feature level >= 11_0.
+         * The embedded D3D stock was compiled for Shader Model 5. */
+        if (!caps || !(caps->supported & BGFX_CAPS_PRIMITIVE_ID))
+            backend_refusal = "d3d11_shader_model_5_unavailable";
+        else {
+            const bgfx_internal_data_t *data = bgfx_get_internal_data();
+            if (data && jce_window_legacy_d3d11_is_software(data->context))
+                backend_refusal = "d3d11_software_device";
+        }
+    }
+#endif
+    /* Post-init Web API admission uses that exact active context. */
+    const bool web_api_ok = from_bgfx_type(type) != JCE_BACKEND_OPENGLES ||
+        jce_renderer_caps_api_admit_web_context();
+    if (!backend_refusal && web_api_ok && jce_renderer_caps_api_accept_active_backend()) {
+        s_device.frame_index = 0;
+        s_device.offscreen_submission_index = 0;
+        if (presentation) *presentation = candidate;
+        if (effective_reset_flags) *effective_reset_flags = init.resolution.reset;
+        renderer_launch_diagnostics_observe(launch, &init, 2);
         return true;
+    }
 
     api = jce_renderer_get_api_info();
-    if (api.runtime_version_verified) {
+    if (backend_refusal) {
+        LOG_WARN(LOG_TAG, "backend %s refused: %s; trying the next backend",
+                 bgfx_get_renderer_name(type), backend_refusal);
+    } else if (api.runtime_version_verified) {
         LOG_WARN(LOG_TAG,
                  "%s negotiated API %u.%u.%u below %s floor %u.%u.%u; "
                  "trying the next backend",
@@ -846,7 +890,10 @@ static bool init_backend_attempt(bgfx_renderer_type_t type,
                  jce_renderer_backend_name(api.backend),
                  jce_graphics_api_tier_name(api.build_tier));
     }
-    bgfx_shutdown();
+    renderer_launch_diagnostics_observe(launch, &init, 3);
+    JCE_TRACE_SCOPE_CALL("renderer.backend_shutdown_cpu", bgfx_shutdown());
+    jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_API_REFUSED);
+    jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_JOINED);
     /* Same reason as the bgfx_init-failed path above, and it was missing here:
      * bgfx does not destroy a context it did not create, so returning without
      * this leaks the laddered context AND leaves s_gl_ladder_context set --
@@ -855,6 +902,14 @@ static bool init_backend_attempt(bgfx_renderer_type_t type,
      * shut down.  Order matters: bgfx first, then the context it was using. */
     gl_ladder_release();
     jce_renderer_caps_api_reset();
+
+retry_or_fail:
+    if (display_adapter && display_adapter->performance_applied) {
+        /* The preferred device is optional. Retire the failed attempt first,
+         * then try the same backend once with the legacy adapter policy. */
+        display_adapter->performance_blocked = true;
+        goto retry_adapter;
+    }
     return false;
 }
 
@@ -926,30 +981,26 @@ static int resolve_backend_choice(int cfg_backend)
     return backend_choice;
 }
 
-JceRenderer *jce_renderer_create(JceWindow *win,
+JceRenderer *jce_renderer_create_impl(JceWindow *win,
                                   const JceRendererConfig *cfg)
 {
     if (!win || !cfg) return NULL;
+    const JceRendererLaunchDiagnostics launch = renderer_launch_diagnostics_snapshot();
+    if (launch.invalid) { renderer_launch_diagnostics_observe(&launch, NULL, 0); return NULL; }
 
     /* The ladder builds its context on the real window, so publish it before
      * any backend attempt runs. */
     s_gl_ladder_window = jce_window_sdl(win);
 
-    /* Test/diagnostic hook: JCE_FORCE_FALLBACK=1 short-circuits the
-     * entire bgfx init path so the engine drops straight into the
-     * SDL software fallback (the blue/orange info-panel UI in
-     * jce_renderer_render_fallback_frame()).  Use this in caged_kingdom
-     * to exercise the fallback live without needing a broken GPU:
-     *     PowerShell:  $env:JCE_FORCE_FALLBACK=1; .\caged_kingdom.exe
-     *     bash:        JCE_FORCE_FALLBACK=1 ./caged_kingdom
-     * Any non-empty value other than "0" enables it. */
+    /* JCE_FORCE_FALLBACK: any nonempty value not beginning with '0' skips
+     * bgfx initialization so the application can select its software fallback. */
     {
         const char *force = getenv("JCE_FORCE_FALLBACK");
         if (force && force[0] && force[0] != '0') {
             LOG_WARN(LOG_TAG,
                 "JCE_FORCE_FALLBACK=%s set — skipping bgfx init, "
                 "engine will use SDL software renderer", force);
-            return NULL;
+            renderer_launch_diagnostics_observe(&launch, NULL, 5); return NULL;
         }
     }
 
@@ -1019,15 +1070,9 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         "init request: backend=%s nwh=%p ndt=%p size=%ux%u",
         backend_name, pd.nwh, pd.ndt, w, h);
 
-    /* On macOS (not iOS), bgfx's default multi-threaded mode causes a deadlock:
-     * the render thread needs to call back to the main thread (via GCD)
-     * to set up CAMetalLayer, but the main thread is blocked in bgfx_init()
-     * waiting for the render thread.  Calling bgfx_render_frame(-1) before
-     * bgfx_init() switches bgfx to single-threaded mode, avoiding the deadlock.
-     *
-     * iOS does NOT have this problem — UIKit's run-loop allows bgfx's render
-     * thread to initialise Metal without deadlocking, so we leave bgfx in its
-     * default multi-threaded mode on iOS. */
+    /* macOS CAMetalLayer creation calls the main thread via GCD: pre-init
+     * render_frame selects single-threaded bgfx to avoid that init deadlock.
+     * iOS UIKit permits its render thread and keeps the default mode. */
 #if JCE_PLATFORM_MACOS
     bgfx_render_frame(-1);
 #endif
@@ -1036,6 +1081,8 @@ JceRenderer *jce_renderer_create(JceWindow *win,
      * attempt that first; on failure (or AUTO) we walk the platform-specific
      * preferred list until one succeeds. */
     bool ok = false;
+    JceRendererDisplayAdapterState display_adapter = {0};
+    JceRendererLaunchVsync presentation = {0};
 
     if (requested_type != BGFX_RENDERER_TYPE_COUNT) {
         if (!backend_probe(requested_type)) {
@@ -1043,7 +1090,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                      bgfx_get_renderer_name(requested_type));
         } else {
             ok = init_backend_attempt(requested_type, &pd, w, h,
-                                      reset_flags, gfx_debug);
+                                      reset_flags, gfx_debug, win, &display_adapter, &presentation, &reset_flags, &launch);
             if (!ok)
                 LOG_WARN(LOG_TAG, "requested backend %s failed",
                          bgfx_get_renderer_name(requested_type));
@@ -1062,7 +1109,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             LOG_INFO(LOG_TAG, "trying backend: %s",
                      bgfx_get_renderer_name(chain[i]));
             if (init_backend_attempt(chain[i], &pd, w, h,
-                                     reset_flags, gfx_debug)) {
+                                     reset_flags, gfx_debug, win, &display_adapter, &presentation, &reset_flags, &launch)) {
                 ok = true;
                 break;
             }
@@ -1072,6 +1119,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     if (!ok) {
         /* Every attempt failed.  A GL attempt in the chain may have left its
          * laddered context behind; nothing else will free it on this path. */
+        log_display_adapter(win,&display_adapter,NULL);
         gl_ladder_release();
         jce_renderer_caps_api_reset();
         LOG_ERROR(LOG_TAG, "bgfx_init failed - all backends exhausted "
@@ -1104,6 +1152,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         }
     }
     log_gpu_adapters();
+    log_display_adapter(win,&display_adapter,bgfx_get_caps());
 
     /* bgfx's built-in debug text is an ALLOWLIST, not a denylist.
      *
@@ -1142,11 +1191,10 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     debug_flags |= BGFX_DEBUG_PROFILER;
     LOG_INFO(LOG_TAG, "bgfx GPU profiler enabled (Tracy mode)");
 #endif
-    /* JCE_PERF_LOG headless profiling needs per-VIEW GPU timers, which bgfx only
-     * populates when BGFX_DEBUG_PROFILER is set (frame-level GPU time is always
-     * available; the per-view slice is not).  Env-gated so it costs nothing in a
-     * normal run — the extra per-view GPU timer queries only exist while profiling. */
-    if (getenv("JCE_PERF_LOG") != NULL) {
+    /* JCE_PERF_LOG requests optional per-view GPU timers through the bgfx
+     * profiler bit. Preserve the shared nonempty, nonzero-prefix flag policy;
+     * an empty value or a value starting with 0 must not enable these queries. */
+    if (jce_env_flag_enabled(getenv("JCE_PERF_LOG"))) {
         debug_flags |= BGFX_DEBUG_PROFILER;
         LOG_INFO(LOG_TAG, "bgfx GPU profiler enabled (JCE_PERF_LOG per-view timing)");
     }
@@ -1174,12 +1222,15 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     /* Vertex layout: Position (float3) + Color0 (UINT8x4, normalized). */
     JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) {
-        bgfx_shutdown();
+        JCE_TRACE_SCOPE_CALL("renderer.backend_shutdown_cpu", bgfx_shutdown());
+        jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_ALLOCATION_FAILED);
+        jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_JOINED);
         gl_ladder_release();
         jce_renderer_caps_api_reset();
         return NULL;
     }
     r->reset_flags = reset_flags;
+    r->launch_vsync = presentation;
     r->debug_flags = debug_flags;
     s_dbg_text_enabled = enable_debug_text;
 
@@ -1272,7 +1323,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         /* Effective encoder-pool cap (after caps clamp) — the ceiling for the
          * opt-in parallel command-submission path (JCE_PARALLEL_SUBMIT). */
         r->max_encoders = caps->limits.maxEncoders;
-        LOG_INFO(LOG_TAG, "encoder pool: maxEncoders=%u (requested 16)",
+        LOG_INFO(LOG_TAG, "encoder pool: maxEncoders=%u",
                  (unsigned)r->max_encoders);
     }
 
@@ -1301,17 +1352,20 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                  vis.idx, cnt.idx, ind.idx);
     }
 
-    jce_upload_metrics_bind(&s_device.payload, &r->submitted_payload);
+    s_device.owner = r; jce_upload_metrics_bind(&s_device.payload, &r->submitted_payload);
+    jce_rcb_backend_started();
+    jce_render_readback_backend_open(r);
     return r;
 }
-
 /* NullRHI: a bgfx NOOP renderer with NO window / platform data, for the
  * dedicated-server / headless boot (cf. Unreal's NullRHI, Unity's headless
  * graphics device).  bgfx NOOP never touches a GPU or a display, so this
  * boots on a display-less host.  Render entry points early-out on r->headless;
  * resource/scene calls that create bgfx handles remain valid no-ops. */
-JceRenderer *jce_renderer_create_headless(void)
+JceRenderer *jce_renderer_create_headless_impl(void)
 {
+    const JceRendererLaunchDiagnostics launch = renderer_launch_diagnostics_snapshot();
+    renderer_launch_diagnostics_observe(&launch, NULL, 4);
     /* macOS single-thread guard mirrors the windowed path (harmless for NOOP). */
 #if JCE_PLATFORM_MACOS
     bgfx_render_frame(-1);
@@ -1321,25 +1375,36 @@ JceRenderer *jce_renderer_create_headless(void)
     jce_renderer_caps_api_begin_attempt(JCE_BACKEND_NOOP);
     bgfx_init_ctor(&init);
     apply_adapter_preference(&init);
+    init.allocator = jce_bgfx_allocator();
     init.type              = BGFX_RENDERER_TYPE_NOOP;
     init.resolution.width  = 1;
     init.resolution.height = 1;
     init.resolution.reset  = BGFX_RESET_NONE;
-    /* No platformData (no window), no callback: NOOP needs neither. */
+    /* NOOP has no window/capture capability, but diagnostics must use the
+     * same process-owned callback as the windowed backend. */
+    init.callback = jce_rcb_callback_interface();
     if (!bgfx_init(&init)) {
+        jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_INIT_FAILED);
+        jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_INIT_FAILED);
         jce_renderer_caps_api_reset();
         LOG_ERROR(LOG_TAG, "headless bgfx NOOP init failed");
         return NULL;
     }
     if (!jce_renderer_caps_api_accept_active_backend()) {
-        bgfx_shutdown();
+        JCE_TRACE_SCOPE_CALL("renderer.backend_shutdown_cpu", bgfx_shutdown());
+        jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_API_REFUSED);
+        jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_JOINED);
         jce_renderer_caps_api_reset();
         return NULL;
     }
 
+    s_device.frame_index = 0;
+    s_device.offscreen_submission_index = 0;
     JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) {
-        bgfx_shutdown();
+        JCE_TRACE_SCOPE_CALL("renderer.backend_shutdown_cpu", bgfx_shutdown());
+        jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_ALLOCATION_FAILED);
+        jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_JOINED);
         gl_ladder_release();
         jce_renderer_caps_api_reset();
         return NULL;
@@ -1390,10 +1455,14 @@ JceRenderer *jce_renderer_create_headless(void)
     r->program_shadow_inst.idx        = UINT16_MAX;
     r->program_shadow_skinned.idx     = UINT16_MAX;
     r->program_terrain.idx            = UINT16_MAX;
+    for (int v = 0; v < JCE_SHADER_VARIANT_COUNT; ++v)
+        for (int k = 0; k < JCE_SHADER_KEY_COUNT; ++k)
+            r->program_variant[v][k].idx = UINT16_MAX;
 
     SDL_strlcpy(r->gpu_name, "Null / Noop (headless)", sizeof(r->gpu_name));
     LOG_SUCCESS(LOG_TAG, "headless renderer initialized (NullRHI: bgfx NOOP, no window)");
-    jce_upload_metrics_bind(&s_device.payload, &r->submitted_payload);
+    s_device.owner = r; jce_upload_metrics_bind(&s_device.payload, &r->submitted_payload);
+    jce_render_readback_backend_open(r);
     return r;
 }
 
@@ -1434,74 +1503,45 @@ void jce_renderer_set_shaders(JceRenderer *r,
         LOG_ERROR(LOG_TAG, "color shader not provided");
 }
 
+static JceShaderSet renderer_owned_shader_set(const JceRenderer *r)
+{
+    JceShaderSet set;
+    memset(&set, 0xff, sizeof(set));
+#define JCE_SNAPSHOT_PROGRAM(member_, renderer_) \
+    set.member_ = (JceShaderHandle){ r->renderer_.idx };
+    JCE_SHADER_SET_OWNED_FIELDS(JCE_SNAPSHOT_PROGRAM)
+#undef JCE_SNAPSHOT_PROGRAM
+    memcpy(set.variant, r->program_variant, sizeof(set.variant));
+    return set;
+}
+
 bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
                                     const char         *dev_dir,
                                     const JcePakArchive *pak)
 {
-    if (!r || r->is_fallback || !pak) return false;
+    if (!r || r->is_fallback || r->headless || !pak) return false;
 
-    /* Snapshot old program handles so we can destroy them after the
-       new set is installed.  bgfx defers destruction to end-of-frame
-       which keeps any in-flight draws safe. */
-    bgfx_program_handle_t old[] = {
-        r->program, r->program_textured, r->program_mesh,
-        r->program_pbr, r->program_pbr_inst, r->program_pbr_inst_tint,
-        r->program_pbr_inst_tex_array, r->program_pbr_inst_fade,
-        r->program_pbr_skinned,
-        r->program_pbr_fwdplus, r->program_pbr_inst_fwdplus,
-        r->program_pbr_skinned_fwdplus,
-        r->program_pbr_toon, r->program_outline_skinned,
-        r->program_shadow, r->program_shadow_inst, r->program_shadow_skinned,
-        r->program_terrain,
-    };
-
-    JceShaderHandle old_variant[JCE_SHADER_VARIANT_COUNT][JCE_SHADER_KEY_COUNT];
-    memcpy(old_variant, r->program_variant, sizeof old_variant);
-    JceShaderSet ns = jce_shaders_load_all_fs(dev_dir, pak);
-    if (!jce_shader_valid(ns.color)) {
+    /* Retire one owner after the new set is installed. bgfx defers GPU
+     * destruction until queued draws finish. Partial-load failure owns the
+     * complete new set too, including SDF and all deduplicated variants. */
+    const JceShaderSet old = renderer_owned_shader_set(r);
+    const JceShaderSet next = jce_shaders_load_all_fs(dev_dir, pak);
+    if (!jce_shader_valid(next.color)) {
         LOG_ERROR(LOG_TAG, "reload: color shader load failed, aborting swap");
-        /* Destroy any partially-loaded handles to avoid leaking. */
-        bgfx_program_handle_t parts[] = {
-            { ns.color.idx }, { ns.textured.idx }, { ns.mesh.idx },
-            { ns.pbr.idx }, { ns.pbr_inst.idx }, { ns.pbr_inst_tint.idx },
-            { ns.pbr_inst_tex_array.idx }, { ns.pbr_inst_fade.idx },
-            { ns.pbr_skinned.idx },
-            { ns.pbr_fwdplus.idx }, { ns.pbr_inst_fwdplus.idx },
-            { ns.pbr_skinned_fwdplus.idx },
-            { ns.pbr_toon.idx }, { ns.outline_skinned.idx },
-            { ns.shadow.idx }, { ns.shadow_inst.idx }, { ns.shadow_skinned.idx },
-            { ns.terrain.idx },
-        };
-        for (size_t i = 0; i < sizeof(parts)/sizeof(parts[0]); i++) {
-            if (parts[i].idx != UINT16_MAX)
-                jce_shader_program_destroy((JceShaderHandle){ (parts[i]).idx });
-        }
+        jce_shader_set_release_owned(&next);
         return false;
     }
-
-    jce_renderer_set_shaders(r, &ns);
-
-    for (size_t i = 0; i < sizeof(old)/sizeof(old[0]); i++) {
-        if (old[i].idx != UINT16_MAX)
-            jce_shader_program_destroy((JceShaderHandle){ (old[i]).idx });
-    }
-    for (int v = 0; v < JCE_SHADER_VARIANT_COUNT; ++v) {
-        for (int k = 0; k < JCE_SHADER_KEY_COUNT; ++k) {
-            const uint16_t idx = old_variant[v][k].idx;
-            bool seen = false;
-            for (int previous = 0; previous < v * JCE_SHADER_KEY_COUNT + k; ++previous)
-                if (old_variant[previous / JCE_SHADER_KEY_COUNT][previous % JCE_SHADER_KEY_COUNT].idx == idx)
-                    seen = true;
-            if (!seen) jce_shader_program_destroy((JceShaderHandle){ idx });
-        }
-    }
+    jce_renderer_set_shaders(r, &next);
+    jce_shader_set_release_owned(&old);
     LOG_INFO(LOG_TAG, "shaders reloaded (dev_dir=%s)", dev_dir ? dev_dir : "(none)");
     return true;
 }
 
-JceRenderer *jce_renderer_create_fallback(JceWindow *win)
+JceRenderer *jce_renderer_create_fallback_impl(JceWindow *win)
 {
     if (!win) return NULL;
+    const JceRendererLaunchDiagnostics launch = renderer_launch_diagnostics_snapshot();
+    renderer_launch_diagnostics_observe(&launch, NULL, 5);
     JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) return NULL;
 
@@ -1691,15 +1731,228 @@ void jce_renderer_render_fallback_frame(const JceRenderer *r)
     SDL_RenderPresent(rd);
 }
 
-void jce_renderer_destroy(JceRenderer *r)
+/* Instance buffers share one logical budget across shader stride families.
+ * Reservations and commits run on the renderer owner thread; encoder binding
+ * of committed tokens is read-only. Backend release callbacks only free CPU
+ * staging, which uses the existing thread-safe engine allocator. */
+static uint32_t instance_available(void *user, uint32_t count, uint16_t stride)
+{
+    (void)user;
+    /* Bound backend count/size arithmetic. Large complete batches use the
+     * reusable dynamic route instead of trusting a large transient query. */
+    if (count > 65536u) count = 65536u;
+    const uint32_t available = bgfx_get_avail_instance_data_buffer(count, stride);
+    return available < count ? available : count;
+}
+static bool instance_allocate_transient(void *user, uint32_t count, uint16_t stride,
+                                         JceInstanceTransient *out)
+{
+    (void)user;
+    bgfx_instance_data_buffer_t idb;
+    memset(&idb, 0, sizeof idb);
+    bgfx_alloc_instance_data_buffer(&idb, count, stride);
+    out->data = idb.data; out->size = idb.size; out->offset = idb.offset;
+    out->num = idb.num; out->stride = idb.stride; out->handle = idb.handle.idx;
+    return idb.data != NULL;
+}
+static uint16_t instance_create_dynamic(void *user, uint32_t count, uint16_t stride)
+{
+    (void)user;
+    bgfx_vertex_layout_t layout;
+    bgfx_vertex_layout_begin(&layout, BGFX_RENDERER_TYPE_NOOP);
+    for (uint16_t i = 0; i < stride / 16u; ++i)
+        bgfx_vertex_layout_add(&layout, (bgfx_attrib_t)(BGFX_ATTRIB_TEXCOORD7 - i),
+                                 4, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&layout);
+    return bgfx_create_dynamic_vertex_buffer(count, &layout, BGFX_BUFFER_NONE).idx;
+}
+static void instance_destroy_dynamic(void *user, uint16_t idx)
+{
+    (void)user;
+    bgfx_dynamic_vertex_buffer_handle_t handle = {idx};
+    bgfx_destroy_dynamic_vertex_buffer(handle);
+}
+static void *instance_allocate_staging(void *user, uint32_t bytes)
+{
+    (void)user;
+    return JCE_MALLOC(bytes);
+}
+static void instance_free_staging(void *user, void *data)
+{
+    (void)user;
+    JCE_FREE(data);
+}
+static void instance_release_staging(void *data, void *user)
+{
+    /* CPU staging is freed exactly once by bgfx's release callback. The
+     * optional immutable trace lease never borrows the renderer owner. */
+    instance_free_staging(NULL, data);
+    jce_instance_upload_trace_release((JceInstanceStageLease *)user);
+}
+static bool instance_update_dynamic(void *user, uint16_t idx, uint32_t offset,
+                                     void *data, uint32_t bytes)
+{
+    (void)user;
+    const bgfx_memory_t *memory = bgfx_make_ref_release(data, bytes, instance_release_staging, NULL);
+    if (!memory) return false;
+    bgfx_dynamic_vertex_buffer_handle_t handle = {idx};
+    bgfx_update_dynamic_vertex_buffer(handle, offset, memory);
+    return true;
+}
+static bool instance_update_dynamic_traced(void *user, uint16_t idx, uint32_t offset,
+                                            void *data, uint32_t bytes, JceInstanceStageLease *lease)
+{
+    (void)user;
+    const bgfx_memory_t *memory = bgfx_make_ref_release(data, bytes, instance_release_staging, lease);
+    if (!memory) return false; /* Caller cancels metadata; staging was not transferred. */
+    jce_instance_upload_trace_transfer(lease);
+    bgfx_dynamic_vertex_buffer_handle_t handle = {idx};
+    bgfx_update_dynamic_vertex_buffer(handle, offset, memory);
+    return true;
+}
+static void instance_bind_dynamic(void *user, void *encoder, uint16_t idx,
+                                   uint32_t offset, uint32_t count)
+{
+    (void)user;
+    bgfx_dynamic_vertex_buffer_handle_t handle = {idx};
+    if (encoder)
+        bgfx_encoder_set_instance_data_from_dynamic_vertex_buffer((bgfx_encoder_t *)encoder, handle, offset, count);
+    else bgfx_set_instance_data_from_dynamic_vertex_buffer(handle, offset, count);
+}
+static void instance_bind_transient(void *user, void *encoder,
+                                     const JceInstanceTransient *t, uint32_t count)
+{
+    (void)user;
+    bgfx_instance_data_buffer_t idb;
+    idb.data = t->data; idb.size = t->size; idb.offset = t->offset;
+    idb.num = t->num; idb.stride = t->stride; idb.handle.idx = t->handle;
+    if (encoder) bgfx_encoder_set_instance_data_buffer((bgfx_encoder_t *)encoder, &idb, 0, count);
+    else bgfx_set_instance_data_buffer(&idb, 0, count);
+}
+static void instance_warn_partial(void *user, uint32_t epoch, uint32_t requested,
+                                   uint32_t admitted, uint16_t stride)
+{
+    (void)user;
+    LOG_WARN(LOG_TAG, "CPU instance upload unavailable: requested=%u admitted=%u stride=%u submission=%u",
+             requested, admitted, (unsigned)stride, epoch);
+}
+static const JceInstanceUploadProvider s_instance_provider = {
+    instance_available, instance_allocate_transient, instance_create_dynamic,
+    instance_destroy_dynamic, instance_allocate_staging, instance_free_staging,
+    instance_update_dynamic, instance_bind_dynamic, instance_bind_transient, instance_warn_partial,
+    instance_update_dynamic_traced, NULL, NULL
+};
+static uint32_t instance_transient_reserve_bytes(void)
+{
+    /* Conservative policy for later UI/geometry submissions, not a measured
+     * guarantee for arbitrary UI. Small-pool editor captures showed UI loss
+     * when instance chunks consumed the entire vertex pool. Default 1 MiB;
+     * JCE_INSTANCE_TRANSIENT_RESERVE_KB explicitly accepts 0..131072 KiB. */
+    const char *text = getenv("JCE_INSTANCE_TRANSIENT_RESERVE_KB");
+    if (!text || !text[0]) return 1048576u;
+    uint32_t kb = 0;
+    for (const char *p = text; *p; ++p) {
+        if (*p < '0' || *p > '9' || kb > 131072u / 10u) goto invalid;
+        kb = kb * 10u + (uint32_t)(*p - '0');
+        if (kb > 131072u) goto invalid;
+    }
+    return kb * 1024u;
+invalid:
+    LOG_WARN(LOG_TAG, "JCE_INSTANCE_TRANSIENT_RESERVE_KB must be 0..131072; using 1024");
+    return 1048576u;
+}
+JceInstanceUploadOwner *jce_renderer_instance_upload_owner(const JceRenderer *r)
+{
+    if (!r || r->is_fallback) return NULL;
+    JceInstanceUploadOwner *owner = &((JceRenderer *)r)->instance_upload;
+    if (!owner->initialized)
+        jce_instance_upload_owner_init(owner, &s_instance_provider, NULL, instance_transient_reserve_bytes(),
+                                       r->submitted_payload.context_generation);
+    return owner;
+}
+uint32_t jce_renderer_instance_upload_epoch(void)
+{
+    return s_device.offscreen_submission_index;
+}
+
+JceOffscreenTarget **jce_renderer_offscreen_head(const JceRenderer *r)
+{
+    return &((JceRenderer *)r)->offscreen_targets;
+}
+
+bool jce_renderer_offscreen_diag_enabled(const JceRenderer *r)
+{
+    return r && !r->is_fallback && s_device.render_resource_diag;
+}
+
+uint32_t jce_renderer_offscreen_submission_index(void)
+{
+    return s_device.offscreen_submission_index;
+}
+
+bool jce_renderer_frame_admission_current_internal(const JceRenderer *r)
+{
+    if (!r) return false;
+    /* Noop and SDL fallback keep their separate existing lifetimes. */
+    if (r->is_fallback || r->headless) return true;
+    return jce_renderer_caps_api_web_context_current();
+}
+
+static bool renderer_submit_frame_checked(const JceRenderer *r)
+{
+    if (!r || r->is_fallback || !jce_renderer_frame_admission_current_internal(r)) {
+        JceTraceScope refused = jce_trace_scope_begin("renderer.submit_refused");
+        jce_trace_scope_end(refused, r ? JCE_TRACE_TASK_FAILED : JCE_TRACE_TASK_CANCELLED);
+        return false;
+    }
+    /* Main-thread CPU call interval, nested within end_frame. It can include
+     * synchronization or scheduling; it does not measure GPU execution or
+     * isolated presentation time. Keep resource retirement outside this span. */
+    JceTraceScope advance = jce_trace_scope_begin("renderer.frame_advance_cpu");
+    uint64_t trace_generation = 0;
+    uint32_t trace_backend_before = 0, trace_ordinal_before = 0;
+    if (advance.id) {
+        trace_generation = r->submitted_payload.context_generation;
+        trace_backend_before = s_device.frame_index;
+        trace_ordinal_before = s_device.offscreen_submission_index;
+    }
+    const bool measure = jce_perf_phase_enabled() != 0;
+    const bool timed = measure || advance.id != 0;
+    const uint64_t started = timed ? jce_time_perf_counter() : 0;
+    s_device.frame_index = bgfx_frame(false);
+    const uint64_t ended = timed ? jce_time_perf_counter() : 0;
+    if (measure) jce_perf_phase_add("renderer_frame_advance_cpu", jce_time_perf_to_ms(started, ended));
+    jce_renderer_submission_trace_emit(advance, trace_generation,
+        trace_backend_before, s_device.frame_index, trace_ordinal_before);
+    jce_renderer_submission_clock_emit(advance, started, ended);
+    jce_trace_scope_end(advance, JCE_TRACE_TASK_SUCCEEDED);
+    jce_render_readback_collect(r, s_device.frame_index);
+    ++s_device.offscreen_submission_index;
+    jce_offscreen_retirement_collect(r, s_device.offscreen_submission_index);
+    jce_instance_upload_owner_advance(&((JceRenderer *)r)->instance_upload,
+                                       s_device.offscreen_submission_index);
+    return true;
+}
+
+uint32_t jce_renderer_submit_frame(const JceRenderer *r)
+{
+    (void)renderer_submit_frame_checked(r);
+    return s_device.frame_index;
+}
+void jce_renderer_destroy_impl(JceRenderer *r)
 {
     if (!r) return;
+    renderer_shader_dev_release(r);
     jce_upload_metrics_unbind(&s_device.payload, &r->submitted_payload);
     /* Drain and join the PNG writer BEFORE anything else goes away: a capture
      * delivered on the last frame is still only pixels in a queue, and losing
      * it on exit would defeat every harness that reads the files back. */
     jce_renderer_readback_capture_shutdown();
+    jce_render_readback_before_backend_shutdown(r);
+    jce_offscreen_retirement_shutdown(r);
+    jce_instance_upload_owner_destroy(&r->instance_upload);
     if (r->is_fallback) {
+        jce_rcb_after_backend_shutdown();
         if (r->sdl_renderer) {
             SDL_DestroyRenderer(r->sdl_renderer);
         }
@@ -1708,12 +1961,8 @@ void jce_renderer_destroy(JceRenderer *r)
         return;
     }
     s_dbg_text_enabled = false;
-    if (r->program.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program).idx });
-    if (r->program_textured.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_textured).idx });
-    if (r->program_text_sdf.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ r->program_text_sdf.idx });
+    const JceShaderSet owned = renderer_owned_shader_set(r);
+    jce_shader_set_release_owned(&owned);
     if (r->u_sdf_params.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_sdf_params);
     if (r->u_sdf_outline.idx != UINT16_MAX)
@@ -1724,42 +1973,6 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_uniform(r->u_sdf_shadow_color);
     if (r->u_tex_color.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_tex_color);
-    if (r->program_mesh.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_mesh).idx });
-    if (r->program_pbr.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr).idx });
-    if (r->program_pbr_inst.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst).idx });
-    if (r->program_pbr_inst_tint.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_tint).idx });
-    if (r->program_pbr_inst_tex_array.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_tex_array).idx });
-    if (r->program_pbr_inst_fade.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_fade).idx });
-    if (r->program_pbr_skinned.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_skinned).idx });
-    if (r->program_pbr_fwdplus.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_fwdplus).idx });
-    if (r->program_pbr_inst_fwdplus.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_inst_fwdplus).idx });
-    if (r->program_pbr_skinned_fwdplus.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_skinned_fwdplus).idx });
-    if (r->program_shadow.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_shadow).idx });
-    if (r->program_shadow_inst.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_shadow_inst).idx });
-    if (r->program_shadow_skinned.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_shadow_skinned).idx });
-    if (r->program_terrain.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_terrain).idx });
-    /* Toon/outline stylized programs were sentinel-init'd + created but never
-     * destroyed — a small handle leak left for bgfx_shutdown to sweep.  They
-     * are distinct shader-set handles (not aliases), so destroy them here with
-     * the rest of the renderer's own programs. */
-    if (r->program_pbr_toon.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_pbr_toon).idx });
-    if (r->program_outline_skinned.idx != UINT16_MAX)
-        jce_shader_program_destroy((JceShaderHandle){ (r->program_outline_skinned).idx });
     if (r->u_light_dir.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_dir);
     if (r->u_light_color.idx != UINT16_MAX)
@@ -1779,14 +1992,14 @@ void jce_renderer_destroy(JceRenderer *r)
      * uniforms, any in-flight bake FBO) while bgfx is still alive. */
     jce_impostor_shutdown();
 
-    /* JCE_DBG_LEAKSTATS=1: dump bgfx's live resource counts right before
-     * shutdown.  After every engine destroy above, any non-zero count is a
-     * LEAK (a handle the engine created but never destroyed) — names the
-     * leaking resource TYPE, backend-agnostic. */
+    /* JCE_DBG_LEAKSTATS=1: preserve the legacy fields as a pre-shutdown
+     * backend-reported handle snapshot. Destroy commands may still be queued;
+     * nonzero counts are not a leak verdict, GPU idle or physical residency. */
     if (getenv("JCE_DBG_LEAKSTATS") && getenv("JCE_DBG_LEAKSTATS")[0] == '1') {
         const bgfx_stats_t *st = bgfx_get_stats();
         if (st)
-            LOG_INFO(LOG_TAG, "[leakstats] tex=%u fb=%u vb=%u ib=%u dvb=%u dib=%u "
+            LOG_INFO(LOG_TAG, "[leakstats] scope=pre_shutdown_backend_snapshot gpu_completion=unavailable "
+                     "tex=%u fb=%u vb=%u ib=%u dvb=%u dib=%u "
                      "prog=%u shader=%u uniform=%u occ=%u",
                      (unsigned)st->numTextures, (unsigned)st->numFrameBuffers,
                      (unsigned)st->numVertexBuffers, (unsigned)st->numIndexBuffers,
@@ -1797,7 +2010,11 @@ void jce_renderer_destroy(JceRenderer *r)
     }
 
     jce_shader_deferred_shutdown();
-    bgfx_shutdown();
+    JCE_TRACE_SCOPE_CALL("renderer.backend_shutdown_cpu", bgfx_shutdown());
+    jce_render_readback_after_backend_shutdown(r);
+    jce_bgfx_trace_end(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_JOINED);
+    jce_impostor_after_backend_shutdown();
+    jce_rcb_after_backend_shutdown();
     /* After bgfx is down: it never deletes a context it did not create, so
      * the ladder's context is ours to release and only now is it unused. */
     gl_ladder_release();
@@ -1808,11 +2025,12 @@ void jce_renderer_destroy(JceRenderer *r)
 
 /* -- Per-frame ------------------------------------------------------ */
 
-void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
+bool jce_renderer_begin_frame_impl(const JceRenderer *r, JceWindow *win)
 {
     JCE_PROFILE_ZONE_N("Renderer::BeginFrame");
-    if (!r || !win) { JCE_PROFILE_ZONE_END; return; }
-    if (r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return; }
+    if (!r || !win) { JCE_PROFILE_ZONE_END; return false; }
+    if (r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return true; }
+    if (!jce_renderer_frame_admission_current_internal(r)) { JCE_PROFILE_ZONE_END; return false; }
 
     /* Full-backbuffer viewport for all views. */
     uint16_t vp_x, vp_y, vp_w, vp_h;
@@ -1820,6 +2038,7 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
 
     const bgfx_caps_t *caps = bgfx_get_caps();
 
+    bgfx_set_view_name(JCE_VIEW_MAIN_3D, "Renderer/Main", INT32_MAX);
     /* View 0 (3D): identity view, ortho proj  overridden by begin_frame_3d. */
     {
         jce_mat4 view = jce_m4_identity();
@@ -1852,14 +2071,16 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
     bgfx_touch(JCE_VIEW_DEBUG);
     bgfx_touch(JCE_VIEW_IMGUI);
     JCE_PROFILE_ZONE_END;
+    return true;
 }
 
-void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
+bool jce_renderer_begin_frame_3d_impl(const JceRenderer *r, JceWindow *win,
                                   const JceCamera *cam, uint16_t view_id)
 {
     JCE_PROFILE_ZONE_N("Renderer::BeginFrame3D");
-    if (!r || !win) { JCE_PROFILE_ZONE_END; return; }
-    if (r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
+    if (!r || !win) { JCE_PROFILE_ZONE_END; return false; }
+    if (r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return true; }
+    if (!jce_renderer_frame_admission_current_internal(r)) { JCE_PROFILE_ZONE_END; return false; }
 
     uint16_t vp_x, vp_y, vp_w, vp_h;
     jce_window_calc_viewport(win, &vp_x, &vp_y, &vp_w, &vp_h);
@@ -1912,31 +2133,125 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
     bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_touch(view_id);
     JCE_PROFILE_ZONE_END;
+    return true;
 }
 
 void jce_renderer_present_splash(const JceRenderer *r,
                                  JceWindow *win,
                                  uint32_t rgba_color)
 {
-    if (!r || r->is_fallback || !win) return;
+    if (!r || r->is_fallback || !win ||
+        !jce_renderer_frame_admission_current_internal(r)) return;
 
     uint32_t w = 0, h = 0;
     jce_window_get_size(win, &w, &h);
     if (w == 0) w = 1;
     if (h == 0) h = 1;
 
+    bgfx_set_view_name(0, "Renderer/Splash", INT32_MAX);
     bgfx_set_view_clear(0,
                         BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
                         rgba_color, 1.0f, 0);
     bgfx_set_view_rect(0, 0, 0, (uint16_t)w, (uint16_t)h);
     bgfx_touch(0);
-    s_device.frame_index = bgfx_frame(false);
+    jce_renderer_submit_frame(r);
 }
 
-void jce_renderer_end_frame(const JceRenderer *r)
+/* Most recent backend snapshot, not a GPU-completion or all-heap claim.
+ * Sample counters at a bounded cadence; no readback, query or allocation. */
+void jce_renderer_trace_snapshot(const JceRenderer *r)
+{
+    if (!r || r->is_fallback || r->headless ||
+        !jce_renderer_snapshot_due_at_submission(s_device.frame_index,
+            s_device.offscreen_submission_index))
+        return;
+    /* PERF_LOG independently consumes this existing bounded node. Read its
+     * environment flag only after cadence admission, never on every frame. */
+    const bool trace_on = jce_trace_enabled();
+    const bool perf_on = jce_env_flag_enabled(getenv("JCE_PERF_LOG"));
+    if (!trace_on && !perf_on) return;
+    if (trace_on)
+        jce_bgfx_trace_summary(&s_device.allocation_trace, JCE_BGFX_ALLOC_SUMMARY_SNAPSHOT);
+    const bgfx_stats_t *st = bgfx_get_stats();
+    if (!st) return;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    const JceRendererSnapshot snapshot = {
+        .draw_count = st->numDraw,
+        .compute_count = st->numCompute,
+        .texture_count = st->numTextures,
+        .framebuffer_count = st->numFrameBuffers,
+        .program_count = st->numPrograms,
+        .shader_count = st->numShaders,
+        .vertex_buffer_count = st->numVertexBuffers,
+        .index_buffer_count = st->numIndexBuffers,
+        .transient_vb_used_bytes = st->transientVbUsed,
+        .transient_ib_used_bytes = st->transientIbUsed,
+        .texture_estimate_bytes = st->textureMemoryUsed,
+        .rt_estimate_bytes = st->rtMemoryUsed,
+        .adapter_reported_used_bytes = st->gpuMemoryUsed,
+        .gpu_timer_frequency = st->gpuTimerFreq,
+        .gpu_time_begin = st->gpuTimeBegin,
+        .gpu_time_end = st->gpuTimeEnd,
+        .encoder_frame_used = st->numEncoders,
+        .adapter_reported_vendor_id = caps ? caps->vendorId : 0,
+        .adapter_reported_device_id = caps ? caps->deviceId : 0,
+        .bgfx_renderer_type = caps ? (uint32_t)caps->rendererType : 0,
+        .host_submission_ordinal = s_device.offscreen_submission_index,
+        .device_epoch = r->submitted_payload.valid ? r->submitted_payload.context_generation : 0,
+        .gpu_frame_num = st->gpuFrameNum,
+        .gpu_view_count = st->numViews,
+        .gpu_view_data_available = st->numViews == 0 || st->viewStats != NULL,
+    };
+    if (trace_on)
+        jce_renderer_snapshot_emit(s_device.frame_index, &snapshot,
+            caps ? &caps->limits.maxEncoders : NULL);
+    if (trace_on && st->viewStats) {
+        /* numViews bounds this borrowed provider array; no sampled view is
+         * silently truncated to the public overlay's smaller view list. */
+        for (uint16_t i = 0; i < st->numViews; ++i) {
+            const bgfx_view_stats_t *source = &st->viewStats[i];
+            const JceRendererViewSnapshot view = {
+                .view_id = source->view,
+                .gpu_frame_num = source->gpuFrameNum,
+                .gpu_time_begin = source->gpuTimeBegin,
+                .gpu_time_end = source->gpuTimeEnd,
+            };
+            jce_renderer_snapshot_emit_view(s_device.frame_index, &snapshot, &view);
+        }
+    }
+    if (perf_on) {
+        /* Explicit diagnostic survives DIST; all raw values stay integers.
+         * This one line is timing provenance, never a GPU/present fence. */
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+            "gpu-provenance: api_frame=%u submission=%u device_epoch=%llu epoch_available=%u "
+            "source_frame=%u begin_ticks=%lld end_ticks=%lld frequency=%lld interval_available=%u "
+            "views=%u view_data_available=%u",
+            s_device.frame_index, snapshot.host_submission_ordinal,
+            (unsigned long long)snapshot.device_epoch,
+            jce_renderer_snapshot_epoch_available(snapshot.device_epoch) ? 1u : 0u,
+            snapshot.gpu_frame_num, (long long)snapshot.gpu_time_begin,
+            (long long)snapshot.gpu_time_end, (long long)snapshot.gpu_timer_frequency,
+            jce_renderer_gpu_interval_available(snapshot.gpu_timer_frequency,
+                snapshot.gpu_time_begin, snapshot.gpu_time_end) ? 1u : 0u,
+            (unsigned)snapshot.gpu_view_count, snapshot.gpu_view_data_available ? 1u : 0u);
+        JceRendererViewNames names = jce_renderer_view_names_begin(st->numViews,
+            snapshot.host_submission_ordinal, snapshot.gpu_view_data_available);
+        if (st->viewStats) for (uint16_t i = 0; i < st->numViews; ++i) {
+            const uint16_t index = (uint16_t)(((uint32_t)names.start + i) % st->numViews);
+            const bgfx_view_stats_t *view = &st->viewStats[index];
+            if (!jce_renderer_view_names_append(&names, view->view, view->gpuFrameNum,
+                    view->name, sizeof(view->name))) break;
+        }
+        jce_renderer_snapshot_log_view_names(s_device.frame_index, &snapshot, &names);
+    }
+}
+
+bool jce_renderer_end_frame_impl(const JceRenderer *r)
 {
     JCE_PROFILE_ZONE_N("Renderer::EndFrame");
-    if (!r || r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return; }
+    if (!r) { JCE_PROFILE_ZONE_END; return false; }
+    if (r->is_fallback || r->headless) { JCE_PROFILE_ZONE_END; return true; }
+    if (!jce_renderer_frame_admission_current_internal(r)) { JCE_PROFILE_ZONE_END; return false; }
 
     /* ── GPU memory diagnostic (every 15 seconds) ─────────────────────
      * Logs bgfx GPU resource counts and memory usage. Use this to
@@ -2081,7 +2396,7 @@ void jce_renderer_end_frame(const JceRenderer *r)
         static int s_perf_log = -1;
         if (s_perf_log < 0) {
             const char *v = getenv("JCE_PERF_LOG");
-            s_perf_log = (v && v[0] && v[0] != '0') ? 1 : 0;
+            s_perf_log = jce_env_flag_enabled(v);
         }
         if (s_perf_log && (s_device.frame_index % 120u) == 0u && s_xform_peak > 0)
             LOG_INFO(LOG_TAG, "perf-xform: peak %u matrices/frame (cache cap %u)",
@@ -2089,7 +2404,7 @@ void jce_renderer_end_frame(const JceRenderer *r)
         jce_dbg_xform_matrices = 0;
     }
 
-    s_device.frame_index = bgfx_frame(false);
+    const bool submitted = renderer_submit_frame_checked(r);
 
     /* Surface allocator + renderer stats to Tracy each frame. */
 #if defined(JCE_PROFILER_ENABLED)
@@ -2116,13 +2431,14 @@ void jce_renderer_end_frame(const JceRenderer *r)
 #endif
 
     JCE_PROFILE_ZONE_END;
+    return submitted;
 }
 
 /* -- Events --------------------------------------------------------- */
 
 void jce_renderer_resize(const JceRenderer *r, uint32_t w, uint32_t h)
 {
-    if (!r) return;
+    if (!jce_renderer_frame_admission_current_internal(r)) return;
     if (r->is_fallback) return;
 
     /* Sanitize dimensions before handing them to bgfx:
@@ -2134,11 +2450,12 @@ void jce_renderer_resize(const JceRenderer *r, uint32_t w, uint32_t h)
      *    swap chain — the user sees a frozen / flickering image while the
      *    window is dragged across DPI boundaries that produce odd pixel
      *    widths. Round the width up so reset always succeeds. */
+    const uint32_t requested_w = w, requested_h = h;
     if (w < 1u) w = 1u;
     if (h < 1u) h = 1u;
     w = (w + 3u) & ~3u;
 
-    bgfx_reset(w, h, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
+    renderer_reset_cpu(JCE_RENDERER_RESET_RESIZE, requested_w, requested_h, w, h, r->reset_flags);
 }
 
 void jce_renderer_rebind_platform(JceRenderer *r, JceWindow *win)
@@ -2161,7 +2478,8 @@ void jce_renderer_rebind_platform(JceRenderer *r, JceWindow *win)
 
     uint32_t w, h;
     jce_window_get_size(win, &w, &h);
-    bgfx_reset(w, h, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
+    renderer_presentation_vsync_rebind(r, win);
+    renderer_reset_cpu(JCE_RENDERER_RESET_REBIND, w, h, w, h, r->reset_flags);
 }
 
 /* -- Debug text ----------------------------------------------------- */
@@ -2291,14 +2609,9 @@ JceShaderHandle jce_renderer_get_program_mesh(const JceRenderer *r)
  * present, so this terminates; if even that failed to load the caller gets an
  * invalid handle and skips the draw, which is what it did before.
  *
- * THE FRAME'S OWN KEYS ARE FOLDED IN, and they have to be.  Forward+ is a
- * property of the renderer for the whole frame, not of any one material, and
- * the alternative -- every call site remembering to OR it -- is exactly the
- * per-site agreement that failed last time.  It is a renderer field, the
- * renderer is an argument, so the answer still depends only on what is
- * named.  JCE_SHADER_FORCE_KEYS exists for the same reason: a control that
- * forces an axis must travel the path a material's key travels, or it proves
- * something about the control instead of about the wiring. */
+ * Fold frame-wide keys into every material selection here, including
+ * JCE_SHADER_FORCE_KEYS, so normal draws and diagnostic controls use the
+ * same path rather than relying on each call site to add the right bits. */
 JceShaderHandle jce_renderer_get_program_variant(const JceRenderer *r,
                                                  JceShaderVertexVariant vv,
                                                  uint32_t keys)
@@ -2329,52 +2642,13 @@ JceShaderHandle jce_renderer_get_program_pbr(const JceRenderer *r)
         0u);
 }
 
-JceShaderHandle jce_renderer_create_program_from_blobs(
-    const void *vs_blob, size_t vs_size,
-    const void *fs_blob, size_t fs_size)
-{
-    JceShaderHandle invalid = JCE_INVALID_SHADER;
-    if (!vs_blob || vs_size == 0 || !fs_blob || fs_size == 0)
-        return invalid;
-
-    /* bgfx_copy: bgfx allocates internal memory and copies the bytes,
-       so the caller's buffers may be freed immediately after this. */
-    const bgfx_memory_t *vs_mem = bgfx_copy(vs_blob, (uint32_t)vs_size);
-    const bgfx_memory_t *fs_mem = bgfx_copy(fs_blob, (uint32_t)fs_size);
-    if (!vs_mem || !fs_mem) return invalid;
-
-    bgfx_shader_handle_t vs = bgfx_create_shader(vs_mem);
-    bgfx_shader_handle_t fs = bgfx_create_shader(fs_mem);
-    if (vs.idx == UINT16_MAX || fs.idx == UINT16_MAX) {
-        if (vs.idx != UINT16_MAX) bgfx_destroy_shader(vs);
-        if (fs.idx != UINT16_MAX) bgfx_destroy_shader(fs);
-        return invalid;
-    }
-
-    /* destroy_shaders=true: bgfx ref-counts the shaders to the program,
-       and destroys them when the program is destroyed.  We never need
-       to touch the vs/fs handles after this point. */
-    bgfx_program_handle_t prog = bgfx_create_program(vs, fs, true);
-    if (prog.idx == UINT16_MAX) {
-        bgfx_destroy_shader(vs);
-        bgfx_destroy_shader(fs);
-        return invalid;
-    }
-    return (JceShaderHandle){ prog.idx };
-}
-
-void jce_renderer_destroy_program(JceShaderHandle prog)
-{
-    if (prog.idx == UINT16_MAX) return;
-    jce_shader_program_destroy((JceShaderHandle){ ((bgfx_program_handle_t){ prog.idx }).idx });
-}
-
 JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
 {
     if (!r) { JceShaderHandle iv = JCE_INVALID_SHADER; return iv; }
     return jce_renderer_get_program_variant(r, JCE_SHADER_VV_PBR_INST,
         0u);
 }
+
 
 /* Per-instance-tint instanced PBR program (large-world-opt P1 #7).  Returns
  * invalid when the variant didn't load (older pak): callers fall back to solo
@@ -2410,14 +2684,8 @@ void jce_renderer_set_forwardplus_program_active(JceRenderer *r, bool on)
     if (!r) return;
     r->forwardplus_program_active = on;
 
-    /* JCE_SHADER_FORCE_KEYS: OR these bits into every pick, read once.
-     *
-     * It is the POSITIVE CONTROL for the whole variant table, and it has to
-     * live here rather than in a test harness: forcing an axis has to travel
-     * the same path a material's key travels, or a green result says the
-     * control works and nothing about whether the draw paths are wired.  The
-     * last attempt at a keyword axis passed its own check and moved zero
-     * pixels for exactly that reason. */
+    /* JCE_SHADER_FORCE_KEYS: OR diagnostic bits into the shared variant
+     * selection path, read once. */
     if (r->force_shader_keys < 0) {
         const char *v = getenv("JCE_SHADER_FORCE_KEYS");
         r->force_shader_keys = (v && v[0]) ? (int)strtol(v, NULL, 0) : 0;
@@ -2584,27 +2852,32 @@ void jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
                                      uint32_t width, uint32_t height)
 {
     if (!r || r->is_fallback) return;
+    enabled = renderer_launch_vsync_resolve(r, enabled);
+    enabled = renderer_presentation_vsync_resolve(&r->launch_vsync, enabled);
     bool current = (r->reset_flags & BGFX_RESET_VSYNC) != 0;
-    if (current == enabled) return;
+    if (current == enabled) { jce_renderer_launch_vsync_observe_internal(r, 2); return; }
 
     if (enabled)
         r->reset_flags |= BGFX_RESET_VSYNC;
     else
         r->reset_flags &= ~BGFX_RESET_VSYNC;
 
+    const uint32_t requested_w = width, requested_h = height;
     if (width == 0 || height == 0) {
         const bgfx_stats_t *stats = bgfx_get_stats();
         width = stats->width;
         height = stats->height;
     }
 
-    bgfx_reset(width, height, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
+    renderer_reset_cpu(JCE_RENDERER_RESET_VSYNC, requested_w, requested_h, width, height, r->reset_flags);
+    jce_renderer_launch_vsync_observe_internal(r, 2);
 }
 
 void jce_renderer_set_vsync(JceRenderer *r, bool enabled)
 {
-    const bgfx_stats_t *stats = bgfx_get_stats();
-    jce_renderer_set_vsync_for_size(r, enabled, stats->width, stats->height);
+    /* The size-aware owner rejects null/fallback and unchanged state before
+     * querying the backend. Resolve dimensions only for an actual reset. */
+    jce_renderer_set_vsync_for_size(r, enabled, 0, 0);
 }
 
 /* Multisample anti-aliasing.  `samples` 0/1 = off, else snapped to 2/4/8/16.
@@ -2626,7 +2899,7 @@ void jce_renderer_set_msaa(JceRenderer *r, int samples)
     if (want == r->reset_flags) return;
     r->reset_flags = want;
     const bgfx_stats_t *stats = bgfx_get_stats();
-    bgfx_reset(stats->width, stats->height, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
+    renderer_reset_cpu(JCE_RENDERER_RESET_MSAA, 0, 0, stats->width, stats->height, r->reset_flags);
 }
 
 void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable)

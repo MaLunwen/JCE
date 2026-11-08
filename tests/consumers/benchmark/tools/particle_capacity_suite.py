@@ -4,11 +4,10 @@ import argparse
 from pathlib import Path
 import re
 
-from particle_suite import particle_asset, scene, alive_records
+from particle_suite import particle_asset, scene, alive_records, component_population
 from gbuffer_asset_suite import sha256_file, write
 from tools.benchmark_suite import source_identity
-from tools.jce_determinism import assert_backend
-from tools.perf_bench import run
+from particle_process import particle_backend, run_particle_process
 
 CASES = {
     "zero": (1, 64, 0, 0, 1000, 0),
@@ -65,18 +64,17 @@ def main():
                    "JCE_GPU_PARTICLES_FORCE": "1", "JCE_BENCH_ASSET_STILL": "1",
                    "JCE_BENCH_SHOT_FRAME": "50", "JCE_BENCH_PLAYER_SHOT": str(directory / "target.png"),
                    "JCE_BENCH_PARTICLE_GPU_STATS": "1"}
-            process = run(env, directory / "engine.log", frames=200, exe=executable)
+            process = run_particle_process(env, directory / "engine.log", frames=200, exe=executable,
+                                           samples_path=directory / "frames.csv")
             log = (directory / "engine.log").read_text(encoding="utf-8")
             files = {name: {"path": str(directory / name), "sha256": sha256_file(directory / name)}
-                     for name in ("fixture.particles.json", "scene.json", "engine.log", "target.png")
+                     for name in ("fixture.particles.json", "scene.json", "engine.log", "target.png", "frames.csv")
                      if (directory / name).is_file()}
             result["cases"][label] = {"process": process, "environment": env, "files": files,
                                       "expected_per_emitter": expected}
             write(args.out / "suite.json", result)
-            assert_backend(process.get("stdout", "") + "\n" + log, args.backend)
-            marker = re.search(r"benchmark-particles: frame=50 components=(\d+) loaded=(\d+) cpu_handles=(\d+) gpu_requested=(\d+)", log)
-            if "] ERROR -" in log or not marker or int(marker[1]) != emitters or int(marker[4]) != emitters:
-                raise ValueError("GPU component witness failed")
+            particle_backend(log, args.backend)
+            component_population(log, emitters, False)
             if "target.png" not in files:
                 raise ValueError("missing diagnostic capture")
             result["cases"][label]["actual_gpu_alive"] = validate_counts(label, log)

@@ -13,6 +13,14 @@
 #include "jce_editor_assert_bridge.h"
 #include "jce_editor_operation_metrics.h"
 #include "jce_editor_play_transaction.h"
+#include "jce_editor_play_presentation.h"
+#include "jce_editor_cadence.h"
+#include "jce_editor_play_module.h"
+#include "jce_editor_play_viewport.h"
+#include "jce_editor_play_input_owner.h"
+#include <jce/application/jce_runtime_host_policy.inc.h>
+#include "jce_editor_effective_render_settings.h"
+#include "jce_editor_project.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h" /* resolve_mesh_path (collider) */
 #include "ui/jce_editor_panels.h"
@@ -55,7 +63,17 @@ extern char s_current_project_root[512];
 static EditorHistorySnapshot s_play_snapshot;
 static bool                  s_play_snapshot_valid = false;
 
-static JceRuntimeStatsHost s_play_host = {};
+/* Runtime/stats and temporary presentation changes share one Play owner. */
+struct EditorPlayHost {
+    JceRuntimeStatsHost runtime_stats;
+    JceEditorPlayPresentationState presentation;
+    JceEditorPlayModule module;
+    JceRuntimeHostPolicy policy;
+    JceEditorPlayViewport viewport;
+    int requested_paused_fps = 30, requested_background_fps = 15;
+    float render_dt = 0.0f;
+};
+static EditorPlayHost s_play_host = {};
 static JceAudio   *s_play_audio   = NULL;   /* owned alongside the runtime */
 static bool        s_play_resync_clock = false;
 static float       s_play_resync_dt = 1.0f / 60.0f;
@@ -336,7 +354,7 @@ static void play_streaming_begin(void)
     jce_world_streamer_set_entity_callbacks(s_play_streamer,
                                             play_streamer_spawn_cb,
                                             play_streamer_despawn_cb,
-                                            s_play_host.runtime);
+                                            s_play_host.runtime_stats.runtime);
     /* Toggle the always-resident HLOD far-skyline proxies as chunks (un)load. */
     jce_state_attach_streamer_hlod(s_play_streamer);
     LOG_INFO(LOG_TAG,
@@ -347,9 +365,9 @@ static void play_streaming_begin(void)
 
 static void play_streaming_tick(void)
 {
-    if (!s_play_streamer || !s_play_host.runtime) return;
+    if (!s_play_streamer || !s_play_host.runtime_stats.runtime) return;
     jce_vec3 pos;
-    if (jce_runtime_get_player_position(s_play_host.runtime, &pos)) {
+    if (jce_runtime_get_player_position(s_play_host.runtime_stats.runtime, &pos)) {
         s_play_stream_pos = pos;
         s_play_stream_pos_valid = true;
     }
@@ -396,13 +414,90 @@ static void play_streaming_end(void)
     jce_state_detach_streamer_hlod();
 }
 
-void jce_state_play(void)
+/* Apply the same authored composition the packager and viewport resolve,
+ * including custom source/cooked roots and isolated Bundle Preview. */
+static JceEditorCadenceRates play_apply_presentation_settings(void)
 {
+    JceRenderSettings settings = jce_render_settings_default();
+    JceFileSystem *active_fs = jce_fs_get_active();
+    const bool isolated = active_fs != nullptr &&
+        jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED;
+    const JceProject *project = jce_editor_project_get();
+    const bool resolved = jce_editor_effective_render_settings(
+        isolated, project ? project->project_root : nullptr,
+        &settings, nullptr,
+        project ? project->source_assets : nullptr,
+        project ? project->cooked_assets : nullptr,
+        jce_editor_scene_content_root());
+    JceEditorConfig config;
+    (void)jce_editor_config_load(&config);
+    const auto rates = jce_editor_cadence_rates(config);
+    s_play_host.requested_paused_fps = rates.idle;
+    s_play_host.requested_background_fps = rates.play_background;
+    jce_editor_play_presentation_begin(s_play_host.presentation,
+        jce_editor_get_renderer(), settings, rates.play, resolved);
+    return rates;
+}
+
+void jce_editor_play_bind_services(const JceServices *services)
+{
+    s_play_host.module.services = services;
+}
+void jce_editor_play_host_tick(int paused_fps, int background_fps, int preview_fps)
+{
+    if (s.play_state == JCE_PLAY_STOPPED) return;
+    s_play_host.requested_paused_fps = paused_fps;
+    s_play_host.requested_background_fps = background_fps;
+    if (jce_editor_play_presentation_preview_cap(s_play_host.presentation, preview_fps)) {
+        const int target = s_play_host.presentation.running_target_fps;
+        s_play_host.policy.running_fps = target;
+        // A temporary cap owns the current target until focus/Pause releases it.
+        if (!s_play_host.policy.temporary_fps && jce_engine_get_target_fps() != target)
+            jce_engine_set_target_fps(target);
+    }
+    /* Recompute from project/preview and raw preferences, never a temporary target. */
+    s_play_host.policy.paused_fps = jce_editor_play_preview_fps(
+        s_play_host.presentation.running_target_fps, paused_fps);
+    s_play_host.policy.background_fps = jce_editor_play_preview_fps(
+        s_play_host.presentation.running_target_fps, background_fps);
+    if (s.play_state == JCE_PLAY_PAUSED)
+        s_play_host.policy.background_fps = jce_editor_play_preview_fps(
+            s_play_host.policy.background_fps, s_play_host.policy.paused_fps);
+    jce_runtime_host_policy_tick(&s_play_host.policy, s.play_state == JCE_PLAY_PAUSED);
+}
+float jce_editor_play_render_delta(void) { return s_play_host.render_dt; }
+void jce_editor_play_draw_module(void)
+{
+    if (s.play_state == JCE_PLAY_PLAYING &&
+        jce_runtime_host_policy_focus_step_allowed(&s_play_host.policy))
+        jce_editor_play_module_draw(s_play_host.module, s.scene, s_play_host.render_dt);
+}
+const JceGameModule *jce_editor_play_get_module(void)
+{
+    return s_play_host.module.selected ? s_play_host.module.selected : jce_game_module_default();
+}
+void jce_editor_play_set_module(const JceGameModule *module)
+{
+    if (s_play_host.module.selected == module) return;
+    jce_editor_play_module_end(s_play_host.module);
+    s_play_host.module.selected = module;
+    if (s.play_state != JCE_PLAY_STOPPED &&
+        !jce_editor_play_module_begin(s_play_host.module, s_play_host.module.services, s.scene)) {
+        LOG_ERROR(LOG_TAG, "%s", "replacement Play module init failed; stopping session");
+        jce_state_stop();
+    }
+}
+
+static void play_begin_ready(void)
+{
+    JceEditorCpuScope play_scope("editor.play.begin");
+    play_scope.result(JCE_TRACE_TASK_CANCELLED);
     if (s.play_state != JCE_PLAY_STOPPED) return;
     if (s_play_snapshot_valid) {
         LOG_ERROR(LOG_TAG, "play refused while failed stop snapshot awaits retry");
         return;
     }
+    play_scope.result(JCE_TRACE_TASK_FAILED);
 
     /* JCE_ENSURE reports once PER SITE for the life of the process.  Without
      * this an invariant that broke in the previous Play session would stay
@@ -415,6 +510,7 @@ void jce_state_play(void)
         if (!jce_editor_play_capture(s_play_snapshot_valid,
                 [] { return history_capture_snapshot(&s_play_snapshot); },
                 [] { s_play_snapshot = EditorHistorySnapshot(); })) {
+            operation.result(JCE_TRACE_TASK_FAILED);
             LOG_ERROR(LOG_TAG, "play refused: failed to capture play-mode snapshot");
             return;
         }
@@ -485,11 +581,18 @@ void jce_state_play(void)
     if (s_current_project_root[0])
         snprintf(s_mixer_cfg, sizeof(s_mixer_cfg),
                  "%s/Settings/audio_mixer.json", s_current_project_root);
-    if (!s_mixer_cfg[0] || !jce_fs_host_exists_file(s_mixer_cfg))
-        jce_editor_dotjce_path("audio_mixer.json", s_mixer_cfg,
-                               sizeof(s_mixer_cfg));
-    if (s_mixer_cfg[0])
+    /* Only confirmed absence selects the legacy/default route. UNKNOWN keeps
+     * the real read, including inaccessible authored files, observable. */
+    if (s_mixer_cfg[0] &&
+        jce_fs_probe_read(s_mixer_cfg) != JCE_FS_PRESENCE_ABSENT) {
         rd.mixer_config_path = s_mixer_cfg;
+    } else {
+        s_mixer_cfg[0] = '\0';
+        if (jce_editor_dotjce_path("audio_mixer.json", s_mixer_cfg,
+                                  sizeof(s_mixer_cfg)) && s_mixer_cfg[0] &&
+            jce_fs_probe_read(s_mixer_cfg) != JCE_FS_PRESENCE_ABSENT)
+            rd.mixer_config_path = s_mixer_cfg;
+    }
     /* Navmesh: hand the runtime the .navmesh.bin baked by the NavMesh panel
      * as a sibling of the current scene (same basename, .navmesh.bin).  The
      * runtime loads it + stands up the nav-agent set; missing file disables
@@ -521,21 +624,34 @@ void jce_state_play(void)
         snprintf(s_saves_dir, sizeof(s_saves_dir), "%s/saves", proj_root);
         rd.saves_dir = s_saves_dir;
     }
-    const bool configured = jce_runtime_stats_host_attach_env(&s_play_host);
-    const bool capable = !s_play_host.stats || jce_platform_stats_available(s_play_host.stats);
+    /* Capture succeeds before this point. Failed runtime construction below
+     * restores presentation before attempting authored-scene rollback. */
+    const auto cadence_rates = play_apply_presentation_settings();
+    uint32_t viewport_w = 0, viewport_h = 0;
+    jce_editor_game_render_resolve_extent(s_play_host.viewport.width,
+        s_play_host.viewport.height, &viewport_w, &viewport_h);
+    const JceRuntimeCreateOptions create_options = {(float)viewport_w, (float)viewport_h};
+    const bool configured = jce_runtime_stats_host_attach_env(&s_play_host.runtime_stats);
+    const bool capable = !s_play_host.runtime_stats.stats || jce_platform_stats_available(s_play_host.runtime_stats.stats);
     if (!configured || !capable)
         LOG_WARN(LOG_TAG, "runtime stats configuration unavailable");
     const bool created = jce_editor_play_create(s_play_snapshot_valid,
         [&] {
             JceEditorOperationScope operation("ed_play_create");
-            s_play_host.runtime = jce_runtime_create_with_platform_services(
-                &rd, configured && capable ? s_play_host.stats : NULL);
-            return s_play_host.runtime != NULL;
+            operation.result(JCE_TRACE_TASK_FAILED);
+            if (!jce_editor_game_render_begin_play_camera()) return false;
+            s_play_host.runtime_stats.runtime = jce_runtime_create_with_options(
+                &rd, configured && capable ? s_play_host.runtime_stats.stats : NULL,
+                &create_options, sizeof create_options);
+            if (s_play_host.runtime_stats.runtime) operation.result(JCE_TRACE_TASK_SUCCEEDED);
+            return s_play_host.runtime_stats.runtime != NULL;
         },
         [] {
             JceEditorOperationScope operation("ed_play_teardown");
             LOG_ERROR(LOG_TAG, "failed to create play runtime");
-            if (!jce_runtime_stats_host_close(&s_play_host))
+            jce_editor_game_render_end_play_camera();
+            jce_editor_play_presentation_restore(s_play_host.presentation);
+            if (!jce_runtime_stats_host_close(&s_play_host.runtime_stats))
                 LOG_WARN(LOG_TAG, "runtime stats flush failed after create failure");
             if (s_play_audio) {
                 jce_audio_destroy(s_play_audio);
@@ -546,14 +662,16 @@ void jce_state_play(void)
             JceEditorOperationScope operation("ed_play_restore");
             const bool restored = history_restore_snapshot(
                 s_play_snapshot, "play-create-rollback");
-            if (!restored)
+            if (!restored) {
+                operation.result(JCE_TRACE_TASK_FAILED);
                 LOG_ERROR(LOG_TAG, "play create scene restoration failed; snapshot retained");
+            }
             return restored;
         },
         [] { s_play_snapshot = EditorHistorySnapshot(); });
     if (!created) return;
-    jce_runtime_set_platform_services(s_play_host.runtime,
-        configured && capable ? s_play_host.stats : NULL);
+    jce_runtime_set_platform_services(s_play_host.runtime_stats.runtime,
+        configured && capable ? s_play_host.runtime_stats.stats : NULL);
 
     /* Runtime construction performs synchronous scene/script/resource setup.
      * That wall-clock delay is not simulation time: consume one authored fixed
@@ -563,24 +681,11 @@ void jce_state_play(void)
                            ? rd.fixed_timestep
                            : (1.0f / 60.0f);
 
-    /* Target Framerate (Project Settings > Quality) — PLAY ONLY.
-     *
-     * The field is authored per quality level, exported into the cooked tree,
-     * and applied by the shipped main via jce_engine_set_target_fps.  Play has
-     * to honour it too or the designer tunes against a frame rate the game
-     * will never run at: gameplay written against dt behaves differently at
-     * 400 fps in the viewport and 30 fps on the target machine, which is the
-     * editor/ship divergence this engine warns about most.
-     *
-     * Restored on Stop, not left applied, because the editor is a tool: Unity
-     * ignores targetFrameRate outside Play for the same reason, and a 30 fps
-     * cap left on the whole editor would make every panel feel broken. */
+    /* Additional authored simulation/render settings remain Play-only. */
     if (ps) {
         int ql = ps->quality.current_level;
         if (ql < 0) ql = 0;
         if (ql >= JCE_PS_MAX_QUALITY_LEVELS) ql = JCE_PS_MAX_QUALITY_LEVELS - 1;
-        const int tf = ps->quality.levels[ql].target_framerate;
-        jce_engine_set_target_fps(tf > 0 ? tf : 0);
         /* Same reasoning for the per-pixel light budget: a designer capping
          * lights for a low-end target must SEE the capped lighting in Play,
          * not only in the shipped exe. */
@@ -597,13 +702,13 @@ void jce_state_play(void)
     /* Subscribe to contact events so the Physics Debugger can show live
      * active-contact counts (also activates engine manifold diffing). */
     s_active_contacts = 0;
-    jce_runtime_set_contact_listener(s_play_host.runtime, editor_contact_cb, NULL);
+    jce_runtime_set_contact_listener(s_play_host.runtime_stats.runtime, editor_contact_cb, NULL);
 
     /* Phase 0.2: seed the runtime's global time scale from the project's Time
      * settings (Unity-style default timeScale — previously built-but-unwired).
      * Scripts (jce.set_time_scale / jce.pause) override it live during play. */
     if (ps && ps->time.time_scale > 0.0f)
-        jce_runtime_set_time_scale(s_play_host.runtime, ps->time.time_scale);
+        jce_runtime_set_time_scale(s_play_host.runtime_stats.runtime, ps->time.time_scale);
 
     /* Project Settings > Time > Maximum Particle Timestep.  The slider, the
      * default and both halves of its serializer have existed since it was
@@ -626,57 +731,109 @@ void jce_state_play(void)
      * authored on_anim_event handlers fire in editor Play just like a shipped
      * game (cleared on Stop below). */
     jce_scene_renderer_set_anim_event_fn(jce_editor_get_scene_renderer(),
-                                         editor_anim_event_cb, s_play_host.runtime);
+                                         editor_anim_event_cb, s_play_host.runtime_stats.runtime);
     /* Route SM state changes into the play runtime's script VM so authored
      * on_state_enter / on_state_exit handlers fire in editor Play just like a
      * shipped game (cleared on Stop below). */
     jce_scene_renderer_set_anim_state_fn(jce_editor_get_scene_renderer(),
-                                         editor_anim_state_cb, s_play_host.runtime);
+                                         editor_anim_state_cb, s_play_host.runtime_stats.runtime);
     /* Foot IK ground-query hook (cleared on Stop below, before runtime destroy). */
     jce_scene_renderer_set_ground_query_fn(jce_editor_get_scene_renderer(),
-                                           editor_ground_query_cb, s_play_host.runtime);
+                                           editor_ground_query_cb, s_play_host.runtime_stats.runtime);
     /* Hand the game renderer the live runtime so canvas UI events (button
      * clicks, slider/toggle/dropdown value changes, input-field edits + submit)
      * dispatch to the gameplay script VM in editor Play, exactly like a shipped
      * game (detached on Stop below). */
-    jce_editor_game_render_set_play_runtime(s_play_host.runtime);
+    jce_editor_game_render_set_play_runtime(s_play_host.runtime_stats.runtime);
     /* World streaming for this Play session (inert unless the scene authored a
      * streaming block) — the runtime has no streamer of its own. */
     play_streaming_begin();
     s.play_state = JCE_PLAY_PLAYING;
+    if (!jce_runtime_host_policy_begin(&s_play_host.policy,
+            s_play_host.runtime_stats.runtime, ps ? ps->player.run_in_background : false,
+            s_play_host.module.services && s_play_host.module.services->window,
+            jce_editor_play_preview_fps(s_play_host.presentation.running_target_fps, cadence_rates.idle),
+            jce_editor_play_preview_fps(s_play_host.presentation.running_target_fps, cadence_rates.play_background)) ||
+        !jce_editor_play_module_begin(s_play_host.module, s_play_host.module.services, s.scene)) {
+        LOG_ERROR(LOG_TAG, "%s", "Play host/module initialization failed; rolling back session");
+        jce_state_stop();
+        return;
+    }
     jce_editor_layout_request_focus_game_view();
     LOG_INFO(LOG_TAG, "play mode started");
+    play_scope.result(JCE_TRACE_TASK_SUCCEEDED);
+}
+
+void jce_state_play(void)
+{
+    JceEditorCpuScope play_scope("editor.play.request");
+    if (s.play_state != JCE_PLAY_STOPPED || s_play_host.viewport.pending) {
+        play_scope.result(JCE_TRACE_TASK_CANCELLED); return;
+    }
+    jce_editor_play_viewport_request(s_play_host.viewport);
+    jce_editor_layout_request_focus_game_view();
+    LOG_INFO(LOG_TAG, "play requested; waiting for Game View layout");
+}
+
+void jce_editor_play_publish_viewport(uint32_t width, uint32_t height)
+{
+    if (!jce_editor_play_viewport_publish(s_play_host.viewport, width, height)) return;
+    (void)jce_editor_play_viewport_begin_pending(s_play_host.viewport, [] { play_begin_ready(); });
+    uint32_t actual_w = 0, actual_h = 0;
+    jce_editor_game_render_resolve_extent(width, height, &actual_w, &actual_h);
+    if (s_play_host.runtime_stats.runtime)
+        (void)jce_runtime_set_viewport_size(s_play_host.runtime_stats.runtime,
+            (float)actual_w, (float)actual_h);
 }
 
 void jce_state_pause(void)
 {
     if (s.play_state == JCE_PLAY_PLAYING) {
-        if (s_play_host.runtime) jce_runtime_pause_audio(s_play_host.runtime);
         s.play_state = JCE_PLAY_PAUSED;
+        s_play_host.render_dt = 0.0f;
+        jce_editor_play_host_tick(s_play_host.requested_paused_fps,
+            s_play_host.requested_background_fps, s_play_host.presentation.preview_cap);
         LOG_INFO(LOG_TAG, "play mode paused");
     } else if (s.play_state == JCE_PLAY_PAUSED) {
-        if (s_play_host.runtime) jce_runtime_resume_audio(s_play_host.runtime);
         s.play_state = JCE_PLAY_PLAYING;
+        jce_editor_play_host_tick(s_play_host.requested_paused_fps,
+            s_play_host.requested_background_fps, s_play_host.presentation.preview_cap);
         LOG_INFO(LOG_TAG, "play mode resumed");
     }
 }
 
 void jce_state_stop(void)
 {
+    JceEditorCpuScope play_scope("editor.play.stop");
+    s_play_host.viewport.pending = false;
     if (s.play_state == JCE_PLAY_STOPPED) {
+        jce_editor_game_render_end_play_camera();
         if (s_play_snapshot_valid) {
             JceEditorOperationScope operation("ed_play_restore");
             if (jce_editor_play_restore(s_play_snapshot_valid,
                     [] { return history_restore_snapshot(s_play_snapshot, "play-stop-retry"); },
                     [] { s_play_snapshot = EditorHistorySnapshot(); })) {
                 LOG_INFO(LOG_TAG, "play stop scene restoration retry completed");
-            } else LOG_ERROR(LOG_TAG, "play stop scene restoration retry failed; snapshot retained");
+            } else {
+                operation.result(JCE_TRACE_TASK_FAILED);
+                play_scope.result(JCE_TRACE_TASK_FAILED);
+                LOG_ERROR(LOG_TAG, "play stop scene restoration retry failed; snapshot retained");
+            }
         }
         return;
     }
     {
         JceEditorOperationScope operation("ed_play_teardown");
-        jce_editor_game_render_set_mouse_capture(false);
+        /* Release keyboard/mouse ownership synchronously, BEFORE runtime
+         * teardown. The Game View panel may not draw this frame (clipped,
+         * hidden, other dock tab), so waiting for its Stop-edge is unsafe. */
+        jce_editor_game_view_release_play_input();
+        /* Module exit still borrows the live runtime/renderer. Policy detaches
+         * its sole listener and restores running FPS before the presentation
+         * transaction restores the editor entry state. */
+        jce_editor_play_module_end(s_play_host.module);
+        jce_runtime_host_policy_end(&s_play_host.policy);
+        s_play_host.render_dt = 0.0f;
 
         /* Clear the renderer's anim-event hook BEFORE destroying the runtime it
          * forwards to — otherwise a stray render frame could route an event into a
@@ -691,23 +848,19 @@ void jce_state_stop(void)
          * it, so a stray render frame can't route a drained click into a freed
          * runtime pointer (mirrors the renderer-hook clears above). */
         jce_editor_game_render_set_play_runtime(NULL);
+        jce_editor_game_render_end_play_camera();
 
         /* Unload streamed chunks (destroys their entities from the live scene)
          * BEFORE the runtime is destroyed and BEFORE the pre-play snapshot is
          * restored below, so streamed content never lingers or bakes in. */
         play_streaming_end();
 
-        /* Uncap the editor again.  Restoring a SAVED value would be false
-         * precision: jce_engine_set_target_fps has exactly two call sites -- the
-         * shipped main, which the editor never runs, and the Play block above --
-         * so outside Play the editor's cap is 0 by construction.  Saving a value
-         * that is always 0 buys nothing and would quietly become wrong if someone
-         * ever capped the editor deliberately, because it would restore a stale
-         * reading rather than that deliberate choice. */
-        jce_engine_set_target_fps(0);
+        /* Restore the entry state, including a deliberately capped editor;
+         * this also stays restored if the scene snapshot needs a Stop retry. */
+        jce_editor_play_presentation_restore(s_play_host.presentation);
         jce_lighting_set_pixel_light_count(0);
-        if (s_play_host.runtime) { jce_runtime_destroy(s_play_host.runtime); s_play_host.runtime = NULL; }
-        if (!jce_runtime_stats_host_close(&s_play_host))
+        if (s_play_host.runtime_stats.runtime) { jce_runtime_destroy(s_play_host.runtime_stats.runtime); s_play_host.runtime_stats.runtime = NULL; }
+        if (!jce_runtime_stats_host_close(&s_play_host.runtime_stats))
             LOG_WARN(LOG_TAG, "runtime stats flush failed");
         if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
         s_active_contacts = 0;
@@ -721,6 +874,8 @@ void jce_state_stop(void)
                 [] { s_play_snapshot = EditorHistorySnapshot(); })) {
             // Runtime/input teardown above still completes; retain the snapshot
             // for a subsequent Stop retry instead of claiming scene restoration.
+            operation.result(JCE_TRACE_TASK_FAILED);
+            play_scope.result(JCE_TRACE_TASK_FAILED);
             LOG_ERROR(LOG_TAG, "play stop scene restoration failed; snapshot retained");
         }
     }
@@ -739,21 +894,48 @@ void jce_state_stop(void)
 
 JcePlayState jce_state_get_play_state(void) { return s.play_state; }
 
-void stop_play_before_scene_swap(void)
+/* Final state destruction has no future restore destination. Ordinary scene
+ * transitions must never call this terminal-only discard path. */
+void jce_editor_play_finish_shutdown(void)
 {
-    if (jce_state_get_play_state() != JCE_PLAY_STOPPED) {
+    JceEditorCpuScope shutdown_scope("editor.play.finish_shutdown");
+    // An already retired Play owner needs no further Stop transaction.
+    if (s.play_state != JCE_PLAY_STOPPED || s_play_host.viewport.pending ||
+        s_play_snapshot_valid)
+        jce_state_stop();
+    if (s_play_snapshot_valid) {
+        shutdown_scope.result(JCE_TRACE_TASK_FAILED);
+        LOG_ERROR(LOG_TAG, "editor shutdown: authoring restoration failed; releasing final restore point without claiming restoration");
+        s_play_snapshot = EditorHistorySnapshot();
+        s_play_snapshot_valid = false;
+    }
+}
+
+bool stop_play_before_scene_swap(void)
+{
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED || s_play_host.viewport.pending ||
+        s_play_snapshot_valid) {
         LOG_INFO(LOG_TAG, "auto-stopping play mode before scene swap "
                           "(new/open/load during Play)");
         jce_state_stop();
     }
+    const bool retired = jce_state_get_play_state() == JCE_PLAY_STOPPED &&
+        !s_play_host.viewport.pending && !s_play_snapshot_valid;
+    if (!retired)
+        LOG_ERROR(LOG_TAG, "scene switch refused: Play authoring restore remains pending");
+    return retired;
 }
 
 void jce_state_step(float dt)
 {
-    if (s.play_state != JCE_PLAY_PAUSED) return;
-    if (s_play_host.runtime) {
-        jce_runtime_step(s_play_host.runtime, dt > 0 ? dt : 1.0f/60.0f);
-        if (jce_runtime_quit_requested(s_play_host.runtime)) { jce_state_stop(); return; }
+    if (s.play_state != JCE_PLAY_PAUSED ||
+        !jce_runtime_host_policy_focus_step_allowed(&s_play_host.policy)) return;
+    if (s_play_host.runtime_stats.runtime) {
+        const float step_dt = dt > 0 ? dt : 1.0f/60.0f;
+        jce_runtime_step(s_play_host.runtime_stats.runtime, step_dt);
+        jce_editor_play_module_tick(s_play_host.module, s.scene, step_dt);
+        if (s.play_state == JCE_PLAY_STOPPED || !s_play_host.runtime_stats.runtime) return;
+        if (jce_runtime_quit_requested(s_play_host.runtime_stats.runtime)) { jce_state_stop(); return; }
         jce_state_prune_dead();   /* sync mirror list with runtime jce.destroy */
         play_streaming_tick();    /* load/unload chunks around the player */
     }
@@ -761,8 +943,10 @@ void jce_state_step(float dt)
 
 void jce_state_play_mode_tick(float dt)
 {
-    if (s.play_state != JCE_PLAY_PLAYING) return;
-    if (s_play_host.runtime) {
+    s_play_host.render_dt = 0.0f;
+    if (s.play_state != JCE_PLAY_PLAYING ||
+        !jce_runtime_host_policy_step(&s_play_host.policy, false, &dt)) return;
+    if (s_play_host.runtime_stats.runtime) {
         if (s_play_resync_clock) {
             dt = s_play_resync_dt;
             s_play_resync_clock = false;
@@ -797,8 +981,11 @@ void jce_state_play_mode_tick(float dt)
             }
             if (s_fdt) dt = s_fdtv;
         }
-        jce_runtime_step(s_play_host.runtime, dt);
-        if (jce_runtime_quit_requested(s_play_host.runtime)) { jce_state_stop(); return; }
+        s_play_host.render_dt = dt;
+        jce_runtime_step(s_play_host.runtime_stats.runtime, dt);
+        if (jce_runtime_quit_requested(s_play_host.runtime_stats.runtime)) { jce_state_stop(); return; }
+        jce_editor_play_module_tick(s_play_host.module, s.scene, dt);
+        if (s.play_state != JCE_PLAY_PLAYING) return;
         jce_state_prune_dead();   /* drop runtime-destroyed entities (jce.destroy)
                                    * so the hierarchy never touches a dead handle */
         play_streaming_tick();    /* load/unload chunks around the player */
@@ -812,7 +999,7 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
                                       bool sprint, bool attack,
                                       struct JceInput *keyboard)
 {
-    if (!s_play_host.runtime) return;
+    if (!s_play_host.runtime_stats.runtime) return;
     JceRuntimeInput in = {};
     in.walk_x         = walk_x;
     in.walk_z         = walk_z;
@@ -822,26 +1009,26 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
     in.attack_pressed = attack;
     in.speed_mult     = 1.0f;   /* sprint scaling is authored on the component */
     in.keyboard       = keyboard;   /* NULL when the view lacks capture */
-    jce_runtime_set_input(s_play_host.runtime, &in);
+    jce_runtime_set_input(s_play_host.runtime_stats.runtime, &in);
 }
 
 void jce_editor_play_set_pointer_input(float dx, float dy, float wheel,
                                        unsigned int buttons)
 {
-    if (!s_play_host.runtime) return;
-    jce_runtime_set_pointer_input(s_play_host.runtime, dx, dy, wheel, buttons);
+    if (!s_play_host.runtime_stats.runtime) return;
+    jce_runtime_set_pointer_input(s_play_host.runtime_stats.runtime, dx, dy, wheel, buttons);
 }
 
 void jce_editor_play_set_touch_input(const JceRuntimeTouch *touches, int count)
 {
-    if (!s_play_host.runtime) return;
-    jce_runtime_set_touch_input(s_play_host.runtime, touches, count);
+    if (!s_play_host.runtime_stats.runtime) return;
+    jce_runtime_set_touch_input(s_play_host.runtime_stats.runtime, touches, count);
 }
 
 void jce_editor_play_set_pointer_position(float x, float y, float width, float height)
 {
-    if (s_play_host.runtime)
-        jce_runtime_set_pointer_position(s_play_host.runtime, x, y, width, height);
+    if (s_play_host.runtime_stats.runtime)
+        jce_runtime_set_pointer_position(s_play_host.runtime_stats.runtime, x, y, width, height);
 }
 
 /* Top 6: bind the live editor action map so editor-Play scripts can query
@@ -849,15 +1036,15 @@ void jce_editor_play_set_pointer_position(float x, float y, float width, float h
  * game.  The runtime borrows the pointer for this frame. */
 void jce_editor_play_set_actions(const JceInputActions *actions)
 {
-    if (!s_play_host.runtime) return;
-    jce_runtime_set_actions(s_play_host.runtime, actions);
+    if (!s_play_host.runtime_stats.runtime) return;
+    jce_runtime_set_actions(s_play_host.runtime_stats.runtime, actions);
 }
 
 bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_z)
 {
-    if (!s_play_host.runtime) return false;
+    if (!s_play_host.runtime_stats.runtime) return false;
     jce_vec3 p;
-    if (!jce_runtime_get_player_position(s_play_host.runtime, &p)) return false;
+    if (!jce_runtime_get_player_position(s_play_host.runtime_stats.runtime, &p)) return false;
     if (out_x) *out_x = p.x;
     if (out_y) *out_y = p.y;
     if (out_z) *out_z = p.z;
@@ -866,9 +1053,9 @@ bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_
 
 bool jce_editor_play_get_player_forward(float *out_x, float *out_y, float *out_z)
 {
-    if (!s_play_host.runtime) return false;
+    if (!s_play_host.runtime_stats.runtime) return false;
     jce_vec3 f;
-    if (!jce_runtime_get_player_forward(s_play_host.runtime, &f)) return false;
+    if (!jce_runtime_get_player_forward(s_play_host.runtime_stats.runtime, &f)) return false;
     if (out_x) *out_x = f.x;
     if (out_y) *out_y = f.y;
     if (out_z) *out_z = f.z;
@@ -877,7 +1064,7 @@ bool jce_editor_play_get_player_forward(float *out_x, float *out_y, float *out_z
 
 JcePhysicsWorld *jce_editor_play_get_physics_world(void)
 {
-    return s_play_host.runtime ? jce_runtime_physics(s_play_host.runtime) : NULL;
+    return s_play_host.runtime_stats.runtime ? jce_runtime_physics(s_play_host.runtime_stats.runtime) : NULL;
 }
 
 /* The 2D world Play stands up when a scene uses RigidBody2D.  The Physics
@@ -886,12 +1073,12 @@ JcePhysicsWorld *jce_editor_play_get_physics_world(void)
  * collisions and never see a single number about them. */
 JcePhysics2D *jce_editor_play_get_physics2d_world(void)
 {
-    return s_play_host.runtime ? jce_runtime_physics2d(s_play_host.runtime) : NULL;
+    return s_play_host.runtime_stats.runtime ? jce_runtime_physics2d(s_play_host.runtime_stats.runtime) : NULL;
 }
 
 JceRuntime *jce_editor_play_get_runtime(void)
 {
-    return s_play_host.runtime;
+    return s_play_host.runtime_stats.runtime;
 }
 
 /* ── Entity Clipboard ────────────────────────────────────────────── */

@@ -236,3 +236,69 @@ requires four repeated --suite arguments with distinct actual Windows backends
 and the same executable. It rehashes raw scenes/logs/captures and recomputes
 every pixel control before exporting the participation heatmap and count table.
 This visualization shows correctness, not engine speed or lighting throughput.
+
+Particle evidence is explicitly opt-in through the existing observation/statistics
+flags. Its finite public logger calls and actual public backend-name observation
+survive DIST; ordinary DIST logging remains quiet. `tools/particle_process.py`
+shares OS sampling, fresh execution-log merging and KPI parsing with maintained
+tools, without requiring the stock host's unavailable aggregate perf record.
+All three particle runners require a clean completed process, observed backend,
+complete consecutive frame CSV and unchanged typed-count/pixel controls. These
+observer-on results are correctness diagnostics, not throughput certification.
+
+## Public GPU timing readout
+
+With the refreshed installed SDK, both consumer hosts retain opt-in
+`JCE_BENCH_COUNTERS=<absolute JSONL path>`. The default target now links the same
+metrics source and records successful initialization, every 5 seconds of draw
+callbacks, and exit before stock scene/renderer teardown. Its frame source is
+`default_host_draw_count`; the unavailable stock simulation clock is null. The
+custom Player update clock/event protocol is unchanged.
+Use the independent `gpu_timing` object for qualified intervals. It records the
+public getter's availability/reason, signed decimal-string `timer_frequency`,
+`raw_begin`, `raw_end`, exact unsigned-string `context_generation`, numeric
+`gpu_source_frame` and `read_host_frame_index`, and `duration_ms` or null with
+`UNAVAILABLE`. Preserved `gpu` numeric fields are unqualified legacy observations.
+These latched samples are not an engine/GPU frame join, fence or presentation.
+Retain repeated sample identities and the raw JSONL; do not infer fresh GPU work
+from a changed caller counter. Observation/serialization adds diagnostic cost.
+
+Build the stock target through the existing command with an explicit current SDK:
+`python scripts/jce.py app tests/consumers/benchmark --sdk <install> --arch x64
+--variant release --target JceBenchmarkDefault --exe jce_benchmark_default.exe`.
+The existing `tools/postfx_fixture.py --out <scratch>` supplies a first-party room.
+For an external diagnostic, copy its `base.scene.json` into the executable's
+mounted cooked root at `resources/_cooked/qa_gpu_timer/base.scene.json` (use the
+project's actual `cooked_assets` root if configured). The stock host consumes
+`JCE_STARTUP_SCENE=qa_gpu_timer/base.scene.json` through that runtime VFS; it does
+not consume the custom Player's `JCE_SCENE` or read an absolute host scene path.
+Require the startup log to confirm the mounted loose source and exact virtual
+address. This loose fixture is diagnostic input, not embedded-asset closure or
+Dist product-admission evidence. A bounded readout also uses
+`JCE_BACKEND=d3d11`, `JCE_BENCH_POST_EFFECT=base`,
+`JCE_BENCH_COUNTERS=<scratch>/gpu.jsonl` and `JCE_MAX_FRAMES=<bounded count>`.
+Hidden-window rendering is optional through
+`JCE_WINDOW_HIDDEN=1`; do not set `JCE_HEADLESS` for physical GPU observation.
+Leave screenshot/readback/trace/KPI observers off unless a separate diagnostic
+requires them. Retain the actual log/backend, clean exit, executable and SDK
+hashes, consumer source identity and original JSONL; this is not a performance
+benchmark or an uncontended-machine claim. The generic custom Player
+`player_counters` validator intentionally rejects this distinct default draw
+clock, so do not relax it to admit a null simulation clock.
+
+The excluded targets `JceBenchmarkMetricsWire` and
+`JceBenchmarkMetricsMissingWire` and `JceBenchmarkMetricsOldFrameReplace` compile
+the whole actual metrics owner with typed
+SDK-call ports and real SDK JSON. They link the installed SDK's sanctioned
+`JCE::Core` native-test target; product targets retain `JCE::JCE`. Build them with the existing `app` target
+selection or the already configured consumer build's target selector. The first
+must exit zero with eight groups; both ordinary negative controls must fail
+assertions. The existing `JCE_HEADLESS=1 JCE_BENCH_PROBE=metrics-selftest` custom
+Player route also checks the real encoder's new precision/unavailable groups.
+None of these CPU controls establishes physical GPU timer support.
+
+Only a frame-zero explicit `initialized` or `default-initialized` event replaces
+the JSONL file. A successful initialization followed by zero draw callbacks still
+appends its exit record, preserving both lifetime endpoints. Public JSON child
+attachment is void-returning: local object allocation failures are cleaned up,
+but this transport does not certify complete successful encoding under all OOM.

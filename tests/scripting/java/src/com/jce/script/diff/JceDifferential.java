@@ -347,6 +347,8 @@ public final class JceDifferential {
         case 226: c226(label); return;
         case 227: c227(label); return;
         case 228: c228(label); return;
+        case 229: c229(label); return;
+        case 230: c230(label); return;
         default:
             throw new IllegalStateException("no case " + index);
         }
@@ -2279,23 +2281,23 @@ public final class JceDifferential {
         }
     }
 
-    /* get_position [no host] */
+    /* get_viewport_size */
     private static void c121(String label) {
         JceDiffHost.reset();
-        try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
+        try (JceScript s = JceScript.open(JceDiffHost.fullHostPointer(),
                 JceDiffHost.hostSize())) {
             if (s == null) {
                 line("CASE 121 " + label);
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getPosition(78L);
-            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
+            float[] v = s.getViewportSize();
+            String r = "2|" + f((double) v[0]) + "|" + f((double) v[1]);
             emit(121, label, r);
         }
     }
 
-    /* set_position [no host] */
+    /* get_position [no host] */
     private static void c122(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2305,13 +2307,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setPosition(80L, 106.375f, 1674.125f, 2181.125f);
-            String r = "0|";
+            float[] v = s.getPosition(78L);
+            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
             emit(122, label, r);
         }
     }
 
-    /* get_rotation [no host] */
+    /* set_position [no host] */
     private static void c123(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2321,13 +2323,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getRotation(89L);
-            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
+            s.setPosition(80L, 106.375f, 1674.125f, 2181.125f);
+            String r = "0|";
             emit(123, label, r);
         }
     }
 
-    /* set_rotation [no host] */
+    /* get_rotation [no host] */
     private static void c124(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2337,13 +2339,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setRotation(91L, 761.75f, 2123.25f, 578.125f);
-            String r = "0|";
+            float[] v = s.getRotation(89L);
+            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
             emit(124, label, r);
         }
     }
 
-    /* get_scale [no host] */
+    /* set_rotation [no host] */
     private static void c125(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2353,13 +2355,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getScale(29L);
-            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
+            s.setRotation(91L, 761.75f, 2123.25f, 578.125f);
+            String r = "0|";
             emit(125, label, r);
         }
     }
 
-    /* get_world_position [no host] */
+    /* get_scale [no host] */
     private static void c126(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2369,13 +2371,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getWorldPosition(48L);
+            float[] v = s.getScale(29L);
             String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
             emit(126, label, r);
         }
     }
 
-    /* set_scale [no host] */
+    /* get_world_position [no host] */
     private static void c127(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2385,13 +2387,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setScale(12L, 598.0f, 706.5f, 313.625f);
-            String r = "0|";
+            float[] v = s.getWorldPosition(48L);
+            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
             emit(127, label, r);
         }
     }
 
-    /* set_parent [no host] */
+    /* set_scale [no host] */
     private static void c128(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2401,13 +2403,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.setParent(45L, 48L, true);
-            String r = "1|" + b(v);
+            s.setScale(12L, 598.0f, 706.5f, 313.625f);
+            String r = "0|";
             emit(128, label, r);
         }
     }
 
-    /* get_parent [no host] */
+    /* set_parent [no host] */
     private static void c129(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2417,13 +2419,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long v = s.getParent(6L);
-            String r = "1|" + i((long) v);
+            boolean v = s.setParent(45L, 48L, true);
+            String r = "1|" + b(v);
             emit(129, label, r);
         }
     }
 
-    /* is_key_down [no host] */
+    /* get_parent [no host] */
     private static void c130(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2433,13 +2435,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.isKeyDown(48);
-            String r = "1|" + b(v);
+            long v = s.getParent(6L);
+            String r = "1|" + i((long) v);
             emit(130, label, r);
         }
     }
 
-    /* find_with_tag [no host] */
+    /* is_key_down [no host] */
     private static void c131(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2449,13 +2451,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long v = s.findWithTag("find_with_tag_tag");
-            String r = "1|" + i((long) v);
+            boolean v = s.isKeyDown(48);
+            String r = "1|" + b(v);
             emit(131, label, r);
         }
     }
 
-    /* destroy [no host] */
+    /* find_with_tag [no host] */
     private static void c132(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2465,13 +2467,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.destroy(77L);
-            String r = "0|";
+            long v = s.findWithTag("find_with_tag_tag");
+            String r = "1|" + i((long) v);
             emit(132, label, r);
         }
     }
 
-    /* spawn [no host] */
+    /* destroy [no host] */
     private static void c133(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2481,13 +2483,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long v = s.spawn("spawn_prefab_path", 1196.375f, 1714.625f, 601.25f);
-            String r = "1|" + i((long) v);
+            s.destroy(77L);
+            String r = "0|";
             emit(133, label, r);
         }
     }
 
-    /* move_axis [no host] */
+    /* spawn [no host] */
     private static void c134(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2497,13 +2499,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.moveAxis();
-            String r = "2|" + f((double) v[0]) + "|" + f((double) v[1]);
+            long v = s.spawn("spawn_prefab_path", 1196.375f, 1714.625f, 601.25f);
+            String r = "1|" + i((long) v);
             emit(134, label, r);
         }
     }
 
-    /* jump_pressed [no host] */
+    /* move_axis [no host] */
     private static void c135(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2513,13 +2515,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.jumpPressed();
-            String r = "1|" + b(v);
+            float[] v = s.moveAxis();
+            String r = "2|" + f((double) v[0]) + "|" + f((double) v[1]);
             emit(135, label, r);
         }
     }
 
-    /* sprint [no host] */
+    /* jump_pressed [no host] */
     private static void c136(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2529,13 +2531,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.sprint();
+            boolean v = s.jumpPressed();
             String r = "1|" + b(v);
             emit(136, label, r);
         }
     }
 
-    /* attack_pressed [no host] */
+    /* sprint [no host] */
     private static void c137(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2545,13 +2547,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.attackPressed();
+            boolean v = s.sprint();
             String r = "1|" + b(v);
             emit(137, label, r);
         }
     }
 
-    /* set_time_scale [no host] */
+    /* attack_pressed [no host] */
     private static void c138(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2561,13 +2563,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setTimeScale(254.5f);
-            String r = "0|";
+            boolean v = s.attackPressed();
+            String r = "1|" + b(v);
             emit(138, label, r);
         }
     }
 
-    /* pause [no host] */
+    /* set_time_scale [no host] */
     private static void c139(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2577,13 +2579,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.pause(true);
+            s.setTimeScale(254.5f);
             String r = "0|";
             emit(139, label, r);
         }
     }
 
-    /* shake_camera [no host] */
+    /* pause [no host] */
     private static void c140(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2593,13 +2595,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.shakeCamera(1814.625f);
+            s.pause(true);
             String r = "0|";
             emit(140, label, r);
         }
     }
 
-    /* music_set_intensity [no host] */
+    /* shake_camera [no host] */
     private static void c141(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2609,13 +2611,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.musicSetIntensity(2273.5f);
+            s.shakeCamera(1814.625f);
             String r = "0|";
             emit(141, label, r);
         }
     }
 
-    /* music_get_intensity [no host] */
+    /* music_set_intensity [no host] */
     private static void c142(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2625,13 +2627,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.musicGetIntensity();
-            String r = "1|" + f((double) v);
+            s.musicSetIntensity(2273.5f);
+            String r = "0|";
             emit(142, label, r);
         }
     }
 
-    /* music_request_transition [no host] */
+    /* music_get_intensity [no host] */
     private static void c143(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2641,13 +2643,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.musicRequestTransition(13);
+            float v = s.musicGetIntensity();
             String r = "1|" + f((double) v);
             emit(143, label, r);
         }
     }
 
-    /* gas_activate [no host] */
+    /* music_request_transition [no host] */
     private static void c144(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2657,13 +2659,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.gasActivate(64L, 81);
-            String r = "1|" + b(v);
+            float v = s.musicRequestTransition(13);
+            String r = "1|" + f((double) v);
             emit(144, label, r);
         }
     }
 
-    /* gas_get [no host] */
+    /* gas_activate [no host] */
     private static void c145(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2673,13 +2675,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            Float v = s.gasGet(24L, "gas_get_attr_name");
-            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
+            boolean v = s.gasActivate(64L, 81);
+            String r = "1|" + b(v);
             emit(145, label, r);
         }
     }
 
-    /* gas_apply [no host] */
+    /* gas_get [no host] */
     private static void c146(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2689,13 +2691,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.gasApply(2L, "gas_apply_attr_name", 52, 2178.75f, 833.75f);
-            String r = "1|" + b(v);
+            Float v = s.gasGet(24L, "gas_get_attr_name");
+            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
             emit(146, label, r);
         }
     }
 
-    /* raycast [no host] */
+    /* gas_apply [no host] */
     private static void c147(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2705,13 +2707,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            JceScript.RaycastResult v = s.raycast(new float[] {2443.375f, 2492.875f, 311.5f}, new float[] {1408.625f, 2363.5f, 295.375f}, 1438.5f);
-            String r = v == null ? "1|" + i(0) : "8|" + i((long) v.entity) + "|" + f((double) v.point[0]) + "|" + f((double) v.point[1]) + "|" + f((double) v.point[2]) + "|" + f((double) v.normal[0]) + "|" + f((double) v.normal[1]) + "|" + f((double) v.normal[2]) + "|" + f((double) v.distance);
+            boolean v = s.gasApply(2L, "gas_apply_attr_name", 52, 2178.75f, 833.75f);
+            String r = "1|" + b(v);
             emit(147, label, r);
         }
     }
 
-    /* raycast_filtered [no host] */
+    /* raycast [no host] */
     private static void c148(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2721,13 +2723,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            JceScript.RaycastFilteredResult v = s.raycastFiltered(new float[] {2080.5f, 1822.5f, 1165.25f}, new float[] {2419.875f, 1239.875f, 2342.375f}, 245.25f, 71, false);
+            JceScript.RaycastResult v = s.raycast(new float[] {2443.375f, 2492.875f, 311.5f}, new float[] {1408.625f, 2363.5f, 295.375f}, 1438.5f);
             String r = v == null ? "1|" + i(0) : "8|" + i((long) v.entity) + "|" + f((double) v.point[0]) + "|" + f((double) v.point[1]) + "|" + f((double) v.point[2]) + "|" + f((double) v.normal[0]) + "|" + f((double) v.normal[1]) + "|" + f((double) v.normal[2]) + "|" + f((double) v.distance);
             emit(148, label, r);
         }
     }
 
-    /* raycast_all [no host] */
+    /* raycast_filtered [no host] */
     private static void c149(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2737,13 +2739,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long[] v = s.raycastAll(new float[] {724.875f, 90.5f, 1886.25f}, new float[] {2205.0f, 1525.625f, 1440.625f}, 2482.0f, 31, false);
-            String r = "1|" + t(v);
+            JceScript.RaycastFilteredResult v = s.raycastFiltered(new float[] {2080.5f, 1822.5f, 1165.25f}, new float[] {2419.875f, 1239.875f, 2342.375f}, 245.25f, 71, false);
+            String r = v == null ? "1|" + i(0) : "8|" + i((long) v.entity) + "|" + f((double) v.point[0]) + "|" + f((double) v.point[1]) + "|" + f((double) v.point[2]) + "|" + f((double) v.normal[0]) + "|" + f((double) v.normal[1]) + "|" + f((double) v.normal[2]) + "|" + f((double) v.distance);
             emit(149, label, r);
         }
     }
 
-    /* apply_impulse [no host] */
+    /* raycast_all [no host] */
     private static void c150(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2753,13 +2755,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.applyImpulse(88L, 583.25f, 1706.75f, 1721.25f);
-            String r = "0|";
+            long[] v = s.raycastAll(new float[] {724.875f, 90.5f, 1886.25f}, new float[] {2205.0f, 1525.625f, 1440.625f}, 2482.0f, 31, false);
+            String r = "1|" + t(v);
             emit(150, label, r);
         }
     }
 
-    /* set_velocity [no host] */
+    /* apply_impulse [no host] */
     private static void c151(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2769,13 +2771,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setVelocity(46L, 2132.75f, 881.375f, 1655.125f);
+            s.applyImpulse(88L, 583.25f, 1706.75f, 1721.25f);
             String r = "0|";
             emit(151, label, r);
         }
     }
 
-    /* anim_set_float [no host] */
+    /* set_velocity [no host] */
     private static void c152(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2785,13 +2787,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.animSetFloat(79L, "anim_set_float_name", 2114.75f);
+            s.setVelocity(46L, 2132.75f, 881.375f, 1655.125f);
             String r = "0|";
             emit(152, label, r);
         }
     }
 
-    /* anim_set_int [no host] */
+    /* anim_set_float [no host] */
     private static void c153(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2801,13 +2803,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.animSetInt(49L, "anim_set_int_name", 78);
+            s.animSetFloat(79L, "anim_set_float_name", 2114.75f);
             String r = "0|";
             emit(153, label, r);
         }
     }
 
-    /* anim_set_bool [no host] */
+    /* anim_set_int [no host] */
     private static void c154(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2817,13 +2819,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.animSetBool(47L, "anim_set_bool_name", false);
+            s.animSetInt(49L, "anim_set_int_name", 78);
             String r = "0|";
             emit(154, label, r);
         }
     }
 
-    /* anim_set_trigger [no host] */
+    /* anim_set_bool [no host] */
     private static void c155(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2833,13 +2835,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.animSetTrigger(23L, "anim_set_trigger_name");
+            s.animSetBool(47L, "anim_set_bool_name", false);
             String r = "0|";
             emit(155, label, r);
         }
     }
 
-    /* is_action_down [no host] */
+    /* anim_set_trigger [no host] */
     private static void c156(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2849,13 +2851,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.isActionDown("is_action_down_name");
-            String r = "1|" + b(v);
+            s.animSetTrigger(23L, "anim_set_trigger_name");
+            String r = "0|";
             emit(156, label, r);
         }
     }
 
-    /* is_action_pressed [no host] */
+    /* is_action_down [no host] */
     private static void c157(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2865,13 +2867,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.isActionPressed("is_action_pressed_name");
+            boolean v = s.isActionDown("is_action_down_name");
             String r = "1|" + b(v);
             emit(157, label, r);
         }
     }
 
-    /* get_axis [no host] */
+    /* is_action_pressed [no host] */
     private static void c158(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2881,13 +2883,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.getAxis("get_axis_name");
-            String r = "1|" + f((double) v);
+            boolean v = s.isActionPressed("is_action_pressed_name");
+            String r = "1|" + b(v);
             emit(158, label, r);
         }
     }
 
-    /* get_pointer_delta [no host] */
+    /* get_axis [no host] */
     private static void c159(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2897,13 +2899,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getPointerDelta();
-            String r = "2|" + f((double) v[0]) + "|" + f((double) v[1]);
+            float v = s.getAxis("get_axis_name");
+            String r = "1|" + f((double) v);
             emit(159, label, r);
         }
     }
 
-    /* get_pointer_position [no host] */
+    /* get_pointer_delta [no host] */
     private static void c160(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2913,13 +2915,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getPointerPosition();
-            String r = "4|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]) + "|" + f((double) v[3]);
+            float[] v = s.getPointerDelta();
+            String r = "2|" + f((double) v[0]) + "|" + f((double) v[1]);
             emit(160, label, r);
         }
     }
 
-    /* get_pointer_wheel [no host] */
+    /* get_pointer_position [no host] */
     private static void c161(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2929,13 +2931,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.getPointerWheel();
-            String r = "1|" + f((double) v);
+            float[] v = s.getPointerPosition();
+            String r = "4|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]) + "|" + f((double) v[3]);
             emit(161, label, r);
         }
     }
 
-    /* is_pointer_down [no host] */
+    /* get_pointer_wheel [no host] */
     private static void c162(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2945,13 +2947,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.isPointerDown(1);
-            String r = "1|" + b(v);
+            float v = s.getPointerWheel();
+            String r = "1|" + f((double) v);
             emit(162, label, r);
         }
     }
 
-    /* get_touch_count [no host] */
+    /* is_pointer_down [no host] */
     private static void c163(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2961,13 +2963,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            int v = s.getTouchCount();
-            String r = "1|" + i((long) v);
+            boolean v = s.isPointerDown(1);
+            String r = "1|" + b(v);
             emit(163, label, r);
         }
     }
 
-    /* get_touch [no host] */
+    /* get_touch_count [no host] */
     private static void c164(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2977,13 +2979,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            JceScript.GetTouchResult v = s.getTouch(1);
-            String r = v == null ? "1|nil" : "4|" + i((long) v.id) + "|" + f((double) v.x) + "|" + f((double) v.y) + "|" + f((double) v.pressure);
+            int v = s.getTouchCount();
+            String r = "1|" + i((long) v);
             emit(164, label, r);
         }
     }
 
-    /* tr [no host] */
+    /* get_touch [no host] */
     private static void c165(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -2993,13 +2995,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            String v = s.tr("tr_key");
-            String r = "1|" + s(v);
+            JceScript.GetTouchResult v = s.getTouch(1);
+            String r = v == null ? "1|nil" : "4|" + i((long) v.id) + "|" + f((double) v.x) + "|" + f((double) v.y) + "|" + f((double) v.pressure);
             emit(165, label, r);
         }
     }
 
-    /* get_locale [no host] */
+    /* tr [no host] */
     private static void c166(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3009,13 +3011,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            String v = s.getLocale();
+            String v = s.tr("tr_key");
             String r = "1|" + s(v);
             emit(166, label, r);
         }
     }
 
-    /* set_locale [no host] */
+    /* get_locale [no host] */
     private static void c167(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3025,13 +3027,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setLocale("set_locale_locale");
-            String r = "0|";
+            String v = s.getLocale();
+            String r = "1|" + s(v);
             emit(167, label, r);
         }
     }
 
-    /* get_velocity [no host] */
+    /* set_locale [no host] */
     private static void c168(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3041,13 +3043,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getVelocity(44L);
-            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
+            s.setLocale("set_locale_locale");
+            String r = "0|";
             emit(168, label, r);
         }
     }
 
-    /* vehicle_set_input [no host] */
+    /* get_velocity [no host] */
     private static void c169(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3057,13 +3059,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.vehicleSetInput(13L, 2206.0f, 2181.875f, 914.5f);
-            String r = "0|";
+            float[] v = s.getVelocity(44L);
+            String r = v == null ? "1|nil" : "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
             emit(169, label, r);
         }
     }
 
-    /* vehicle_get_speed [no host] */
+    /* vehicle_set_input [no host] */
     private static void c170(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3073,13 +3075,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.vehicleGetSpeed(51L);
-            String r = "1|" + f((double) v);
+            s.vehicleSetInput(13L, 2206.0f, 2181.875f, 914.5f);
+            String r = "0|";
             emit(170, label, r);
         }
     }
 
-    /* get_move [no host] */
+    /* vehicle_get_speed [no host] */
     private static void c171(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3089,13 +3091,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.getMove();
-            String r = "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
+            float v = s.vehicleGetSpeed(51L);
+            String r = "1|" + f((double) v);
             emit(171, label, r);
         }
     }
 
-    /* ui_get_slider [no host] */
+    /* get_move [no host] */
     private static void c172(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3105,13 +3107,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            Float v = s.uiGetSlider(74L);
-            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
+            float[] v = s.getMove();
+            String r = "3|" + f((double) v[0]) + "|" + f((double) v[1]) + "|" + f((double) v[2]);
             emit(172, label, r);
         }
     }
 
-    /* ui_set_slider [no host] */
+    /* ui_get_slider [no host] */
     private static void c173(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3121,13 +3123,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetSlider(16L, 2225.5f);
-            String r = "0|";
+            Float v = s.uiGetSlider(74L);
+            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
             emit(173, label, r);
         }
     }
 
-    /* ui_get_progress [no host] */
+    /* ui_set_slider [no host] */
     private static void c174(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3137,13 +3139,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            Float v = s.uiGetProgress(9L);
-            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
+            s.uiSetSlider(16L, 2225.5f);
+            String r = "0|";
             emit(174, label, r);
         }
     }
 
-    /* ui_set_progress [no host] */
+    /* ui_get_progress [no host] */
     private static void c175(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3153,13 +3155,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetProgress(10L, 198.5f);
-            String r = "0|";
+            Float v = s.uiGetProgress(9L);
+            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
             emit(175, label, r);
         }
     }
 
-    /* ui_get_toggle [no host] */
+    /* ui_set_progress [no host] */
     private static void c176(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3169,13 +3171,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            Boolean v = s.uiGetToggle(75L);
-            String r = v == null ? "1|nil" : "1|" + b(v.booleanValue());
+            s.uiSetProgress(10L, 198.5f);
+            String r = "0|";
             emit(176, label, r);
         }
     }
 
-    /* ui_set_toggle [no host] */
+    /* ui_get_toggle [no host] */
     private static void c177(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3185,13 +3187,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetToggle(17L, false);
-            String r = "0|";
+            Boolean v = s.uiGetToggle(75L);
+            String r = v == null ? "1|nil" : "1|" + b(v.booleanValue());
             emit(177, label, r);
         }
     }
 
-    /* ui_set_text [no host] */
+    /* ui_set_toggle [no host] */
     private static void c178(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3201,13 +3203,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetText(84L, "ui_set_text_txt");
+            s.uiSetToggle(17L, false);
             String r = "0|";
             emit(178, label, r);
         }
     }
 
-    /* send_message [no host] */
+    /* ui_set_text [no host] */
     private static void c179(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3217,13 +3219,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.sendMessage(8L, "send_message_msg", 776.875, "send_message_str_arg");
+            s.uiSetText(84L, "ui_set_text_txt");
             String r = "0|";
             emit(179, label, r);
         }
     }
 
-    /* broadcast [no host] */
+    /* send_message [no host] */
     private static void c180(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3233,13 +3235,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.broadcast("broadcast_msg", 1055.625, "broadcast_str_arg");
+            s.sendMessage(8L, "send_message_msg", 776.875, "send_message_str_arg");
             String r = "0|";
             emit(180, label, r);
         }
     }
 
-    /* has_component [no host] */
+    /* broadcast [no host] */
     private static void c181(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3249,13 +3251,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.hasComponent(40L, "has_component_comp_name");
-            String r = "1|" + b(v);
+            s.broadcast("broadcast_msg", 1055.625, "broadcast_str_arg");
+            String r = "0|";
             emit(181, label, r);
         }
     }
 
-    /* is_component_enabled [no host] */
+    /* has_component [no host] */
     private static void c182(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3265,13 +3267,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.isComponentEnabled(41L, "is_component_enabled_comp_name");
+            boolean v = s.hasComponent(40L, "has_component_comp_name");
             String r = "1|" + b(v);
             emit(182, label, r);
         }
     }
 
-    /* set_component_enabled [no host] */
+    /* is_component_enabled [no host] */
     private static void c183(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3281,13 +3283,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.setComponentEnabled(48L, "set_component_enabled_comp_name", true);
-            String r = "0|";
+            boolean v = s.isComponentEnabled(41L, "is_component_enabled_comp_name");
+            String r = "1|" + b(v);
             emit(183, label, r);
         }
     }
 
-    /* net_is_server [no host] */
+    /* set_component_enabled [no host] */
     private static void c184(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3297,13 +3299,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.netIsServer();
-            String r = "1|" + b(v);
+            s.setComponentEnabled(48L, "set_component_enabled_comp_name", true);
+            String r = "0|";
             emit(184, label, r);
         }
     }
 
-    /* net_is_client [no host] */
+    /* net_is_server [no host] */
     private static void c185(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3313,13 +3315,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.netIsClient();
+            boolean v = s.netIsServer();
             String r = "1|" + b(v);
             emit(185, label, r);
         }
     }
 
-    /* net_spawn [no host] */
+    /* net_is_client [no host] */
     private static void c186(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3329,13 +3331,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long v = s.netSpawn("net_spawn_prefab_path", 301.375f, 1501.625f, 1861.125f);
-            String r = "1|" + i((long) v);
+            boolean v = s.netIsClient();
+            String r = "1|" + b(v);
             emit(186, label, r);
         }
     }
 
-    /* rpc_send [no host] */
+    /* net_spawn [no host] */
     private static void c187(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3345,13 +3347,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.rpcSend(23L, "rpc_send_event", 39, "rpc_send_payload");
-            String r = "1|" + b(v);
+            long v = s.netSpawn("net_spawn_prefab_path", 301.375f, 1501.625f, 1861.125f);
+            String r = "1|" + i((long) v);
             emit(187, label, r);
         }
     }
 
-    /* particle_burst [no host] */
+    /* rpc_send [no host] */
     private static void c188(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3361,13 +3363,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.particleBurst(36L, 53);
-            String r = "0|";
+            boolean v = s.rpcSend(23L, "rpc_send_event", 39, "rpc_send_payload");
+            String r = "1|" + b(v);
             emit(188, label, r);
         }
     }
 
-    /* particle_set_emitting [no host] */
+    /* particle_burst [no host] */
     private static void c189(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3377,13 +3379,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.particleSetEmitting(41L, true);
+            s.particleBurst(36L, 53);
             String r = "0|";
             emit(189, label, r);
         }
     }
 
-    /* particle_set_color [no host] */
+    /* particle_set_emitting [no host] */
     private static void c190(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3393,13 +3395,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.particleSetColor(76L, 1588.75f, 2102.125f, 1560.25f);
+            s.particleSetEmitting(41L, true);
             String r = "0|";
             emit(190, label, r);
         }
     }
 
-    /* find_by_name [no host] */
+    /* particle_set_color [no host] */
     private static void c191(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3409,14 +3411,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            JceScript.FindByNameResult v = s.findByName("find_by_name_name");
-            String first = v.first == null ? "nil" : i(v.first.longValue());
-            String r = "2|" + first + "|" + i(v.count);
+            s.particleSetColor(76L, 1588.75f, 2102.125f, 1560.25f);
+            String r = "0|";
             emit(191, label, r);
         }
     }
 
-    /* find_by_prefix [no host] */
+    /* find_by_name [no host] */
     private static void c192(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3426,13 +3427,14 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long[] v = s.findByPrefix("find_by_prefix_prefix");
-            String r = "1|" + t(v);
+            JceScript.FindByNameResult v = s.findByName("find_by_name_name");
+            String first = v.first == null ? "nil" : i(v.first.longValue());
+            String r = "2|" + first + "|" + i(v.count);
             emit(192, label, r);
         }
     }
 
-    /* comp_get [no host] */
+    /* find_by_prefix [no host] */
     private static void c193(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3442,13 +3444,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            String v = s.compGet(26L, "comp_get_type");
-            String r = v == null ? "1|nil" : "1|" + s(v);
+            long[] v = s.findByPrefix("find_by_prefix_prefix");
+            String r = "1|" + t(v);
             emit(193, label, r);
         }
     }
 
-    /* comp_set [no host] */
+    /* comp_get [no host] */
     private static void c194(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3458,13 +3460,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.compSet(97L, "comp_set_type", "comp_set_json");
-            String r = "1|" + b(v);
+            String v = s.compGet(26L, "comp_get_type");
+            String r = v == null ? "1|nil" : "1|" + s(v);
             emit(194, label, r);
         }
     }
 
-    /* render_get [no host] */
+    /* comp_set [no host] */
     private static void c195(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3474,13 +3476,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            String v = s.renderGet();
-            String r = v == null ? "1|nil" : "1|" + s(v);
+            boolean v = s.compSet(97L, "comp_set_type", "comp_set_json");
+            String r = "1|" + b(v);
             emit(195, label, r);
         }
     }
 
-    /* render_set [no host] */
+    /* render_get [no host] */
     private static void c196(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3490,13 +3492,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.renderSet("render_set_json");
-            String r = "1|" + b(v);
+            String v = s.renderGet();
+            String r = v == null ? "1|nil" : "1|" + s(v);
             emit(196, label, r);
         }
     }
 
-    /* audio_set_volume [no host] */
+    /* render_set [no host] */
     private static void c197(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3506,13 +3508,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.audioSetVolume(55L, 966.25f);
-            String r = "0|";
+            boolean v = s.renderSet("render_set_json");
+            String r = "1|" + b(v);
             emit(197, label, r);
         }
     }
 
-    /* ui_get_dropdown [no host] */
+    /* audio_set_volume [no host] */
     private static void c198(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3522,13 +3524,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            Integer v = s.uiGetDropdown(37L);
-            String r = v == null ? "1|nil" : "1|" + i(v.longValue());
+            s.audioSetVolume(55L, 966.25f);
+            String r = "0|";
             emit(198, label, r);
         }
     }
 
-    /* ui_set_dropdown [no host] */
+    /* ui_get_dropdown [no host] */
     private static void c199(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3538,13 +3540,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetDropdown(39L, 22);
-            String r = "0|";
+            Integer v = s.uiGetDropdown(37L);
+            String r = v == null ? "1|nil" : "1|" + i(v.longValue());
             emit(199, label, r);
         }
     }
 
-    /* ui_get_input_text [no host] */
+    /* ui_set_dropdown [no host] */
     private static void c200(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3554,13 +3556,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            String v = s.uiGetInputText(47L);
-            String r = "1|" + s(v);
+            s.uiSetDropdown(39L, 22);
+            String r = "0|";
             emit(200, label, r);
         }
     }
 
-    /* ui_set_input_text [no host] */
+    /* ui_get_input_text [no host] */
     private static void c201(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3570,13 +3572,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetInputText(41L, "ui_set_input_text_text");
-            String r = "0|";
+            String v = s.uiGetInputText(47L);
+            String r = "1|" + s(v);
             emit(201, label, r);
         }
     }
 
-    /* ui_get_scroll [no host] */
+    /* ui_set_input_text [no host] */
     private static void c202(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3586,13 +3588,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float[] v = s.uiGetScroll(70L);
-            String r = v == null ? "1|nil" : "2|" + f((double) v[0]) + "|" + f((double) v[1]);
+            s.uiSetInputText(41L, "ui_set_input_text_text");
+            String r = "0|";
             emit(202, label, r);
         }
     }
 
-    /* ui_set_scroll [no host] */
+    /* ui_get_scroll [no host] */
     private static void c203(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3602,13 +3604,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.uiSetScroll(18L, 728.375f, 1564.75f);
-            String r = "0|";
+            float[] v = s.uiGetScroll(70L);
+            String r = v == null ? "1|nil" : "2|" + f((double) v[0]) + "|" + f((double) v[1]);
             emit(203, label, r);
         }
     }
 
-    /* world_get_hour [no host] */
+    /* ui_set_scroll [no host] */
     private static void c204(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3618,13 +3620,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.worldGetHour();
-            String r = "1|" + f((double) v);
+            s.uiSetScroll(18L, 728.375f, 1564.75f);
+            String r = "0|";
             emit(204, label, r);
         }
     }
 
-    /* world_set_hour [no host] */
+    /* world_get_hour [no host] */
     private static void c205(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3634,13 +3636,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            s.worldSetHour(1754.875f);
-            String r = "0|";
+            float v = s.worldGetHour();
+            String r = "1|" + f((double) v);
             emit(205, label, r);
         }
     }
 
-    /* world_is_daytime [no host] */
+    /* world_set_hour [no host] */
     private static void c206(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3650,13 +3652,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.worldIsDaytime();
-            String r = "1|" + b(v);
+            s.worldSetHour(1754.875f);
+            String r = "0|";
             emit(206, label, r);
         }
     }
 
-    /* world_get_weather [no host] */
+    /* world_is_daytime [no host] */
     private static void c207(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3666,13 +3668,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            int v = s.worldGetWeather();
-            String r = "1|" + i((long) v);
+            boolean v = s.worldIsDaytime();
+            String r = "1|" + b(v);
             emit(207, label, r);
         }
     }
 
-    /* world_get_weather_intensity [no host] */
+    /* world_get_weather [no host] */
     private static void c208(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3682,13 +3684,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.worldGetWeatherIntensity();
-            String r = "1|" + f((double) v);
+            int v = s.worldGetWeather();
+            String r = "1|" + i((long) v);
             emit(208, label, r);
         }
     }
 
-    /* world_get_wind_speed [no host] */
+    /* world_get_weather_intensity [no host] */
     private static void c209(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3698,13 +3700,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            float v = s.worldGetWindSpeed();
+            float v = s.worldGetWeatherIntensity();
             String r = "1|" + f((double) v);
             emit(209, label, r);
         }
     }
 
-    /* request_scene [no host] */
+    /* world_get_wind_speed [no host] */
     private static void c210(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3714,13 +3716,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.requestScene("request_scene_scene_path");
-            String r = "1|" + b(v);
+            float v = s.worldGetWindSpeed();
+            String r = "1|" + f((double) v);
             emit(210, label, r);
         }
     }
 
-    /* is_transitioning [no host] */
+    /* request_scene [no host] */
     private static void c211(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3730,13 +3732,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.isTransitioning();
+            boolean v = s.requestScene("request_scene_scene_path");
             String r = "1|" + b(v);
             emit(211, label, r);
         }
     }
 
-    /* audio_play [no host] */
+    /* is_transitioning [no host] */
     private static void c212(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3746,13 +3748,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.audioPlay(72L);
+            boolean v = s.isTransitioning();
             String r = "1|" + b(v);
             emit(212, label, r);
         }
     }
 
-    /* audio_stop [no host] */
+    /* audio_play [no host] */
     private static void c213(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3762,13 +3764,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.audioStop(79L);
+            boolean v = s.audioPlay(72L);
             String r = "1|" + b(v);
             emit(213, label, r);
         }
     }
 
-    /* audio_is_playing [no host] */
+    /* audio_stop [no host] */
     private static void c214(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3778,13 +3780,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.audioIsPlaying(86L);
+            boolean v = s.audioStop(79L);
             String r = "1|" + b(v);
             emit(214, label, r);
         }
     }
 
-    /* save_game [no host] */
+    /* audio_is_playing [no host] */
     private static void c215(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3794,13 +3796,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.saveGame("save_game_path");
+            boolean v = s.audioIsPlaying(86L);
             String r = "1|" + b(v);
             emit(215, label, r);
         }
     }
 
-    /* load_game [no host] */
+    /* save_game [no host] */
     private static void c216(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3810,13 +3812,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.loadGame("load_game_path");
+            boolean v = s.saveGame("save_game_path");
             String r = "1|" + b(v);
             emit(216, label, r);
         }
     }
 
-    /* overlap_sphere [no host] */
+    /* load_game [no host] */
     private static void c217(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3826,13 +3828,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long[] v = s.overlapSphere(1035.5f, 207.625f, 1063.125f, 2067.5f, 32);
-            String r = "1|" + t(v);
+            boolean v = s.loadGame("load_game_path");
+            String r = "1|" + b(v);
             emit(217, label, r);
         }
     }
 
-    /* overlap_box [no host] */
+    /* overlap_sphere [no host] */
     private static void c218(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3842,13 +3844,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            long[] v = s.overlapBox(1952.625f, 352.875f, 352.875f, 2421.625f, 209.5f, 1736.125f, 38);
+            long[] v = s.overlapSphere(1035.5f, 207.625f, 1063.125f, 2067.5f, 32);
             String r = "1|" + t(v);
             emit(218, label, r);
         }
     }
 
-    /* get_param [no host] */
+    /* overlap_box [no host] */
     private static void c219(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3858,13 +3860,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            JceScript.GetParamResult v = s.getParam(85L, "get_param_name");
-            String r = v == null ? "1|nil" : "3|" + i((long) v.outKind) + "|" + f((double) v.outNumber) + "|" + i((long) v.outEntity);
+            long[] v = s.overlapBox(1952.625f, 352.875f, 352.875f, 2421.625f, 209.5f, 1736.125f, 38);
+            String r = "1|" + t(v);
             emit(219, label, r);
         }
     }
 
-    /* get_param_text [no host] */
+    /* get_param [no host] */
     private static void c220(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3874,13 +3876,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            String v = s.getParamText(86L, "get_param_text_name");
-            String r = "1|" + s(v);
+            JceScript.GetParamResult v = s.getParam(85L, "get_param_name");
+            String r = v == null ? "1|nil" : "3|" + i((long) v.outKind) + "|" + f((double) v.outNumber) + "|" + i((long) v.outEntity);
             emit(220, label, r);
         }
     }
 
-    /* curve_eval [no host] */
+    /* get_param_text [no host] */
     private static void c221(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3890,13 +3892,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            Double v = s.curveEval("curve_eval_path", "curve_eval_channel", 2253.625);
-            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
+            String v = s.getParamText(86L, "get_param_text_name");
+            String r = "1|" + s(v);
             emit(221, label, r);
         }
     }
 
-    /* vcam_activate [no host] */
+    /* curve_eval [no host] */
     private static void c222(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3906,13 +3908,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            int v = s.vcamActivate("vcam_activate_name");
-            String r = "1|" + i((long) v);
+            Double v = s.curveEval("curve_eval_path", "curve_eval_channel", 2253.625);
+            String r = v == null ? "1|nil" : "1|" + f(v.doubleValue());
             emit(222, label, r);
         }
     }
 
-    /* set_cursor [no host] */
+    /* vcam_activate [no host] */
     private static void c223(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3922,13 +3924,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.setCursor("set_cursor_asset_path", 43, 93);
-            String r = "1|" + b(v);
+            int v = s.vcamActivate("vcam_activate_name");
+            String r = "1|" + i((long) v);
             emit(223, label, r);
         }
     }
 
-    /* request_quit [no host] */
+    /* set_cursor [no host] */
     private static void c224(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3938,13 +3940,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.requestQuit();
+            boolean v = s.setCursor("set_cursor_asset_path", 43, 93);
             String r = "1|" + b(v);
             emit(224, label, r);
         }
     }
 
-    /* stat_available [no host] */
+    /* request_quit [no host] */
     private static void c225(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3954,13 +3956,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.statAvailable();
+            boolean v = s.requestQuit();
             String r = "1|" + b(v);
             emit(225, label, r);
         }
     }
 
-    /* stat_set [no host] */
+    /* stat_available [no host] */
     private static void c226(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3970,13 +3972,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            boolean v = s.statSet("stat_set_id", 669.25);
+            boolean v = s.statAvailable();
             String r = "1|" + b(v);
             emit(226, label, r);
         }
     }
 
-    /* stat_get [no host] */
+    /* stat_set [no host] */
     private static void c227(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -3986,13 +3988,13 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
-            int v = s.statGet("stat_get_id", 1784.25);
-            String r = "1|" + i((long) v);
+            boolean v = s.statSet("stat_set_id", 669.25);
+            String r = "1|" + b(v);
             emit(227, label, r);
         }
     }
 
-    /* stat_flush [no host] */
+    /* stat_get [no host] */
     private static void c228(String label) {
         JceDiffHost.reset();
         try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
@@ -4002,9 +4004,41 @@ public final class JceDifferential {
                 line("R VMFAIL");
                 return;
             }
+            int v = s.statGet("stat_get_id", 1784.25);
+            String r = "1|" + i((long) v);
+            emit(228, label, r);
+        }
+    }
+
+    /* stat_flush [no host] */
+    private static void c229(String label) {
+        JceDiffHost.reset();
+        try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
+                JceDiffHost.hostSize())) {
+            if (s == null) {
+                line("CASE 229 " + label);
+                line("R VMFAIL");
+                return;
+            }
             boolean v = s.statFlush();
             String r = "1|" + b(v);
-            emit(228, label, r);
+            emit(229, label, r);
+        }
+    }
+
+    /* get_viewport_size [no host] */
+    private static void c230(String label) {
+        JceDiffHost.reset();
+        try (JceScript s = JceScript.open(JceDiffHost.partialHostPointer(),
+                JceDiffHost.hostSize())) {
+            if (s == null) {
+                line("CASE 230 " + label);
+                line("R VMFAIL");
+                return;
+            }
+            float[] v = s.getViewportSize();
+            String r = "2|" + f((double) v[0]) + "|" + f((double) v[1]);
+            emit(230, label, r);
         }
     }
 

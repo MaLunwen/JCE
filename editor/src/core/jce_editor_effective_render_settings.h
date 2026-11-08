@@ -46,9 +46,14 @@
  * stating once and testing directly rather than inferring from a build. */
 int jce_editor_quality_msaa(int level_anti_aliasing, int project_default_msaa);
 
+/* Pass the requested project's source/cooked asset roots. Null roots preserve
+ * legacy conventional defaults; ISOLATED always consumes its mounted VFS key. */
 bool jce_editor_effective_render_settings(bool isolated,
                                           const char *project_root,
                                           JceRenderSettings *out,
-                                          std::string *out_source_path);
+                                          std::string *out_source_path,
+                                          const char *source_assets = nullptr,
+                                          const char *cooked_assets = nullptr,
+                                          const char *loose_asset_root = nullptr);
 
 #endif /* JCE_EDITOR_EFFECTIVE_RENDER_SETTINGS_H */

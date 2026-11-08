@@ -15,10 +15,16 @@
  */
 
 #include "jce_build_manager.h"
+#include "jce_build_log.h"
+#include "jce_project_build_target.h"
+#include "jce_build_tool_paths.h"
+#include "jce_build_tool_probe.h"
+#include "jce_build_process_outcome.h"
 
 #include "jce_binary_embed.h"
 #include "jce_build_asset_policy.h"
 #include "jce_build_stage_runtime.h"
+#include "jce_build_package.h"
 #include "jce_editor_project.h"
 #include "jce_dist_content_graph.h"
 #include "jce_dist_audit.h"
@@ -66,7 +72,6 @@ extern char s_current_project_root[512];
 namespace {
 
 constexpr int kGracefulStopMs   = 5000;
-constexpr int kToolProbeTimeoutMs = 2000;
 
 #if JCE_PLATFORM_WINDOWS
 constexpr char PATH_SEP_CHR_LOCAL = '\\';
@@ -89,6 +94,7 @@ struct Build {
     std::string   package_path;
     std::string   asset_bom_path;
     std::string   dist_audit_path;
+    JceBuildLog   log;
     std::string   stdout_partial;
     std::string   stderr_partial;
     uint64_t      stop_deadline_ms = 0;
@@ -127,6 +133,7 @@ struct FinishPlan {
     std::string exe_name;
     bool        stage = false;     /* package staging (replaces package-game) */
     std::string out_dir;
+    std::string package_reports_dir;
     std::string cooked_src;        /* <project>/<cooked_rel> */
     std::string cooked_rel;        /* relative, for the staged layout */
     std::string asset_bom_src;     /* generated project asset BOM */
@@ -173,14 +180,8 @@ void clear_build_outputs()
  * capture entries here and replay them on the main thread once the  *
  * structured task completes.                                       *
  * ---------------------------------------------------------------- */
-struct DeferredLogEntry {
-    JceConsoleLevel level;
-    std::string     text;
-};
-struct WorkerLogSink {
-    std::vector<DeferredLogEntry> entries;
-    std::string                   last_error;
-};
+using WorkerLogSink = JceBuildWorkerLog<JceConsoleLevel>;
+using DeferredLogEntry = WorkerLogSink::Entry;
 thread_local WorkerLogSink *t_log_sink = nullptr;
 
 /* ---------------------------------------------------------------- *
@@ -215,6 +216,7 @@ struct PendingProjectBuild {
     /* Context needed to build the cmake queue + finish plan on the main
      * thread once the cook succeeds. */
     std::string build_dir, output_dir, archive_dir, build_type, cmake_dir;
+    std::string cmake_exe, ninja_exe;
     std::string target, label, exe_name, platform_tag;
     bool        use_cmake_fresh = false;
 #if JCE_PLATFORM_WINDOWS
@@ -251,10 +253,55 @@ ToolCache g_tools;
 void log_line(JceConsoleLevel level, const std::string &line)
 {
     if (t_log_sink) {
-        t_log_sink->entries.push_back({level, line});
+        t_log_sink->append(level, line);
         return;
     }
+    g_build.log.append_line(line);
     jce_editor_console_log_level(level, "%s", line.c_str());
+}
+
+/* Pipe origin does not determine severity: Ninja relays compiler failures on
+ * stdout, while CMake writes warnings and progress to stderr. Recognize common
+ * diagnostic forms; unknown output stays informational. Only the actual tool
+ * completion decides whether the Build succeeds. Keep the observed body intact. */
+JceConsoleLevel build_output_level(const std::string &line)
+{
+    std::string lower = line;
+    for (char &c : lower) if (c >= 'A' && c <= 'Z') c = char(c + ('a' - 'A'));
+    const size_t first = lower.find_first_not_of(" \t");
+    if (first == std::string::npos) return JCE_CONSOLE_INFO;
+    if (lower.compare(first, 7, "failed:") == 0 ||
+        lower.compare(first, 21, "ninja: build stopped:") == 0 ||
+        lower.compare(first, 11, "cmake error") == 0)
+        return JCE_CONSOLE_ERROR;
+    for (size_t pos = first; pos < lower.size(); ++pos) {
+        if (pos && lower[pos - 1] != ' ' && lower[pos - 1] != '\t' &&
+            lower[pos - 1] != ':' && lower[pos - 1] != ')' && lower[pos - 1] != ']') continue;
+        const auto token = [&](const char *word) {
+            const size_t len = std::strlen(word);
+            if (lower.compare(pos, len, word) != 0) return false;
+            const size_t end = pos + len;
+            return end == lower.size() || lower[end] == ':' || lower[end] == ' ' ||
+                   lower[end] == '\t' || lower[end] == '(';
+        };
+        if (token("warning")) return JCE_CONSOLE_WARNING;
+        if (token("fatal error")) return JCE_CONSOLE_ERROR;
+        if (!token("error")) continue;
+        size_t end = pos + 5;
+        if (end < lower.size() && lower[end] == ':') return JCE_CONSOLE_ERROR;
+        while (end < lower.size() && (lower[end] == ' ' || lower[end] == '\t')) ++end;
+        const size_t code = end;
+        while (end < lower.size() && lower[end] >= 'a' && lower[end] <= 'z') ++end;
+        if (end > code && end < lower.size() && lower[end] >= '0' && lower[end] <= '9')
+            return JCE_CONSOLE_ERROR; // MSVC C/LNK, MSBuild MSB and similar codes.
+    }
+    return JCE_CONSOLE_INFO;
+}
+
+void log_tool_output(const std::string &line, JceConsoleLevel level)
+{
+    const char *origin = level == JCE_CONSOLE_ERROR ? "[build] [stderr] " : "[build] ";
+    log_line(build_output_level(line), origin + line);
 }
 
 void emit_lines(std::string &partial, const char *data, size_t len,
@@ -265,11 +312,17 @@ void emit_lines(std::string &partial, const char *data, size_t len,
         if (c == '\r') continue;
         if (c == '\n') {
             if (!partial.empty()) {
-                log_line(level, "[build] " + partial);
+                log_tool_output(partial, level);
                 partial.clear();
             }
         } else {
             partial.push_back(c);
+            if (partial.size() == JCE_BUILD_LOG_CAPACITY) {
+                g_build.log.incomplete = true;
+                const char *origin = level == JCE_CONSOLE_ERROR ? "[build] [stderr] " : "[build] ";
+                log_line(JCE_CONSOLE_WARNING, std::string(origin) + "partial line exceeded transcript capacity: " + partial);
+                partial.clear();
+            }
         }
     }
 }
@@ -293,7 +346,8 @@ void drain_pipes()
 void flush_partial(std::string &partial, JceConsoleLevel level)
 {
     if (!partial.empty()) {
-        log_line(level, "[build] " + partial);
+        g_build.log.incomplete = true; // EOF without a complete observed line.
+        log_tool_output(partial, level);
         partial.clear();
     }
 }
@@ -314,28 +368,32 @@ void set_error(const std::string &msg)
 {
     if (t_log_sink) {
         t_log_sink->last_error = msg;
-        t_log_sink->entries.push_back({JCE_CONSOLE_ERROR, "[build] " + msg});
+        t_log_sink->append(JCE_CONSOLE_ERROR, "[build] " + msg);
         return;
     }
     g_build.last_error = msg;
     log_line(JCE_CONSOLE_ERROR, "[build] " + msg);
 }
 
-/* Resolve a bare exe name like "conan" / "cmake" to a full path via the
- * platform PATH search wrapper.  Needed on Windows because SDL3 spawn +
- * a custom working_directory can confuse CreateProcess's implicit PATH
- * lookup.  On POSIX execvp handles it and the wrapper returns false →
- * we leave exe unchanged. */
-static bool resolve_exe_on_path(const char *exe, std::string &out)
+/* Refusal belongs to the new request only after the current owner is idle.
+ * Busy callers receive a diagnostic without changing in-flight status/log identity. */
+bool begin_build_request(const char *label, const char *busy_error)
 {
-    char buf[1024];
-    if (jce_host_resolve_executable(exe, buf, sizeof(buf))) {
-        out = buf;
-        /* Suppress the trivial "already a path" passthrough so callers
-         * can detect "real resolution happened" with strcmp if needed. */
-        return out != exe;
+    if (g_build.process || asset_prep_active()) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR, "[build] %s", busy_error);
+        return false;
     }
-    return false;
+    reset_pipeline();
+    clear_build_outputs();
+    g_build.log.reset();
+    g_build.stdout_partial.clear();
+    g_build.stderr_partial.clear();
+    g_build.state = JCE_BUILD_FAILED;
+    g_build.stage = JCE_BUILD_STAGE_NONE;
+    g_build.exit_code = -1;
+    g_build.preset = label ? label : "";
+    g_build.last_error.clear();
+    return true;
 }
 
 bool spawn_tool(JceBuildStage stage, const char *exe,
@@ -351,10 +409,13 @@ bool spawn_tool(JceBuildStage stage, const char *exe,
         return false;
     }
 
-    std::string resolved;
-    const char *exe_for_spawn = exe;
-    if (resolve_exe_on_path(exe, resolved))
-        exe_for_spawn = resolved.c_str();
+    const std::string resolved = jce_build_tool_executable(exe);
+    if (resolved.empty()) {
+        set_error(std::string("build tool not found: ") + exe);
+        g_build.state = JCE_BUILD_FAILED;
+        return false;
+    }
+    const char *exe_for_spawn = resolved.c_str();
 
     JceProcessConfig pcfg{};
     pcfg.executable_path   = exe_for_spawn;
@@ -441,6 +502,9 @@ bool run_dist_audit(const std::string &exe, const char *package_dir)
     input.require_secure = true;
 #if JCE_PLATFORM_WINDOWS
     input.require_gui = true;
+    input.expected_pe_machine = g_pending.arch == "i686" ? 0x014cu :
+        g_pending.arch == "x86_64" ? 0x8664u :
+        g_pending.arch == "aarch64" ? 0xaa64u : UINT16_MAX;
 #endif
     input.require_single_file = package_dir && package_dir[0];
     input.require_graph_parity = true;
@@ -531,9 +595,15 @@ void export_project_runtime_configs(const std::string &project_root,
              * cooked tree -- and the file it writes IS the viewport's own
              * fallback source, so it overwrote them rather than merely
              * failing to carry them. */
-            if (jce_editor_effective_render_settings(false, proj_root.c_str(),
-                                                     &rs, &seed) &&
-                !seed.empty())
+            /* Resolve the manifest for the requested build root; the active
+             * editor project may be a different project. */
+            JceProject *settings_project = jce_project_load(proj_root.c_str());
+            const bool settings_loaded = jce_editor_effective_render_settings(
+                false, proj_root.c_str(), &rs, &seed,
+                settings_project ? settings_project->source_assets : nullptr,
+                settings_project ? settings_project->cooked_assets : nullptr);
+            jce_project_free(settings_project);
+            if (settings_loaded && !seed.empty())
                 log_line(JCE_CONSOLE_INFO,
                          "[build] render settings seeded from " + seed);
             else if (seed.empty())
@@ -647,8 +717,31 @@ void run_finish_plan()
     }
 
     const std::string &out = g_finish.out_dir;
-    if (jce_fs_host_exists_dir(out.c_str()))
-        jce_fs_host_remove_recursive(out.c_str());
+    std::string package_error;
+    if (g_finish.dist) {
+        const auto audit = [](const std::string &artifact,
+                              const char *directory, void *) {
+            return run_dist_audit(artifact, directory);
+        };
+        if (!jce_build_package_publish_dist(exe, g_finish.package_reports_dir,
+                out, g_finish.exe_name, audit, nullptr, &package_error)) {
+            if (g_build.state != JCE_BUILD_FAILED) set_error(package_error);
+            g_build.state = JCE_BUILD_FAILED;
+            return;
+        }
+        g_build.package_path = out;
+        log_line(JCE_CONSOLE_INFO, "[build] dist package published at: " + out);
+        return;
+    }
+
+    /* Legacy authoring packages carry multiple files. Reuse is refused until
+     * they have a transaction of their own; no old directory is deleted. */
+    if (!jce_build_package_check_directory(out, g_finish.exe_name, false,
+                                            &package_error)) {
+        g_build.state = JCE_BUILD_FAILED;
+        set_error(package_error);
+        return;
+    }
     if (!jce_fs_host_create_directory(out.c_str())) {
         g_build.state = JCE_BUILD_FAILED;
         set_error("package: cannot create output dir: " + out);
@@ -660,35 +753,16 @@ void run_finish_plan()
         set_error("package: failed to copy exe to " + dst_exe);
         return;
     }
-    g_build.package_path = out;
-
-    /* The scripting runtime the exe imports.  Done for dist packages too: a
-     * one-file public package still cannot start without the shared
-     * libraries its own executable links.  A failure here fails the BUILD,
-     * because a package that cannot start is worse than one never made.
-     * See jce_build_stage_runtime.h for what travels and why. */
-    {
-        std::string stage_err;
-        const int staged =
-            jce_build_stage_runtime_payload(exe, out, &stage_err);
-        if (staged < 0) {
-            g_build.state = JCE_BUILD_FAILED;
-            set_error(stage_err);
-            return;
-        }
-        if (staged > 0)
-            log_line(JCE_CONSOLE_INFO,
-                     "[build] package: staged " + std::to_string(staged) +
-                     " scripting runtime entry/entries beside the exe");
-    }
-
-    /* Dist is a one-file public package.  Authoring configs, symbols, BOMs,
-     * and audit data remain under the private build/reports tree. */
-    if (g_finish.dist) {
-        if (run_dist_audit(dst_exe, out.c_str()))
-            log_line(JCE_CONSOLE_INFO, "[build] dist package staged at: " + out);
+    std::string stage_error;
+    const int staged = jce_build_stage_runtime_payload(exe, out, &stage_error);
+    if (staged < 0) {
+        g_build.state = JCE_BUILD_FAILED;
+        set_error(stage_error);
         return;
     }
+    if (staged > 0)
+        log_line(JCE_CONSOLE_INFO, "[build] authoring package: staged " +
+                 std::to_string(staged) + " runtime entry/entries");
 
     /* Optional authored runtime config, staged beside the exe.  Copied only
      * when the project authored it; silent when absent (the runtime seeds
@@ -774,7 +848,8 @@ void run_finish_plan()
         }
     }
 
-    log_line(JCE_CONSOLE_INFO, "[build] package staged at: " + out);
+    g_build.package_path = out;
+    log_line(JCE_CONSOLE_INFO, "[build] authoring package staged at: " + out);
 }
 
 void poll_state()
@@ -796,6 +871,11 @@ void poll_state()
     int exit_code = 0;
     if (!jce_process_poll_exit(g_build.process, &exit_code)) return;
 
+    /* release_process clears stopping; retain the user's terminal request
+     * before cleanup or any next-step/finish admission. */
+    const bool cancelled = g_build.stopping;
+    const auto completion = jce_build_process_outcome(cancelled, exit_code);
+    JceBuildProcessCompletionTrace completion_trace(g_build.state, cancelled, exit_code);
     drain_pipes();
     g_build.exit_code = exit_code;
 
@@ -803,7 +883,7 @@ void poll_state()
      * queued (and we are not stopping), launch the next one and stay
      * RUNNING.  This drives multi-process native builds (POSIX
      * configure -> compile) through the same poll loop. */
-    if (exit_code == 0 && !g_build.stopping && g_queue_pos < g_queue.size()) {
+    if (completion.state == JCE_BUILD_SUCCEEDED && g_queue_pos < g_queue.size()) {
         log_line(JCE_CONSOLE_INFO, "[build] step finished OK");
         QueuedStep step = g_queue[g_queue_pos++];
         release_process();   /* frees handle, keeps state RUNNING */
@@ -816,16 +896,19 @@ void poll_state()
         return;
     }
 
-    g_build.state = (exit_code == 0) ? JCE_BUILD_SUCCEEDED
-                                     : JCE_BUILD_FAILED;
-    if (exit_code != 0) {
+    g_build.state = completion.state;
+    if (cancelled) {
+        g_build.last_error = "build cancelled (tool exit code " + std::to_string(exit_code) + ")";
+    } else if (exit_code != 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "tool exited with code %d", exit_code);
         g_build.last_error = buf;
     }
     release_process();
 
-    if (exit_code == 0)
+    if (cancelled)
+        log_line(JCE_CONSOLE_WARNING, "[build] " + g_build.last_error);
+    else if (exit_code == 0)
         log_line(JCE_CONSOLE_INFO, "[build] step finished OK");
     else
         log_line(JCE_CONSOLE_ERROR,
@@ -951,16 +1034,12 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
 {
     LOG_INFO("build", "run_script: enter cfg=%p", (const void*)cfg);
     jce_log_flush();
+    if (!begin_build_request(cfg && cfg->label ? cfg->label : "build-script",
+            "run_script: a build is already running")) return false;
     if (!cfg || !cfg->script_path || !cfg->script_path[0]) {
         set_error("run_script: script_path is required");
         return false;
     }
-    if (g_build.process || asset_prep_active()) {
-        set_error("run_script: a build is already running");
-        return false;
-    }
-    reset_pipeline();   /* drop any stale native-pipeline queue/finish plan */
-    clear_build_outputs();
 
     const char *wd = (cfg->working_dir && cfg->working_dir[0])
                          ? cfg->working_dir
@@ -1121,6 +1200,11 @@ bool jce_build_manager_is_running(void)
     return g_build.state == JCE_BUILD_RUNNING || g_pending.active;
 }
 
+void jce_build_manager_get_log(JceBuildLogView *out)
+{
+    if (out) *out = g_build.log.view();
+}
+
 void jce_build_manager_get_status(JceBuildStatus *out)
 {
     if (!out) return;
@@ -1147,68 +1231,29 @@ void jce_build_manager_get_status(JceBuildStatus *out)
 
 namespace {
 
-void copy_first_line(char *dst, size_t dst_cap, const std::string &s)
-{
-    if (!dst || dst_cap == 0) return;
-    size_t i = 0;
-    for (; i < s.size() && i + 1 < dst_cap; ++i) {
-        char c = s[i];
-        if (c == '\n' || c == '\r') break;
-        dst[i] = c;
-    }
-    dst[i] = '\0';
-}
-
 bool probe_tool(const char *exe, char *version_out, size_t version_cap)
 {
     if (version_out && version_cap) version_out[0] = '\0';
-
-    JceProcessConfig pcfg{};
-    pcfg.executable_path = exe;
-    pcfg.arguments       = "--version";
-    pcfg.capture_stdout  = true;
-    pcfg.capture_stderr  = true;
-
-    JceProcess *proc = jce_process_spawn(&pcfg);
-    if (!proc) return false;
-
-    std::string out;
-    uint64_t deadline = jce_time_ticks_ms() + kToolProbeTimeoutMs;
-    int exit_code = 0;
-    bool exited   = false;
-    while (jce_time_ticks_ms() < deadline) {
-        char buf[256];
-        for (;;) {
-            size_t got = jce_process_read_stdout(proc, buf, sizeof(buf));
-            if (got == 0) break;
-            out.append(buf, got);
-        }
-        for (;;) {
-            size_t got = jce_process_read_stderr(proc, buf, sizeof(buf));
-            if (got == 0) break;
-            out.append(buf, got);
-        }
-        if (jce_process_poll_exit(proc, &exit_code)) { exited = true; break; }
-        jce_thread_sleep_ms(10);
-    }
-    if (!exited) {
-        jce_process_force_kill(proc);
-        jce_process_destroy(proc);
+    const std::string resolved = jce_build_tool_executable(exe);
+    const JceBuildToolProbeResult result = jce_build_tool_probe(resolved.c_str());
+    if (result.state != JceBuildToolProbeState::Ready) {
+        std::string diagnostic = std::string("[build] tool ") + exe + ": " +
+            jce_build_tool_probe_state_name(result.state) + " (exit=" +
+            std::to_string(result.exit_code) + ", observed_bytes=" +
+            std::to_string(result.observed_bytes) + ", elapsed_ms=" +
+            std::to_string(result.elapsed_ms) + ")";
+        if (result.spawn_error[0]) diagnostic += std::string("; spawn: ") + result.spawn_error;
+        if (result.stderr_prefix[0]) diagnostic += std::string("; stderr: ") + result.stderr_prefix;
+        if (result.stderr_truncated) diagnostic += " [stderr prefix truncated]";
+        if (result.kill_requested && !result.kill_accepted) diagnostic += "; force-kill request failed; public destroy cleanup invoked";
+        log_line(JCE_CONSOLE_WARNING, diagnostic);
         return false;
     }
-    /* Drain any final bytes. */
-    {
-        char buf[256];
-        for (;;) {
-            size_t got = jce_process_read_stdout(proc, buf, sizeof(buf));
-            if (got == 0) break;
-            out.append(buf, got);
-        }
+    if (version_out && version_cap) {
+        const size_t count = std::min(std::strlen(result.version), version_cap - 1);
+        std::memcpy(version_out, result.version, count);
+        version_out[count] = '\0';
     }
-    jce_process_destroy(proc);
-
-    if (exit_code != 0) return false;
-    copy_first_line(version_out, version_cap, out);
     return true;
 }
 
@@ -1225,6 +1270,7 @@ void jce_build_manager_check_tools(JceBuildToolStatus *out)
         return;
     }
 
+    jce_toolchain_refresh();
     JceBuildToolStatus s{};
     s.cmake_ok = probe_tool("cmake", s.cmake_version, sizeof(s.cmake_version));
     s.conan_ok = probe_tool("conan", s.conan_version, sizeof(s.conan_version));
@@ -1543,7 +1589,6 @@ bool append_runtime_input_actions_asset(
     ProjectAssetInput item;
     item.abs_path = path;
     item.vpath = "settings/input_actions.json";
-    item.protect_path = true;
     item.bytes.resize((size_t)size);
     if (size)
         std::memcpy(item.bytes.data(), raw, (size_t)size);
@@ -1564,18 +1609,20 @@ void dist_content_graph_log(int level, const char *message, void *)
 }
 
 bool append_dist_bundle_graph(const std::string &project,
+                              const std::string &sdk,
                               const std::string &gen_dir,
                               const std::string &reports_dir,
                               std::vector<ProjectAssetInput> &items,
                               std::vector<ApprovedGraphAsset> &graph_assets,
                               std::string &graph_snapshot,
-                              std::string &error)
+                              std::string &error,
+                              const std::string &prepared_root = std::string())
 {
     JceDistContentGraph graph;
     if (!jce_dist_content_graph_build(
             project, gen_dir, reports_dir,
             jce_dist_content_graph_host_platform(), dist_content_graph_log,
-            nullptr, &graph, &error)) {
+            nullptr, &graph, &error, sdk, prepared_root)) {
         return false;
     }
 
@@ -1585,7 +1632,9 @@ bool append_dist_bundle_graph(const std::string &project,
         item.abs_path = std::move(source.source_label);
         item.vpath = source.address;
         item.bytes = std::move(source.bytes);
-        item.protect_path = true;
+        // Name-only privacy; all payloads still enter the secure DIST cook.
+        item.protect_path = std::binary_search(graph.confidential_paths.begin(),
+            graph.confidential_paths.end(), source.address);
         items.push_back(std::move(item));
         graph_assets.push_back({std::move(source.address), source.content_id});
     }
@@ -1858,20 +1907,6 @@ std::vector<std::string> split_cmake_list(const std::string &value)
     return out;
 }
 
-std::string project_build_root(const std::string &project,
-                               const char *platform_tag,
-                               const std::string &arch)
-{
-    return project + PATH_SEP_CHR_LOCAL + "build" +
-           PATH_SEP_CHR_LOCAL + std::string(platform_tag) + "-" + arch;
-}
-
-std::string variant_output_dir(const std::string &build_root,
-                               const std::string &variant)
-{
-    return build_root + PATH_SEP_CHR_LOCAL + variant;
-}
-
 std::string project_reports_dir(const std::string &build_root)
 {
     return build_root + PATH_SEP_CHR_LOCAL + "reports";
@@ -1989,9 +2024,9 @@ bool prepare_project_generated_assets(const std::string &project,
         return false;
     }
     if (variant == "dist") {
-        if (!append_dist_bundle_graph(project, gen_dir, reports_dir, items,
+        if (!append_dist_bundle_graph(project, sdk, gen_dir, reports_dir, items,
                                       out_graph_assets,
-                                      out_graph_snapshot, error)) {
+                                      out_graph_snapshot, error, cooked)) {
             set_error("assets: " + error);
             return false;
         }
@@ -2003,7 +2038,8 @@ bool prepare_project_generated_assets(const std::string &project,
         set_error("assets: " + error);
         return false;
     }
-    if (!append_runtime_input_actions_asset(project, items, error)) {
+    if (variant != "dist" &&
+        !append_runtime_input_actions_asset(project, items, error)) {
         set_error("assets: " + error);
         return false;
     }
@@ -2205,36 +2241,6 @@ bool prepare_project_generated_assets(const std::string &project,
     }
 
     return true;
-}
-
-bool has_exe_suffix(const std::string &name)
-{
-    if (name.size() < 4)
-        return false;
-
-    const size_t pos = name.size() - 4;
-    const char suffix[5] = ".exe";
-    for (size_t i = 0; i < 4; ++i) {
-        char c = name[pos + i];
-        if (c >= 'A' && c <= 'Z')
-            c = (char)(c - 'A' + 'a');
-        if (c != suffix[i])
-            return false;
-    }
-    return true;
-}
-
-std::string project_exe_name(const std::string &target,
-                             const char *configured)
-{
-    std::string name = (configured && configured[0])
-                           ? std::string(configured)
-                           : target;
-#if JCE_PLATFORM_WINDOWS
-    if (!has_exe_suffix(name))
-        name += ".exe";
-#endif
-    return name;
 }
 
 std::string cmake_cache_norm(std::string s)
@@ -2470,8 +2476,15 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
         a += " -S " + qtok(p.project);
         a += " -B " + qtok(p.build_dir);
         a += " -G Ninja";
+        a += " -DCMAKE_MAKE_PROGRAM=" + qtok(p.ninja_exe);
         a += " -DCMAKE_BUILD_TYPE=" + p.build_type;
+#if JCE_PLATFORM_MACOS
+        a += " -DCMAKE_OSX_ARCHITECTURES=";
+        a += p.arch == "aarch64" ? "arm64" : "x86_64";
+#endif
         a += " -DJCE_BUILD_VARIANT=" + p.variant;
+        a += " -DJCE_DELIVERY_PROFILE=";
+        a += jce_project_build_delivery(p.variant);
         a += " -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + qtok(p.output_dir);
         a += " -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + qtok(p.output_dir);
         a += " -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=" + qtok(p.archive_dir);
@@ -2512,13 +2525,13 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
                  "[build] MSVC vcvarsall.bat not found; assuming cl.exe is "
                  "already on PATH");
     }
-    args += "cmake";
+    args += qtok(p.cmake_exe);
     append_configure(args);
     if (!p.c_compiler.empty())
         args += " -DCMAKE_C_COMPILER=" + qtok(p.c_compiler);
     else
         args += " -DCMAKE_C_COMPILER=cl";
-    args += " && cmake --build " + qtok(p.build_dir) +
+    args += " && " + qtok(p.cmake_exe) + " --build " + qtok(p.build_dir) +
             " --target " + qtok(p.target);
 
     QueuedStep step;
@@ -2533,7 +2546,7 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
     {
         QueuedStep configure;
         configure.stage = JCE_BUILD_STAGE_CONFIGURE;
-        configure.exe   = "cmake";
+        configure.exe   = p.cmake_exe;
         std::string a;
         append_configure(a);
         configure.args  = a;
@@ -2543,7 +2556,7 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
 
         QueuedStep compile;
         compile.stage = JCE_BUILD_STAGE_COMPILE;
-        compile.exe   = "cmake";
+        compile.exe   = p.cmake_exe;
         compile.args  = "--build " + qtok(p.build_dir) +
                         " --target " + qtok(p.target);
         compile.wd    = p.project;
@@ -2579,6 +2592,7 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
     if (p.want_package) {
         g_finish.stage       = true;
         g_finish.out_dir     = p.package_out_dir;
+        g_finish.package_reports_dir = p.reports_dir;
         g_finish.cooked_rel  = p.cooked;
         /* Single self-contained exe by default (desktop): the project build
          * always embeds its PAK into the executable, and the runtime mounts
@@ -2633,7 +2647,8 @@ void asset_prep_complete(JceAsyncTask *task, void *arg)
     /* Replay captured log/error lines now, on the thread
      * where the console + toast path is safe. */
     for (const DeferredLogEntry &e : p->sink.entries)
-        jce_editor_console_log_level(e.level, "%s", e.text.c_str());
+        log_line(e.level, e.text);
+    if (p->sink.truncated) g_build.log.truncated = true;
     p->sink.entries.clear();
 
     const bool cancelled = p->stop_requested ||
@@ -2653,6 +2668,9 @@ void asset_prep_complete(JceAsyncTask *task, void *arg)
         g_build.state      = JCE_BUILD_FAILED;
         g_build.last_error = sink_error.empty()
             ? std::string("asset cook/pack failed") : sink_error;
+        /* Owner-thread witness survives DIST and headless Console-only routing. */
+        jce_log_write(JCE_LOG_LEVEL_ERROR, "editor-build", __FILE__, __LINE__,
+                      "%s", g_build.last_error.c_str());
         reset_pipeline();
     } else {
         /* Success: build the cmake queue + spawn it (state stays RUNNING). */
@@ -2682,47 +2700,26 @@ void asset_prep_shutdown()
                 jce_thread_sleep_ms(1);
         }
     }
-    g_pending.sink.entries.clear();
+    g_pending.sink.reset();
     std::memset(g_pending.pak_key, 0, sizeof(g_pending.pak_key));
     g_pending.active = false;
 }
 
-/* The `variant:` line an SDK stamps into its own VERSION.txt, or "" when the
- * tree has no such stamp (older SDK, or a hand-assembled one). */
-std::string sdk_stamped_variant(const std::string &sdk)
-{
-    const std::string vf = sdk + PATH_SEP_CHR_LOCAL + "VERSION.txt";
-    uint64_t sz = 0;
-    char *raw = (char *)jce_fs_host_read_all(vf.c_str(), &sz);
-    if (!raw) return std::string();
-    const std::string text(raw, (size_t)sz);
-    jce_fs_buffer_free(raw);
-
-    size_t pos = 0;
-    while (pos < text.size()) {
-        size_t eol = text.find('\n', pos);
-        if (eol == std::string::npos) eol = text.size();
-        std::string line = text.substr(pos, eol - pos);
-        pos = eol + 1;
-        if (line.rfind("variant:", 0) != 0) continue;
-        std::string v = line.substr(8);
-        size_t b = v.find_first_not_of(" \t\r");
-        if (b == std::string::npos) return std::string();
-        size_t e = v.find_last_not_of(" \t\r");
-        return v.substr(b, e - b + 1);
-    }
-    return std::string();
-}
 
 } // namespace
 
+bool jce_build_manager_reject_request(const char *label, const char *error)
+{
+    if (!begin_build_request(label, "a build is already running")) return false;
+    set_error(error && error[0] ? error : "build request was refused");
+    return false;
+}
+
 bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
 {
+    if (!begin_build_request(cfg && cfg->label ? cfg->label : "build-project",
+            "start_project_build: a build is already running")) return false;
     if (!cfg) { set_error("start_project_build: cfg is null"); return false; }
-    if (g_build.process || asset_prep_active()) {
-        set_error("start_project_build: a build is already running");
-        return false;
-    }
     if (!cfg->project_dir || !cfg->project_dir[0]) {
         set_error("start_project_build: project_dir is required");
         return false;
@@ -2736,16 +2733,28 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
         return false;
     }
 
-    reset_pipeline();
-    clear_build_outputs();
+    const char *host_arch = jce_project_build_host_arch();
+    const char *selected_arch = jce_project_build_arch(cfg->arch, host_arch);
+#if JCE_PLATFORM_WINDOWS
+    const auto build_platform = JceProjectBuildPlatform::Windows;
+#elif JCE_PLATFORM_MACOS
+    const auto build_platform = JceProjectBuildPlatform::MacOS;
+#else
+    const auto build_platform = JceProjectBuildPlatform::Linux;
+#endif
+    if (const char *error = jce_project_build_target_error(
+            selected_arch, host_arch, build_platform)) {
+        set_error(error);
+        g_build.state = JCE_BUILD_FAILED;
+        return false;
+    }
 
     const std::string project = join_norm_sep(cfg->project_dir);
     const std::string sdk     = join_norm_sep(cfg->sdk_dir);
     const std::string target  = cfg->target;
     const std::string variant = (cfg->variant && cfg->variant[0])
                                     ? std::string(cfg->variant) : "release";
-    const std::string arch    = (cfg->arch && cfg->arch[0])
-                                    ? std::string(cfg->arch) : "x86_64";
+    const std::string arch = selected_arch;
     const std::string label   = (cfg->label && cfg->label[0])
                                     ? std::string(cfg->label) : "build-project";
 
@@ -2756,7 +2765,25 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
 #else
     const char *platform_tag       = "linux";
 #endif
-    const std::string exe_name = project_exe_name(target, cfg->exe_name);
+    const std::string exe_name = jce_project_build_exe_name(target, cfg->exe_name);
+
+    std::string package_out_dir;
+    std::string package_error;
+    if (!jce_build_package_component_valid(exe_name, &package_error)) {
+        set_error(package_error);
+        g_build.state = JCE_BUILD_FAILED;
+        return false;
+    }
+    const bool want_package = cfg->package_out_dir && cfg->package_out_dir[0];
+    if (want_package && !jce_build_package_admit(project, sdk,
+            cfg->cooked_assets && cfg->cooked_assets[0] ? cfg->cooked_assets :
+                                                        "resources/_cooked",
+            cfg->package_out_dir, exe_name, variant == "dist",
+            &package_out_dir, &package_error)) {
+        set_error(package_error);
+        g_build.state = JCE_BUILD_FAILED;
+        return false;
+    }
 
     /* Resolve the SDK's CMake package dir: prefer the installed
      * <sdk>/lib/cmake/JCE layout, fall back to <sdk>/cmake. */
@@ -2779,47 +2806,23 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
         }
     }
 
-    /* A project build does NOT build the engine — it configures the project
-     * against this prebuilt SDK, whose fat lib already has the patented codec
-     * adapters (AAC / H.264 / H.265) compiled in or out. -DJCE_BUILD_VARIANT
-     * below therefore cannot subtract them, and JCEConfig.cmake links the core
-     * archive with /WHOLEARCHIVE, so a release SDK drags every fdk-aac /
-     * OpenH264 / libhevc object into a bundle the UI labels "dist". The
-     * engine-tree asserts that guard this never run here: add_subdirectory
-     * (engine) is not on this path. Variant and SDK arrive as two independent
-     * inputs (the --dist checkbox vs. the Build Profiles SDK field / project
-     * sdk_path / JCE_SDK_DIR), so nothing tied them together. Compare the
-     * SDK's own stamp against the requested variant. */
-    {
-        const std::string stamped = sdk_stamped_variant(sdk);
-        const std::string want    = (variant == "dist") ? "dist" : "release";
-        if (stamped.empty()) {
-            if (want == "dist") {
-                log_line(JCE_CONSOLE_WARNING,
-                         "[build] SDK at " + sdk + " has no `variant:` stamp "
-                         "- cannot verify it is royalty-free.");
-            }
-        } else if (stamped != want) {
-            if (want == "dist") {
-                set_error("dist build against a '" + stamped + "' SDK at " +
-                          sdk + ". A prebuilt SDK's patented codecs (AAC / "
-                          "H.264 / H.265) cannot be removed at project-"
-                          "configure time, so this would ship them in a bundle "
-                          "labelled royalty-free. Point the SDK root at a dist "
-                          "SDK (built with `jce.py sdk --variant dist`).");
-            } else {
-                set_error("release build against a '" + stamped + "' SDK at " +
-                          sdk + ". Point the SDK root at a release SDK "
-                          "(built with `jce.py sdk --variant release`).");
-            }
-            return false;
-        }
+    if (const auto error = jce_project_build_sdk_target_error(sdk,
+            selected_arch, build_platform, variant); !error.empty()) {
+        set_error(error);
+        g_build.state = JCE_BUILD_FAILED;
+        return false;
     }
 
-    const std::string build_dir = project_build_root(project,
-                                                     platform_tag,
-                                                     arch);
-    const std::string output_dir = variant_output_dir(build_dir, variant);
+    jce_toolchain_refresh();
+    const std::string cmake_exe = jce_build_tool_executable("cmake");
+    const std::string ninja_exe = jce_build_tool_executable("ninja");
+    if (cmake_exe.empty() || ninja_exe.empty()) {
+        set_error("Native project build needs CMake and Ninja; configure the public toolchain paths");
+        g_build.state = JCE_BUILD_FAILED;
+        return false;
+    }
+    const std::string build_dir = jce_project_build_root(project, build_platform, arch);
+    const std::string output_dir = jce_project_build_output_dir(build_dir, variant);
     const std::string reports_dir = project_reports_dir(build_dir);
     const std::string intermediates_dir =
         project_intermediate_dir(build_dir, variant);
@@ -2831,7 +2834,6 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
 
     std::string c_compiler;
 #if JCE_PLATFORM_WINDOWS
-    jce_toolchain_refresh();
     const JceToolchain *msvc = jce_toolchain_get(JCE_TOOLCHAIN_MSVC);
     std::string vcvars;
     if (msvc && msvc->present && msvc->path[0]) {
@@ -2935,6 +2937,8 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     memset(pak_key, 0, sizeof(pak_key));
     p.build_dir         = build_dir;
     p.output_dir        = output_dir;
+    p.cmake_exe         = cmake_exe;
+    p.ninja_exe         = ninja_exe;
     p.archive_dir       = archive_dir;
     p.build_type        = build_type;
     p.cmake_dir         = cmake_dir;
@@ -2948,9 +2952,8 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     p.vc_arch    = vc_arch;
     p.c_compiler = c_compiler;
 #endif
-    p.want_package = (cfg->package_out_dir && cfg->package_out_dir[0]);
-    if (p.want_package)
-        p.package_out_dir = join_norm_sep(cfg->package_out_dir);
+    p.want_package = want_package;
+    p.package_out_dir = package_out_dir;
     p.app_name    = (cfg->app_name && cfg->app_name[0]) ? cfg->app_name : "";
     p.app_version = (cfg->app_version && cfg->app_version[0])
                         ? cfg->app_version : "";

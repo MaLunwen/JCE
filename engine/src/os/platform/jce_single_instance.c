@@ -3,10 +3,12 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_env.h>
 #include <jce/os/platform/jce_single_instance.h>
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #if defined(__APPLE__)
@@ -47,6 +49,17 @@ static char s_lock_path[260];
 #endif
 
 #define LOG_TAG "single_instance"
+
+#if !defined(__ANDROID__) && !defined(__EMSCRIPTEN__) && \
+    !(defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+static void si_lock_diagnostic(const char *stage, const char *name)
+{
+    if (jce_env_flag_enabled(getenv("JCE_EDITOR_CADENCE_DIAG")) ||
+        jce_env_flag_enabled(getenv("JCE_PERF_LOG")))
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+            "instance: stage=%s app=%s", stage, name);
+}
+#endif
 
 static void sanitize_name(const char *name, char *out, size_t out_size)
 {
@@ -102,12 +115,12 @@ bool jce_single_instance_lock(const char *app_name)
     const DWORD err = GetLastError();
     if (err == ERROR_ALREADY_EXISTS || err == ERROR_ACCESS_DENIED) {
         CloseHandle(mtx);
-        LOG_INFO(LOG_TAG, "single-instance lock already held: %s", mutex_name);
+        si_lock_diagnostic("lock-not-acquired", mutex_name);
         return false;
     }
 
     s_single_mutex = mtx;
-    LOG_INFO(LOG_TAG, "single-instance lock acquired: %s", mutex_name);
+    si_lock_diagnostic("lock-acquired", mutex_name);
     return true;
 #else
     if (s_lock_fd >= 0) return true;
@@ -129,14 +142,14 @@ bool jce_single_instance_lock(const char *app_name)
     }
 
     if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        LOG_INFO(LOG_TAG, "single-instance lock already held: %s", s_lock_path);
+        si_lock_diagnostic("lock-not-acquired", s_lock_path);
         close(fd);
         s_lock_path[0] = '\0';
         return false;
     }
 
     s_lock_fd = fd;
-    LOG_INFO(LOG_TAG, "single-instance lock acquired: %s", s_lock_path);
+    si_lock_diagnostic("lock-acquired", s_lock_path);
     return true;
 #endif
 }
@@ -238,14 +251,26 @@ bool jce_single_instance_activate_existing(void)
     SiWndPayload *view = (SiWndPayload *)MapViewOfFile(
         mapping, FILE_MAP_READ, 0, 0, sizeof(SiWndPayload));
     HWND hwnd = NULL;
+    DWORD published_pid = 0;
     if (view) {
         hwnd = (HWND)(uintptr_t)view->hwnd;
+        published_pid = (DWORD)view->pid;
         UnmapViewOfFile(view);
     }
     CloseHandle(mapping);
 
     if (!hwnd || !IsWindow(hwnd)) {
         LOG_INFO(LOG_TAG, "published window handle is stale");
+        return false;
+    }
+
+    /* HWNDs may be recycled for an unrelated process. A live window alone
+     * cannot authorize attention to the published owner. Snapshot-check its
+     * actual PID before any restore/foreground/flash operation. */
+    DWORD actual_pid = 0;
+    DWORD window_thread = GetWindowThreadProcessId(hwnd, &actual_pid);
+    if (!published_pid || !window_thread || actual_pid != published_pid) {
+        LOG_WARN(LOG_TAG, "published window process identity is stale or unavailable");
         return false;
     }
 

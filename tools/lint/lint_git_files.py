@@ -17,8 +17,8 @@ the one commit where it mattered.
 
 TWO SETS, AND THE DIFFERENCE IS THE QUESTION BEING ASKED.
 
-  working_tree()  tracked PLUS untracked-not-ignored: what a commit is about to
-                  contain.  This is the right set for a checker asking "is this
+  working_tree()  tracked PLUS untracked-not-ignored, MINUS Git-declared working
+                  tree deletions. This is the right set for "is this
                   code correct" -- a rule about the code should not wait a
                   commit to apply to new code.
 
@@ -30,6 +30,8 @@ TWO SETS, AND THE DIFFERENCE IS THE QUESTION BEING ASKED.
 
 --exclude-standard is what keeps build/, dist/ and every other ignored tree out
 of working_tree(); without it this would hand a checker a build directory.
+Call working_tree(strict=True) when an unavailable or incomplete Git inventory
+must fail the caller instead of retaining the legacy empty-list behavior.
 """
 
 import subprocess
@@ -38,15 +40,25 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _run(args: list) -> list:
+class GitInventoryError(RuntimeError):
+    """Git could not provide the requested source inventory."""
+
+
+def _run(args: list, *, strict: bool = False) -> list:
     try:
         out = subprocess.run(["git"] + args, cwd=REPO_ROOT,
-                             capture_output=True, text=True, check=False)
-    except OSError:
+                             capture_output=True, text=True, check=False,
+                             **({"encoding": "utf-8"} if strict else {}))
+    except OSError as error:
+        if strict:
+            raise GitInventoryError(f"git {' '.join(args)} failed: {error}") from error
         return []
     if out.returncode != 0:
+        if strict:
+            raise GitInventoryError(f"git {' '.join(args)} failed: {out.stderr.strip()}")
         return []
-    return [line for line in out.stdout.split("\n") if line.strip()]
+    separator = "\0" if "-z" in args else "\n"
+    return [line for line in out.stdout.split(separator) if line.strip()]
 
 
 def tracked() -> list:
@@ -54,11 +66,21 @@ def tracked() -> list:
     return _run(["ls-files"])
 
 
-def working_tree() -> list:
-    """tracked() plus untracked-but-not-ignored: what a commit will contain."""
+def _working_tree_deleted(*, strict: bool = False) -> list:
+    """Index entries Git explicitly reports deleted from the working tree."""
+    return _run(["ls-files", "--deleted"] + (["-z"] if strict else []), strict=strict)
+
+
+def working_tree(*, strict: bool = False) -> list:
+    """Current maintained files; tracked baseline enumeration stays unchanged."""
+    # --cached retains unstaged deletions after a source owner moves. Exclude
+    # only Git-declared deletions, never arbitrary missing/unreadable inputs:
+    # source readers must still fail if an admitted file cannot be consumed.
+    deleted = set(_working_tree_deleted(strict=strict))
     seen, out = set(), []
-    for rel in _run(["ls-files", "--cached", "--others", "--exclude-standard"]):
-        if rel not in seen:
+    args = ["ls-files", "--cached", "--others", "--exclude-standard"]
+    for rel in _run(args + (["-z"] if strict else []), strict=strict):
+        if rel not in deleted and rel not in seen:
             seen.add(rel)
             out.append(rel)
     return out
@@ -72,14 +94,18 @@ def self_test() -> int:
     invocation: python tools/lint/lint_git_files.py
     """
     t, w = set(tracked()), set(working_tree())
+    deleted = set(_working_tree_deleted())
     problems = []
     if not t:
         problems.append("tracked() is empty -- git is not answering, and every "
                         "checker built on this would report a clean tree")
-    if not t <= w:
-        missing = sorted(t - w)[:5]
-        problems.append("working_tree() does not contain tracked(): missing " +
+    if not t - deleted <= w:
+        missing = sorted(t - deleted - w)[:5]
+        problems.append("working_tree() omits tracked files not declared deleted: " +
                         ", ".join(missing))
+    if deleted & w:
+        problems.append("working_tree() retained Git-declared deleted files: " +
+                        ", ".join(sorted(deleted & w)[:5]))
     for rel in w - t:
         if rel.startswith(("build/", "dist/", ".git/")):
             problems.append("working_tree() leaked an ignored tree: " + rel)
@@ -89,7 +115,8 @@ def self_test() -> int:
         print("lint_git_files: SELF-TEST FAIL - %d" % len(problems))
         return 1
     print("lint_git_files: OK (%d tracked, %d in the working tree, "
-          "%d untracked-not-ignored)" % (len(t), len(w), len(w - t)))
+          "%d untracked-not-ignored, %d Git-declared deletions)" %
+          (len(t), len(w), len(w - t), len(deleted)))
     return 0
 
 

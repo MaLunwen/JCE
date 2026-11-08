@@ -5,14 +5,10 @@
  * same path works for project-loose editor assets and embedded PAK content. */
 #include "jce_sr_foliage_cooked.h"
 #include "jce_sr_internal.h"
+#include "os/core/jce_filesystem_read_internal.h"
+#include <jce/os/core/jce_path.h>
 
-typedef enum {
-    SR_FOLIAGE_BLOB_NONE = 0,
-    SR_FOLIAGE_BLOB_FS,
-    SR_FOLIAGE_BLOB_ALLOC
-} SrFoliageBlobOwner;
-
-static void sr_foliage_blob_free(void *data, SrFoliageBlobOwner owner)
+void sr_foliage_blob_free(void *data, SrFoliageBlobOwner owner)
 {
     if (owner == SR_FOLIAGE_BLOB_FS)
         jce_fs_buffer_free(data);
@@ -35,12 +31,29 @@ static void *sr_foliage_read_host_capped(const char *path, size_t max_size,
     return data;
 }
 
-static void *sr_foliage_read_asset(JceSceneRenderer *sr, const char *path,
+void *sr_foliage_read_asset(JceSceneRenderer *sr, const char *path,
                                    size_t max_size, size_t *out_size,
                                    SrFoliageBlobOwner *out_owner)
 {
     *out_size = 0u;
     *out_owner = SR_FOLIAGE_BLOB_NONE;
+
+    /* Relative component assets belong to the active content owner before
+     * editor resolution. An isolated miss must not escape through a callback
+     * to an absolute file in the previously open project or this renderer PAK.
+     * The VFS checks the bound before allocation or PAK decompression. */
+    JceFileSystem *active = jce_fs_get_active();
+    if (active && !jce_path_is_absolute(path)) {
+        uint64_t total = 0u;
+        void *mounted = jce_fs_read_all_bounded_internal(
+            active, path, (uint64_t)max_size, &total);
+        if (mounted || total ||
+            jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED) {
+            *out_size = (size_t)total;
+            if (mounted) *out_owner = SR_FOLIAGE_BLOB_FS;
+            return mounted;
+        }
+    }
 
     if (sr->has_cbs && sr->cbs.resolve_path) {
         char resolved[1024];
@@ -76,6 +89,15 @@ static void *sr_foliage_read_asset(JceSceneRenderer *sr, const char *path,
     void *data = sr_foliage_read_host_capped(path, max_size, out_size);
     if (data) *out_owner = SR_FOLIAGE_BLOB_FS;
     return data;
+}
+
+void *sr_foliage_read_image_blob(JceSceneRenderer *sr, const char *path,
+    size_t *out_size, SrFoliageBlobOwner *out_owner)
+{
+    if (!sr || !path || !path[0]) return NULL;
+    if (jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED &&
+        (!jce_fs_get_active() || jce_path_is_absolute(path))) return NULL;
+    return sr_foliage_read_asset(sr, path, 64u * 1024u * 1024u, out_size, out_owner);
 }
 
 static bool sr_foliage_load_cooked_asset(
@@ -136,38 +158,6 @@ static bool sr_foliage_load_cooked_asset(
     *out_count = count;
     sr_foliage_blob_free(data, owner);
     return true;
-}
-
-uint32_t sr_foliage_param_hash(const JceVegetationScatterComponent *scatter,
-                               const jce_vec3 *origin,
-                               uint32_t surface_hash)
-{
-    uint32_t h = jce_fnv1a32_append(JCE_FNV1A32_INIT, &scatter->seed,
-                                    sizeof scatter->seed);
-    h = jce_fnv1a32_append(h, &scatter->density, sizeof scatter->density);
-    h = jce_fnv1a32_append(h, &scatter->area_x, sizeof scatter->area_x);
-    h = jce_fnv1a32_append(h, &scatter->area_z, sizeof scatter->area_z);
-    h = jce_fnv1a32_append(h, &scatter->max_slope_deg,
-                           sizeof scatter->max_slope_deg);
-    h = jce_fnv1a32_append(h, &scatter->scale_min,
-                           sizeof scatter->scale_min);
-    h = jce_fnv1a32_append(h, &scatter->scale_max,
-                           sizeof scatter->scale_max);
-    h = jce_fnv1a32_append(h, &scatter->align_to_normal,
-                           sizeof scatter->align_to_normal);
-    h = jce_fnv1a32_append(h, origin, sizeof *origin);
-    h = jce_fnv1a32_append(h, &surface_hash, sizeof surface_hash);
-    h = jce_fnv1a32_append(h, scatter->baked_placement_path,
-        (uint32_t)strlen(scatter->baked_placement_path));
-    h = jce_fnv1a32_append(h, scatter->density_mask_path,
-        (uint32_t)strlen(scatter->density_mask_path));
-    h = jce_fnv1a32_append(h, &scatter->density_paint_active,
-                           sizeof scatter->density_paint_active);
-    if (scatter->density_paint_active) {
-        h = jce_fnv1a32_append(h, scatter->density_paint,
-                               (uint32_t)sizeof scatter->density_paint);
-    }
-    return h;
 }
 
 bool sr_foliage_try_load_cooked(JceSceneRenderer *sr,

@@ -57,15 +57,21 @@ std::string jce_run_manager_resolve_path(const JceRunResolveInputs &in,
         }
     }
 
-    if (!in.build_output_path.empty() && !in.target_name.empty() &&
-        try_with_suffix(in.build_output_path + "/" + in.target_name,
+    const std::string &name = in.artifact_name.empty() ? in.target_name : in.artifact_name;
+    if (!in.build_output_path.empty() && !name.empty() &&
+        try_with_suffix(in.build_output_path + "/" + name,
                         in.exe_suffix, exists, user, &hit))
         return hit;
 
-    if (!in.target_name.empty()) {
+    for (const std::string &candidate : in.project_artifacts) {
+        if (try_with_suffix(candidate, in.exe_suffix, exists, user, &hit))
+            return hit;
+    }
+
+    if (!name.empty()) {
         for (const std::string &dir : in.output_dirs) {
             for (const std::string &par : in.parents) {
-                if (try_with_suffix(par + "/" + dir + "/" + in.target_name,
+                if (try_with_suffix(par + "/" + dir + "/" + name,
                                     in.exe_suffix, exists, user, &hit))
                     return hit;
             }

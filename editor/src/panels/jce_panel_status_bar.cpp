@@ -113,8 +113,11 @@ static void draw_graphics_api_section(void)
      * than an arbitrary number.  Rebuilding is what moves it, hence the tip. */
     char ladder[192];
     int  used = 0;
-    for (int t = 0; t < JCE_GRAPHICS_API_TIER_COUNT; ++t) {
-        const JceGraphicsApiTier    tier = (JceGraphicsApiTier)t;
+    static constexpr JceGraphicsApiTier tiers[] = {
+        JCE_GRAPHICS_API_TIER_STABLE, JCE_GRAPHICS_API_TIER_MODERN,
+        JCE_GRAPHICS_API_TIER_CURRENT, JCE_GRAPHICS_API_TIER_COMPATIBILITY
+    };
+    for (JceGraphicsApiTier tier : tiers) {
         const JceGraphicsApiVersion v =
             jce_renderer_api_tier_minimum(info.backend, tier);
         if (!v.major) continue;   /* backend has no versioned floor policy */

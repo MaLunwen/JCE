@@ -16,9 +16,95 @@
 # All three mean the same thing on every machine. A literal does not.
 #
 # ---------------------------------------------------------------------------
-# EMPTY, and it should stay that way.
-#
-# It starts empty because the eight literals that prompted this gate were all
-# fixable by derivation -- none of them needed an exemption. If you are about
-# to add the first entry, that is the signal to check the three derivations
-# above one more time.
+# Exact synthetic test inputs used by mocked platform ports.
+tools/tests/test_bgfx_blit_emulation.py:77 Synthetic quoted include input for compiler flag normalization.
+tools/tests/test_host_font_selection.py:309 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:310 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:352 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:469 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:511 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:520 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:529 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:531 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:533 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:588 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_host_font_selection.py:595 Synthetic paths served by fake Windows font API ports.
+tools/tests/test_memory_commit_probe.py:40 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:118 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:130 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:131 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:168 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:171 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:194 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:346 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:355 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:387 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:395 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:429 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:545 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_memory_commit_probe.py:553 Synthetic image paths returned by memory process observation ports.
+tools/tests/test_windows_xp_consumers_hook.py:14 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:71 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:73 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:75 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:78 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:79 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:83 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:200 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:203 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:223 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:244 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:247 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:251 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:252 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:256 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:259 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:261 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:270 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:271 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:278 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:309 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:310 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:328 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:329 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:330 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:372 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:382 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:387 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:395 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:398 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:403 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:444 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:536 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:551 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:562 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:579 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:583 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:594 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:595 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:596 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:597 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:598 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:606 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:607 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_windows_xp_consumers_hook.py:664 Synthetic Windows and POSIX inputs for XP dependency path validation.
+tools/tests/test_xp_guest_exports.py:134 Synthetic Windows system paths for guest export normalization.
+tools/tests/test_xp_guest_exports.py:135 Synthetic Windows system paths for guest export normalization.
+tools/tests/test_xp_mimalloc_configuration.py:60 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:145 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:152 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:153 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:154 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:173 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:194 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:231 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:238 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:248 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:267 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:312 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:313 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:314 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_mimalloc_configuration.py:315 Synthetic compiler paths for XP configuration and containment tests.
+tools/tests/test_xp_vm.py:871 Synthetic controller inputs for Windows VM path rejection.
+tools/tests/test_xp_vm.py:878 Synthetic controller inputs for Windows VM path rejection.
+tools/tests/test_xp_vm.py:1012 Synthetic controller inputs for Windows VM path rejection.

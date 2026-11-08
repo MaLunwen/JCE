@@ -1,70 +1,19 @@
 #!/usr/bin/env python3
-"""
-check_jce_tests_closure.py — the `jce_tests` aggregate target must build
-EVERY test carrying the "unit" ctest label, not a subset that happens to
-look complete.
+"""Verify test build-input routing through the shared domain metadata owner.
 
-`jce_tests` exists so CI can build the exact dependency closure of the test
-suite (`cmake --build <dir> --target jce_tests`) instead of the editor and
-every vendored codec, then run `ctest -L unit`.  `jce_add_unit_test` and
-`jce_add_cxx_test` call `add_dependencies(jce_tests ${NAME})` themselves, so
-every test registered through either helper is covered by construction.
-
-`tests/middleware/ai_dispatch/CMakeLists.txt` registers `aid_demo` with a
-raw `add_executable` + `add_test(NAME aid_demo_selftest COMMAND aid_demo)` —
-it bypasses both helpers (it is a multi-mode CLI demo, not a Unity test, and
-its ctest name deliberately differs from its target name), so it never got
-the helper's automatic `add_dependencies`.  `jce_tests` silently built every
-test except that one.  `ctest -L unit -N` still lists `aid_demo_selftest`
-because ctest only knows about `add_test`, not `jce_tests`'s dependency
-list — so on a from-scratch build, `ctest -L unit` reports "Unable to find
-executable" for it, indistinguishable from a real test failure, while
-`jce_tests` itself reports success.
-
-This check has two parts:
-
-  1. Both helper functions must still call
-     `add_dependencies(jce_tests ${NAME})` — the mechanism every normal test
-     relies on.  If a future edit drops that line, every test registered
-     through that helper silently falls out of `jce_tests` at once.
-
-  2. Every *raw* `add_test(NAME <literal> COMMAND <target>)` anywhere under
-     tests/ (i.e. one that does not go through either helper) whose test
-     carries the "unit" label must have a matching
-     `add_dependencies(jce_tests <target>)` somewhere in the tree.  This is
-     deliberately NOT a check for "aid_demo" by name: the next raw
-     `add_test` with a "unit" label reopens the identical hole, and this
-     rule catches it the same way regardless of what it is called.
-
-     WITH ONE EXCLUSION, and it is about what the rule can mean rather than
-     about convenience.  The rule reads a COMMAND token as a BUILD TARGET —
-     that is the whole premise, since the failure it prevents is `jce_tests`
-     not building something ctest will later try to run.  A COMMAND that is
-     a CMake variable reference is not a target name: an interpreter-driven
-     suite registers `COMMAND "${Python3_EXECUTABLE}"`, which `find_package`
-     resolved to a system interpreter that no build produces and no
-     `add_dependencies` can name.  Requiring
-     `add_dependencies(jce_tests "${Python3_EXECUTABLE}")` there would be
-     asking for a line that is false — and satisfying a gate with a false
-     statement is worse than the gap it closes.
-
-     Such suites keep the real closure guarantee in the form that actually
-     means something: they name their genuine build inputs.  Both
-     tests/scripting/python and tests/scripting/java do, for the runner, the
-     mock host and the shared library their driver loads.  Those lines are
-     covered by this rule wherever they appear, because they name targets.
-
-     The exclusion is deliberately narrow — a variable reference and nothing
-     else.  A raw literal target still has to be declared, so `aid_demo`,
-     the registration this check was written for, is unaffected.
-
-Usage:
-  python tools/lint/check_jce_tests_closure.py
-  # exits 0 if clean, 1 with details on violation.
+Helpers and raw executable/script providers use jce_test_build_dependencies.
+Its call-site domain authority wires both jce_tests and jce_tests_<domain>;
+CMake's deferred audit verifies actual dependencies equal those routed inputs.
+This source gate checks helper wiring and literal raw unit executable providers.
+Interpreter COMMANDs are not build targets: their actual runner/library inputs
+are declared at the registering script call site. Actual CMake NONE controls
+verify domain isolation, shared providers, missing edges and unchanged CTest
+inventory; neither source parsing nor those controls certify application/UI use.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -72,6 +21,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TESTS_DIR = REPO_ROOT / "tests"
 TESTS_ROOT_CMAKE = TESTS_DIR / "CMakeLists.txt"
+METADATA_CMAKE = TESTS_DIR / "cmake/JceTestMetadata.cmake"
+
+_spec = importlib.util.spec_from_file_location(
+    "lint_git_files", Path(__file__).with_name("lint_git_files.py"))
+_lgf = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lgf)
+
+
+def source_cmake_files() -> list[Path]:
+    """Actual publication candidates, never ignored generated/frozen copies."""
+    return [REPO_ROOT / rel for rel in _lgf.working_tree()
+            if rel.startswith("tests/") and Path(rel).name == "CMakeLists.txt"]
+
 
 HELPER_NAMES = ("jce_add_unit_test", "jce_add_cxx_test")
 
@@ -83,7 +45,7 @@ SET_PROPS_LABELS_RE_TMPL = (
     r"(?:(?!add_test|set_tests_properties).)*?"
     r"LABELS\s+\"([^\"]*)\""
 )
-ADD_DEPS_RE_TMPL = r"add_dependencies\s*\(\s*jce_tests\s+{target}\s*\)"
+BUILD_INPUTS_RE = re.compile(r"\bjce_test_build_dependencies\s*\(([^)]*)\)", re.MULTILINE)
 
 # A COMMAND token that is a bare CMake variable reference, with or without the
 # surrounding quotes: "${Python3_EXECUTABLE}" or ${SOMETHING}.  Anchored at both
@@ -104,26 +66,56 @@ def _function_body(text: str, fn_name: str) -> str | None:
 
 
 def check_helpers_still_wired(root_text: str) -> list[str]:
+    root_text = re.sub(r"(?m)#.*$", "", root_text)
     problems = []
     for fn in HELPER_NAMES:
         body = _function_body(root_text, fn)
         if body is None:
             problems.append(f"tests/CMakeLists.txt: function {fn}() not found")
             continue
-        if "add_dependencies(jce_tests ${NAME})" not in body:
+        if "jce_test_build_dependencies(${NAME})" not in body:
             problems.append(
                 f"tests/CMakeLists.txt: {fn}() no longer calls "
-                f"add_dependencies(jce_tests ${{NAME}}) — every test registered "
+                f"jce_test_build_dependencies(${{NAME}}) — every test registered "
                 f"through this helper just silently fell out of jce_tests"
             )
     return problems
 
 
+def check_build_dependency_authority(metadata_text: str) -> list[str]:
+    """Actual CMake guards also fail when either required edge is removed."""
+    text = re.sub(r"(?m)#.*$", "", metadata_text)
+    body = _function_body(text, "jce_test_build_dependencies")
+    if body is None:
+        return ["JceTestMetadata: build-input routing function is missing"]
+    required = (
+        '_jce_test_owner_domain("${CMAKE_CURRENT_SOURCE_DIR}" _domain)',
+        'set_property(TARGET jce_tests_${_domain} APPEND PROPERTY JCE_TEST_BUILD_INPUTS ${ARGN})',
+        'add_dependencies(jce_tests ${ARGN})',
+        'add_dependencies(jce_tests_${_domain} ${ARGN})',
+    )
+    problems = [f"JceTestMetadata: build-input routing lost {wire}"
+                for wire in required if wire not in body]
+    audit = _function_body(text, "jce_assert_test_metadata") or ""
+    if "_jce_assert_test_build_closure()" not in audit:
+        problems.append("JceTestMetadata: actual aggregate closure audit is missing")
+    return problems
+
+
 def check_raw_registrations_wired(all_text_by_file: dict[Path, str]) -> list[str]:
     problems = []
-    combined = "\n".join(all_text_by_file.values())
+    # Helpers are proven above to add their literal NAME to the aggregate.
+    # Raw extra test cases may reuse those already-built executable targets.
+    source_text = {path: re.sub(r"(?m)#.*$", "", text)
+                   for path, text in all_text_by_file.items()}
+    combined = "\n".join(source_text.values())
+    routed_inputs = {token for match in BUILD_INPUTS_RE.finditer(combined)
+                     for token in match.group(1).split()}
+    helper_targets = set(re.findall(
+        r"\b(?:" + "|".join(HELPER_NAMES) + r")\s*\(\s*([A-Za-z_][A-Za-z0-9_.+-]*)",
+        combined))
 
-    for path, text in all_text_by_file.items():
+    for path, text in source_text.items():
         for m in ADD_TEST_RE.finditer(text):
             test_name, target = m.group(1), m.group(2)
             if test_name == "${NAME}":
@@ -153,12 +145,11 @@ def check_raw_registrations_wired(all_text_by_file: dict[Path, str]) -> list[str
             if "unit" not in labels:
                 continue
 
-            deps_re = re.compile(ADD_DEPS_RE_TMPL.format(target=re.escape(target)))
-            if not deps_re.search(combined):
+            if target not in helper_targets and target not in routed_inputs:
                 rel = path.relative_to(REPO_ROOT).as_posix()
                 problems.append(
                     f"{rel}: add_test(NAME {test_name} COMMAND {target}) carries "
-                    f"LABELS \"unit\" but no add_dependencies(jce_tests {target}) "
+                    f"LABELS \"unit\" but no jce_test_build_dependencies({target}) "
                     f"exists anywhere under tests/ — jce_tests will build "
                     f"successfully while silently skipping {target}, and ctest "
                     f"will report {test_name} as \"Unable to find executable\" "
@@ -174,21 +165,29 @@ def main() -> int:
 
     root_text = TESTS_ROOT_CMAKE.read_text(encoding="utf-8", errors="replace")
     problems = check_helpers_still_wired(root_text)
+    if not METADATA_CMAKE.is_file():
+        problems.append("test domain/build metadata owner is missing")
+    else:
+        problems += check_build_dependency_authority(METADATA_CMAKE.read_text(encoding="utf-8"))
+    if "jce_create_test_domain_targets()" not in re.sub(r"(?m)#.*$", "", root_text):
+        problems.append("tests/CMakeLists.txt: domain build aggregates are not created")
 
     all_text_by_file: dict[Path, str] = {}
-    for cmake_file in TESTS_DIR.rglob("CMakeLists.txt"):
+    cmake_files = source_cmake_files()
+    if TESTS_ROOT_CMAKE not in cmake_files:
+        problems.append("owned source enumeration did not include tests/CMakeLists.txt")
+    for cmake_file in cmake_files:
         try:
             all_text_by_file[cmake_file] = cmake_file.read_text(
                 encoding="utf-8", errors="replace"
             )
         except OSError as e:
-            print(f"warn: cannot read {cmake_file}: {e}", file=sys.stderr)
+            problems.append(f"cannot read owned CMake source {cmake_file}: {e}")
 
     problems += check_raw_registrations_wired(all_text_by_file)
 
     if not problems:
-        print("jce_tests closure check: OK (every unit-labeled test is wired "
-              "into jce_tests)")
+        print("jce_tests closure check: OK (shared all/domain routing and raw executable inputs)")
         return 0
 
     print("jce_tests closure check: FAILED")

@@ -50,6 +50,7 @@
 #include <jce/os/core/jce_defs.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -163,6 +164,36 @@ JCE_API bool JCE_CALL jce_water_fft_use_jonswap(JceWaterFft *fft,
                                                 float wind_speed, float fetch,
                                                 float swell, unsigned int seed);
 
+/* Versioned, opt-in frequency-spectrum controls. Existing create() and
+ * use_jonswap() retain their layouts and defaults. Wind is U10 in m/s;
+ * direction is taken from create(). PM is the fully developed wind sea and
+ * ignores fetch/depth; JONSWAP uses fetch; TMA also attenuates by depth.
+ * directional_blend redistributes energy: 0 isotropic, 1 directional.
+ * Configure before the first evolve. Invalid size/version/model or non-finite
+ * parameters are refused without changing the existing spectrum. */
+#define JCE_WATER_FFT_SPECTRUM_VERSION 1u
+#define JCE_WATER_FFT_SPECTRUM_JONSWAP 1u
+#define JCE_WATER_FFT_SPECTRUM_PM 2u
+#define JCE_WATER_FFT_SPECTRUM_TMA 3u
+
+typedef struct JceWaterFftSpectrumDesc {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t model;
+    uint32_t seed;
+    float wind_speed;
+    float fetch;
+    float swell;
+    float depth;
+    float directional_blend;
+} JceWaterFftSpectrumDesc;
+
+/* The versioned path uses physical spectral-bin variance, compensated for
+ * normalized IFFT resolution. It intentionally differs in wave-height scale
+ * from the unversioned legacy JONSWAP API. Configure before first evolve. */
+JCE_API bool JCE_CALL jce_water_fft_configure_spectrum(
+    JceWaterFft *fft, const JceWaterFftSpectrumDesc *desc);
+
 /* ── Exact surface gradient (Tessendorf eq. 37) ────────────────────────
  *
  * OPT-IN, because it costs two more inverse transforms per evolve -- a
@@ -194,7 +225,9 @@ JCE_API const float *JCE_CALL jce_water_fft_slope_z_data(const JceWaterFft *fft)
 
 /* ── Jacobian foam ─────────────────────────────────────────────────────
  *
- * The determinant of the horizontal map x -> x + D(x), per grid cell.
+ * The determinant of the horizontal map x -> x + D(x), sampled per grid cell.
+ * Versioned spectra differentiate in world units. Legacy spectrum calls retain
+ * their historical unit-cell difference for existing-scene compatibility.
  *
  *   > 1  the surface is being stretched (a trough)
  *   ~ 1  undisturbed

@@ -1,0 +1,90 @@
+{
+  "contract": {"name": "jce.scene", "major": 1, "minor": 0},
+  "scene": {
+    "version": 1,
+    "entities": [
+      {
+        "id": 100,
+        "name": "GateAnchor",
+        "parentId": 0,
+        "components": [{"type": "Transform", "posX": 4, "posZ": 8}]
+      },
+      {
+        "id": 101,
+        "name": "WestGateTrigger",
+        "parentId": 100,
+        "components": [
+          {"type": "Transform", "posX": -4, "posY": 1},
+          {
+            "type": "TriggerVolume", "shape": 0,
+            "cx": 0, "cy": 0, "cz": 0,
+            "hx": 1, "hy": 1, "hz": 1,
+            "enabled": true, "fireStay": true, "tag": "west_gate"
+          },
+          {
+            "type": "Script", "scriptPath": "scripts/gate_rules.lua",
+            "params": [{"name": "target", "kind": 3, "entity": 102}]
+          }
+        ]
+      },
+      {
+        "id": 102,
+        "name": "SignalBeacon",
+        "parentId": 0,
+        "components": [
+          {"type": "Transform", "posY": 0, "scaleX": 0.9, "scaleY": 0.9, "scaleZ": 0.9},
+          {
+            "type": "MeshRenderer", "meshShape": 1, "materialOverrides": 9,
+            "albedoTex": "textures/white.png",
+            "baseColorR": 1, "baseColorG": 0.48, "baseColorB": 0.06, "baseColorA": 1,
+            "emissiveR": 0.8, "emissiveG": 0.21, "emissiveB": 0.02, "visible": true
+          }
+        ]
+      },
+      {
+        "id": 103,
+        "name": "TriggerObserverCamera",
+        "parentId": 0,
+        "components": [
+          {"type": "Transform", "posX": -3, "posY": 1, "posZ": 8},
+          {
+            "type": "Camera", "primary": true, "orthographic": true,
+            "orthoSize": 9, "nearClip": 0.1, "farClip": 50
+          },
+          {"type": "Script", "scriptPath": "scripts/observer_controls.lua"}
+        ]
+      },
+      {
+        "id": 104,
+        "name": "BeaconPedestal",
+        "parentId": 0,
+        "components": [
+          {"type": "Transform", "posY": -0.65, "scaleX": 2.2, "scaleY": 0.4, "scaleZ": 1.4},
+          {
+            "type": "MeshRenderer", "meshShape": 0, "materialOverrides": 9,
+            "albedoTex": "textures/white.png",
+            "baseColorR": 0.11, "baseColorG": 0.36, "baseColorB": 0.57, "baseColorA": 1,
+            "emissiveR": 0.05, "emissiveG": 0.13, "emissiveB": 0.21, "visible": true
+          }
+        ]
+      },
+      {
+        "id": 105,
+        "name": "ReferenceRail",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform", "posY": -1.05, "posZ": -1,
+            "scaleX": 8.5, "scaleY": 0.18, "scaleZ": 0.8
+          },
+          {
+            "type": "MeshRenderer", "meshShape": 0, "materialOverrides": 9,
+            "albedoTex": "textures/white.png",
+            "baseColorR": 0.2, "baseColorG": 0.3, "baseColorB": 0.27, "baseColorA": 1,
+            "emissiveR": 0.06, "emissiveG": 0.1, "emissiveB": 0.09, "visible": true
+          }
+        ]
+      }
+    ]
+  }
+}

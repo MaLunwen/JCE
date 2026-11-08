@@ -20,6 +20,8 @@
 
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/net/jce_net.h>
 #include <jce/middleware/scene/jce_scene.h>
@@ -31,6 +33,20 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#if JCE_PLATFORM_WINDOWS
+#include <process.h>
+#define BOOT_TEST_PROCESS_ID() ((unsigned long)_getpid())
+#else
+#include <unistd.h>
+#define BOOT_TEST_PROCESS_ID() ((unsigned long)getpid())
+#endif
+
+#ifndef JCE_ENGINE_BOOT_TEST_OUTPUT
+#error "JCE_ENGINE_BOOT_TEST_OUTPUT must name this target's private build output"
+#endif
 
 /* Embedded-PAK blob symbols.  The ENGINE declares these extern and the
  * EXECUTABLE supplies them (see engine/src/application/jce_embedded_assets.h);
@@ -47,6 +63,50 @@ static bool s_window_is_null;
 static bool s_audio_is_null;
 static uint32_t s_update_count;
 static bool s_exit_called;
+static uint32_t s_net_pump_updates;
+
+/* Each case owns a PID-scoped generated config; never consume or rewrite
+ * the executable directory's remembered backend or another fixture's file. */
+static char s_config_path[1024];
+static uint32_t s_config_marker;
+static bool s_config_selected;
+static unsigned s_config_case;
+static bool s_config_owned;
+
+static void boot_test_config_begin(void)
+{
+    char desired[1024];
+    int length = snprintf(desired, sizeof desired, "%s/boot-%lu-%u.ini",
+        JCE_ENGINE_BOOT_TEST_OUTPUT, BOOT_TEST_PROCESS_ID(), ++s_config_case);
+    TEST_ASSERT_TRUE(length > 0 && (size_t)length < sizeof desired);
+    TEST_ASSERT_TRUE(jce_fs_host_make_unique_path(desired, s_config_path,
+        (uint32_t)sizeof s_config_path));
+    /* PID/case names are disjoint between first-party concurrent launches;
+     * make_unique_path also preserves a stale file after an interrupted run. */
+    /* AppDesc.name overrides window.title, so use the retained public
+     * clear-color field to prove this config actually reached app.init. */
+    s_config_marker = (((uint32_t)BOOT_TEST_PROCESS_ID() & 0xffffu) << 16) |
+        ((s_config_case & 0xffu) << 8) | 0xffu;
+    char config[256];
+    length = snprintf(config, sizeof config,
+        "[renderer]\nbackend=auto\nclear_color=%08X\n", (unsigned)s_config_marker);
+    TEST_ASSERT_TRUE(length > 0 && (size_t)length < sizeof config);
+    s_config_selected = false;
+    s_config_owned = true;
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(s_config_path, config, (uint64_t)length));
+    jce_engine_set_config_path(s_config_path);
+}
+
+static void boot_test_config_end(void)
+{
+    const bool selected = !s_init_called || s_config_selected;
+    jce_engine_set_config_path(NULL);
+    bool removed = !s_config_owned || jce_fs_host_remove_file(s_config_path);
+    s_config_owned = false;
+    s_config_path[0] = '\0';
+    TEST_ASSERT_TRUE_MESSAGE(removed, "this case's owned config was not removed");
+    TEST_ASSERT_TRUE_MESSAGE(selected, "app.init did not consume this case's owned Auto config");
+}
 
 void setUp(void)
 {
@@ -56,14 +116,18 @@ void setUp(void)
     s_audio_is_null        = false;
     s_update_count         = 0;
     s_exit_called          = false;
+    s_net_pump_updates      = 0;
+    boot_test_config_begin();
 }
 
-void tearDown(void) {}
+void tearDown(void) { boot_test_config_end(); }
 
 static bool hb_init(const JceServices *svc, void *user_data)
 {
     (void)user_data;
     s_init_called          = true;
+    s_config_selected = svc && svc->config &&
+        svc->config->clear_color == s_config_marker;
     /* Headless boot: NullRHI renderer, no window, no audio. */
     s_renderer_is_headless = jce_renderer_is_headless(svc->renderer);
     s_window_is_null       = (svc->window == NULL);
@@ -179,14 +243,15 @@ static bool hb_sim_init(const JceServices *svc, void *user_data)
     rd.enable_physics = true;
     s_runtime = jce_runtime_create(&rd);
 
-    /* ENet host on an ephemeral-ish high port; a busy port must not fail the
-     * test (CI runners are shared), so a NULL host is tolerated below. */
+    /* Real client/ephemeral host, matching the public port=0 contract.
+     * This smoke pumps transport ownership alongside simulation; it does not
+     * certify server listening, peer handshakes or packet exchange. */
     JceNetHostDesc nd = (JceNetHostDesc){0};
-    nd.port          = 45821;
+    nd.port          = 0;
     nd.max_peers     = 8;
     nd.channel_count = 2;
     s_host = jce_net_host_create(&nd, jce_allocator_default());
-    return true;
+    return s_host != NULL; /* actual init failure retires scene/runtime too */
 }
 
 static void hb_sim_update(float dt, void *user_data)
@@ -199,6 +264,7 @@ static void hb_sim_update(float dt, void *user_data)
         JceNetEvent ev;
         while (jce_net_poll(s_host, &ev, 0)) { /* drain */ }
         jce_net_service(s_host);
+        ++s_net_pump_updates;
     }
 }
 
@@ -231,6 +297,8 @@ void test_headless_runs_scene_physics_and_network(void)
     TEST_ASSERT_NOT_NULL_MESSAGE(s_runtime,
                                  "jce_runtime_create failed headless "
                                  "(physics/scene sim unavailable on a server)");
+    TEST_ASSERT_NOT_NULL_MESSAGE(s_host,
+        "headless transport smoke requires a real ephemeral ENet host");
 
     /* Tick long enough for gravity to visibly move the bodies. */
     for (int i = 0; i < 90; ++i) {
@@ -239,6 +307,7 @@ void test_headless_runs_scene_physics_and_network(void)
                                       "headless sim iterate did not CONTINUE");
     }
     TEST_ASSERT_TRUE_MESSAGE(s_update_count >= 90u, "sim did not tick");
+    TEST_ASSERT_TRUE_MESSAGE(s_net_pump_updates >= 90u, "real ENet host poll/service path did not run each simulation tick");
 
     /* The simulation actually advanced with no GPU: physics pulled the bodies
      * down from their spawn height. */
@@ -252,6 +321,7 @@ void test_headless_runs_scene_physics_and_network(void)
 
     jce_engine_destroy(e);
     TEST_ASSERT_TRUE_MESSAGE(s_exit_called, "app exit not called on destroy");
+    TEST_ASSERT_NULL_MESSAGE(s_host, "ephemeral ENet host ownership survived app exit");
 }
 
 /* ================================================================== */
@@ -271,6 +341,80 @@ static void hb_set_env(const char *name, const char *value)
 #else
     (void)setenv(name, value, 1);
 #endif
+}
+
+static void hb_clear_launch_env(void)
+{
+#if defined(_WIN32)
+    (void)_putenv_s("JCE_LAUNCH_VSYNC", "");
+    (void)_putenv_s("JCE_LAUNCH_TARGET_FPS", "");
+#else
+    (void)unsetenv("JCE_LAUNCH_VSYNC");
+    (void)unsetenv("JCE_LAUNCH_TARGET_FPS");
+#endif
+}
+static bool hb_launch_fail;
+static int hb_launch_observed;
+static bool hb_launch_init(const JceServices *svc, void *user_data)
+{
+    (void)hb_init(svc, user_data);
+    jce_engine_set_target_fps(60);
+    hb_launch_observed = jce_engine_get_target_fps();
+    return !hb_launch_fail;
+}
+static void hb_launch_exit(void *user_data)
+{
+    hb_exit(user_data);
+    jce_engine_set_target_fps(90); /* latest request during actual teardown */
+}
+static JceEngine *hb_launch_create(void)
+{
+    JceAppDesc desc = {0};
+    desc.name = "launch-policy-headless"; desc.headless = true;
+    desc.init = hb_launch_init; desc.exit = hb_launch_exit;
+    jce_engine_set_app_desc(&desc);
+    char arg0[] = "launch-policy-headless"; char *argv[] = {arg0, NULL};
+    return jce_engine_create(1, argv);
+}
+void test_invalid_launch_rejects_before_application_or_policy_mutation(void)
+{
+    hb_clear_launch_env(); jce_engine_set_target_fps(144);
+    hb_set_env("JCE_LAUNCH_VSYNC", "0"); hb_set_env("JCE_LAUNCH_TARGET_FPS", "0junk");
+    JceEngine *engine = hb_launch_create();
+    hb_clear_launch_env();
+    if (engine) jce_engine_destroy(engine);
+    TEST_ASSERT_NULL(engine); TEST_ASSERT_FALSE(s_init_called);
+    TEST_ASSERT_EQUAL_INT(144, jce_engine_get_target_fps());
+    jce_engine_set_target_fps(0);
+}
+void test_actual_launch_session_survives_app_init_and_restores_latest_exit_request(void)
+{
+    hb_clear_launch_env(); hb_set_env("JCE_LAUNCH_VSYNC", "0");
+    hb_set_env("JCE_LAUNCH_TARGET_FPS", "0");
+    hb_launch_fail = false; hb_launch_observed = -1;
+    JceEngine *engine = hb_launch_create();
+    hb_clear_launch_env(); /* snapshot is immutable even if environment changes */
+    int effective = -1;
+    if (engine) { jce_engine_set_target_fps(15); effective = jce_engine_get_target_fps(); jce_engine_destroy(engine); }
+    TEST_ASSERT_NOT_NULL(engine); TEST_ASSERT_EQUAL_INT(0, hb_launch_observed);
+    TEST_ASSERT_EQUAL_INT(0, effective);
+    TEST_ASSERT_TRUE(s_exit_called); TEST_ASSERT_EQUAL_INT(90, jce_engine_get_target_fps());
+    jce_engine_set_target_fps(0);
+}
+void test_actual_failed_app_init_releases_launch_session_for_the_next_boot(void)
+{
+    hb_clear_launch_env(); hb_set_env("JCE_LAUNCH_TARGET_FPS", "0");
+    hb_launch_fail = true; hb_launch_observed = -1;
+    JceEngine *engine = hb_launch_create();
+    hb_clear_launch_env();
+    if (engine) jce_engine_destroy(engine);
+    TEST_ASSERT_NULL(engine); TEST_ASSERT_EQUAL_INT(0, hb_launch_observed);
+    TEST_ASSERT_TRUE(s_exit_called); TEST_ASSERT_EQUAL_INT(90, jce_engine_get_target_fps());
+    hb_launch_fail = false;
+    engine = hb_launch_create();
+    if (engine) jce_engine_destroy(engine);
+    TEST_ASSERT_NOT_NULL(engine); TEST_ASSERT_EQUAL_INT(60, hb_launch_observed);
+    jce_engine_set_target_fps(0);
 }
 
 void test_jce_headless_env_forces_headless(void)
@@ -415,5 +559,8 @@ int main(void)
     RUN_TEST(test_jce_headless_env_forces_headless);
     RUN_TEST(test_short_app_desc_is_not_read_past_its_end);
     RUN_TEST(test_long_app_desc_tail_is_ignored);
+    RUN_TEST(test_invalid_launch_rejects_before_application_or_policy_mutation);
+    RUN_TEST(test_actual_launch_session_survives_app_init_and_restores_latest_exit_request);
+    RUN_TEST(test_actual_failed_app_init_releases_launch_session_for_the_next_boot);
     return UNITY_END();
 }

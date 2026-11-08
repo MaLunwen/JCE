@@ -1,0 +1,16 @@
+# XP target profile base. The builder injects verified compiler/runtime inputs.
+# GNU/MSVCRT archives must never be mixed with the MSVC build-host tool graph.
+include(base)
+
+[settings]
+os=Windows
+arch=x86_64
+compiler=clang
+compiler.version=22
+compiler.libcxx=libc++
+compiler.cppstd=20
+
+[conf]
+user.jce:windows_xp=True
+user.jce:ai_dispatch=False
+tools.info.package_id:confs=["user.jce:windows_xp_abi"]

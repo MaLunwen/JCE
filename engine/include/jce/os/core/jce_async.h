@@ -282,7 +282,10 @@ jce_async_group_wait(JceAsyncGroup *group);
 /* Process-wide background executor. The returned pointer is borrowed and is
  * valid until owner-thread default shutdown. The engine initializes it on the
  * main thread before background consumers can submit. Returns NULL while an
- * owner-thread shutdown is in progress; recreation is enabled after destroy. */
+ * owner-thread shutdown is in progress. Standalone shutdown permits recreation
+ * after destroy. Engine teardown prevents lazy recreation through exit callbacks
+ * and the inter-session gap; the next admitted Engine constructor reopens it.
+ * A retained executor remains queryable until its owner-thread shutdown. */
 JCE_API JceAsyncExecutor *JCE_CALL jce_async_default_executor(void);
 JCE_API uint32_t JCE_CALL
 jce_async_default_pump(const JceAsyncPumpBudget *budget);

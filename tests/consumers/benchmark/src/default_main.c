@@ -1,7 +1,9 @@
 /* Test policy around the stock SDK lifecycle; no private host state access. */
 #include <jce/application/jce_default_main.inc.h>
 #include "default_rt.h"
+#include "metrics.h"
 #include <jce/api_graphics.h>
+#include <string.h>
 
 static JcePakArchive *postfx_asset_pak;
 static JcePakArchive *postfx_base_pak;
@@ -9,6 +11,11 @@ static unsigned postfx_frame;
 static unsigned postfx_raw_frame;
 static uint64_t postfx_wait_started;
 static bool postfx_ready;
+/* Value packet, with engine-owned members borrowed only until postfx_exit.
+ * Never retain the callback's services-packet address across callbacks. */
+static JceServices postfx_metrics_services;
+static bool postfx_metrics_live;
+static uint64_t postfx_next_metrics_ms;
 static const char *postfx_after;
 static unsigned postfx_switch_frame;
 static bool postfx_apply(const char *effect);
@@ -101,6 +108,14 @@ static void postfx_draw(const JceServices *svc, void *user)
                  postfx_frame, postfx_after);
     app_draw(svc, user);
     ++postfx_raw_frame;
+    if(postfx_metrics_live) {
+        uint64_t now=jce_time_ticks_ms();
+        if(now>=postfx_next_metrics_ms) {
+            bench_metrics_sample_draw(svc,jce_default_main_get_scene(),
+                (JceSceneRenderer *)jce_default_main_get_scene_renderer(),postfx_raw_frame,"default-periodic");
+            postfx_next_metrics_ms=now+5000u;
+        }
+    }
     const char *model_path = getenv("JCE_BENCH_POST_MODEL");
     if (model_path && model_path[0] && !postfx_ready) {
         JceSceneRenderer *renderer = (JceSceneRenderer *)jce_default_main_get_scene_renderer();
@@ -178,6 +193,9 @@ static bool postfx_apply(const char *effect)
 
 static bool postfx_init(const JceServices *svc, void *user)
 {
+    postfx_metrics_live=false;
+    memset(&postfx_metrics_services,0,sizeof(postfx_metrics_services));
+    if(!svc)return false;
     postfx_wait_started = jce_time_ticks_ms();
     const char *switch_at = getenv("JCE_BENCH_POST_SWITCH_FRAME");
     postfx_after = getenv("JCE_BENCH_POST_EFFECT_AFTER");
@@ -201,13 +219,27 @@ static bool postfx_init(const JceServices *svc, void *user)
         }
         jce_pak_overlay_push(postfx_base_pak, postfx_asset_pak);
     }
-    return app_init(svc, user) && postfx_apply(getenv("JCE_BENCH_POST_EFFECT")) &&
-           bench_default_rt_init(svc);
+    const bool ready=app_init(svc,user) && postfx_apply(getenv("JCE_BENCH_POST_EFFECT")) &&
+        bench_default_rt_init(svc);
+    if(ready) {
+        postfx_metrics_services=*svc;postfx_metrics_live=true;
+        postfx_next_metrics_ms=jce_time_ticks_ms()+5000u;
+        bench_metrics_sample_draw(svc,jce_default_main_get_scene(),
+            (JceSceneRenderer *)jce_default_main_get_scene_renderer(),0,"default-initialized");
+    }
+    return ready;
 }
 
 static void postfx_exit(void *user)
 {
     bench_default_rt_exit();
+    if(postfx_metrics_live) {
+        /* Final read is before the stock host retires scene/renderer/window. */
+        bench_metrics_sample_draw(&postfx_metrics_services,jce_default_main_get_scene(),
+            (JceSceneRenderer *)jce_default_main_get_scene_renderer(),postfx_raw_frame,"default-exit");
+    }
+    postfx_metrics_live=false;
+    memset(&postfx_metrics_services,0,sizeof(postfx_metrics_services));
     app_exit(user);
     if (postfx_asset_pak) {
         jce_pak_overlay_remove(postfx_base_pak, postfx_asset_pak);

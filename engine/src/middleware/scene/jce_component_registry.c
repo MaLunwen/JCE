@@ -46,8 +46,20 @@ static int flag_bit_index(uint64_t single_bit_flag)
         return -1;   /* zero or multi-bit mask */
 #if defined(_MSC_VER)
     unsigned long idx;
+#if defined(_M_IX86)
+    /* MSVC x86 does not provide _BitScanForward64.  Scan the low and high
+     * halves separately, preserving the full [0, 63] bit position. */
+    unsigned long low = (unsigned long)(single_bit_flag & 0xffffffffULL);
+    if (low != 0) {
+        _BitScanForward(&idx, low);
+        return (int)idx;
+    }
+    _BitScanForward(&idx, (unsigned long)(single_bit_flag >> 32));
+    return (int)(idx + 32);
+#else
     _BitScanForward64(&idx, single_bit_flag);
     return (int)idx;
+#endif
 #elif defined(__GNUC__) || defined(__clang__)
     return __builtin_ctzll(single_bit_flag);
 #else

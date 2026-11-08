@@ -122,6 +122,16 @@ def read_header():
     # Camera-stack overlays: one view per overlay camera.
     o, om = macro("JCE_VIEW_SR_CAMERA_OVERLAY_OFFSET"), macro("JCE_VIEW_SR_CAMERA_OVERLAY_MAX")
     if o is not None and om: live.append((o, o + om - 1))
+    caustic = macro("JCE_VIEW_SR_WATER_CAUSTIC_OFFSET")
+    if caustic is not None: live.append((caustic, caustic))
+    trace = macro("JCE_VIEW_SR_WATER_TRACE_OFFSET")
+    transparent = macro("JCE_VIEW_SR_TRANSPARENCY_OFFSET")
+    if trace is not None and transparent is not None:
+        live.append((min(trace, transparent), max(trace, transparent)))
+    for name in ("JCE_VIEW_SR_SCREEN_SHAFTS_OFFSET", "JCE_VIEW_SR_TOON_HAIR_OFFSET"):
+        offset = macro(name)
+        if offset is not None:
+            live.append((offset, offset))
 
     bases = {}
     for name, key in (("JCE_VIEW_EDITOR_SCENE", "editor-scene-view"),

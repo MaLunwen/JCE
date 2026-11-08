@@ -21,7 +21,8 @@
  *
  * Same crash-safety model as the user config: values live on an in-memory
  * table, writes are debounced (~0.5s quiet) and flushed atomically; a
- * project-root switch flushes the outgoing project's state first.
+ * project-root switch publishes the outgoing project's state first; failure
+ * retains that project's identity and dirty table and refuses the switch.
  *
  * Per-scene keys: pass the scene's project-relative path as `scene`.
  * Scene sections are LRU-capped (most recent 24 scenes) so the file can't
@@ -70,9 +71,11 @@ void  jce_editor_pstate_scene_set_str(const char *scene, const char *key,
 bool  jce_editor_pstate_active(void);
 
 /* Debounce pump + forced flush — mirror jce_editor_config_flush_*.
- * flush_tick also detects project-root changes (flush old, reload new). */
+ * Failed timed/forced writes retain dirty state for retry, with the existing
+ * quiet-period debounce. flush_now returns false while publication is pending.
+ * Root transitions consume this same result before replacing the table. */
 void  jce_editor_pstate_flush_tick(float dt_sec);
-void  jce_editor_pstate_flush_now(void);
+bool  jce_editor_pstate_flush_now(void);
 
 /* ── Open-project root ───────────────────────────────────────────────
  *
@@ -82,13 +85,15 @@ void  jce_editor_pstate_flush_now(void);
  * it is safe to hold across calls — but re-read it if you need the
  * current value.
  *
- * The setter only replaces the string (truncated at 511 chars).  The
- * full open-project transition — asset DB, PAK key, render pipeline,
- * project settings, build/run profile, game l10n — is
- * set_current_project_root() in dialogs/jce_dialog_project.cpp, which
- * calls this.  Do not call the setter from anywhere else. */
+ * The setter rejects oversized roots and refuses a transition when outgoing
+ * state cannot be published. On false, both the root and dirty table still
+ * belong to the outgoing project; callers must not repoint assets or report
+ * success. NULL / "" requests no open project under the same save rule.
+ * The full open-project transition (asset DB, key, renderer, settings,
+ * profiles and l10n) is set_current_project_root() in the project dialog;
+ * headless initialization uses the same root admission before its build. */
 const char *jce_editor_current_project_root(void);
-void        jce_editor_current_project_root_set(const char *root);
+bool        jce_editor_current_project_root_set(const char *root);
 
 #ifdef __cplusplus
 }

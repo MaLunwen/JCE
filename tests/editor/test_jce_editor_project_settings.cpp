@@ -10,6 +10,7 @@
 #include <doctest.h>
 
 #include "core/jce_project_settings.h"
+#include <jce/os/core/jce_defs.h>
 
 #include <cstring>
 
@@ -167,4 +168,97 @@ TEST_CASE("apply caches the snapshot for current(), overwrite replaces it")
     REQUIRE(cur != nullptr);
     CHECK(cur->audio.master_volume == doctest::Approx(0.99f));
     CHECK(cur->player.default_screen_width == 1280); /* reset by defaults() */
+}
+
+
+TEST_CASE("project root changes retire the cached settings snapshot")
+{
+    jce_project_settings_set_root("_ut_project_settings_root_a");
+    JceProjectSettings settings;
+    jce_project_settings_defaults(&settings);
+    settings.audio.master_volume = 0.23f;
+    settings.time.fixed_timestep = 0.125f;
+    settings.physics.gravity[1] = -2.5f;
+    jce_project_settings_apply(&settings);
+    REQUIRE(jce_project_settings_current() != nullptr);
+
+    jce_project_settings_set_root("_ut_project_settings_root_b");
+    CHECK(jce_project_settings_current() == nullptr);
+
+    /* Selecting A again cannot resurrect its old process-wide snapshot. */
+    jce_project_settings_set_root("_ut_project_settings_root_a");
+    CHECK(jce_project_settings_current() == nullptr);
+
+    settings.audio.master_volume = 0.76f;
+    jce_project_settings_apply(&settings);
+    REQUIRE(jce_project_settings_current() != nullptr);
+    CHECK(jce_project_settings_current()->audio.master_volume == doctest::Approx(0.76f));
+    jce_project_settings_set_root(nullptr);
+}
+
+TEST_CASE("selecting the same normalized project root preserves edited settings")
+{
+    jce_project_settings_set_root("_ut_project_settings_same_root");
+    JceProjectSettings settings;
+    jce_project_settings_defaults(&settings);
+    settings.audio.master_volume = 0.37f;
+    settings.time.fixed_timestep = 0.0625f;
+    jce_project_settings_apply(&settings);
+    const JceProjectSettings *before = jce_project_settings_current();
+    REQUIRE(before != nullptr);
+
+    jce_project_settings_set_root("_ut_project_settings_same_root");
+    const JceProjectSettings *after = jce_project_settings_current();
+    REQUIRE(after != nullptr);
+    CHECK(after == before);
+    CHECK(after->audio.master_volume == doctest::Approx(0.37f));
+    CHECK(after->time.fixed_timestep == doctest::Approx(0.0625f));
+
+#if JCE_PLATFORM_WINDOWS
+    /* Match the editor's identity rule for already-normalized Windows roots. */
+    jce_project_settings_set_root("_UT_PROJECT_SETTINGS_SAME_ROOT");
+    after = jce_project_settings_current();
+    REQUIRE(after != nullptr);
+    CHECK(after->audio.master_volume == doctest::Approx(0.37f));
+#endif
+    jce_project_settings_set_root(nullptr);
+}
+
+TEST_CASE("closing a project clears its settings without loading another root")
+{
+    JceProjectSettings settings;
+    jce_project_settings_defaults(&settings);
+    settings.audio.disable_audio = true;
+    settings.time.fixed_timestep = 0.125f;
+    jce_project_settings_set_root("_ut_project_settings_close");
+    jce_project_settings_apply(&settings);
+    REQUIRE(jce_project_settings_current() != nullptr);
+
+    SUBCASE("null closes the explicit root")
+    {
+        jce_project_settings_set_root(nullptr);
+        CHECK(jce_project_settings_current() == nullptr);
+        jce_project_settings_set_root("");
+        CHECK(jce_project_settings_current() == nullptr);
+    }
+    SUBCASE("empty closes the explicit root")
+    {
+        jce_project_settings_set_root("");
+        CHECK(jce_project_settings_current() == nullptr);
+        jce_project_settings_set_root(nullptr);
+        CHECK(jce_project_settings_current() == nullptr);
+    }
+
+    /* No-project is one identity. Explicit apply remains a supported operation;
+     * the setter must not implicitly read CWD or discard same-owner edits. */
+    jce_project_settings_defaults(&settings);
+    settings.audio.master_volume = 0.63f;
+    jce_project_settings_apply(&settings);
+    jce_project_settings_set_root(nullptr);
+    jce_project_settings_set_root("");
+    REQUIRE(jce_project_settings_current() != nullptr);
+    CHECK(jce_project_settings_current()->audio.master_volume == doctest::Approx(0.63f));
+    jce_project_settings_set_root("_ut_project_settings_new_owner");
+    CHECK(jce_project_settings_current() == nullptr);
+    jce_project_settings_set_root(nullptr);
 }

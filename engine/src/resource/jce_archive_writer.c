@@ -700,9 +700,7 @@ bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_
     bb_append(&buf, index_stored, index_stored_size);
 
     /* Hashes (spec §9.1): over the data region and the index as stored. */
-    uint64_t data_hash = 0;
-    if (data_end > data_start)
-        data_hash = (uint64_t)XXH3_64bits(buf.data + data_start, data_end - data_start);
+    uint64_t data_hash = (uint64_t)XXH3_64bits(buf.data + data_start, data_end - data_start);
     uint64_t index_hash = (uint64_t)XXH3_64bits(buf.data + index_offset, index_stored_size);
 
     /* Optional debug path table (spec §4.8), in sorted index order. */

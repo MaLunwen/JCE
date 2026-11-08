@@ -1,8 +1,8 @@
 /*
  * test_jce_scene_renderer_view_order.c
  *
- * Scene renderer view ordering: shadow + GPU-compute producer views must
- * execute before the color consumer view, even when their numeric bgfx view
+ * Scene renderer view ordering: camera depth, shadow and GPU-compute producers
+ * must execute before the color consumer, even when their numeric bgfx view
  * IDs are higher. Assertions favour ordering invariants over exact slot
  * indices so they survive band layout tweaks (only the stable cascade band
  * head and total range count are pinned numerically).
@@ -59,7 +59,8 @@ static void test_scene_color_stays_before_fog_when_shadows_are_disabled(void)
 
     TEST_ASSERT_EQUAL_UINT16(3, order.first);
     TEST_ASSERT_EQUAL_UINT16(17, order.count);
-    TEST_ASSERT_EQUAL_UINT16(3, order.order[0]);
+    TEST_ASSERT_TRUE(index_of(&order, 4) >= 0);
+    TEST_ASSERT_TRUE(index_of(&order, 4) < index_of(&order, 3));
     TEST_ASSERT_TRUE(index_of(&order, 3) < index_of(&order, 18));
     TEST_ASSERT_TRUE(index_of(&order, 18) < index_of(&order, 19));
 }
@@ -260,6 +261,268 @@ static void test_no_overlays_is_the_order_this_build_had_before(void)
     TEST_ASSERT_TRUE(index_of(&none, (uint16_t)(3 + 64)) < 0);
 }
 
+/* base+1 is the shared current-camera depth producer, even when shadow,
+ * fog, particle compute and every other optional view are disabled.  Reserving
+ * its existing core-band sort slot does not touch it or enable a prepass.
+ * The real render owner may submit RP.depth_prepass after this helper runs;
+ * an absent slot must not leave that producer sorting after base+0. */
+static void assert_depth_before_color(const JceSceneRendererViewOrder *order,
+                                      uint16_t base)
+{
+    const int depth = index_of(order, (uint16_t)(base + 1u));
+    const int color = index_of(order, base);
+    TEST_ASSERT_TRUE_MESSAGE(depth >= 0, "current-camera depth slot is missing");
+    TEST_ASSERT_TRUE_MESSAGE(color >= 0, "scene color slot is missing");
+    TEST_ASSERT_TRUE_MESSAGE(depth < order->named_count,
+                             "depth producer must be an owned view, not filler");
+    TEST_ASSERT_TRUE_MESSAGE(depth < color,
+                             "current-camera depth must execute before color readers");
+}
+
+/* The bgfx remap window is a finite permutation in this product's 256-view
+ * configuration.  Validate before indexing so a malformed owner result fails
+ * an ordinary assertion instead of corrupting the fixture's own array. */
+static void assert_finite_view_window(const JceSceneRendererViewOrder *order)
+{
+    bool seen[256] = {false};
+    TEST_ASSERT_TRUE(order->count > 0u);
+    TEST_ASSERT_TRUE(order->count <= JCE_SCENE_RENDERER_VIEW_ORDER_MAX);
+    TEST_ASSERT_TRUE(order->named_count <= order->count);
+    TEST_ASSERT_TRUE_MESSAGE((uint32_t)order->first + order->count <= 256u,
+                             "view remap window exceeds the hardware view limit");
+    for (uint16_t i = 0; i < order->count; ++i) {
+        const uint16_t id = order->order[i];
+        TEST_ASSERT_TRUE_MESSAGE(id < 256u, "view id exceeds the hardware view limit");
+        TEST_ASSERT_TRUE(id >= order->first);
+        TEST_ASSERT_TRUE((uint32_t)id < (uint32_t)order->first + order->count);
+        TEST_ASSERT_FALSE_MESSAGE(seen[id], "view remap is not a permutation");
+        seen[id] = true;
+    }
+    for (uint16_t i = 0; i < order->count; ++i)
+        TEST_ASSERT_TRUE(seen[(uint16_t)(order->first + i)]);
+}
+
+static void test_prepass_only_depth_producer_executes_before_color(void)
+{
+    JceSceneRendererViewOrder order;
+    /* The public helper has no depth-request parameter.  This is the actual
+     * existing call for a pipeline enabling only depth_prepass, not a fixture
+     * flag pretending that production already admits a separate request. */
+    TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build(
+        30u, false, 0u, false, false, false, false, false, false, 0u, &order));
+    assert_finite_view_window(&order);
+    assert_depth_before_color(&order, 30u);
+    TEST_ASSERT_EQUAL_UINT16(2u, order.count);
+    TEST_ASSERT_EQUAL_UINT16(2u, order.named_count);
+    TEST_ASSERT_EQUAL_UINT16(31u, order.order[0]);
+    TEST_ASSERT_EQUAL_UINT16(30u, order.order[1]);
+}
+
+static void test_depth_producer_precedes_color_at_each_view_base(void)
+{
+    /* Runtime, Scene, Game, preview and high-end reduced-pass reservations all
+     * use this same complete owner.  This test does not initialize a viewport
+     * or claim that the reduced reflection path calls this helper. */
+    const uint16_t bases[] = {0u, JCE_VIEW_EDITOR_SCENE, 30u, 60u, 80u,
+        JCE_VIEW_EDITOR_GAME, 128u, 238u, 254u};
+    for (unsigned i = 0; i < sizeof(bases) / sizeof(bases[0]); ++i) {
+        JceSceneRendererViewOrder order;
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build(
+            bases[i], false, 0u, false, false, false, false, false, false, 0u, &order));
+        assert_finite_view_window(&order);
+        assert_depth_before_color(&order, bases[i]);
+    }
+}
+
+static void test_depth_keeps_compute_shadow_and_overlay_dependencies(void)
+{
+    /* Each optional producer band is exercised independently, then together.
+     * Existing exact shadow/fog/overlay controls above remain unchanged. */
+    const struct {
+        bool shadows;
+        bool fog;
+        bool particles;
+        bool cull;
+        bool cube;
+        bool dynamic;
+        bool underwater;
+        uint8_t overlays;
+    } cases[] = {
+        {false, false, true,  false, false, false, false, 0u},
+        {false, false, false, true,  false, false, false, 0u},
+        {true,  false, false, false, false, false, false, 0u},
+        {false, true,  false, false, false, false, false, 0u},
+        {false, false, false, false, true,  false, false, 0u},
+        {false, false, false, false, false, true,  false, 0u},
+        {false, false, false, false, false, false, true,  0u},
+        {false, false, false, false, false, false, false, 3u},
+        {true,  true,  true,  true,  true,  true,  true,  3u}
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        JceSceneRendererViewOrder order;
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build(
+            3u, cases[i].shadows, 4u, cases[i].fog,
+            cases[i].particles, cases[i].cull, cases[i].cube,
+            cases[i].dynamic, cases[i].underwater, cases[i].overlays, &order));
+        assert_finite_view_window(&order);
+        assert_depth_before_color(&order, 3u);
+        if (cases[i].cull) {
+            const int reset = index_of(&order,
+                (uint16_t)(3u + JCE_VIEW_SR_GPU_CULL_RESET_OFFSET));
+            const int cull = index_of(&order, 12u);
+            TEST_ASSERT_TRUE(reset >= 0 && cull >= 0);
+            TEST_ASSERT_TRUE(reset < cull);
+            TEST_ASSERT_TRUE_MESSAGE(cull < index_of(&order, 4u),
+                                     "depth draws must follow visibility compute");
+        }
+        if (cases[i].shadows) {
+            for (uint16_t c = 0; c < 4u; ++c)
+                TEST_ASSERT_TRUE(index_of(&order, (uint16_t)(14u + c)) <
+                                 index_of(&order, 3u));
+        }
+        if (cases[i].overlays) {
+            const int overlay = index_of(&order, 67u);
+            TEST_ASSERT_TRUE(overlay > index_of(&order, 3u));
+            TEST_ASSERT_TRUE(overlay < index_of(&order, 21u)); /* SSR reader */
+            TEST_ASSERT_TRUE(overlay < index_of(&order, 23u)); /* fullscreen */
+            TEST_ASSERT_TRUE(overlay < index_of(&order, 33u)); /* postfx */
+        }
+    }
+}
+
+static void test_last_legal_view_windows_preserve_depth_and_permutation(void)
+{
+    const struct {
+        uint16_t base;
+        bool fog;
+        bool cull;
+        bool cube;
+        uint8_t overlays;
+    } cases[] = {
+        {254u, false, false, false, 0u}, /* base+1 = 255 */
+        {239u, true,  false, false, 0u}, /* base+16 = 255 */
+        {192u, false, true,  false, 0u}, /* base+63 = 255 */
+        {139u, false, false, true,  0u}, /* base+116 = 255 */
+        {189u, false, false, false, 3u}  /* base+66 = 255 */
+    };
+    for (unsigned i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        JceSceneRendererViewOrder order;
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build(
+            cases[i].base, false, 0u, cases[i].fog, false,
+            cases[i].cull, cases[i].cube, false, false, cases[i].overlays, &order));
+        assert_finite_view_window(&order);
+        assert_depth_before_color(&order, cases[i].base);
+        TEST_ASSERT_TRUE(index_of(&order, 255u) >= 0);
+        TEST_ASSERT_EQUAL_UINT16(256u - cases[i].base, order.count);
+    }
+}
+
+static void test_depth_slot_beyond_last_hardware_view_is_rejected(void)
+{
+    JceSceneRendererViewOrder order;
+    TEST_ASSERT_FALSE_MESSAGE(jce_scene_renderer_view_order_build(
+        255u, false, 0u, false, false, false, false, false, false, 0u, &order),
+        "a color-only window cannot omit a potentially submitted depth producer");
+}
+
+static void test_base_outside_hardware_view_window_is_rejected(void)
+{
+    JceSceneRendererViewOrder order;
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build(
+        256u, false, 0u, false, false, false, false, false, false, 0u, &order));
+}
+
+static void test_optional_bands_cannot_extend_past_hardware_view_window(void)
+{
+    JceSceneRendererViewOrder order;
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build(
+        193u, false, 0u, false, false, true, false, false, false, 0u, &order));
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build(
+        140u, false, 0u, false, false, false, true, false, false, 0u, &order));
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build(
+        190u, false, 0u, false, false, false, false, false, false, 3u, &order));
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build(
+        240u, false, 0u, true, false, false, false, false, false, 0u, &order));
+}
+
+static void test_caustic_atlas_is_owned_before_water_colour(void)
+{
+    const uint16_t bases[] = {JCE_VIEW_EDITOR_SCENE, JCE_VIEW_RUNTIME_GAME, JCE_VIEW_EDITOR_GAME};
+    for (unsigned i = 0; i < sizeof bases / sizeof bases[0]; ++i) {
+        const uint16_t base = bases[i];
+        const uint16_t caustic = (uint16_t)(base + JCE_VIEW_SR_WATER_CAUSTIC_OFFSET);
+        JceSceneRendererViewOrder order, off;
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build_with_caustic(base,
+            false, 0u, false, false, false, false, false, false, 0u, true, &order));
+        assert_finite_view_window(&order);
+        const int producer = index_of(&order, caustic);
+        TEST_ASSERT_TRUE(producer >= 0 && producer < order.named_count);
+        TEST_ASSERT_TRUE(producer < index_of(&order, base));
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build(base,
+            false, 0u, false, false, false, false, false, false, 0u, &off));
+        TEST_ASSERT_EQUAL_INT(-1, index_of(&off, caustic));
+    }
+    JceSceneRendererViewOrder out;
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build_with_caustic(JCE_VIEW_PLANAR_REFLECTION_BASE,
+        false, 0u, false, false, false, false, false, false, 0u, true, &out));
+    TEST_ASSERT_EQUAL_UINT16(0u, out.count);
+}
+
+static void test_cloud_temporal_runs_before_each_primary_sky(void)
+{
+    const uint16_t bases[] = {JCE_VIEW_EDITOR_SCENE, JCE_VIEW_EDITOR_GAME,
+                             JCE_VIEW_RUNTIME_GAME};
+    for (unsigned i = 0; i < sizeof bases / sizeof bases[0]; ++i) {
+        const uint16_t base = bases[i];
+        const uint16_t cloud = (uint16_t)(base + JCE_VIEW_SR_CLOUD_TEMPORAL_OFFSET);
+        JceSceneRendererViewOrder order, off;
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build_with_cloud_temporal(base,
+            false, 0u, false, false, false, false, false, false, 0u,
+            false, false, false, false, true, &order));
+        assert_finite_view_window(&order);
+        TEST_ASSERT_TRUE(index_of(&order, cloud) >= 0);
+        TEST_ASSERT_TRUE(index_of(&order, cloud) < index_of(&order, base));
+        TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build_with_cloud_temporal(base,
+            false, 0u, false, false, false, false, false, false, 0u,
+            false, false, false, false, false, &off));
+        TEST_ASSERT_EQUAL_INT(-1, index_of(&off, cloud));
+    }
+    JceSceneRendererViewOrder offscreen;
+    TEST_ASSERT_FALSE(jce_scene_renderer_view_order_build_with_cloud_temporal(
+        JCE_VIEW_PLANAR_REFLECTION_BASE, false, 0u, false, false, false, false,
+        false, false, 0u, false, false, false, false, true, &offscreen));
+}
+
+static void test_cloud_opaque_precedes_transparency_and_preserves_optics_source(void)
+{
+    const uint16_t bases[] = {JCE_VIEW_EDITOR_SCENE, JCE_VIEW_EDITOR_GAME,
+                             JCE_VIEW_RUNTIME_GAME};
+    for (unsigned i = 0; i < sizeof bases / sizeof bases[0]; ++i) {
+        const uint16_t base = bases[i];
+        for (unsigned optics = 0; optics < 2; ++optics) {
+            JceSceneRendererViewOrder order;
+            TEST_ASSERT_TRUE(jce_scene_renderer_view_order_build_with_cloud_temporal(base,
+                false, 0u, false, false, false, false, false, false, 0u,
+                false, optics != 0u, false, false, true, &order));
+            assert_finite_view_window(&order);
+            const int composite = index_of(&order,
+                (uint16_t)(base + JCE_VIEW_SR_CLOUD_OPAQUE_OFFSET));
+            const int transparent = index_of(&order,
+                (uint16_t)(base + JCE_VIEW_SR_TRANSPARENCY_OFFSET));
+            TEST_ASSERT_TRUE(composite > index_of(&order, base));
+            TEST_ASSERT_TRUE(transparent > composite);
+            TEST_ASSERT_TRUE(composite < order.named_count);
+            TEST_ASSERT_TRUE(transparent < order.named_count);
+            if (optics) {
+                const int trace = index_of(&order,
+                    (uint16_t)(base + JCE_VIEW_SR_WATER_TRACE_OFFSET));
+                TEST_ASSERT_TRUE(trace > index_of(&order, base));
+                TEST_ASSERT_TRUE(trace < composite);
+            }
+        }
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -272,5 +535,15 @@ int main(void)
     RUN_TEST(test_named_views_never_touch_the_postfx_band);
     RUN_TEST(test_camera_overlays_sort_after_colour_and_before_its_readers);
     RUN_TEST(test_no_overlays_is_the_order_this_build_had_before);
+    RUN_TEST(test_prepass_only_depth_producer_executes_before_color);
+    RUN_TEST(test_depth_producer_precedes_color_at_each_view_base);
+    RUN_TEST(test_depth_keeps_compute_shadow_and_overlay_dependencies);
+    RUN_TEST(test_last_legal_view_windows_preserve_depth_and_permutation);
+    RUN_TEST(test_depth_slot_beyond_last_hardware_view_is_rejected);
+    RUN_TEST(test_base_outside_hardware_view_window_is_rejected);
+    RUN_TEST(test_optional_bands_cannot_extend_past_hardware_view_window);
+    RUN_TEST(test_caustic_atlas_is_owned_before_water_colour);
+    RUN_TEST(test_cloud_temporal_runs_before_each_primary_sky);
+    RUN_TEST(test_cloud_opaque_precedes_transparency_and_preserves_optics_source);
     return UNITY_END();
 }

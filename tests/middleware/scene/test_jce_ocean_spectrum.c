@@ -161,28 +161,55 @@ static void test_fetch_develops_the_sea(void)
     }
 }
 
+static float t_unenhanced_jonswap(const JceOceanSpectrumParams *p, float w)
+{
+    const double g = p->gravity;
+    const double wp = 22.0 * cbrt(g * g / (p->wind_speed * p->fetch));
+    const double alpha = 0.076 * pow(p->wind_speed * p->wind_speed /
+                                    (p->fetch * g), 0.22);
+    return (float)(alpha * g * g / pow(w, 5.0) *
+                   exp(-1.25 * pow(wp / w, 4.0)));
+}
+
+static void test_pm_fully_developed_wind_sea(void)
+{
+    JceOceanSpectrumParams p = t_params();
+    p.type = JCE_OCEAN_SPECTRUM_PM;
+    const float expected_peak = (float)((0.877 / 1.026) * p.gravity / p.wind_speed);
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, expected_peak, jce_ocean_spectrum_peak_omega(&p));
+    const float energy = jce_ocean_spectrum_energy(&p, expected_peak);
+    const float expected = (float)(0.0081 * p.gravity * p.gravity /
+        pow(expected_peak, 5.0) * exp(-1.25));
+    TEST_ASSERT_FLOAT_WITHIN(expected * 1e-5f, expected, energy);
+    p.fetch = 1.0f;
+    TEST_ASSERT_EQUAL_FLOAT(energy, jce_ocean_spectrum_energy(&p, expected_peak));
+    p.fetch = 1e8f;
+    TEST_ASSERT_EQUAL_FLOAT(energy, jce_ocean_spectrum_energy(&p, expected_peak));
+    p.wind_speed *= 2.0f;
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, expected_peak * 0.5f,
+                            jce_ocean_spectrum_peak_omega(&p));
+}
+
 static void test_spectrum_family_ordering(void)
 {
     JceOceanSpectrumParams js = t_params();
-    JceOceanSpectrumParams pm = t_params();
     JceOceanSpectrumParams tma_shallow = t_params();
     JceOceanSpectrumParams tma_deep    = t_params();
     float wp = jce_ocean_spectrum_peak_omega(&js);
     int i;
 
-    pm.type          = JCE_OCEAN_SPECTRUM_PM;
     tma_shallow.type = JCE_OCEAN_SPECTRUM_TMA;
     tma_deep.type    = JCE_OCEAN_SPECTRUM_TMA;
     tma_shallow.depth = 5.0f;
     tma_deep.depth    = 4000.0f;
 
-    /* gamma = 3.3 only ADDS energy, and only near the peak: PM is the same
+    /* gamma = 3.3 only ADDS energy, and only near the peak: the baseline is the same
      * curve without the enhancement. */
-    TEST_ASSERT_TRUE(jce_ocean_spectrum_energy(&pm, wp) <
+    TEST_ASSERT_TRUE(t_unenhanced_jonswap(&js, wp) <
                      jce_ocean_spectrum_energy(&js, wp));
     {
         float w_far = wp * 4.0f; /* r underflows to 0 here, so gamma^r == 1 */
-        float a = jce_ocean_spectrum_energy(&pm, w_far);
+        float a = t_unenhanced_jonswap(&js, w_far);
         float b = jce_ocean_spectrum_energy(&js, w_far);
         TEST_ASSERT_FLOAT_WITHIN(b * 1e-4f + 1e-30f, b, a);
     }
@@ -194,9 +221,9 @@ static void test_spectrum_family_ordering(void)
     {
         float d  = 0.15f;
         double r_lo = (double)jce_ocean_spectrum_energy(&js, wp * (1.0f - d))
-                    / (double)jce_ocean_spectrum_energy(&pm, wp * (1.0f - d));
+                    / (double)t_unenhanced_jonswap(&js, wp * (1.0f - d));
         double r_hi = (double)jce_ocean_spectrum_energy(&js, wp * (1.0f + d))
-                    / (double)jce_ocean_spectrum_energy(&pm, wp * (1.0f + d));
+                    / (double)t_unenhanced_jonswap(&js, wp * (1.0f + d));
         TEST_ASSERT_TRUE(r_lo > 1.0 && r_hi > r_lo * 1.01);
     }
 
@@ -447,6 +474,31 @@ static void test_null_and_default_params(void)
                         jce_ocean_spectrum_peak_omega(&p)) > 0.0f);
 }
 
+static void test_tma_finite_depth_dispersion(void)
+{
+    JceOceanSpectrumParams p;
+    jce_ocean_spectrum_params_default(&p);
+    p.type = JCE_OCEAN_SPECTRUM_TMA;
+    p.depth = 2.0f;
+    double group = 0.0;
+    const double k = 0.0001;
+    const double omega = jce_ocean_spectrum_dispersion(&p, k, &group);
+    const double shallow_speed = sqrt((double)p.gravity * p.depth);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, shallow_speed, omega / k);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, shallow_speed, group);
+    const double middle_k = 0.3, epsilon = 1e-5;
+    (void)jce_ocean_spectrum_dispersion(&p, middle_k, &group);
+    const double numeric = (jce_ocean_spectrum_dispersion(&p, middle_k + epsilon, NULL)
+        - jce_ocean_spectrum_dispersion(&p, middle_k - epsilon, NULL)) / (2.0 * epsilon);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-7, numeric, group);
+    p.depth = 10000.0f;
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, sqrt((double)p.gravity * middle_k),
+        jce_ocean_spectrum_dispersion(&p, middle_k, &group));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, 0.5 * sqrt((double)p.gravity / middle_k), group);
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, jce_ocean_spectrum_dispersion(&p, 0.0, &group));
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, group);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -454,6 +506,8 @@ int main(void)
     RUN_TEST(test_energy_peaks_at_expected_wp);
     RUN_TEST(test_fetch_develops_the_sea);
     RUN_TEST(test_spectrum_family_ordering);
+    RUN_TEST(test_pm_fully_developed_wind_sea);
+    RUN_TEST(test_tma_finite_depth_dispersion);
     RUN_TEST(test_spreading_integrates_to_one);
     RUN_TEST(test_spreading_symmetric_and_periodic);
     RUN_TEST(test_swell_concentrates_the_lobe);

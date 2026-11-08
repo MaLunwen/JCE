@@ -6,6 +6,9 @@
  */
 
 #include "jce_editor.h"
+#include "jce_editor_key_event.h"
+#include "jce_editor_viewport_work.h"
+#include "jce_editor_hotkey_diag.h"
 #include "viewers/jce_file_viewer.h"
 
 #include <cstdlib>
@@ -20,10 +23,17 @@
 #include "gizmo/jce_gizmo.h"
 #include "jce_editor_alloc.h"
 #include "jce_editor_config.h"
+#include "jce_editor_host_services.h"
+#include "jce_editor_lan_discovery.h"
 #include "jce_editor_game_input_bridge.h"
 #include "jce_editor_project_state.h"
+#include "jce_editor_project_context.h"
+#include "jce_editor_project.h"
+#include "jce_editor_scene_route.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_kpi_game_capture.h"
+#include "jce_editor_screenshot_completion.h"
+#include "jce_editor_toast.h"
 #include "jce_editor_script_backends.h"
 #include "ui/jce_editor_layout.h"
 #include "ui/jce_editor_panels.h"
@@ -59,6 +69,8 @@ extern "C" int  jce_editor_prefs_autosave_interval_sec(void);
 /* jce_panel_project_settings.cpp — per-project quality tier boot re-apply
  * (settings-persistence audit, gap #14). */
 void jce_editor_quality_tier_boot_apply(void);
+/* Existing project transaction; restore before loading any scene. */
+bool set_current_project_root(const char *path);
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
@@ -83,6 +95,10 @@ extern "C" {
 static struct {
     bool        initialized;
     bool        active;         /* editor overlay visible? */
+    bool        overview_diagnostics;
+    bool        static_batch_bake_requested;
+    int         overview_focus_frames;
+    int         static_batch_bake_frames;
     uint64_t    last_time;      /* for delta-time computation */
     JceCursor  *cursors[ImGuiMouseCursor_COUNT];
     JceWindow  *window;         /* opaque engine window for text input API */
@@ -96,8 +112,78 @@ static struct {
     bool        frame_kpi_shot_done; /* JCE_KPI_SHOT one-shot guard */
     uint32_t    autoplay_frame;
 
+    JceEditorScreenshotOwner screenshot;
+    JceEditorScreenshotSlot screenshot_slot;
     float       autosave_accum;   /* seconds since last autosave tick */
 } s_editor;
+
+/* Launch-only presence selectors; the editor lifecycle owns their snapshots. */
+static void editor_launch_diagnostics_begin(void)
+{
+    s_editor.overview_diagnostics = getenv("JCE_DBG_OVERVIEW") != nullptr;
+    s_editor.static_batch_bake_requested = getenv("JCE_STATIC_BATCH_BAKE") != nullptr;
+    s_editor.overview_focus_frames = 0;
+    s_editor.static_batch_bake_frames = 0;
+}
+
+static void screenshot_poll_()
+{
+    jce_editor_screenshot_complete(s_editor.screenshot,
+        [] { return jce_editor_screenshot_slot_poll(s_editor.screenshot_slot,
+            JCE_EDITOR_SCREENSHOT_BACKBUFFER, [] { return jce_screenshot_poll(); }); },
+        [](const JceEditorScreenshotOwner &request, int result) {
+            if (result == 1) {
+                LOG_INFO(LOG_TAG, "screenshot completed source=%u path=%s",
+                         request.source, request.path);
+                if (request.interactive)
+                    jce_toast_success(jce_editor_i18n("toast.screenshot"), request.path);
+            } else {
+                LOG_ERROR(LOG_TAG, "screenshot write failed source=%u path=%s",
+                          request.source, request.path);
+                if (request.interactive)
+                    jce_toast_error("%s", jce_editor_i18n("toast.screenshotFailed"));
+            }
+        });
+}
+
+bool jce_editor_request_screenshot(const char *path, bool interactive,
+                                   unsigned source)
+{
+    const bool accepted = s_editor.initialized && jce_editor_screenshot_request(
+        s_editor.screenshot, path, interactive, source,
+        [](const char *destination) {
+            return jce_editor_screenshot_slot_submit(s_editor.screenshot_slot,
+                JCE_EDITOR_SCREENSHOT_BACKBUFFER, [destination] {
+                    return jce_screenshot_save(destination, JCE_SCREENSHOT_PNG);
+                });
+        });
+    if (accepted)
+        LOG_INFO(LOG_TAG, "screenshot submitted source=%u path=%s", source, path);
+    else {
+        LOG_WARN(LOG_TAG, "screenshot request rejected source=%u", source);
+        if (interactive)
+            jce_toast_error("%s", jce_editor_i18n("toast.screenshotFailed"));
+    }
+    return accepted;
+}
+
+bool jce_editor_request_viewport_screenshot(unsigned owner, uint16_t texture,
+    uint16_t view, uint16_t width, uint16_t height, const char *path, int yflip)
+{
+    if (!s_editor.initialized || (owner != JCE_EDITOR_SCREENSHOT_SCENE &&
+                                 owner != JCE_EDITOR_SCREENSHOT_GAME)) return false;
+    return jce_editor_screenshot_slot_submit(s_editor.screenshot_slot, owner,
+        [=] { return jce_renderer_readback_capture_submit(
+            texture, view, width, height, path, yflip); });
+}
+
+int jce_editor_viewport_capture_poll(unsigned owner)
+{
+    if (owner != JCE_EDITOR_SCREENSHOT_SCENE &&
+        owner != JCE_EDITOR_SCREENSHOT_GAME) return -1;
+    return jce_editor_screenshot_legacy_poll(s_editor.screenshot_slot, owner,
+        [] { return jce_renderer_readback_capture_poll(); });
+}
 
 /* ── Key mapping (JCE → ImGui) ─────────────────────────────────────── */
 
@@ -198,15 +284,6 @@ extern "C" int jce_editor_scancode_to_imgui_key(int scancode)
     return (int)jce_key_to_imgui_key((JceKey)scancode);
 }
 
-static void update_key_modifiers(uint16_t mods)
-{
-    ImGuiIO &io = ImGui::GetIO();
-    io.AddKeyEvent(ImGuiMod_Ctrl,  (mods & JCE_KMOD_CTRL)  != 0);
-    io.AddKeyEvent(ImGuiMod_Shift, (mods & JCE_KMOD_SHIFT) != 0);
-    io.AddKeyEvent(ImGuiMod_Alt,   (mods & JCE_KMOD_ALT)   != 0);
-    io.AddKeyEvent(ImGuiMod_Super, (mods & JCE_KMOD_GUI)   != 0);
-}
-
 /* ── Clipboard (JCE <-> ImGui) ────────────────────────────────────── */
 
 static const char *clipboard_get(void *)
@@ -265,6 +342,7 @@ static void update_cursor(void)
 bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
 {
     if (s_editor.initialized) return true;
+    editor_launch_diagnostics_begin();
 
     /* Create ImGui context.
      * Route ImGui's IM_ALLOC/IM_FREE through the editor allocator (mimalloc-
@@ -379,25 +457,32 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
      * streaming world) without touching the user's editor config.  Falls back to
      * the normal last-scene restore when unset or the file is missing. */
     const char *env_scene = getenv("JCE_SCENE");
+    const bool jce_route_explicit_scene = env_scene && env_scene[0];
+    const bool jce_route_explicit_valid =
+        jce_route_explicit_scene && jce_fs_host_exists_file(env_scene);
+    if (jce_route_explicit_scene && !jce_route_explicit_valid)
+        LOG_ERROR(LOG_TAG, "JCE_SCENE path is missing; refusing fallback: %s",
+                  env_scene);
     /* Last-scene auto-restore honors Preferences > General > startup:
      * only "Last scene" (0) reopens it.  "Empty" and "Show picker" used
      * to reopen the last scene anyway — the pref only gated the Welcome
      * dialog, never this restore.  JCE_SCENE (QA/profiling) always wins. */
     const bool restore_last = have_ecfg && ecfg.startup_mode == 0;
     const char *restore_path =
-        (env_scene && env_scene[0] && jce_fs_host_exists_file(env_scene))
-            ? env_scene
+        jce_route_explicit_scene
+            ? (jce_route_explicit_valid ? env_scene : nullptr)
         : (restore_last && ecfg.last_scene_path[0] != '\0' &&
            jce_fs_host_exists_file(ecfg.last_scene_path))
             ? ecfg.last_scene_path
-            : NULL;
+            : nullptr;
     /* JCE_STRESS_CUBES / JCE_STRESS_SKINNED force the built-in demo scene (which
      * spawns the stress grid) for headless performance/limits testing, bypassing
      * scene restore (otherwise the editor restores the last scene and the stress
      * entities are never rendered — e.g. it silently falls back to meadow). */
     const bool force_demo = (getenv("JCE_STRESS_CUBES") != NULL)
                          || (getenv("JCE_STRESS_SKINNED") != NULL);
-    const bool will_restore = !force_demo && (restore_path != NULL);
+    bool will_restore = !force_demo && (restore_path != NULL);
+    const bool initial_will_restore = will_restore;
     jce_editor_state_init(/*with_demo_scene=*/!will_restore);
     jce_editor_panels_init();
     jce_run_manager_init();
@@ -408,6 +493,82 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     jce_workspace_init();
     jce_editor_prefs_load_and_apply();
     jce_gizmo_init();
+
+    /* A restored scene can live outside its authoring project, especially a
+     * relocated Bundle. Bind the validated declared project through the same
+     * transaction as Open Project, after state/VM owners exist and before any
+     * scene is deserialized. Without an effective restore, startup preferences
+     * and forced demo behavior remain unchanged. */
+    if (!force_demo && (will_restore || restore_last) &&
+        !jce_route_explicit_valid && have_ecfg && ecfg.last_project[0]) {
+        char project_root[512];
+        if (jce_editor_project_context_resolve(ecfg.last_project, project_root,
+                                                sizeof(project_root))) {
+            if (set_current_project_root(project_root)) {
+                LOG_INFO(LOG_TAG, "restored authoring project '%s'", project_root);
+            } else {
+                LOG_ERROR(LOG_TAG, "authoring project restore refused: outgoing state is pending");
+            }
+        } else {
+            LOG_WARN(LOG_TAG, "saved authoring project is unavailable: '%s'",
+                     ecfg.last_project);
+        }
+    }
+
+    /* JCE_PROJECT_SCENE_ROUTE_V2: reconcile cold-boot project/scene identity
+     * AFTER the saved project has been admitted via its existing transaction,
+     * and BEFORE deserializing the scene. The explicit JCE_SCENE override is
+     * project-independent and must still win (or visibly fail). */
+    char jce_route_startup_path[2048] = {};
+    bool jce_route_has_startup = false;
+    if (!force_demo && !jce_route_explicit_scene && restore_last &&
+        have_ecfg && ecfg.last_project[0]) {
+        char expected_root[512] = {};
+        const char *current_root = jce_editor_current_project_root();
+        const bool matching_project =
+            jce_editor_project_context_resolve(ecfg.last_project,
+                                               expected_root, sizeof(expected_root)) &&
+            jce_editor_scene_route::same_absolute(current_root, expected_root);
+        if (matching_project) {
+            const JceProject *manifest = jce_editor_project_get();
+            const char *source =
+                (manifest && manifest->source_assets && manifest->source_assets[0])
+                    ? manifest->source_assets : "assets";
+            if (manifest && manifest->startup_scene && manifest->startup_scene[0]) {
+                const std::string startup =
+                    jce_editor_scene_route::startup_scene_path(
+                        current_root, source, manifest->startup_scene);
+                if (!startup.empty() &&
+                    jce_fs_host_exists_file(startup.c_str()) &&
+                    startup.size() < sizeof(jce_route_startup_path)) {
+                    memcpy(jce_route_startup_path, startup.c_str(), startup.size() + 1);
+                    jce_route_has_startup = true;
+                }
+            }
+            if (!restore_path || !jce_editor_scene_route::project_scene(
+                    current_root, source, restore_path)) {
+                if (jce_route_has_startup) {
+                    LOG_INFO(LOG_TAG,
+                        "cold boot: stale/foreign last_scene; loading startup_scene %s",
+                        jce_route_startup_path);
+                    restore_path = jce_route_startup_path;
+                    will_restore = true;
+                } else {
+                    LOG_ERROR(LOG_TAG,
+                        "cold boot: last_scene unavailable/foreign and no valid "
+                        "project startup_scene (no old scene will be opened)");
+                    restore_path = nullptr;
+                    will_restore = false;
+                }
+            }
+        } else {
+            LOG_ERROR(LOG_TAG,
+                "cold boot: saved project could not be restored; refusing "
+                "unrelated last_scene");
+            restore_path = nullptr;
+            will_restore = false;
+        }
+    }
 
     /* Pre-warm project settings cache so panels can use
      * jce_project_settings_current() without a per-panel disk read. */
@@ -506,7 +667,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
          * commands in and bgfx_submit calls out -- which is the number a
          * batching change moves. */
         static const char hdr[] = "frame_index,frame_ms,num_draw,rq_commands,rq_submits,rq_enabled,"
-            "cull_total,cull_visible,cull_disabled\n";
+            "cull_total,cull_visible,cull_disabled,gpu_stats_available\n";
         if (jce_fs_host_write_all(frame_kpi_path, hdr, sizeof(hdr) - 1)) {
             jce_strlcpy(s_editor.frame_kpi_path, frame_kpi_path,
                         sizeof(s_editor.frame_kpi_path));
@@ -541,10 +702,26 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
          * loaded scene. Interactive startup keeps the time-sliced path. */
         const char *sync = getenv("JCE_DBG_SCENE_LOAD_SYNC");
         const bool load_sync = sync && strcmp(sync, "1") == 0;
-        const bool loaded = load_sync ? jce_state_load_scene_file(restore_path)
-                                      : jce_state_load_scene_file_async(restore_path);
-        if (!loaded)
+        bool loaded = load_sync ? jce_state_load_scene_file(restore_path)
+                                : jce_state_load_scene_file_async(restore_path);
+        if (!loaded && !jce_route_explicit_scene && jce_route_has_startup &&
+            !jce_editor_scene_route::same_absolute(restore_path,
+                                                    jce_route_startup_path)) {
+            LOG_WARN(LOG_TAG,
+                     "cold boot: last_scene failed to load; retrying startup_scene %s",
+                     jce_route_startup_path);
+            loaded = load_sync ? jce_state_load_scene_file(jce_route_startup_path)
+                               : jce_state_load_scene_file_async(jce_route_startup_path);
+        }
+        if (!loaded) {
+            LOG_ERROR(LOG_TAG, "cold boot: scene load failed; using default scene");
             jce_state_new_default_scene();
+        }
+    } else if (initial_will_restore) {
+        /* The initial scene restore was vetoed by project admission; state
+         * init intentionally skipped creating a demo. Restore the normal
+         * default instead of leaving a half-initialized empty viewport. */
+        jce_state_new_default_scene();
     }
 
     return true;
@@ -553,6 +730,16 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
 void jce_editor_shutdown(void)
 {
     if (!s_editor.initialized) return;
+
+    /* Closing the observer does not certify an unfinished backend write. */
+    s_editor.screenshot.interactive = false;
+    jce_renderer_readback_capture_flush();
+    screenshot_poll_();
+    if (s_editor.screenshot.active) {
+        LOG_WARN(LOG_TAG, "screenshot observer closed unresolved source=%u path=%s",
+                 s_editor.screenshot.source, s_editor.screenshot.path);
+        s_editor.screenshot.active = false;
+    }
 
     if (s_editor.text_input_active && s_editor.window) {
         if (!jce_window_stop_text_input(s_editor.window)) {
@@ -569,7 +756,8 @@ void jce_editor_shutdown(void)
 
     /* Flush any config changes still inside the debounce window. */
     jce_editor_config_flush_now();
-    jce_editor_pstate_flush_now();
+    if (!jce_editor_pstate_flush_now())
+        LOG_ERROR(LOG_TAG, "shutdown continues with unpublished project editor state");
 
     jce_gizmo_shutdown();
     jce_cook_manager_shutdown();
@@ -582,6 +770,7 @@ void jce_editor_shutdown(void)
     jce_editor_panels_shutdown();
     jce_thumb_shutdown();
     jce_editor_state_shutdown();
+    jce_editor_script_modules_reload(nullptr);
     jce_editor_i18n_shutdown();
     jce_imgui_renderer_shutdown();
 
@@ -606,6 +795,12 @@ void jce_editor_shutdown(void)
 
 bool jce_editor_process_event(const JceEvent *event)
 {
+    if (jce_editor_hotkey_diag_enabled() &&
+        (event->type == JCE_EVENT_KEY_DOWN || event->type == JCE_EVENT_KEY_UP)) {
+        jce_editor_hotkey_diag_event(*event, (int)jce_key_to_imgui_key(event->key.scancode),
+            ImGui::GetCurrentContext() ? ImGui::GetFrameCount() : -1,
+            s_editor.initialized, s_editor.active);
+    }
     if (!s_editor.initialized) return false;
 
     ImGuiIO &io = ImGui::GetIO();
@@ -677,8 +872,12 @@ bool jce_editor_process_event(const JceEvent *event)
             if (btn >= 0) jce_editor_game_render_push_mouse_button(btn, down);
             break;
         }
-        if (btn >= 0)
+        if (btn >= 0) {
+            /* Button events carry the same host-window coordinates as motion,
+             * including a click or release with no preceding motion event. */
+            io.AddMousePosEvent(event->button.x, event->button.y);
             io.AddMouseButtonEvent(btn, down);
+        }
         break;
     }
 
@@ -688,10 +887,10 @@ bool jce_editor_process_event(const JceEvent *event)
 
     case JCE_EVENT_KEY_DOWN:
     case JCE_EVENT_KEY_UP: {
-        update_key_modifiers(event->key.mod);
-        ImGuiKey key = jce_key_to_imgui_key(event->key.scancode);
-        if (key != ImGuiKey_None)
-            io.AddKeyEvent(key, event->type == JCE_EVENT_KEY_DOWN);
+        if (event->type == JCE_EVENT_KEY_DOWN &&
+            event->key.scancode == JCE_KEY_ESCAPE && game_capture)
+            jce_editor_game_view_release_play_input();
+        jce_editor_submit_key_event(*event, jce_key_to_imgui_key(event->key.scancode));
         break;
     }
 
@@ -699,6 +898,9 @@ bool jce_editor_process_event(const JceEvent *event)
         io.AddFocusEvent(true);
         break;
     case JCE_EVENT_WINDOW_FOCUS_LOST:
+        /* Platform focus loss must revoke mouse lock even if the Game View
+         * panel is hidden and will not run its per-frame input policy. */
+        jce_editor_game_view_release_play_input();
         io.AddFocusEvent(false);
         break;
 
@@ -710,9 +912,24 @@ bool jce_editor_process_event(const JceEvent *event)
     return io.WantCaptureMouse || io.WantCaptureKeyboard;
 }
 
+/* CPU-only host maintenance; independent of ImGui/render frame admission. */
+void jce_editor_tick_cpu_services(float dt, bool refresh_ui_clock)
+{
+    if (!s_editor.initialized) return;
+    JCE_EDITOR_HOST_SERVICE_CALL("editor.cpu_services.lan_discovery", jce_editor_lan_discovery_update());
+    JCE_EDITOR_HOST_SERVICE_CALL("editor.cpu_services.recorder", jce_editor_recorder_update());
+    JCE_EDITOR_HOST_SERVICE_CALL("editor.cpu_services.config_flush", jce_editor_config_flush_tick(dt));
+    JCE_EDITOR_HOST_SERVICE_CALL("editor.cpu_services.state_flush", jce_editor_pstate_flush_tick(dt));
+    /* Refresh only skipped UI intervals. A visible frame keeps its full dt. */
+    if (refresh_ui_clock || !s_editor.active)
+        s_editor.last_time = jce_time_perf_counter();
+}
+
 void jce_editor_update(JceWindow *window)
 {
-    if (!s_editor.initialized || !s_editor.active) return;
+    if (!s_editor.initialized) return;
+    screenshot_poll_();
+    if (!s_editor.active) return;
 
     ImGuiIO &io = ImGui::GetIO();
 
@@ -753,12 +970,7 @@ void jce_editor_update(JceWindow *window)
         }
     }
 
-    /* Debounced config flush: coalesces the ~30 load-modify-save sites'
-     * whole-file rewrites into one atomic write pair per quiet period. */
-    jce_editor_config_flush_tick(dt);
-    /* Same pump for the per-project editor state (<root>/.jce/
-     * editor-state.json); also follows project-root switches. */
-    jce_editor_pstate_flush_tick(dt);
+    /* Config/project-state flushing runs in the pre-render host service poll. */
     /* Drive an in-flight language-model request.  Here and not in the
      * panel's draw: a closed or background-tabbed panel does not draw,
      * and a child whose stdout is never drained blocks in write() and
@@ -820,11 +1032,10 @@ void jce_editor_update(JceWindow *window)
      * bird's-eye overview camera armed in jce_editor_scene_render_frame) is what
      * the KPI screenshot captures — a docked background tab never runs its body.
      * Inert when unset; only affects which tab is foregrounded at startup. */
-    if (getenv("JCE_DBG_OVERVIEW")) {
-        static int s_overview_focus_frames = 0;
-        if (s_overview_focus_frames < 10) {
+    if (s_editor.overview_diagnostics) {
+        if (s_editor.overview_focus_frames < 10) {
             jce_editor_layout_request_focus_scene_view();
-            s_overview_focus_frames++;
+            s_editor.overview_focus_frames++;
         }
     }
 
@@ -867,7 +1078,7 @@ void jce_editor_update(JceWindow *window)
          * automatic, and the stand-down is logged ONCE so the capture is never
          * quietly of something else. */
         static bool s_gameview_focus_yielded = false;
-        if (getenv("JCE_DBG_OVERVIEW")) {
+        if (s_editor.overview_diagnostics) {
             if (!s_gameview_focus_yielded) {
                 s_gameview_focus_yielded = true;
                 /* SAY WHAT THE CAPTURE IS, not only what it is not: "not the
@@ -902,9 +1113,9 @@ void jce_editor_update(JceWindow *window)
      *
      * A FEW FRAMES IN, not at load: the bake resolves every candidate's mesh
      * through the asset cache, and on frame 0 that cache is still filling. */
-    if (getenv("JCE_STATIC_BATCH_BAKE")) {
-        static int s_sb_frames = 0;
-        if (s_sb_frames <= 30 && ++s_sb_frames == 30) {
+    if (s_editor.static_batch_bake_requested) {
+        if (s_editor.static_batch_bake_frames <= 30 &&
+            ++s_editor.static_batch_bake_frames == 30) {
             LOG_INFO("editor", "%s", "JCE_STATIC_BATCH_BAKE set - baking static "
                                      "batches once");
             jce_editor_panel_static_batch_bake_now();
@@ -919,9 +1130,11 @@ void jce_editor_update(JceWindow *window)
              * its stats block (numDraw) — the headline metric for batching
              * wins (e.g. per-instance-tint collapsing solo draws into one
              * instanced submit).  Appended as a third CSV column. */
+            /* Available counts are latched whole-frame values including editor UI;
+             * shared rq/cull snapshots are not an exact frame or viewport join. */
             JceGpuStats gpu_stats{};
-            const uint32_t num_draw =
-                jce_renderer_get_gpu_stats(&gpu_stats) ? gpu_stats.num_draw : 0u;
+            const bool gpu_stats_available = jce_renderer_get_gpu_stats(&gpu_stats);
+            const uint32_t num_draw = gpu_stats_available ? gpu_stats.num_draw : 0u;
             /* AND the collected / visible entity counts.  rq_* is zero
              * whenever the render-queue path is not taken -- MEASURED: a
              * plain prop scene in the Scene View reports rq_enabled=0 --
@@ -937,12 +1150,12 @@ void jce_editor_update(JceWindow *window)
             }
             char kpi_line[128];
             int kpi_len = snprintf(kpi_line, sizeof(kpi_line),
-                                   "%u,%.3f,%u,%u,%u,%d,%u,%u,%u\n",
+                                   "%u,%.3f,%u,%u,%u,%d,%u,%u,%u,%d\n",
                                    s_editor.frame_kpi_index, frame_ms, num_draw,
                                    rq.commands_in, rq.submits_out,
                                    rq.enabled ? 1 : 0,
                                    cull.total, cull.visible,
-                                   cull.disabled_skipped);
+                                   cull.disabled_skipped, gpu_stats_available ? 1 : 0);
             if (kpi_len > 0)
                 jce_fs_host_append(s_editor.frame_kpi_path, kpi_line, (size_t)kpi_len);
             s_editor.frame_kpi_index++;
@@ -956,7 +1169,7 @@ void jce_editor_update(JceWindow *window)
                 /* Self-capture path: grab the OFFSCREEN scene FBO (no swap-chain
                    present needed, so it works headless), fall back to backbuffer. */
                 if (!jce_editor_scene_render_screenshot(shot))
-                    jce_screenshot_save(shot, JCE_SCREENSHOT_PNG);
+                    jce_editor_request_screenshot(shot, false, 1);
             }
             s_editor.frame_kpi_shot_done = true;
         }
@@ -965,17 +1178,22 @@ void jce_editor_update(JceWindow *window)
     /* The renderer owns one asynchronous readback slot.  Route completion to
      * the submitting viewport so a Game View result cannot be consumed by the
      * legacy Scene View poller. */
-    if (jce_editor_kpi_game_capture_global_in_flight()) {
+    if (jce_editor_screenshot_poll_game(s_editor.screenshot_slot,
+        jce_editor_kpi_game_capture_global_in_flight())) {
+        const bool scheduled = jce_editor_kpi_game_capture_global_in_flight();
         const int result = jce_editor_game_render_capture_poll();
         if (result == 1 || result == 2) {
-            jce_editor_kpi_game_capture_global_mark_complete(result == 1);
+            if (scheduled)
+                jce_editor_kpi_game_capture_global_mark_complete(result == 1);
             if (result == 1)
                 LOG_INFO(LOG_TAG, "Game View capture completed");
             else
                 LOG_ERROR(LOG_TAG, "Game View capture write failed");
         }
     } else {
-        jce_editor_scene_render_capture_poll();
+        const int result = jce_editor_scene_render_capture_poll();
+        if (result == 1) LOG_INFO(LOG_TAG, "Scene View capture completed");
+        else if (result == 2) LOG_ERROR(LOG_TAG, "Scene View capture write failed");
     }
 
     /* Headless octahedral-impostor bake (JCE_IMPOSTOR_BAKE): reproducible,
@@ -1192,7 +1410,9 @@ void jce_editor_update(JceWindow *window)
             s_autoplay_tick >= (uint32_t)s_autoplay) {
             jce_state_play();
             s_autoplay_done = true;
-            LOG_INFO(LOG_TAG, "autoplay: entered Play at frame %u",
+            /* This branch is an explicit QA request, never default chatter. */
+            jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                     "autoplay: entered Play at frame %u",
                      s_autoplay_tick);
         }
     }
@@ -1239,7 +1459,7 @@ void jce_editor_update(JceWindow *window)
                         snprintf(dot, sizeof pp - (size_t)(dot - pp), "%s", tail);
                     }
                 }
-                if (jce_screenshot_save(pp, JCE_SCREENSHOT_PNG)) {
+                if (jce_editor_request_screenshot(pp, false, 2)) {
                     ++s_shot_n;
                     /* SAY WHAT WAS IN FRAME.  A capture that contains none of
                      * its subject is not blank -- it has sky, grid and gizmos --
@@ -1646,16 +1866,22 @@ void jce_editor_update(JceWindow *window)
     jce_editor_apply_pending_font_reload();
 
     /* Begin ImGui frame. */
+    jce_editor_viewport_sync_window_focus(window);
     ImGui::NewFrame();
 
     /* Horizontal scroll direction is decided per-event in the wheel
        handler above based on touchpad vs mouse-wheel detection
        (jce_editor_pref_touchpad_h_invert). No global flip here. */
 
+    /* Render-admitted modal capture maintenance. Never move to CPU services. */
+    jce_editor_scene_render_maintenance(w > 0 && h > 0 &&
+        (!io.AppFocusLost || jce_editor_viewport_capture_requested(false)));
+
     /* Draw editor panels.  ed_layout spans the whole UI build INCLUDING the
      * Scene/Game view panels (which run the scene_render inside); subtract
      * the scene_render phase to get the pure-UI share.  ed_submit is the
      * ImGui draw-data encode + bgfx submit. */
+    jce_editor_game_render_observation_begin(jce_engine_frame_observation_enabled());
     uint64_t _t0_layout = jce_time_perf_counter();
     jce_editor_layout_draw();
     uint64_t _t0_submit = jce_time_perf_counter();
@@ -1663,7 +1889,27 @@ void jce_editor_update(JceWindow *window)
 
     /* Render and submit to bgfx. */
     ImGui::Render();
-    jce_imgui_renderer_draw();
+    JceFrameViewportObservation game_observation{};
+    if (jce_editor_game_render_observation_copy(&game_observation)) {
+        JceImGuiDrawObservation ui_observation{};
+        const bool watched = (game_observation.flags & JCE_FRAME_VIEWPORT_TEXTURE_VALID) != 0;
+        if (jce_imgui_renderer_draw_observed(watched
+                ? static_cast<uint16_t>(game_observation.texture_index) : UINT16_MAX,
+                &ui_observation, sizeof(ui_observation))) {
+            if (ui_observation.flags & JCE_IMGUI_DRAW_QUEUE_OBSERVED) {
+                game_observation.flags |= JCE_FRAME_VIEWPORT_QUEUE_COUNT_VALID;
+                game_observation.queued_commands = ui_observation.queued_commands;
+            }
+            if (ui_observation.flags & JCE_IMGUI_DRAW_SUBMISSIONS_OBSERVED) {
+                game_observation.flags |= JCE_FRAME_VIEWPORT_SUBMIT_COUNTS_VALID;
+                game_observation.main_submits = ui_observation.main_submits;
+                game_observation.recording_submits = ui_observation.recording_submits;
+            }
+        }
+        (void)jce_engine_report_frame_observations(&game_observation, 1, sizeof(game_observation));
+    } else {
+        jce_imgui_renderer_draw();
+    }
     jce_perf_phase_add("ed_submit", jce_time_perf_to_ms(_t0_submit,
                                                         jce_time_perf_counter()));
 

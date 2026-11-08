@@ -47,6 +47,8 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_sky_celestial.h>
+#include <jce/middleware/scene/jce_scene_cloud_shape.h>
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/middleware/world/jce_environment.h>
 #include <jce/middleware/world/jce_time_of_day.h>
@@ -188,6 +190,42 @@ jce_vec3 angles_to_direction(float yaw_deg, float pitch_deg)
 
 /* ── Section helpers ──────────────────────────────────────────────── */
 
+bool draw_sky_celestial(JceScene *scene)
+{
+    const auto *authored = jce_scene_get_sky_celestial_settings(scene);
+    auto value = authored ? *authored : jce_scene_sky_celestial_default();
+    bool changed = ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.env.celestial.star_intensity"),
+        &value.star_intensity, 0.0f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.env.celestial.moon_intensity"),
+        &value.moon_intensity, 0.0f, 4.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.env.celestial.moon_phase"),
+        &value.moon_phase, 0.0f, 1.0f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.env.celestial.solar_flare_intensity"),
+        &value.solar_flare_intensity, 0.0f, 4.0f, "%.2f");
+    if (!changed) return false;
+    jce_editor_scene_ensure_rendering_settings(scene);
+    return jce_scene_set_sky_celestial_settings(scene, &value);
+}
+
+bool draw_cloud_shape(JceScene *scene)
+{
+    const auto *authored = jce_scene_get_cloud_shape_settings(scene);
+    auto value = authored ? *authored : jce_scene_cloud_shape_default();
+    bool changed = ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.env.clouds.detail_erosion"),
+        &value.detail_erosion, 0.0f, 0.95f, "%.2f");
+    changed |= ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.env.clouds.curl"),
+        &value.curl_metres, 0.0f, 256.0f, "%.0f m");
+    if (!changed) return false;
+    jce_editor_scene_ensure_rendering_settings(scene);
+    return jce_scene_set_cloud_shape_settings(scene, &value);
+}
+
 bool draw_environment(JceScene *scene, const LightCollect &c,
                       JceSceneRenderingSettings *rendering)
 {
@@ -245,11 +283,15 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
         if (rendering->cloud_coverage > 0.0f) {
             changed |= ImGui::SliderFloat(
                 jce_editor_i18n("panel.lighting.env.clouds.density"),
-                &rendering->cloud_density, 0.0f, 8.0f, "%.2f");
+                &rendering->cloud_density, 0.0f, 100.0f, "%.3f",
+                ImGuiSliderFlags_Logarithmic);
             changed |= ImGui::DragFloatRange2(
                 jce_editor_i18n("panel.lighting.env.clouds.layer"),
                 &rendering->cloud_bottom_km, &rendering->cloud_top_km,
                 0.05f, 0.0f, 20.0f, "%.2f km", "%.2f km");
+            if (rendering->sky_mode == JCE_SCENE_SKY_PHYSICAL ||
+                rendering->sky_mode == JCE_SCENE_SKY_STYLIZED)
+                changed |= draw_cloud_shape(scene);
         } else {
             ImGui::TextDisabled("%s",
                 jce_editor_i18n("panel.lighting.env.clouds.off"));
@@ -259,6 +301,8 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
                 jce_editor_i18n("panel.lighting.env.turbidity"),
                 &rendering->sky_turbidity, 0.05f, 1.0f, 10.0f, "%.2f");
         }
+        if (rendering->sky_mode == JCE_SCENE_SKY_PHYSICAL)
+            changed |= draw_sky_celestial(scene);
         if (rendering->sky_mode == JCE_SCENE_SKY_STYLIZED) {
             ImGui::SeparatorText(jce_editor_i18n("panel.lighting.env.sky_mode.stylized"));
             changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.env.dome.zenith"),      rendering->sky_dome_zenith);

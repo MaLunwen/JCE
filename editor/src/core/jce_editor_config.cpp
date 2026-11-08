@@ -57,7 +57,9 @@ bool jce_editor_dotjce_path(const char *name, char *out, size_t cap) {
         static bool logged = false;
         const bool ok = jce_editor_config_profile_path(profile, name, out, cap);
         if (ok && !logged) {
-            LOG_INFO(LOG_TAG, "profile directory: %s", profile);
+            /* Explicit isolated-profile confirmation, once per process. */
+            jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                          "profile directory: %s", profile);
             logged = true;
         }
         return ok;
@@ -127,9 +129,10 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
      * D3D11 (device+swapchain create is far cheaper) — matching Unity's
      * Windows editor default.  D3D12/Vulkan remain one click away in
      * Preferences, and the runtime/game/dist backend chain is untouched
-     * (jce_renderer_caps.c stays D3D12-first).  Only affects FRESH configs;
-     * an existing saved `renderer` value is preserved on load. */
-#if JCE_PLATFORM_WINDOWS
+     * (jce_renderer_caps.c stays D3D12-first). The XP compatibility
+     * product uses Auto to admit a backend for the current device.
+     * An existing saved renderer value is preserved on load. */
+#if JCE_PLATFORM_WINDOWS && !(defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY)
     strncpy(cfg->renderer, "D3D11", sizeof(cfg->renderer) - 1);
 #else
     strncpy(cfg->renderer, "Auto", sizeof(cfg->renderer) - 1);
@@ -863,16 +866,18 @@ void jce_editor_config_flush_tick(float dt_sec) {
     if (!s_dirty) return;
     s_quiet += (dt_sec > 0.0f ? dt_sec : 0.0f);
     if (s_quiet < 0.5f) return;
-    s_dirty = false;
+    /* A failed publication still owns pending edits. Retry after another
+       quiet period rather than logging/retrying on every editor frame. */
     s_quiet = 0.0f;
-    config_flush_to_disk();
+    s_dirty = !config_flush_to_disk();
 }
 
 void jce_editor_config_flush_now(void) {
     if (!s_dirty) return;
-    s_dirty = false;
+    /* A failed publication still owns pending edits. Retry after another
+       quiet period rather than logging/retrying on every editor frame. */
     s_quiet = 0.0f;
-    config_flush_to_disk();
+    s_dirty = !config_flush_to_disk();
 }
 
 void jce_editor_config_ensure_dir(void) {

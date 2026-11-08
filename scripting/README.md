@@ -26,6 +26,19 @@ scripts still run, and each non-Lua entity is refused by name in the log.
 
 ---
 
+## Embedded JavaScript providers
+
+Modern targets use QuickJS-NG 0.16.2. The explicit LLVM-MinGW-XP lane selects
+pinned official 0.4.1, which predates the native Vista synchronization layer.
+Both retain the same JCE JavaScript backend and report the actual runtime
+version; the legacy package supplies an explicit exception API capability.
+Its callers already observed JS_EXCEPTION or a failed pending job before
+consuming an exception, including thrown null and undefined. Modern targets
+keep the newer pending-exception query. The legacy provider has no Atomics or
+Worker support; applications requiring those features are not compatible with
+that provider. A standalone interpreter probe does not qualify JCE bindings,
+Editor scripting, graphics or the full application lifecycle on XP.
+
 ## The four steps
 
 ### 1. Build the backend

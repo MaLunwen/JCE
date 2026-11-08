@@ -3,7 +3,7 @@
  * jce_scene_renderer.c).
  *
  * Shadow-caster per-cascade culling + caster AABB, the shadow VP / CSM
- * helpers, the directional shadow target lifecycle, the per-frame
+ * helpers, the per-frame
  * shadow-caster spatial grid, and the directional + local (spot/point)
  * shadow passes.  Pure move from the monolithic renderer: cross-module entry
  * points are declared in jce_sr_internal.h, everything else stays file-static
@@ -15,9 +15,11 @@
 #include <stdlib.h>  /* getenv */
 #include <SDL3/SDL.h> /* SDL_IOStream: engine code does not use stdio file IO */
 #include <jce/os/core/jce_frustum.h>
+#include <jce/os/core/jce_hash.h>
 #include "jce_sr_internal.h"
+#include "jce_sr_shadow_frame.h"
 #include "jce_sr_grass_shadow.h"
-#include <jce/renderer/jce_render_pipeline.h>  /* live cascade count */
+#include <jce/renderer/jce_render_pipeline.h>  /* active shadow feature policy */
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_timer.h>
 #include "renderer/jce_render_encoder.h"
@@ -123,31 +125,24 @@ jce_mat4 sr_cascade_sample_vp(const JceSceneRenderer *sr,
     return cached ? sr->shadow_cache_vp[c] : csm->vp[c];
 }
 
-void sr_pack_csm_splits(const float *splits, uint32_t cascade_count,
-                        float out[4])
+
+const char *sr_model_bounds_path(JceScene *scene, JceEntity e)
 {
-    uint32_t n = 0;
-    if (splits) {
-        for (; n < cascade_count && n < 4u; n++) out[n] = splits[n + 1];
+    if (jce_scene_has_skeletal_animator(scene, e)) {
+        JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
+        if (sa && sa->skeleton_path[0]) return sa->skeleton_path;
     }
-    /* No cascades at all is a legitimate state -- the shader's own first line
-     * is `if (u_csmSplits.x <= 0.0) return 1.0;`, i.e. zero means "no shadow
-     * map", which is a different statement from "shadows end here". Padding
-     * that case with anything positive would invent a shadow distance. */
-    for (uint32_t i = n; i < 4u; i++) out[i] = (n > 0u) ? out[n - 1u] : 0.0f;
+    return sr_mesh_renderer_model_path(scene, e);
 }
 
 bool sr_shadow_caster_aabb(JceSceneRenderer *sr, JceScene *scene,
                                   JceEntity e, const jce_mat4 *world,
                                   jce_vec3 *out_mn, jce_vec3 *out_mx)
 {
-    if (!jce_scene_has_transform(scene, e)) return false;
-    const char *path = NULL;
-    if (jce_scene_has_skeletal_animator(scene, e)) {
-        JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
-        if (sa && sa->skeleton_path[0]) path = sa->skeleton_path;
-    }
-    if (!path) path = sr_mesh_renderer_model_path(scene, e);
+    const bool has_transform = jce_scene_has_transform(scene, e);
+    const char *path = has_transform ? sr_model_bounds_path(scene, e) : NULL;
+    sr_model_bounds_track(sr, e, path);
+    if (!has_transform) return false;
     if (!path) {
         /* Primitive / shared-JceMesh caster (cube/sphere/.. or a non-glTF .mesh):
          * use the shared mesh's local AABB so the per-cascade shadow cull, the
@@ -218,14 +213,68 @@ static bool sr_caster_culled_for_cascade(const jce_vec3 *wmn, const jce_vec3 *wm
     return false;
 }
 
-/* Per-renderer "Cast Shadows" (Unity-style): an entity whose MeshRenderer has
- * shadow_cast_off set is skipped by EVERY shadow producer pass (CSM/dir +
- * local atlas). Entities without a MeshRenderer keep the default (cast on). */
+/* Preserve the authored MeshRenderer veto across all shadow producers. Without
+ * one, only known legacy geometry or opaque registry membership can cast.
+ * Ecull retains this participation with its existing metadata cohort. */
 bool sr_entity_casts_shadow(JceScene *scene, JceEntity e)
 {
-    if (!jce_scene_has_mesh_renderer(scene, e)) return true;
-    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
-    return !(mr && mr->shadow_cast_off);
+    if (!scene || e == JCE_ENTITY_INVALID) return true;
+    if (jce_scene_has_mesh_renderer(scene, e)) {
+        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+        return !(mr && mr->shadow_cast_off);
+    }
+    if (jce_scene_has_skeletal_animator(scene, e) ||
+        jce_scene_has_terrain(scene, e)) return true;
+
+    const int count = jce_component_count();
+    if (count <= 0) return true;
+    /* Light is the registry's zero-flag serializer alias for the concrete
+     * legacy lights. AreaLight retains its separate opaque row below. */
+    const int light_alias = jce_component_find("Light");
+    for (int id = 0; id < count; ++id) {
+        if (id == light_alias) continue;
+        const uint64_t flag = jce_component_legacy_flag(id);
+        /* Post-64 producers (foliage/grass/scatter), custom types and aliases
+         * are not represented by the legacy geometry test. Fail open. */
+        if ((!flag || jce_component_from_legacy_flag(flag) != id) &&
+            jce_scene_has_comp(scene, e, id)) return true;
+    }
+    /* A presence callback may append registry rows; do not certify absence
+     * against an incomplete cohort. The next render refreshes its metadata. */
+    return jce_component_count() != count;
+}
+
+/* Current content, not transform dynamics: the dual atlas does not own these
+ * leaf draws. Keep their original full-resolution CSM maps time-correct. */
+uint64_t sr_prepare_foliage_cluster_shadows(JceSceneRenderer *sr,
+    JceScene *scene, EntityList *list)
+{
+    uint64_t key = 1469598103934665603ull;
+    if (!sr || !scene || !list || !sr->ecull) return key;
+    for (int i = 0; i < list->count; ++i) {
+        if (!sr->ecull[i].casts_shadow) continue;
+        const JceEntity e = list->entities[i];
+        const JceFoliageClusterComponent *fc = jce_scene_get_foliage_cluster(scene, e);
+        if (!fc || !fc->visible || !entity_enabled(scene, e)) continue;
+        const bool transform = jce_scene_has_transform(scene, e);
+        const jce_mat4 world = sr->ecull[i].world_valid
+            ? sr->ecull_world[i] : jce_scene_get_world_matrix(scene, e);
+        const jce_vec3 origin = jce_v3(world.col[3].x, world.col[3].y, world.col[3].z);
+        key = sr_shadow_fold_part(key, (uint64_t)e);
+        key = sr_shadow_fold_part(key, sr_foliage_hash(fc, &origin));
+        key = sr_shadow_fold_part(key, jce_fnv1a32_str(fc->alpha_tex));
+        /* Match the leaf producer's admission. A proxy or zero-leaf cluster
+         * retains a stable content key while the scene clock advances. */
+        const bool leaf_wind = BGFX_HANDLE_IS_VALID(sr->prog_fcluster_shadow) &&
+            sr->fcluster_quad && fc->leaf_count > 0 && transform;
+        key = sr_shadow_fold_part(key, leaf_wind ? 1u : 0u);
+        if (leaf_wind) {
+            uint32_t time_bits;
+            memcpy(&time_bits, &sr->water_time, sizeof time_bits);
+            key = sr_shadow_fold_part(key, time_bits);
+        }
+    }
+    return key;
 }
 
 /* ── Shadow VP / CSM helpers ──────────────────────────────────────── */
@@ -304,8 +353,10 @@ static void sr_bind_local_shadow_state(JceSceneRenderer *sr)
     /* Fallback exists only to keep sampler 15 bound when no local shadow is
      * active (the shader's slot indices are all -1, so it never reads it).
      * It used to point at shadow_tex, which is now allocated lazily and is
-     * absent in exactly the common case this fallback serves; csm_tex[0] is
-     * always created with sr_create_shadow_targets and costs nothing extra. */
+     * absent in exactly the common case this fallback serves. A cold scene
+     * with no directional pass has no cascade either: bind the existing white
+     * texture (depth=1) for backend sampler validity; the inactive shader path
+     * never reads it. No shadow-sized placeholder allocation is required. */
     bgfx_texture_handle_t tex = (sr->local_atlas_valid
                                  && BGFX_HANDLE_IS_VALID(sr->local_atlas_tex))
         ? sr->local_atlas_tex
@@ -413,26 +464,14 @@ void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
      * makes the ablation exact: it zeroes u_csmSplits, and csm_shadow.sh
      * opens with `if (u_csmSplits.x <= 0.0) return 1.0;`, so the shader is
      * provably taking the fully-lit branch and not a nearly-off one. */
-    {
-        static JceCvar *s_cv_shadows;
-        if (!s_cv_shadows)
-            s_cv_shadows = jce_cvar_register_bool(
-                "r.shadows", true, JCE_CVAR_FLAG_NONE,
-                "Directional + cascade shadows. 0 forces every surface fully "
-                "lit (exact ablation: zeroes u_csmSplits).");
-        if (s_cv_shadows && !jce_cvar_get_bool(s_cv_shadows)) {
-            sr_bind_shadow_uniforms_disabled(sr);
-            return;
-        }
-    }
-
-    if (!sr->frame_shadow_active) {
+    const SrFrameShadowSelection frame = sr_frame_shadow_selection(sr);
+    if (!frame.active) {
         sr_bind_shadow_uniforms_disabled(sr);
         return;
     }
 
-    if (sr->shadow_use_csm && sr->last_csm_valid) {
-        const JceCsmData *csm = &sr->last_csm;
+    if (frame.csm) {
+        const JceCsmData *csm = frame.csm;
         /* Sample each cascade with the matrix its TEXTURE was rendered with,
          * not with this frame's.
          *
@@ -592,18 +631,18 @@ static bool point_cube_views_on(const JceSceneRenderConfig *cfg)
 
 static bool sr_shadow_dual_on(void);   /* fwd: dual shadow-map env toggle */
 
-void sr_apply_view_order(uint16_t view_id_base,
-                                const JceSceneRenderConfig *cfg,
-                                uint32_t csm_cascade_count,
-                                bool gpu_cull_view,
-                                bool include_underwater_view)
+bool sr_apply_view_order(JceSceneRenderer *sr, uint16_t view_id_base,
+                         const JceSceneRenderConfig *cfg, bool gpu_cull_view,
+                         bool include_underwater_view, bool include_water_caustics,
+                         bool include_water_optics, bool include_screen_shafts,
+                         bool include_toon_hair, bool include_cloud_temporal)
 {
     JceSceneRendererViewOrder order;
-    bool include_fog_views = cfg && cfg->fog_enabled;
-    uint8_t cascades = csm_cascade_count > JCE_CSM_MAX_CASCADES
-        ? JCE_CSM_MAX_CASCADES : (uint8_t)csm_cascade_count;
+    const bool include_fog_views = cfg && cfg->fog_enabled;
+    const uint8_t cascades = sr->csm_cascade_count > JCE_CSM_MAX_CASCADES
+        ? JCE_CSM_MAX_CASCADES : (uint8_t)sr->csm_cascade_count;
 
-    if (!jce_scene_renderer_view_order_build(
+    if (!jce_scene_renderer_view_order_build_with_cloud_temporal(
             view_id_base,
             cfg && cfg->draw_shadows,
             cascades,
@@ -614,7 +653,7 @@ void sr_apply_view_order(uint16_t view_id_base,
                producer (r.point_shadows cvar [idempotent re-register returns the
                existing handle] OR the JCE_POINT_CUBE_SHADOWS env). */
             point_cube_views_on(cfg),
-            /* Dual shadow-map dynamic-atlas band (base+21..25): reserve it before
+            /* Dual shadow-map dynamic-atlas band (base+52..56): reserve it before
                the color view whenever dual mode is enabled so the atlas renders
                before it is sampled.  Harmless when unused (empty views). */
             sr_shadow_dual_on(),
@@ -628,7 +667,8 @@ void sr_apply_view_order(uint16_t view_id_base,
              * the overlays actually drew, for the reason the underwater view
              * is sticky: what draws is decided after this. */
             cfg ? cfg->camera_overlay_count : 0u,
-            &order)) {
+            include_water_caustics,
+            include_water_optics, include_screen_shafts, include_toon_hair, include_cloud_temporal, &order)) {
         /* A failed build means the remap window did not fit the order
          * buffer.  Returning leaves bgfx on default id order, which sorts
          * the shadow atlas AFTER the colour pass that samples it -- a
@@ -642,10 +682,22 @@ void sr_apply_view_order(uint16_t view_id_base,
                      (unsigned)JCE_SCENE_RENDERER_VIEW_ORDER_MAX,
                      (unsigned)view_id_base);
         }
-        return;
+        return false;
     }
 
+    uint16_t *previous_count = &sr->view_order_previous_count[order.first];
+    const JceSceneRendererViewOrderTail tail =
+        jce_scene_renderer_view_order_tail_reset(&order, *previous_count);
+    if (tail.count)
+        bgfx_set_view_order(tail.first, tail.count, NULL);
     bgfx_set_view_order(order.first, order.count, order.order);
+    *previous_count = order.count;
+    sr_water_optics_order_ready(sr->water_optics, include_water_optics);
+    sr_toon_hair_order_ready(sr, include_toon_hair);
+    if (include_water_caustics) {
+        sr->water_caustic_view = (uint16_t)(view_id_base + JCE_VIEW_SR_WATER_CAUSTIC_OFFSET);
+        sr->water_caustic_viewport = (uint8_t)cfg->viewport_id;
+    }
 
     /* Declare what the scene renderer now owns, so a future band that lands on
      * postfx (or on the editor's absolute ids) is named at the moment of the
@@ -677,233 +729,10 @@ void sr_apply_view_order(uint16_t view_id_base,
             ++i;
         }
     }
+    return true;
 }
 
 /* ── Shadow pass ──────────────────────────────────────────────────── */
-
-void sr_destroy_shadow_targets(JceSceneRenderer *sr)
-{
-    if (!sr) return;
-    if (BGFX_HANDLE_IS_VALID(sr->shadow_fbo)) {
-        bgfx_destroy_frame_buffer(sr->shadow_fbo);
-        sr->shadow_fbo.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->shadow_tex)) {
-        bgfx_destroy_texture(sr->shadow_tex);
-        sr->shadow_tex.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->local_atlas_fbo)) {
-        bgfx_destroy_frame_buffer(sr->local_atlas_fbo);
-        sr->local_atlas_fbo.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->local_atlas_tex)) {
-        bgfx_destroy_texture(sr->local_atlas_tex);
-        sr->local_atlas_tex.idx = UINT16_MAX;
-    }
-    sr->local_atlas_valid = false;
-    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
-        if (BGFX_HANDLE_IS_VALID(sr->csm_fbo[i])) {
-            bgfx_destroy_frame_buffer(sr->csm_fbo[i]);
-            sr->csm_fbo[i].idx = UINT16_MAX;
-        }
-        if (BGFX_HANDLE_IS_VALID(sr->csm_tex[i])) {
-            bgfx_destroy_texture(sr->csm_tex[i]);
-            sr->csm_tex[i].idx = UINT16_MAX;
-        }
-    }
-    /* Dual shadow-map dynamic atlas (idx==0 is a legal bgfx handle → guard +
-     * reset to UINT16_MAX so a stale handle can't silently destroy another
-     * resource; see the D3D12 leak family). */
-    if (BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_fbo)) {
-        bgfx_destroy_frame_buffer(sr->dyn_csm_atlas_fbo);
-        sr->dyn_csm_atlas_fbo.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_tex)) {
-        bgfx_destroy_texture(sr->dyn_csm_atlas_tex);
-        sr->dyn_csm_atlas_tex.idx = UINT16_MAX;
-    }
-    sr->dyn_csm_valid = false;
-    sr->shadow_valid = false;
-    sr->csm_valid = false;
-    sr->last_csm_valid = false;
-}
-
-static bool sr_make_depth_target(JceSceneRenderer *sr,
-                                 bgfx_texture_handle_t *tex,
-                                 bgfx_frame_buffer_handle_t *fbo);
-
-/* How many cascade targets this configuration can actually render into.
- * Reads the live pipeline rather than a cached value so a tier change (which
- * re-clamps csm_cascade_count) is reflected the next time targets are built.
- * Never returns 0: the local-shadow sampler fallback binds csm_tex[0]. */
-static uint32_t sr_csm_wanted_count(const JceSceneRenderer *sr)
-{
-    (void)sr;
-    JceRenderPipelineDesc d;
-    jce_render_pipeline_get(&d);
-    uint32_t n = (uint32_t)d.csm_cascade_count;
-    if (n < 1u) n = 1u;
-    if (n > JCE_CSM_MAX_CASCADES) n = JCE_CSM_MAX_CASCADES;
-    return n;
-}
-
-/* Allocate any cascade target that is now needed but was skipped when the
- * targets were built with a smaller count (a tier or pipeline change can raise
- * it).  Cheap no-op once the set is complete. */
-bool sr_ensure_csm_count(JceSceneRenderer *sr)
-{
-    if (!sr || sr->shadow_map_size == 0) return false;
-    const uint32_t want = sr_csm_wanted_count(sr);
-    bool ok = true;
-    for (uint32_t i = 0; i < want; i++) {
-        if (BGFX_HANDLE_IS_VALID(sr->csm_fbo[i])) continue;
-        if (!sr_make_depth_target(sr, &sr->csm_tex[i], &sr->csm_fbo[i]))
-            ok = false;
-        else
-            sr->shadow_cache_valid[i] = false;  /* fresh depth: re-render */
-    }
-    return ok;
-}
-
-void sr_create_shadow_targets(JceSceneRenderer *sr)
-{
-    if (!sr || sr->shadow_map_size == 0) return;
-
-    const uint16_t sz = sr->shadow_map_size;
-    const bgfx_texture_format_t depth_fmt = sr->shadow_depth_fmt;
-    bgfx_attachment_t at;
-
-    /* shadow_tex (the single non-CSM map) and local_atlas_tex are created on
-     * first use, not here -- see sr_ensure_shadow_map / sr_ensure_local_atlas.
-     * A scene with one directional light and no local shadow casters -- the
-     * common case -- was paying for both regardless: seven sz^2 depth targets
-     * were allocated where five are reachable, 33 MB of the 117 MB shadow
-     * budget at sz=2048 for surfaces nothing ever rendered into. */
-
-    /* Re-arm the pass gate: sr_destroy_shadow_targets clears it, and it used
-     * to be restored as a side effect of creating the non-CSM map here.  With
-     * that allocation moved out, a shadow-map RESIZE would have left the flag
-     * false and silently killed every shadow from then on. */
-    sr->shadow_valid = true;
-    sr->csm_valid = true;
-    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
-        /* Only the cascades the pipeline actually renders are allocated.  All
-         * four were created unconditionally, so a LOW-tier run -- where the
-         * floor clamps the count to 1 -- still paid for three shadow_map_size^2
-         * depth surfaces that nothing ever wrote to, and a 3-cascade HIGH-tier
-         * scene paid for a fourth.  Strictly waste: this changes no cascade
-         * that is used, so shadow quality is untouched.  sr_ensure_csm_count
-         * grows the set if the count later rises. */
-        if (i >= sr_csm_wanted_count(sr)) {
-            sr->csm_tex[i].idx = UINT16_MAX;
-            sr->csm_fbo[i].idx = UINT16_MAX;
-            continue;
-        }
-        sr->csm_tex[i] = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
-            BGFX_TEXTURE_RT
-            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-            NULL, 0);
-        memset(&at, 0, sizeof(at));
-        bgfx_attachment_init(&at, sr->csm_tex[i], BGFX_ACCESS_WRITE,
-                             0, 1, 0, BGFX_RESOLVE_NONE);
-        sr->csm_fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
-        if (!BGFX_HANDLE_IS_VALID(sr->csm_fbo[i]))
-            sr->csm_valid = false;
-        /* Fresh FBO holds no valid depth → invalidate the shadow-map cache so
-         * the next frame re-renders this cascade instead of trusting stale
-         * contents of a just-recreated texture. */
-        sr->shadow_cache_valid[i] = false;
-    }
-
-    /* Dual shadow-map DYNAMIC atlas (JCE_SHADOW_DUAL): one depth texture the
-     * same size as a full cascade map, holding the 4 cascades as a 2x2 grid of
-     * (sz/2)^2 tiles.  Same depth fmt / point-clamp as csm_tex.  Always allocated
-     * (cheap: one map) so toggling the env needs no target rebuild; only written
-     * + sampled when dual mode is active. */
-    sr->dyn_csm_atlas_tex = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
-        BGFX_TEXTURE_RT
-        | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-        | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-        NULL, 0);
-    memset(&at, 0, sizeof(at));
-    bgfx_attachment_init(&at, sr->dyn_csm_atlas_tex, BGFX_ACCESS_WRITE,
-                         0, 1, 0, BGFX_RESOLVE_NONE);
-    sr->dyn_csm_atlas_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
-    sr->dyn_csm_atlas_size = sz;
-    sr->dyn_csm_valid = BGFX_HANDLE_IS_VALID(sr->dyn_csm_atlas_fbo);
-
-}
-
-/* Create one sz^2 depth target + its framebuffer.  Returns false when the
- * allocation failed, in which case the caller must skip the pass rather than
- * bind an invalid handle. */
-static bool sr_make_depth_target(JceSceneRenderer *sr,
-                                 bgfx_texture_handle_t *tex,
-                                 bgfx_frame_buffer_handle_t *fbo)
-{
-    if (BGFX_HANDLE_IS_VALID(*fbo)) return true;
-    if (!sr || sr->shadow_map_size == 0) return false;
-    const uint16_t sz = sr->shadow_map_size;
-    *tex = bgfx_create_texture_2d(sz, sz, false, 1, sr->shadow_depth_fmt,
-        BGFX_TEXTURE_RT
-        | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-        | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-        NULL, 0);
-    if (!BGFX_HANDLE_IS_VALID(*tex)) return false;
-    bgfx_attachment_t at;
-    memset(&at, 0, sizeof(at));
-    bgfx_attachment_init(&at, *tex, BGFX_ACCESS_WRITE, 0, 1, 0,
-                         BGFX_RESOLVE_NONE);
-    *fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
-    return BGFX_HANDLE_IS_VALID(*fbo);
-}
-
-/* The single non-CSM shadow map.  Only reachable when a frame decides against
- * cascades, which most directional-light scenes never do. */
-bool sr_ensure_shadow_map(JceSceneRenderer *sr)
-{
-    if (!sr) return false;
-    /* Deliberately does NOT touch sr->shadow_valid: that flag gates the whole
-     * shadow pass (sr_render_shadows returns early on it), not the presence of
-     * this one target.  Conflating the two switched every shadow in the engine
-     * off the moment this map became lazily allocated. */
-    return sr_make_depth_target(sr, &sr->shadow_tex, &sr->shadow_fbo);
-}
-
-/* The spot/point shadow atlas.  Only reachable once a frame actually has a
- * local shadow caster to render. */
-bool sr_ensure_local_atlas(JceSceneRenderer *sr)
-{
-    if (!sr) return false;
-    sr->local_atlas_valid = sr_make_depth_target(sr, &sr->local_atlas_tex,
-                                                 &sr->local_atlas_fbo);
-    return sr->local_atlas_valid;
-}
-
-void sr_ensure_shadow_map_size(JceSceneRenderer *sr, uint16_t size)
-{
-    if (!sr || size == 0) return;
-    if (size < 512) size = 512;
-    if (size > 4096) size = 4096;
-    /* Deliberately does NOT test shadow_fbo: that target is allocated on first
-     * use and a CSM scene never allocates it at all, so requiring it here made
-     * this guard permanently false.  Every frame then destroyed and rebuilt
-     * every shadow target, which cleared shadow_cache_valid[] and drove the
-     * CSM cascade skip-cache to a 0% hit rate -- measured at 4796 evaluations
-     * and 0 hits over 1200 frames on a static camera with no dynamic casters,
-     * costing ~56 ms of a 66 ms frame at 150k entities.  csm_fbo[0] is the
-     * target this function actually sizes; it is the correct witness. */
-    if (sr->shadow_map_size == size &&
-        BGFX_HANDLE_IS_VALID(sr->csm_fbo[0]))
-        return;
-
-    sr_destroy_shadow_targets(sr);
-    sr->shadow_map_size = size;
-    sr_create_shadow_targets(sr);
-    sr->shadow_far_valid = false;
-    LOG_INFO(LOG_TAG, "shadow map resized to %u", (unsigned)size);
-}
 
 /* ── #6 cull-once / consume-many: shadow-caster spatial grid ───────────────
  *
@@ -1154,14 +983,19 @@ static bool sr_build_shadow_space(JceSceneRenderer *sr, EntityList *list,
         s_spacecache_disabled = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
     const uint64_t sp_epoch = jce_scene_get_structural_epoch(scene);
+    const bool pc_on = sr_shadow_percascade_active(sr);
+    const uint64_t caster_key = pc_on ? sr->shadow_static_caster_key
+                                      : sr->shadow_caster_key;
     if (!s_spacecache_disabled
         && sr->shadow_space_valid
         /* Per-cascade mode: dynamics are EXCLUDED from the grid (delivered
          * via sr->shadow_dyn instead), so a mover no longer voids it — the
          * ~2.3ms/frame full grid rebuild while anything moves is gone. */
-        && (sr_shadow_percascade_active(sr) || !sr->shadow_has_dynamic_caster)
-        && sr->shadow_space_caster_key   == sr->shadow_caster_key
+        && (pc_on || !sr->shadow_has_dynamic_caster)
+        && sr->shadow_space_static_only == pc_on
+        && sr->shadow_space_caster_key   == caster_key
         && sr->shadow_space_struct_epoch == sp_epoch
+        && sr->shadow_space_list_gen     == sr->frame_list_gen
         && sr->shadow_space_list_count   == list->count)
         return true;
 
@@ -1193,7 +1027,6 @@ static bool sr_build_shadow_space(JceSceneRenderer *sr, EntityList *list,
     jce_vec3 wmin = { +FLT_MAX, +FLT_MAX, +FLT_MAX };
     jce_vec3 wmax = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
     uint32_t aabb_casters = 0;
-    const bool pc_on = sr_shadow_percascade_active(sr);
     for (int i = 0; i < list->count; i++) {
         if (!sr->ecull[i].casts_shadow) continue;
         /* Per-cascade mode: dynamics are not gridded (and not in noaabb[]) —
@@ -1239,11 +1072,13 @@ static bool sr_build_shadow_space(JceSceneRenderer *sr, EntityList *list,
         if (!sr->ecull[i].casts_shadow || !sr->ecull[i].has_aabb) continue;
         if (pc_on && sr->ecull[i].is_dyn_caster) continue;
         JceAABB b = { sr->ecull[i].wmin, sr->ecull[i].wmax };
-        jce_space_insert(sr->shadow_space, b, (uint32_t)i);
+        if (!jce_space_insert(sr->shadow_space, b, (uint32_t)i)) return false;
     }
     sr->shadow_space_valid       = true;
-    sr->shadow_space_caster_key  = sr->shadow_caster_key;
+    sr->shadow_space_caster_key  = caster_key;
+    sr->shadow_space_static_only = pc_on;
     sr->shadow_space_struct_epoch = sp_epoch;
+    sr->shadow_space_list_gen    = sr->frame_list_gen;
     sr->shadow_space_list_count  = list->count;
     return true;
 }
@@ -1403,6 +1238,18 @@ static void sr_draw_dyn_csm_pass(JceSceneRenderer *sr, JceScene *scene,
     sr->frame_dyn_csm_active = true;
 }
 
+/* A configured resolution/cascade count is not demand. Resolve the actual
+ * shadow-casting key light before admitting any directional depth surfaces. */
+static bool sr_admit_directional_shadow(JceSceneRenderer *sr, JceScene *scene,
+    EntityList *list, bool use_csm, jce_vec3 *shadow_dir)
+{
+    if (!sr_resolve_primary_dir_light(sr, scene, list, true, shadow_dir,
+                                      NULL, NULL))
+        return false;
+    /* A previous failed allocation retries here on the next requested pass. */
+    return !use_csm || sr_ensure_csm_count(sr);
+}
+
 void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                 const JceCamera *camera, EntityList *list,
                                 uint16_t view_id_base, uint32_t vp_w,
@@ -1442,14 +1289,10 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                       && sr->render_queue
                       && shadow_inst_sh.idx != UINT16_MAX;
 
-    const bool use_csm = sr->csm_valid && sr->csm_cascade_count > 0
+    const bool use_csm = sr->csm_cascade_count > 0
                       && jce_render_pipeline_is_feature_enabled("csm");
-    /* Cascade targets are allocated only up to the count in use; a tier or
-     * pipeline change can raise it after they were built, so grow the set
-     * before rendering into it.  No-op once complete. */
-    if (use_csm) sr_ensure_csm_count(sr);
     jce_vec3 shadow_dir;
-    if (!sr_resolve_primary_dir_light(sr, scene, list, true, &shadow_dir, NULL, NULL))
+    if (!sr_admit_directional_shadow(sr, scene, list, use_csm, &shadow_dir))
         return;
 
     /* Capability-matrix U3: at night the moon is the key light.
@@ -2059,9 +1902,13 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
      * gathered into the static cascade maps (they go to the dynamic atlas) and
      * the per-cascade dynamic cache gate is dropped (a mover no longer voids the
      * static cascade cache). */
-    const bool dual_on = sr_shadow_dual_on()
-                      && sr_shadow_percascade_active(sr)
-                      && sr->dyn_csm_valid;
+    /* Admit before testing readiness: putting this after a dyn_csm_valid
+     * gate would prevent a cold atlas from ever being created. No movers (or
+     * disabled dual mode) retains prior storage without creating new targets;
+     * allocation failure leaves dual_on false and the gather appends movers
+     * to the ordinary cascades below. */
+    const bool dual_on = sr_ensure_dyn_csm_atlas(sr, sr_shadow_dual_on(),
+                                                sr_shadow_percascade_active(sr));
 
     /* #6 — build the shadow-caster grid ONCE so each cascade gathers only the
      * casters overlapping its (conservative) bounds.  On failure (or when there
@@ -2345,10 +2192,11 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                    | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA;
                 jce_rq_push(sr->render_queue, &cmd);
             }
-            /* 千万 ③: scatter fields cast shadows as ONE instanced depth draw
-             * per cascade at a reduced LOD — outside the entity walk (scatter
-             * carries no ecull caster AABB; the cache slots know the fields). */
-            sr_submit_scatter_shadows(sr, scene, cv, (uint16_t)shadow_inst_sh.idx);
+            /* Stream every authored scatter before its bounded slot is evicted.
+             * Incomplete content must not become a reusable cascade. */
+            if (!sr_submit_scatter_shadows(sr, scene, list, cv,
+                    (uint16_t)shadow_inst_sh.idx))
+                sr->shadow_cache_valid[c] = false;
             /* GrassField.cast_shadow joins the SAME instanced depth path.
              * The cell runs come from the colour pass's own grid and its own
              * fade, so a blade cannot cast a shadow it is too far away to be
@@ -2356,11 +2204,8 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             {
                 jce_vec4 gplanes[6];
                 jce_frustum_extract_planes(&csm.vp[c], gplanes);
-                sr_submit_grass_shadows(sr, scene, cv,
-                                        (uint16_t)shadow_inst_sh.idx,
-                                        gplanes,
-                                        camera ? jce_camera_get_position(camera)
-                                               : jce_v3(0.0f, 0.0f, 0.0f));
+                if (!sr_submit_grass_shadows(sr, scene, list, cv, gplanes, camera))
+                    sr->shadow_cache_valid[c] = false;
             }
         }
         jce_perf_phase_add("sh_gather", jce_time_perf_to_ms(_ts_gather, jce_time_perf_counter()));
@@ -2490,7 +2335,9 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                 jce_mesh_submit_shadow(mesh, sr->renderer, cv);
             }
             /* 千万 ③: scatter shadows (see the rq branch above). */
-            sr_submit_scatter_shadows(sr, scene, cv, (uint16_t)shadow_inst_sh.idx);
+            if (!sr_submit_scatter_shadows(sr, scene, list, cv,
+                    (uint16_t)shadow_inst_sh.idx))
+                sr->shadow_cache_valid[c] = false;
             /* GrassField.cast_shadow joins the SAME instanced depth path.
              * The cell runs come from the colour pass's own grid and its own
              * fade, so a blade cannot cast a shadow it is too far away to be
@@ -2498,11 +2345,8 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             {
                 jce_vec4 gplanes[6];
                 jce_frustum_extract_planes(&csm.vp[c], gplanes);
-                sr_submit_grass_shadows(sr, scene, cv,
-                                        (uint16_t)shadow_inst_sh.idx,
-                                        gplanes,
-                                        camera ? jce_camera_get_position(camera)
-                                               : jce_v3(0.0f, 0.0f, 0.0f));
+                if (!sr_submit_grass_shadows(sr, scene, list, cv, gplanes, camera))
+                    sr->shadow_cache_valid[c] = false;
             }
         }
     }
@@ -2531,20 +2375,21 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
  * tile's view (rect + light VP), and submit all casters (reusing the skinned +
  * static depth helpers so animated casters deform their local shadows too).
  * Stores the VP into frame_local_vp[slot]. */
-static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
+static bool sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
                                         EntityList *list, uint16_t view_id_base,
                                         const jce_mat4 *vp, uint32_t slot,
                                         const float *ident, bool *cleared,
                                         uint32_t tiles, uint16_t view_off)
 {
+    if (!sr || !scene || !list || !vp || !ident || !cleared) return false;
     uint16_t tx, ty, tsz;
     if (!jce_local_shadow_atlas_tile(slot, sr->shadow_map_size,
                                      tiles, &tx, &ty, &tsz))
-        return;
+        return false;
 
     /* Lazily allocated: the atlas exists only once a frame actually has a
      * local shadow caster.  Bail rather than bind an invalid framebuffer. */
-    if (!sr_ensure_local_atlas(sr)) return;
+    if (!sr_ensure_local_atlas(sr)) return false;
 
     /* NOT cached across frames, and two attempts prove why it is not simple.
      *
@@ -2630,6 +2475,8 @@ static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
        their VP in frame_point_cube_vp via the caller, so guard the OOB write. */
     if (slot < JCE_MAX_LOCAL_SHADOWS)
         sr->frame_local_vp[slot] = *vp;
+    /* A configured, cleared depth tile is valid even with no casters. */
+    return true;
 }
 
 /* P1 — local (spot + point) shadow producer pass. Renders up to
@@ -2752,9 +2599,10 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         float    fov    = 2.0f * acosf(sl->outer_cone_cos);
         jce_mat4 vp = jce_local_shadow_vp(pos, dir, fov,
                                           0.05f * radius, radius, homog);
-        sr_local_shadow_render_tile(sr, scene, list, view_id_base,
-                                    &vp, slot, ident, &cleared,
-                                    sr->local_tiles, loff);
+        if (!sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                        &vp, slot, ident, &cleared,
+                                        sr->local_tiles, loff))
+            continue;
         sr->frame_local_bias_slot[slot] =
             (sl->shadow_bias > 0.0f) ? sl->shadow_bias : 0.0015f;
         sr->frame_spot_slot[my_spot] = (float)slot;
@@ -2804,15 +2652,20 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                 + cube_budget * (uint32_t)JCE_POINT_CUBE_FACES;
             if (base + (uint32_t)JCE_POINT_CUBE_FACES > max_slot)
                 continue;   /* atlas full */
+            bool complete = true;
             for (uint32_t f = 0; f < (uint32_t)JCE_POINT_CUBE_FACES; f++) {
                 jce_vec3 d = jce_v3(CUBE_DIRS[f][0], CUBE_DIRS[f][1], CUBE_DIRS[f][2]);
                 jce_mat4 vp = jce_local_shadow_vp(pos, d, JCE_POINT_CUBE_FOV,
                                                   0.05f * radius, radius, homog);
-                sr_local_shadow_render_tile(sr, scene, list, view_id_base,
-                                            &vp, base + f, ident, &cleared,
-                                            sr->local_tiles, loff);
+                if (!sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                                &vp, base + f, ident, &cleared,
+                                                sr->local_tiles, loff)) {
+                    complete = false;
+                    break;
+                }
                 sr->frame_point_cube_vp[cube_budget * (uint32_t)JCE_POINT_CUBE_FACES + f] = vp;
             }
+            if (!complete) continue;
             sr->frame_point_cube_base_slot[my_point] = (float)base;
             cube_budget++;
         } else {
@@ -2820,9 +2673,10 @@ void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             jce_mat4 vp = jce_local_shadow_vp(pos, jce_v3(0.0f, -1.0f, 0.0f),
                                               JCE_POINT_SHADOW_FOV,
                                               0.05f * radius, radius, homog);
-            sr_local_shadow_render_tile(sr, scene, list, view_id_base,
-                                        &vp, slot, ident, &cleared,
-                                        sr->local_tiles, loff);
+            if (!sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                            &vp, slot, ident, &cleared,
+                                            sr->local_tiles, loff))
+                continue;
             sr->frame_local_bias_slot[slot] =
                 (pl->shadow_bias > 0.0f) ? pl->shadow_bias : 0.0015f;
             sr->frame_point_slot[my_point] = (float)slot;

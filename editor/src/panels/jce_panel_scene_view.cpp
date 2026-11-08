@@ -20,6 +20,7 @@
 #include "scene/jce_editor_scene_camera_tools.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_viewport_work.h"
 #include "core/jce_editor_project_state.h"
 #include "ui/jce_editor_panels.h"
 #include <jce/os/core/jce_filesystem.h>
@@ -27,6 +28,7 @@
 #include <jce/os/core/jce_log.h>     /* JCE_DBG_PICK QA hook logging */
 
 extern "C" {
+#include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_scene_renderer.h>
@@ -324,7 +326,9 @@ static void draw_scene_view_toolbar(void)
 static bool setup_scene_viewport(SceneViewCtx *ctx)
 {
     ImVec2 avail_raw = ImGui::GetContentRegionAvail();
-    if (avail_raw.x <= 0 || avail_raw.y <= 0) {
+    if (!jce_editor_viewport_wants_render(ImGui::GetCursorScreenPos(), avail_raw,
+            jce_editor_viewport_capture_requested(false), "editor.scene.policy")) {
+        if (avail_raw.x > 0.0f && avail_raw.y > 0.0f) ImGui::Dummy(avail_raw);
         clear_stale_gizmo_interaction_state();
         return false;
     }
@@ -398,24 +402,11 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
             "%s  %.0f x %.0f", jce_editor_i18n("Scene"), avail.x, avail.y);
     }
 
-    ImGui::SetCursorScreenPos(screen_pos);
-    ImGui::InvisibleButton("##SceneViewInput", avail,
-                           ImGuiButtonFlags_MouseButtonLeft |
-                           ImGuiButtonFlags_MouseButtonRight |
-                           ImGuiButtonFlags_MouseButtonMiddle);
+    ctx->avail = avail;
+    ctx->screen_pos = screen_pos;
+    ctx->dl = dl;
+    register_scene_viewport_input(ctx, jce_state_show_flag(JCE_SHOW_FLAG_WORLD_AXIS));
     handle_scene_view_asset_drop(screen_pos, avail);  /* drop target must follow the button immediately */
-    bool viewport_hovered       = ImGui::IsItemHovered();
-    bool viewport_active        = ImGui::IsItemActive();
-    bool viewport_left_clicked  = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-    bool viewport_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
-
-    ctx->avail            = avail;
-    ctx->screen_pos       = screen_pos;
-    ctx->dl               = dl;
-    ctx->viewport_hovered = viewport_hovered;
-    ctx->viewport_active  = viewport_active;
-    ctx->viewport_left_clicked  = viewport_left_clicked;
-    ctx->viewport_right_clicked = viewport_right_clicked;
     return true;
 }
 
@@ -555,7 +546,7 @@ static JceMeshRenderer *find_mesh_renderer_component(uint32_t entity_id)
     if (entity_id == 0 || !jce_state_entity_exists(entity_id)) return NULL;
     JceScene *scene = jce_state_get_scene();
     if (!scene) return NULL;
-    return jce_scene_get_mesh_renderer(scene, (JceEntity)entity_id);
+    return jce_scene_get_mesh_renderer(scene, jce_state_to_ecs_entity(entity_id));
 }
 
 static bool entity_accepts_mesh_material_drop(uint32_t entity_id)
@@ -767,10 +758,10 @@ static void flush_async_drop_material_extracts(void)
  * services it on a later frame, poll() answers frames after that (see the
  * s_gpu_pick_selection_pending state machine in handle_ray_pick), and only
  * one request may be in flight.  Click and marquee selection CAN wait across
- * frames, so they use it and fall back here only when it is unsupported or
- * refuses the request.  Drag-and-drop cannot wait: handle_scene_view_asset_drop
- * must know the hovered entity inside the ImGui callback (Alt-replace vs
- * create-new is decided before the payload is released) and needs a fresh
+ * frames, so they use it when available. A click can also query scene geometry
+ * synchronously when the ID pass is unavailable. Drag-and-drop cannot wait:
+ * handle_scene_view_asset_drop needs the hovered entity in the ImGui callback
+ * (Alt-replace vs create-new is decided before release) and needs a fresh
  * hover answer on every frame of the drag; compute_surface_hit additionally
  * needs the ray parameter — a world-space hit POINT that an object-id buffer
  * does not carry at all.  Keep the limitation in mind before "fixing" a drop
@@ -793,7 +784,7 @@ static uint32_t cpu_pick_entity_along_ray(const float ray_o[3],
         if (pid == 0 || !jce_state_entity_exists(pid)) continue;
         if (!jce_state_entity_enabled(pid)) continue;
 
-        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
+        JceTransform *t = scene ? jce_scene_get_transform(scene, jce_state_to_ecs_entity(pid)) : NULL;
         if (!t) continue;
 
         float hx = fabsf(t->scale.x) * 0.5f;
@@ -963,7 +954,7 @@ static void scene_view_frame_entities(bool all)
             bool any_non_terrain = false;
             for (int i = 0; i < sel_n; i++) {
                 if (sel[i] != 0 && jce_state_entity_exists(sel[i]) &&
-                    !jce_scene_has_terrain(scene, (JceEntity)sel[i])) {
+                    !jce_scene_has_terrain(scene, jce_state_to_ecs_entity(sel[i]))) {
                     any_non_terrain = true;
                     break;
                 }
@@ -971,7 +962,7 @@ static void scene_view_frame_entities(bool all)
             for (int i = 0; i < sel_n; i++) {
                 if (sel[i] == 0 || !jce_state_entity_exists(sel[i])) continue;
                 if (any_non_terrain &&
-                    jce_scene_has_terrain(scene, (JceEntity)sel[i])) continue;
+                    jce_scene_has_terrain(scene, jce_state_to_ecs_entity(sel[i]))) continue;
                 accumulate(sel[i]);
             }
         }
@@ -1076,7 +1067,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
             for (int ei = 0; ei < ent_count; ei++) {
                 uint32_t eid = jce_state_get_entity_id_by_index(ei);
                 if (eid == 0 || !jce_state_entity_exists(eid)) continue;
-                if (scene && jce_scene_has_skybox(scene, (JceEntity)eid)) {
+                if (scene && jce_scene_has_skybox(scene, jce_state_to_ecs_entity(eid))) {
                     sky_id = eid;
                     break;
                 }
@@ -1091,7 +1082,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
             if (sky_id) {
                 scene = jce_state_get_scene();
                 JceSkyboxComponent *sky = scene
-                    ? jce_scene_get_skybox(scene, (JceEntity)sky_id)
+                    ? jce_scene_get_skybox(scene, jce_state_to_ecs_entity(sky_id))
                     : NULL;
                 if (sky) {
                     char rel_hdr[1024];
@@ -1249,13 +1240,13 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                 if (id != 0) {
                     JceScene *scene = jce_state_get_scene();
                     if (scene) {
-                        JceTransform *t = jce_scene_get_transform(scene, (JceEntity)id);
+                        JceTransform *t = jce_scene_get_transform(scene, jce_state_to_ecs_entity(id));
                         if (t) {
                             t->position.x = drop_pos[0];
                             t->position.y = drop_pos[1];
                             t->position.z = drop_pos[2];
                         }
-                        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, (JceEntity)id);
+                        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, jce_state_to_ecs_entity(id));
                         if (mr) {
                             char glb_buf2[1024];
                             const char *src_mesh2 = import_ensure_glb(asset_path,
@@ -1296,7 +1287,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                                     id, JCE_COMP_FLAG_SKELETAL_ANIMATOR);
                                 JceSkeletalAnimatorComponent *sa =
                                     jce_scene_get_skeletal_animator(
-                                        scene, (JceEntity)id);
+                                        scene, jce_state_to_ecs_entity(id));
                                 if (sa) {
                                     snprintf(sa->skeleton_path,
                                              sizeof(sa->skeleton_path),
@@ -1324,7 +1315,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                         if (jce_editor_scene_camera_get_entity_focus_bounds(
                                 id, fb_lo, fb_hi)) {
                             JceTransform *t2 =
-                                jce_scene_get_transform(scene, (JceEntity)id);
+                                jce_scene_get_transform(scene, jce_state_to_ecs_entity(id));
                             if (t2)
                                 t2->position.y += (drop_pos[1] - fb_lo[1]);
                         }
@@ -1499,7 +1490,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
             const uint32_t focused = jce_state_get_focused();
             JceScene *scene = jce_state_get_scene();
             const bool has_camera = scene && focused != 0
-                && jce_scene_get_camera(scene, (JceEntity)focused) != nullptr;
+                && jce_scene_get_camera(scene, jce_state_to_ecs_entity(focused)) != nullptr;
             char align_chord[64];
             char pilot_chord[64];
             jce_hotkey_chord_label(
@@ -1853,17 +1844,29 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
     if (request_gpu_pick_for_click(ctx, s_sel_click_pos, add_mode))
         return;
 
-    /* Coarse CPU fallback — only reached when the GPU id pick is unsupported
-     * on this backend or refused the request (see request_gpu_pick_for_click);
-     * every other click above returned already.  Same transform-scale AABB
-     * test the drag-drop path uses, so the two never disagree about a hit
-     * when selection lands here. */
-    float ray_o[3], ray_d[3];
-    gm_screen_to_ray(&pick_cam, s_sel_click_pos.x,
-                     s_sel_click_pos.y, ray_o, ray_d);
+    /* Screen-space overlays are resolved above. Test the clipped world ray
+     * only for a click inside the image, using the rendered model poses. */
+    const ImVec2 click = s_sel_click_pos;
+    const float local_x = click.x - ctx->screen_pos.x;
+    const float local_y = click.y - ctx->screen_pos.y;
+    if (!(local_x >= 0.0f && local_y >= 0.0f &&
+          local_x < ctx->avail.x && local_y < ctx->avail.y))
+        return;
 
-    apply_single_pick_selection(cpu_pick_entity_along_ray(ray_o, ray_d, NULL),
-                                add_mode);
+    float ray_o[3], ray_d[3], max_t;
+    if (!gm_screen_to_clip_ray(&pick_cam, click.x, click.y,
+                                jce_gfx_caps().homogeneous_depth,
+                                ray_o, ray_d, &max_t))
+        return;
+
+    JceEditorSceneRayPick hit = jce_editor_scene_pick_ray(
+        jce_state_get_scene(), GM_V3_CREF(ray_o), GM_V3_CREF(ray_d), max_t);
+    if (getenv("JCE_DBG_PICK"))
+        jce_log_write(JCE_LOG_LEVEL_INFO, "scene_view", __FILE__, __LINE__,
+                      "[dbg-pick] route=cpu-ray entity=%u models=%u source=%s",
+                      hit.entity, hit.models_tested,
+                      hit.geometry_hit ? "geometry" : (hit.entity ? "proxy" : "miss"));
+    apply_single_pick_selection(hit.entity, add_mode);
 }
 
 /* Orange diamond outline on all selected entities. */
@@ -1904,7 +1907,7 @@ static void draw_selection_outlines(const SceneViewCtx *ctx,
             continue;
         }
 
-        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)sid) : NULL;
+        JceTransform *t = scene ? jce_scene_get_transform(scene, jce_state_to_ecs_entity(sid)) : NULL;
         if (!t) continue;
         float swp[3] = { t->position.x, t->position.y, t->position.z };
 
@@ -1965,8 +1968,8 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
 
     int axis_click = -1;
     if (jce_state_show_flag(JCE_SHOW_FLAG_WORLD_AXIS))
-        axis_click = draw_axis_indicator(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
-    int cube_click = draw_view_cube(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
+        axis_click = draw_axis_indicator(ctx->dl, ctx->screen_pos, ctx->avail, view_mat, ctx->axis_left_clicked);
+    int cube_click = draw_view_cube(ctx->dl, ctx->screen_pos, ctx->avail, view_mat, ctx->cube_left_clicked);
 
     if (axis_click >= 0) {
         static const JceCamPresetView axis_presets[6] = {
@@ -1990,7 +1993,7 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
     /* Headless click-pick hook (JCE_DBG_PICK="<entity>@<frame>"): projects
      * the named entity's position to viewport pixels and injects it as a
      * REAL click (s_sel_click_*), so the full selection path runs — icon
-     * hit-test, GPU id-buffer pick, poll, selection apply.  Result is
+     * hit-test, geometry pick, selection apply. The result is
      * logged a second later.  Pairs with JCE_WINCAP_* for visual QA. */
     {
         static int  s_pk_frame = -2;   /* -2 unparsed, -1 disabled/fired */
@@ -2019,8 +2022,9 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
                 uint32_t id = jce_state_get_entity_id_by_index(i);
                 const char *nm = jce_state_entity_name(id);
                 if (!nm || strcmp(nm, s_pk_name) != 0) continue;
-                JceTransform *tf = jce_scene_get_transform(scene, (JceEntity)id);
-                if (!tf) break;
+                const JceEntity entity = jce_state_to_ecs_entity(id);
+                if (!jce_scene_has_transform(scene, entity)) break;
+                const jce_vec3 pivot = jce_scene_get_pivot_world_position(scene, entity);
                 JceGizmoCamera cam;
                 memcpy(cam.view, view_mat, sizeof(float) * 16);
                 memcpy(cam.proj, proj_mat, sizeof(float) * 16);
@@ -2029,15 +2033,16 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
                 cam.viewport_size[1]   = ctx->avail.y;
                 cam.viewport_origin[0] = ctx->screen_pos.x;
                 cam.viewport_origin[1] = ctx->screen_pos.y;
-                float world[3] = { tf->position.x, tf->position.y, tf->position.z };
+                float world[3] = { pivot.x, pivot.y, pivot.z };
                 float screen[2];
                 if (gm_world_to_screen(&cam, world, screen)) {
                     s_sel_click_pos     = ImVec2(screen[0], screen[1]);
                     s_sel_click_pending = true;
                     s_pk_target = id;
                     s_pk_report = (int)s_pk_tick + 60;
-                    LOG_INFO("scene_view", "[dbg-pick] click at %.0f,%.0f for '%s' (id=%u)",
-                             screen[0], screen[1], s_pk_name, id);
+                    jce_log_write(JCE_LOG_LEVEL_INFO, "scene_view", __FILE__, __LINE__,
+                                  "[dbg-pick] click at %.0f,%.0f for '%s' (id=%u)",
+                                  screen[0], screen[1], s_pk_name, id);
                 } else {
                     LOG_WARN("scene_view", "[dbg-pick] '%s' projects off-screen", s_pk_name);
                 }
@@ -2046,8 +2051,9 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
         }
         if (s_pk_report > 0 && s_pk_tick >= (uint32_t)s_pk_report) {
             s_pk_report = -1;
-            LOG_INFO("scene_view", "[dbg-pick] result: '%s' selected=%d",
-                     s_pk_name, jce_state_is_selected(s_pk_target) ? 1 : 0);
+            jce_log_write(JCE_LOG_LEVEL_INFO, "scene_view", __FILE__, __LINE__,
+                          "[dbg-pick] result: '%s' selected=%d",
+                          s_pk_name, jce_state_is_selected(s_pk_target) ? 1 : 0);
         }
     }
 
@@ -2305,13 +2311,22 @@ static void scene_view_draw_plane_brush_cursor(
     }
 }
 
-void jce_editor_panel_scene_view_content(void)
+void jce_editor_panel_scene_view_content(bool viewport_admitted)
 {
     /* Rolling sub-phases: the Scene View panel owns ~8ms/frame of
      * NON-render work at 150k (ed_p_scene_view minus scene_render) —
      * these locate which stage. */
     uint64_t sv_t = jce_time_perf_counter();
     flush_async_drop_material_extracts();
+    if (!viewport_admitted) {
+        clear_stale_gizmo_interaction_state();
+        cancel_deferred_scene_pick();
+        s_is_selecting = false;
+        jce_terrain_panel_end_brush_stroke();
+        jce_foliage_brush_end_stroke();
+        jce_editor_scene_camera_stop_pilot();
+        return;
+    }
     draw_scene_view_toolbar();
     panel_phase_sv("ed_sv_toolbar", &sv_t);
 
@@ -2447,6 +2462,7 @@ void jce_editor_panel_scene_view(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW);
     if (!*vis) {
+        jce_editor_viewport_policy_trace("editor.scene.policy", JceEditorViewportPolicyReason::Hidden);
         jce_editor_scene_camera_stop_pilot();
         return;
     }
@@ -2455,7 +2471,9 @@ void jce_editor_panel_scene_view(void)
     char title[256];
     snprintf(title, sizeof(title), "%s###scene_view", jce_editor_i18n("Scene"));
     if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
-        jce_editor_panel_scene_view_content();
+        jce_editor_panel_scene_view_content(true);
+    else
+        jce_editor_viewport_policy_trace("editor.scene.policy", JceEditorViewportPolicyReason::Collapsed);
     ImGui::End();
     ImGui::PopStyleVar();
 
@@ -2464,9 +2482,9 @@ void jce_editor_panel_scene_view(void)
         JceScene *scene = jce_state_get_scene();
         uint32_t focused = jce_state_get_focused();
         if (scene && focused != 0) {
-            uint64_t cf = jce_scene_get_component_flags(scene, (JceEntity)focused);
+            uint64_t cf = jce_scene_get_component_flags(scene, jce_state_to_ecs_entity(focused));
             if (cf & JCE_COMP_FLAG_CAMERA) {
-                JceCameraComponent *cam = jce_scene_get_camera(scene, (JceEntity)focused);
+                JceCameraComponent *cam = jce_scene_get_camera(scene, jce_state_to_ecs_entity(focused));
                 if (cam) {
                     ImGui::SetNextWindowSize(ImVec2(280.0f, 180.0f), ImGuiCond_FirstUseEver);
                     ImGui::SetNextWindowBgAlpha(0.85f);

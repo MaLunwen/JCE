@@ -106,6 +106,7 @@ typedef void (*fn_set_position)(JceScriptApi *, JceScriptEntity,
                                 float, float, float);
 typedef void (*fn_move_axis)(JceScriptApi *, float *);
 typedef bool (*fn_stat_flush)(JceScriptApi *);
+typedef void (*fn_viewport_size)(JceScriptApi *, float [2]);
 typedef JceScriptEntity (*fn_find_with_tag)(JceScriptApi *, const char *);
 typedef int (*fn_raycast_all)(JceScriptApi *, const float *, const float *,
                               float, uint32_t, bool, JceScriptEntity *, int);
@@ -317,6 +318,7 @@ typedef struct MockHost {
     int   touch_count_value;
     int   json_free_calls;
     char *last_json;
+    int   viewport_size_calls;
 } MockHost;
 
 static MockHost g_mock;
@@ -388,6 +390,13 @@ static const char *m_loc_translate(void *user, const char *key)
     return "translated";
 }
 
+static void m_viewport_size(void *user, float out[2])
+{
+    MockHost *m = (MockHost *)user;
+    ++m->viewport_size_calls;
+    out[0] = 909.25f; out[1] = 650.5f;
+}
+
 static void m_poison(void)
 {
     g_poison_called = true;
@@ -406,6 +415,7 @@ static void fill_host(JceScriptHost *h)
     h->comp_get_json = m_comp_get_json;
     h->json_free = m_json_free;
     h->loc_translate = m_loc_translate;
+    h->viewport_size = m_viewport_size;
 }
 
 static JceScriptApi *open_with(const JceScriptHost *h, size_t size)
@@ -596,6 +606,7 @@ static void test_forwarders_reach_the_host(void)
     JceScriptApi *api;
     float xyz[3] = { 0 };
     float axis[2] = { 0 };
+    float extent[2] = {77.0f, 88.0f};
 
     fill_host(&host);
     api = open_with(&host, sizeof host);
@@ -616,6 +627,18 @@ static void test_forwarders_reach_the_host(void)
 
     TEST_ASSERT_EQUAL_UINT64(7u,
         ((fn_find_with_tag)must_sym("jce_script_api_find_with_tag"))(api, "player"));
+
+    ((fn_viewport_size)must_sym("jce_script_api_get_viewport_size"))(api, extent);
+    TEST_ASSERT_EQUAL_FLOAT(909.25f, extent[0]);
+    TEST_ASSERT_EQUAL_FLOAT(650.5f, extent[1]);
+    TEST_ASSERT_EQUAL_INT(1, g_mock.viewport_size_calls);
+    /* The full host is copied; editing the caller table cannot remove its slot. */
+    host.viewport_size = NULL;
+    extent[0] = 77.0f; extent[1] = 88.0f;
+    ((fn_viewport_size)must_sym("jce_script_api_get_viewport_size"))(api, extent);
+    TEST_ASSERT_EQUAL_FLOAT(909.25f, extent[0]);
+    TEST_ASSERT_EQUAL_FLOAT(650.5f, extent[1]);
+    TEST_ASSERT_EQUAL_INT(2, g_mock.viewport_size_calls);
 
     close_api(api);
 }
@@ -756,9 +779,8 @@ static void test_a_short_host_is_never_read_past_its_end(void)
     void (*poison)(void) = m_poison;
     size_t trunc = offsetof(JceScriptHost, JCE_SCRIPT_API_TAIL_MEMBER);
     size_t tail_slots = 8u, i;
-    /* Appended statistics flush is now the newest withheld callback.
-     * Pin the name so future additions cannot leave this negative test vacuous. */
-    TEST_ASSERT_EQUAL_STRING_MESSAGE("jce_script_api_stat_flush",
+    /* Pin the newest withheld callback and its actual output prototype. */
+    TEST_ASSERT_EQUAL_STRING_MESSAGE("jce_script_api_get_viewport_size",
         JCE_SCRIPT_API_TAIL_ENTRY,
         "the manifest tail moved; re-type this negative call to its new prototype");
     TEST_ASSERT_TRUE_MESSAGE(sizeof(JceScriptHost) > trunc,
@@ -774,14 +796,16 @@ static void test_a_short_host_is_never_read_past_its_end(void)
     api = open_with((const JceScriptHost *)shorter, trunc);
     TEST_ASSERT_NOT_NULL(api);
 
-    /* The absent bool-valued tail must return false without consulting the
+    /* The absent output tail must zero both dimensions without consulting
      * poison immediately after the caller's sized host object. */
-    TEST_ASSERT_FALSE_MESSAGE(
-        ((fn_stat_flush)must_sym(JCE_SCRIPT_API_TAIL_ENTRY))(api),
-        "the absent statistics flush did not return its declared false default");
+    float extent[2] = {77.0f, 88.0f};
+    ((fn_viewport_size)must_sym(JCE_SCRIPT_API_TAIL_ENTRY))(api, extent);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, extent[0]);
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, extent[1]);
     TEST_ASSERT_FALSE_MESSAGE(g_poison_called,
         "the library read past the caller's shorter host: the tail entry "
         "called what followed the caller's object");
+    TEST_ASSERT_EQUAL_INT(0, g_mock.viewport_size_calls);
 
     /* And the members the short host DOES carry still work. */
     TEST_ASSERT_EQUAL_UINT64(7u,

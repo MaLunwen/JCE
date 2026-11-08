@@ -17,8 +17,8 @@ WHERE THE THREE COPIES ARE:
   2. engine/src/renderer/jce_renderer_caps.c  the `#if JCE_GRAPHICS_API_TIER_VALUE
      == n` block -- preprocessor assertions that the package's floor matches the
      tier it claims.
-  3. the same file's jce_renderer_api_tier_minimum() gl[]/gles[] tables -- the
-     numbers the ENGINE reports to callers and to the editor's UI.
+  3. the same file's jce_renderer_api_tier_minimum() gl[]/gles[] tables,
+     indexed by package ordinal after validating the public policy value.
 
 Copy 2 fails the build when it disagrees with copy 1, which is good.  Copy 3
 fails NOTHING: it is a plain lookup table, so a drifted entry means the engine
@@ -118,8 +118,8 @@ def caps_preprocessor(text: str):
 
 
 def caps_runtime_table(text: str, name: str):
-    """copy 3 -> [(maj, min, patch), ...] for gl[] / gles[]"""
-    m = re.search(r"\b%s\[JCE_GRAPHICS_API_TIER_COUNT\]\s*=\s*\{(.*?)\}\s*;"
+    """copy 3 -> [(maj, min, patch), ...] indexed by package ordinal."""
+    m = re.search(r"\b%s\[JCE_GFX_PROVIDER_TIER_COUNT\]\s*=\s*\{(.*?)\}\s*;"
                   % re.escape(name), text, re.S)
     if not m:
         return None
@@ -205,7 +205,7 @@ def main() -> int:
 
     if "--list" in sys.argv:
         print("%-9s %-6s %-9s %-9s %-11s %s"
-              % ("tier", "value", "hook GL", "hook GLES", "caps #if", "caps table"))
+              % ("tier", "pkg id", "hook GL", "hook GLES", "caps #if", "caps table"))
         for value in sorted(by_value):
             name, cfg = by_value[value]
             pre_s = ("%d/%d" % pre[value]) if value in pre else "MISSING"

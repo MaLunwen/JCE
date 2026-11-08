@@ -32,6 +32,29 @@ static void test_default_allocator_round_trip(void)
     JCE_AFREE(a, p);
 }
 
+static void test_failed_realloc_preserves_old_block_and_accounting(void)
+{
+    jce_allocator_t allocator = jce_allocator_default();
+    unsigned char *old = allocator.alloc(64, allocator.ctx);
+    JceAllocTrack before, after;
+    TEST_ASSERT_NOT_NULL(old);
+    memset(old, 0x5a, 64);
+    bool tracked = jce_alloc_track_snapshot(&before);
+    void *failed = allocator.realloc(old, SIZE_MAX, allocator.ctx);
+    TEST_ASSERT_NULL(failed); /* SIZE_MAX cannot be a representable allocation. */
+    for (int i = 0; i < 64; ++i) TEST_ASSERT_EQUAL_HEX8(0x5a, old[i]);
+    if (tracked) {
+        TEST_ASSERT_TRUE(jce_alloc_track_snapshot(&after));
+        TEST_ASSERT_EQUAL_UINT64(before.live_bytes, after.live_bytes);
+        TEST_ASSERT_EQUAL_UINT64(before.live_count, after.live_count);
+        TEST_ASSERT_EQUAL_UINT64(before.total_frees, after.total_frees);
+    }
+    allocator.free(old, allocator.ctx);
+    old = allocator.realloc(NULL, 64, allocator.ctx);
+    TEST_ASSERT_NOT_NULL(old);
+    TEST_ASSERT_NULL(allocator.realloc(old, 0, allocator.ctx));
+}
+
 /* ---- arena ----------------------------------------------------------- */
 
 static void test_arena_push_and_used(void)
@@ -116,6 +139,7 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_default_allocator_round_trip);
+    RUN_TEST(test_failed_realloc_preserves_old_block_and_accounting);
     RUN_TEST(test_arena_push_and_used);
     RUN_TEST(test_arena_push_zero_is_zeroed);
     RUN_TEST(test_arena_reset);

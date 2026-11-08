@@ -77,7 +77,7 @@
 package com.jce.script;
 
 
-/** The scripting surface: 108 entries over the C ABI. */
+/** The scripting surface: 109 entries over the C ABI. */
 public final class JceScript implements AutoCloseable {
 
     /** The manifest's script_api_version this class was generated from. */
@@ -840,9 +840,10 @@ public final class JceScript implements AutoCloseable {
     private static native void nGetPointerDelta(long api, float[] outFloat);
 
     /**
-     * Viewport-local logical pixel x, y, width, height; zero dimensions
-     * indicate unavailable input. The sample is frame-transient and shared by
-     * Editor Game View and standalone runtime.
+     * Viewport-local Canvas pixel x, y, width, height (native drawable or
+     * Editor GameView FBO after render_scale); zero dimensions indicate
+     * unavailable input. The sample is frame-transient and shared by Editor
+     * Game View and standalone runtime.
      * <p>Shape void_out_array, since 1; host member pointer_position.
      */
     public float[] getPointerPosition() {
@@ -1814,5 +1815,21 @@ public final class JceScript implements AutoCloseable {
     }
 
     private static native boolean nStatFlush(long api);
+
+    /**
+     * Host presentation width and height in Canvas pixels (native drawable or
+     * Editor GameView FBO after render_scale), independent of pointer
+     * availability, focus or hover. Persistent until the host replaces or
+     * clears it; unavailable or absent sized-host callbacks return zero,
+     * zero.
+     * <p>Shape void_out_array, since 1; host member viewport_size.
+     */
+    public float[] getViewportSize() {
+        float[] out = new float[2];
+        nGetViewportSize(handle, out);
+        return out;
+    }
+
+    private static native void nGetViewportSize(long api, float[] outFloat);
 
 }

@@ -4,5 +4,6 @@
   "version": "0.1.0",
   "target": "JceBenchmark",
   "exe": "jce_benchmark.exe",
+  "startup_scene": "postfx/empty.scene.json",
   "source_assets": "resources"
 }

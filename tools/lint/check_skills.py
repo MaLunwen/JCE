@@ -178,7 +178,10 @@ def source_blob() -> str:
         parts = []
         for pattern in SOURCE_GLOBS:
             for path in REPO_ROOT.glob(pattern):
-                posix = "/" + path.as_posix().lstrip("/")
+                relative = path.relative_to(REPO_ROOT)
+                posix = "/" + relative.as_posix()
+                if relative.parts[:2] == ("tools", "build"):
+                    posix = posix.removeprefix("/tools/build")
                 if path.is_file() and not any(
                         seg in posix for seg in SOURCE_SKIP_SEGMENTS):
                     parts.append(read(path))

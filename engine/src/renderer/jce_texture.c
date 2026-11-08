@@ -8,7 +8,6 @@
 
 #include <jce/os/core/jce_log.h>
 #include "jce_upload_metrics.h"
-#include <jce/os/core/jce_thread.h>    /* parallel mip downsample */
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_image.h>    /* the one image-decode service */
@@ -20,7 +19,10 @@
 
 #include "jce_texture_mips.h"
 #include "jce_texture_internal.h"      /* jce_lut_strip_to_volume decl */
+#include "jce_texture_diagnostics_internal.h"
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
+#include "os/core/jce_trace_capture_internal.h"
 #include "resource/jce_asset_reader.h"
 #include "resource/jce_tex_compress.h"
 
@@ -47,6 +49,8 @@ typedef struct {
     uint8_t  desired_top_mip;
     int8_t   per_texture_bias;
     bool     streaming_tracked;   /* user opted-in via the streaming API */
+    bool     replacement_warned;  /* raw by-value handles cannot be rebound */
+    uint32_t replacement_trace_generation;
     bool     has_source_pixels;   /* CPU copy retained for re-upload     */
     uint8_t *source_pixels;       /* RGBA8 mip-0 bytes (owned)           */
     int      sampler_mode;
@@ -73,14 +77,10 @@ static int8_t   s_aniso_override = -1;
  * every comparable engine does. */
 static int      s_colour_space_linear = 1;
 
-/* VRAM ceiling (large-world-opt): when set, NEW raw-RGBA8 texture uploads
- * (the streamed-texture path: PAK PNG/JPG → SDL_Surface, and cooked RGBA8)
- * retain a CPU mip-0 copy AND opt into streaming_tracked, so the existing
- * streaming-pressure → global-mip-bias hook can PHYSICALLY drop their top mips
- * under memory pressure (without a retained source the demote is a truthful
- * no-op — audit F29).  Off by default so editor/UI/one-off textures pay zero
- * extra RAM; the runtime renderer arms it around streamed uploads.  Process-
- * wide + render-thread-set (uploads happen on the render thread). */
+/* Existing streaming upload opt-in retains a CPU RGBA8 mip-0 mirror and
+ * records intent. Dynamic raw-handle replacement is unsupported; retaining
+ * a source does not currently reclaim residency memory. Off by default so
+ * editor/UI/one-off textures pay no extra mirror RAM. Owner-thread only. */
 static bool     s_streaming_uploads;
 
 void jce_texture_set_streaming_uploads(bool on)
@@ -185,9 +185,9 @@ static void registry_remove(uint16_t idx)
         s_reg_slot[s_registry[i].idx] = (uint16_t)(i + 1);
 }
 
-/* VRAM ceiling: opt a freshly-registered texture into streaming + retain a CPU
- * RGBA8 mip-0 copy so the streaming-pressure mip-bias hook can physically shrink
- * it.  Called only when s_streaming_uploads is armed (runtime streamed uploads).
+/* Preserve the existing opt-in CPU source ownership and streaming intent.
+ * This mirror does not enable safe runtime raw-handle replacement. Called
+ * only when s_streaming_uploads is armed (runtime streamed uploads).
  * `rgba8` is the tightly-packed (w*h*4) mip-0; a private copy is taken. */
 static void registry_opt_in_streaming(uint16_t idx, uint32_t w, uint32_t h,
                                       const void *rgba8, int sampler_mode)
@@ -197,7 +197,7 @@ static void registry_opt_in_streaming(uint16_t idx, uint32_t w, uint32_t h,
     if (!e || e->has_source_pixels) return;
     size_t bytes = (size_t)w * (size_t)h * 4u;
     uint8_t *copy = (uint8_t *)JCE_MALLOC(bytes);
-    if (!copy) return;   /* best-effort; without it the demote stays a no-op */
+    if (!copy) return;   /* best-effort retained source; no residency claim */
     memcpy(copy, rgba8, bytes);
     e->source_pixels     = copy;
     e->has_source_pixels = true;
@@ -367,8 +367,8 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
      * what the cooked-asset path (jce_texture_from_cooked) already does.  The raw
      * runtime path used to upload mip-0 only.  Levels are concatenated into one
      * blob the way bgfx expects for a mipped create; the existing
-     * downsample_rgba8 produces each 2x level.  +33% VRAM is reclaimable by the
-     * streaming-pressure mip-bias hook (registry_opt_in_streaming below). */
+     * downsample_rgba8 supports initial tier-size selection. Runtime residency
+     * replacement cannot reclaim this published resource safely. */
     const bgfx_memory_t *mem = alloc_mip_chain_rgba8(w, h);
     if (!mem) { JCE_FREE(shrunk); return JCE_TEXTURE_INVALID; }
     /* mip 0: tightly-packed copy (row-by-row if the surface pitch is padded).
@@ -408,8 +408,8 @@ static JceTexture texture_from_rgba8_ex(const uint8_t *src_pixels, uint32_t w, u
 
     registry_add(handle.idx, w, h, full_mip_count(w, h),
                  (uint8_t)BGFX_TEXTURE_FORMAT_RGBA8);
-    /* VRAM ceiling: streamed RGBA8 uploads retain a CPU mip-0 + opt into
-     * streaming so mip-bias under pressure physically reclaims VRAM.  mem->data
+    /* Existing streamed RGBA8 opt-in retains a CPU source and intent. It does
+     * not enable safe replacement of the published raw handle. mem->data
      * is the tightly-packed RGBA8 we just filled (valid this frame, same
      * thread).  No-op unless streaming uploads are armed. */
     registry_opt_in_streaming(handle.idx, w, h, mem->data, mode);
@@ -447,7 +447,11 @@ struct JceTextureCpu {
     uint8_t        *rgba8;         /* raw: mip-0 alias into owned pixels chain */
     uint32_t        rgba8_w;
     uint32_t        rgba8_h;
+    JceTextureRequestIdentity identity;
 };
+
+static JceTexture texture_from_cooked_request(const JceAssetTexInfo *info,
+    const void *pixels,size_t pixel_bytes,int sampler_mode,JceTextureRequestIdentity identity);
 
 static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
                                            int sampler_mode, const char *asset_path);
@@ -508,11 +512,13 @@ JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
 static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
                                            int sampler_mode, const char *asset_path)
 {
+    JceTextureRequestIdentity identity=texture_identity(asset_path);
     /* ── Cooked path: .jceasset ── */
     if (jce_asset_is_cooked(buf, n)) {
         JceAssetView view;
         if (!jce_asset_open(&view, buf, n)) {
-            LOG_ERROR(LOG_TAG, "bad .jceasset: %s", asset_path);
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_HEADER,NULL,n,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
             JCE_FREE(buf);
             return NULL;
         }
@@ -522,18 +528,38 @@ static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
         const JceAssetChunkEntry *pixel_chunk =
             jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_PIXELS);
 
-        if (!info_chunk || !pixel_chunk) {
-            LOG_ERROR(LOG_TAG, "missing TEX_INFO or TEX_PIXELS: %s", asset_path);
+        identity.source_hash=view.header->source_hash;
+        if (view.header->asset_type!=JCEASSET_TYPE_TEXTURE || !info_chunk || !pixel_chunk) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_CHUNKS,NULL,n,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
             JCE_FREE(buf);
             return NULL;
         }
 
+        /* Reject short metadata before memcpy, including on 32-bit Web. */
+        if(info_chunk->original_size<sizeof(JceAssetTexInfo) ||
+           info_chunk->original_size>SIZE_MAX) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_INFO,NULL,n,sizeof(JceAssetTexInfo),
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
+            JCE_FREE(buf);return NULL;
+        }
+        if(pixel_chunk->original_size==0 || pixel_chunk->original_size>SIZE_MAX) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_PIXELS,NULL,n,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
+            JCE_FREE(buf);return NULL;
+        }
         /* Read texture info (info chunk may include mip offsets after the struct). */
         void *info_buf = JCE_MALLOC((size_t)info_chunk->original_size);
-        if (!info_buf) { JCE_FREE(buf); return NULL; }
+        if (!info_buf) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_DECODE_ALLOC,NULL,n,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
+            JCE_FREE(buf); return NULL;
+        }
 
         if (jce_asset_chunk_data(&view, info_chunk,
-                                  info_buf, (size_t)info_chunk->original_size) == 0) {
+                                  info_buf, (size_t)info_chunk->original_size) < sizeof(JceAssetTexInfo)) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_INFO,NULL,n,sizeof(JceAssetTexInfo),
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
             JCE_FREE(info_buf);
             JCE_FREE(buf);
             return NULL;
@@ -546,10 +572,16 @@ static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
         /* Read pixel data (RGBA8 or block-compressed mip chain). */
         size_t pixel_bytes = (size_t)pixel_chunk->original_size;
         void *tex_data = JCE_MALLOC(pixel_bytes);
-        if (!tex_data) { JCE_FREE(buf); return NULL; }
+        if (!tex_data) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_DECODE_ALLOC,&tex_info,pixel_bytes,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
+            JCE_FREE(buf); return NULL;
+        }
 
         if (jce_asset_chunk_data(&view, pixel_chunk,
-                                  tex_data, pixel_bytes) == 0) {
+                                  tex_data, pixel_bytes) != pixel_bytes) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_PIXELS,&tex_info,pixel_bytes,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
             JCE_FREE(tex_data);
             JCE_FREE(buf);
             return NULL;
@@ -557,13 +589,18 @@ static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
         JCE_FREE(buf); /* PAK buffer no longer needed */
 
         JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
-        if (!c) { JCE_FREE(tex_data); return NULL; }
+        if (!c) {
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_DECODE_ALLOC,&tex_info,pixel_bytes,0,
+                BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
+            JCE_FREE(tex_data); return NULL;
+        }
         memset(c, 0, sizeof(*c));
         c->sampler_mode = sampler_mode;
         c->is_cooked    = true;
         c->info         = tex_info;
         c->pixels       = tex_data;
         c->pixel_bytes  = pixel_bytes;
+        c->identity     = identity;
         return c;
     }
 
@@ -583,6 +620,7 @@ static JceTextureCpu *texture_decode_owned(void *buf, size_t n,
     if (!c) { jce_image_free_rgba8(rgba8); return NULL; }
     memset(c, 0, sizeof(*c));
     c->sampler_mode = sampler_mode;
+    c->identity = identity;
     c->is_cooked    = false;
     size_t chain_bytes;
     if (img_w <= 0 || img_h <= 0 || img_w > UINT16_MAX || img_h > UINT16_MAX ||
@@ -684,8 +722,8 @@ JceTexture jce_texture_upload_cpu(JceTextureCpu *c)
     if (!c) return JCE_TEXTURE_INVALID;
     JceTexture tex = JCE_TEXTURE_INVALID;
     if (c->is_cooked) {
-        tex = jce_texture_from_cooked(&c->info, c->pixels, c->pixel_bytes,
-                                      c->sampler_mode);
+        tex = texture_from_cooked_request(&c->info,c->pixels,c->pixel_bytes,
+                                          c->sampler_mode,c->identity);
     } else if (c->rgba8) {
         uint32_t w = c->rgba8_w, h = c->rgba8_h;
         uint32_t cap = 0;
@@ -979,9 +1017,71 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
                                    const void *pixels, size_t pixel_bytes,
                                    int sampler_mode)
 {
+    const JceTextureRequestIdentity identity={0,0};
+    return texture_from_cooked_request(info,pixels,pixel_bytes,sampler_mode,identity);
+}
+
+/* Expand advertised sampled BC3/BC5 emulation explicitly so the resulting
+ * texture can use the destination format's sRGB capability and metadata. */
+static bool decode_sampled_bc_mips(const JceAssetTexInfo *info,
+                                  const uint8_t *blocks, uint8_t *rgba)
+{
+    uint8_t *stripe = NULL;
+    uint32_t mips = info->mip_count > 0u ? info->mip_count : 1u;
+    for (uint32_t mip = 0; mip < mips; ++mip) {
+        uint32_t w, h;
+        jce_tex_mip_dimensions(info->width, info->height, mip, &w, &h);
+        if (((w | h) & 3u) == 0u) {
+            if (!jce_tex_decode_to_rgba8(blocks, w, h, (int)info->format, rgba))
+                goto failed;
+        } else {
+            /* The block decoder takes whole blocks, including edge mips.
+             * Crop one block row at a time to keep scratch memory bounded. */
+            uint32_t padded_w = (w + 3u) & ~3u;
+            if (!stripe) {
+                uint32_t widest = (info->width + 3u) & ~3u;
+                stripe = (uint8_t *)JCE_MALLOC((size_t)widest * 16u);
+                if (!stripe)
+                    goto failed;
+            }
+            for (uint32_t y = 0; y < h; y += 4u) {
+                size_t offset = (size_t)(y / 4u) * padded_w * 4u;
+                if (!jce_tex_decode_to_rgba8(blocks + offset, padded_w, 4u,
+                                            (int)info->format, stripe))
+                    goto failed;
+                uint32_t rows = h - y < 4u ? h - y : 4u;
+                for (uint32_t row = 0; row < rows; ++row)
+                    memcpy(rgba + (size_t)(y + row) * w * 4u,
+                           stripe + (size_t)row * padded_w * 4u, (size_t)w * 4u);
+            }
+        }
+        blocks += jce_tex_cooked_pixel_size(w, h, (int)info->format, 1u);
+        rgba += (size_t)w * h * 4u;
+    }
+    JCE_FREE(stripe);
+    return true;
+
+failed:
+    JCE_FREE(stripe);
+    return false;
+}
+
+static JceTexture texture_from_cooked_request(const JceAssetTexInfo *info,
+    const void *pixels,size_t pixel_bytes,int sampler_mode,JceTextureRequestIdentity identity)
+{
     if (!info || !pixels || pixel_bytes == 0 ||
-        info->width == 0 || info->height == 0)
+        pixel_bytes>UINT32_MAX || info->width == 0 || info->height == 0 ||
+        info->width>UINT16_MAX || info->height>UINT16_MAX) {
+        texture_request_rejected(identity,JCE_TEXTURE_FAIL_LAYOUT,info,pixel_bytes,0,
+            BGFX_TEXTURE_FORMAT_COUNT,NULL,-1);
         return JCE_TEXTURE_INVALID;
+    }
+    bgfx_texture_format_t bgfx_fmt = texfmt_to_bgfx(info->format);
+    if (bgfx_fmt == BGFX_TEXTURE_FORMAT_COUNT) {
+        texture_request_rejected(identity,JCE_TEXTURE_FAIL_FORMAT,info,pixel_bytes,0,
+            bgfx_fmt,NULL,-1);
+        return JCE_TEXTURE_INVALID;
+    }
 
     /* Reject a pixel chunk too small for the declared dimensions/format/mips:
      * bgfx_create_texture_2d reads the implied size from `mem`, so a short
@@ -989,8 +1089,11 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
     uint32_t need = jce_tex_cooked_pixel_size(info->width, info->height,
                                               (int)info->format,
                                               info->mip_count);
-    if (need == 0 || pixel_bytes != need)
+    if (need == 0 || pixel_bytes != need) {
+        texture_request_rejected(identity,JCE_TEXTURE_FAIL_LAYOUT,info,pixel_bytes,need,
+            bgfx_fmt,NULL,-1);
         return JCE_TEXTURE_INVALID;
+    }
 
     /* Block-compressed and multi-mip payloads are uploaded as a single
      * memory blob: when has_mips is true, bgfx consumes the concatenated
@@ -999,15 +1102,53 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
      * previously it forced RGBA8 and dropped mips, corrupting every
      * BC/ASTC texture emitted by Build Bundles. */
     bool has_mips = info->mip_count > 1;
-    bgfx_texture_format_t bgfx_fmt = texfmt_to_bgfx(info->format);
-    if (bgfx_fmt == BGFX_TEXTURE_FORMAT_COUNT)
-        return JCE_TEXTURE_INVALID;
     const bgfx_caps_t *caps = bgfx_get_caps();
-    if (!caps || !(caps->formats[bgfx_fmt] & BGFX_CAPS_FORMAT_TEXTURE_2D))
+    const int backend=caps ? (int)bgfx_get_renderer_type() : -1;
+    uint32_t format_caps = caps ? caps->formats[bgfx_fmt] : 0u;
+    bool native_2d = (format_caps & BGFX_CAPS_FORMAT_TEXTURE_2D) != 0;
+    uint32_t rgba_bytes = 0;
+    if (!native_2d && (format_caps & BGFX_CAPS_FORMAT_TEXTURE_2D_EMULATED) &&
+        (info->format == JCEASSET_TEXFMT_BC3 || info->format == JCEASSET_TEXFMT_BC5) &&
+        (caps->formats[BGFX_TEXTURE_FORMAT_RGBA8] & BGFX_CAPS_FORMAT_TEXTURE_2D) &&
+        info->width <= caps->limits.maxTextureSize &&
+        info->height <= caps->limits.maxTextureSize &&
+        (!has_mips || info->mip_count == jce_tex_mip_count(info->width, info->height))) {
+        /* Older devices can advertise a maximum size much larger than the
+         * memory this one-time CPU expansion should reserve. */
+        const uint32_t max_emulated_bytes = 64u * 1024u * 1024u;
+        rgba_bytes = jce_tex_cooked_pixel_size(info->width, info->height,
+                                               JCEASSET_TEXFMT_RGBA8, info->mip_count);
+        if (rgba_bytes > max_emulated_bytes)
+            rgba_bytes = 0;
+    }
+    if (!native_2d && rgba_bytes == 0) {
+        texture_request_rejected(identity,JCE_TEXTURE_FAIL_CAPS,info,pixel_bytes,need,
+            bgfx_fmt,caps,backend);
         return JCE_TEXTURE_INVALID;
+    }
 
-    const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_bytes);
-    memcpy(mem->data, pixels, pixel_bytes);
+    uint8_t *decoded = NULL;
+    uint32_t upload_bytes = (uint32_t)pixel_bytes;
+    if (rgba_bytes != 0) {
+        decoded = (uint8_t *)JCE_MALLOC(rgba_bytes);
+        if (!decoded || !decode_sampled_bc_mips(info, (const uint8_t *)pixels, decoded)) {
+            JCE_FREE(decoded);
+            texture_request_rejected(identity,JCE_TEXTURE_FAIL_UPLOAD_ALLOC,info,pixel_bytes,need,
+                bgfx_fmt,caps,backend);
+            return JCE_TEXTURE_INVALID;
+        }
+        bgfx_fmt = BGFX_TEXTURE_FORMAT_RGBA8;
+        upload_bytes = rgba_bytes;
+    }
+    const bgfx_memory_t *mem = bgfx_alloc(upload_bytes);
+    if (!mem) {
+        JCE_FREE(decoded);
+        texture_request_rejected(identity,JCE_TEXTURE_FAIL_UPLOAD_ALLOC,info,pixel_bytes,need,
+            bgfx_fmt,caps,backend);
+        return JCE_TEXTURE_INVALID;
+    }
+    memcpy(mem->data, decoded ? decoded : pixels, upload_bytes);
+    JCE_FREE(decoded);
 
     /* A caller that asked for sRGB gets it only if this format has an sRGB
      * view; otherwise the flag is dropped HERE rather than passed to bgfx to
@@ -1027,17 +1168,20 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
     jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_1,
         handle.idx != UINT16_MAX);
 
-    if (handle.idx == UINT16_MAX)
+    if (handle.idx == UINT16_MAX) {
+        texture_request_rejected(identity,JCE_TEXTURE_FAIL_UPLOAD_CREATE,info,pixel_bytes,need,
+            bgfx_fmt,caps,backend);
         return JCE_TEXTURE_INVALID;
+    }
 
     registry_add(handle.idx, info->width, info->height,
                  (uint8_t)(info->mip_count > 0u ? info->mip_count : 1u),
                  (uint8_t)bgfx_fmt);   /* cooked: RGBA8 or block-compressed */
-    /* VRAM ceiling: only the uncompressed RGBA8 cooked format keeps a CPU
-     * source for streaming demote — its mip-0 lives at offset 0 of the chunk as
+    /* Only the uncompressed RGBA8 cooked format retains the existing CPU
+     * source mirror — its mip-0 lives at offset 0 of the chunk as
      * plain RGBA8 (the box-filter downsample is RGBA8-only).  Block-compressed
      * (BC/ASTC/ETC2) and RGB8 are NOT opted in (no RGBA8 source to downsample;
-     * the demote would be a truthful no-op anyway). */
+     * dynamic replacement is unsupported for all raw borrowed handles). */
     if (info->format == JCEASSET_TEXFMT_RGBA8)
         registry_opt_in_streaming(handle.idx, info->width, info->height,
                                   pixels, sampler_mode);
@@ -1158,33 +1302,12 @@ void jce_texture_destroy(JceTexture tex)
 /* ================================================================== */
 /* Runtime mip streaming (P3-A.2)                                     */
 /* ================================================================== */
-/*
- * The on-disk cooked asset format (.jceasset, TEX_PIXELS chunk) only
- * stores mip 0 today; mip chains are auto-generated on the GPU by bgfx
- * at upload time.  Until the asset format gains explicit mip-level
- * storage, runtime mip drop is implemented by:
- *
- *   1. Lazily retaining a CPU RGBA8 copy of mip-0 the first time a
- *      texture is opted in to streaming (set_mip_bias /
- *      request_mip_residency).  Default textures pay zero overhead.
- *   2. On effective top-mip change, destroying the bgfx handle and
- *      recreating it from a CPU box-filter downsample of the cached
- *      pixels.  The handle index changes, so `JceTextureId` is
- *      re-assigned in place (the caller's JceTexture value still
- *      points at the updated registry entry via `idx`, BUT bgfx may
- *      hand back a different idx — for safety we keep the original
- *      handle on best-effort and only update size+resident_top_mip
- *      when recreation succeeds with the same idx; otherwise we just
- *      bookkeep the residency change without touching the GPU).
- *
- * Caps floor:
- *   Low    -> 1 (drop top mip always)
- *   Medium -> 0
- *   High   -> 0
- *
- * The mip-tail (smallest 4x4) is always resident: the effective
- * top_mip is clamped to `max_top_mip` per texture.
- */
+/* Runtime requests retain intent. JceTexture is a borrowed raw bgfx handle
+ * copied into materials, scene components and UI consumers; the registry has
+ * no indirection that can rebind all those copies. Never destroy/recreate a
+ * published handle to change residency. Initial upload still chooses its
+ * quality/size/mip chain before publishing the handle. Dynamic replacement
+ * needs a separate stable-handle contract; do not report reclaimed memory. */
 
 /* Cached caps-floor (queried lazily; bgfx must be inited). */
 static int8_t s_caps_floor_cached = -1;
@@ -1238,119 +1361,45 @@ static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
     return dst;
 }
 
-/* CPU half (worker-safe — NO bgfx): box-filter the cached mip-0 down to
- * `target`.  On success *out_px is the buffer to upload (+ dims); *out_owned
- * is true when it must be freed after upload (false only at target 0, where
- * it aliases e->source_pixels).  Returns false if no source is cached. */
-static bool mip_downsample_cpu(const TexEntry *e, uint8_t target,
-                               uint8_t **out_px, uint32_t *out_w,
-                               uint32_t *out_h, bool *out_owned)
-{
-    if (!e->has_source_pixels || !e->source_pixels) return false;
-
-    uint32_t cw = e->base_width, ch = e->base_height;
-    uint8_t *cur = e->source_pixels;
-    bool owned = false;
-    for (uint8_t i = 0; i < target; i++) {
-        uint32_t nw, nh;
-        uint8_t *next = downsample_rgba8(cur, cw, ch, &nw, &nh);
-        if (owned) JCE_FREE(cur);
-        if (!next) return false;
-        cur = next; owned = true; cw = nw; ch = nh;
-    }
-    *out_px = cur; *out_w = cw; *out_h = ch; *out_owned = owned;
-    return true;
-}
-
-/* GPU half (render thread): recreate the texture from downsampled pixels,
- * freeing `px` when `owned`.  Updates the registry entry.  Returns true if
- * the bgfx handle was recreated. */
-static bool mip_upload_gpu(TexEntry *e, uint8_t *px, uint32_t w, uint32_t h,
-                           uint8_t target, bool owned)
-{
-    bgfx_texture_handle_t old_h; old_h.idx = e->idx;
-    bgfx_destroy_texture(old_h);
-
-    const bgfx_memory_t *mem = bgfx_alloc(w * h * 4u);
-    memcpy(mem->data, px, (size_t)w * h * 4u);
-    if (owned) JCE_FREE(px);
-
-    const uint64_t payload_bytes_0 = mem ? mem->size : 0u;
-    bgfx_texture_handle_t nh = bgfx_create_texture_2d(
-        (uint16_t)w, (uint16_t)h,
-        false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_TEXTURE_NONE | sampler_flags(e->sampler_mode),
-        mem, 0);
-    jce_upload_metrics_record(JCE_UPLOAD_TEXTURE_CREATE, payload_bytes_0,
-        nh.idx != UINT16_MAX);
-
-    if (nh.idx == UINT16_MAX) {
-        LOG_WARN(LOG_TAG,
-            "mip drop reupload failed for tex idx=%u (-> %ux%u)",
-            e->idx, w, h);
-        return false;
-    }
-
-    /* bgfx may hand back a different idx — reflect that in registry. */
-    e->idx              = nh.idx;
-    e->width            = w;
-    e->height           = h;
-    e->resident_top_mip = target;
-    return true;
-}
-
-/* Apply a target top_mip to the GPU resource using cached source pixels.
- * Synchronous (downsample + upload on the calling thread).  Used by the
- * per-texture streaming entry points. */
+/* No portable transaction can replace a raw handle borrowed by value.
+ * Keep the owned source, dimensions, registry mapping and resident mip intact.
+ * A single diagnostic per entry and one cancelled trace per capture expose
+ * the unsupported outcome without per-frame log/trace flooding. */
 static bool apply_top_mip(TexEntry *e, uint8_t target_top_mip)
 {
-    if (target_top_mip == e->resident_top_mip) return false;
-
-    uint8_t *px = NULL; uint32_t w = 0, h = 0; bool owned = false;
-    if (!mip_downsample_cpu(e, target_top_mip, &px, &w, &h, &owned)) {
-        /* No CPU mip-0 source retained → we cannot actually shrink the GPU
-         * texture, so we must NOT pretend we did.  The request stays recorded
-         * as intent (desired_top_mip / per_texture_bias are already set by the
-         * caller); resident_top_mip, width and height keep reflecting the real
-         * GPU state.  Honest demotion engages for source-backed textures only
-         * (audit F29: never report a VRAM shrink that did not happen). */
-        return false;
+    if (!e || target_top_mip == e->resident_top_mip) return false;
+    if (!e->replacement_warned) {
+        LOG_WARN(LOG_TAG,
+            "residency phase=unsupported reason=borrowed_raw_handle "
+            "handle=%u requested_top_mip=%u resident_top_mip=%u",
+            (unsigned)e->idx, (unsigned)target_top_mip,
+            (unsigned)e->resident_top_mip);
+        e->replacement_warned = true;
     }
-    return mip_upload_gpu(e, px, w, h, target_top_mip, owned);
+    if (jce_trace_enabled()) {
+        const uint32_t generation = jce_trace_capture_generation();
+        if (e->replacement_trace_generation != generation) {
+            JceTraceScope scope = jce_trace_scope_begin("texture.residency.unsupported");
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "texture.residency.requested_top_mip", target_top_mip, scope.id, scope.parent);
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_RENDER,
+                "texture.residency.resident_top_mip", e->resident_top_mip, scope.id, scope.parent);
+            jce_trace_scope_end(scope, JCE_TRACE_TASK_CANCELLED);
+            e->replacement_trace_generation = generation;
+        }
+    }
+    return false;
 }
 
-/* ── Parallel global-bias recompute ───────────────────────────────── */
-
-typedef struct {
-    TexEntry *e;
-    uint8_t   target;
-    uint8_t  *pixels;   /* downsampled (worker) */
-    uint32_t  w, h;
-    bool      owned;
-    bool      ok;
-} MipRecompute;
-
-/* Worker: downsample entries [begin,end) (pure CPU, disjoint writes). */
-static void mip_downsample_range(uint32_t begin, uint32_t end, void *user)
-{
-    MipRecompute *list = (MipRecompute *)user;
-    for (uint32_t i = begin; i < end; i++) {
-        MipRecompute *m = &list[i];
-        m->ok = mip_downsample_cpu(m->e, m->target,
-                                   &m->pixels, &m->w, &m->h, &m->owned);
-    }
-}
-
-/* Ensure a streaming-tracked entry has its CPU mip-0 cached so future
- * bias changes can re-upload.  Best-effort; failure is logged. */
+/* Keep late opt-in intent without claiming a source mirror or replacement. */
 static void ensure_source_cached(TexEntry *e)
 {
     if (e->has_source_pixels) return;
     /* No portable GPU readback path in this engine — when a texture
      * opts in late, we record the intent but cannot reconstitute mip 0
-     * from the GPU.  Callers that want full streaming should reload the
-     * texture (which goes through registry_add and could be extended to
-     * stash pixels at decode time in a future revision). */
+     * from the GPU. Source-backed entries retain their existing bytes, but
+     * both paths remain unchanged until a separately owned reload publishes
+     * a new handle to its consumers. */
     e->streaming_tracked = true;
 }
 
@@ -1418,58 +1467,12 @@ void jce_texture_set_global_mip_bias(int8_t bias)
     s_global_mip_bias     = clamp_bias(bias);
     s_global_mip_bias_set = true;
 
-    /* A global bias change can recompute many textures at once, and the
-     * box-filter downsample is the bulk of that work.  Build the change
-     * list, downsample the CPU pixels in parallel (no bgfx), then recreate
-     * the GPU textures serially on this (render) thread.  Untracked
-     * textures stay at full residency (preserves opt-in behaviour). */
-    MipRecompute *list =
-        (MipRecompute *)JCE_MALLOC((size_t)(s_count > 0 ? s_count : 1) *
-                                   sizeof(MipRecompute));
-    if (!list) {
-        /* OOM: fall back to the per-entry synchronous path. */
-        for (int i = 0; i < s_count; i++) {
-            TexEntry *e = &s_registry[i];
-            if (e->streaming_tracked) apply_top_mip(e, effective_top_mip(e));
-        }
-        return;
-    }
-
-    int n = 0;
-    for (int i = 0; i < s_count; i++) {
+    /* Preserve every published raw handle. No CPU downsample, staging blob,
+     * replacement allocation or old-handle retirement is permitted here. */
+    for (int i = 0; i < s_count; ++i) {
         TexEntry *e = &s_registry[i];
-        if (!e->streaming_tracked) continue;
-        uint8_t target = effective_top_mip(e);
-        if (target == e->resident_top_mip) continue;
-        if (!e->has_source_pixels || !e->source_pixels) {
-            /* No retained source → cannot demote; leave residency truthful
-             * (audit F29: never report a GPU shrink that did not happen). */
-            continue;
-        }
-        list[n].e = e; list[n].target = target;
-        list[n].pixels = NULL; list[n].ok = false;
-        n++;
+        if (e->streaming_tracked) apply_top_mip(e, effective_top_mip(e));
     }
-    if (n == 0) { JCE_FREE(list); return; }
-
-    /* Pass A: parallel CPU downsample (worker-safe, disjoint per-index). */
-    JceThreadPool *pool = jce_thread_pool_shared();
-    if (pool && n >= 4)
-        jce_thread_pool_parallel_for_named(
-            pool, "texture.mip-downsample", (uint32_t)n, 0,
-            mip_downsample_range, list);
-    else
-        mip_downsample_range(0u, (uint32_t)n, list);
-
-    /* Pass B: serial GPU recreate on this (render) thread. */
-    for (int i = 0; i < n; i++) {
-        MipRecompute *m = &list[i];
-        if (m->ok)
-            mip_upload_gpu(m->e, m->pixels, m->w, m->h, m->target, m->owned);
-        /* else: downsample failed → GPU untouched; keep residency truthful
-         * (audit F29). */
-    }
-    JCE_FREE(list);
 }
 
 int8_t jce_texture_get_global_mip_bias(void)

@@ -7,7 +7,14 @@
 #ifndef ES_SCRIPT_LANGS_H
 #define ES_SCRIPT_LANGS_H
 
+#if defined(ES_SCRIPT_ENABLE_SHIM)
+#  include <stdbool.h>
+/* False means the public shim refused native registry verification. */
+bool es_script_langs_register(void);
+#else
+/* Retained legacy in-tree development path. */
 void es_script_langs_register(void);
+#endif
 void es_script_langs_shutdown(void);
 
 #endif /* ES_SCRIPT_LANGS_H */

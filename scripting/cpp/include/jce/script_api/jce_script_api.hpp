@@ -688,9 +688,10 @@ public:
     }
 
     /* jce.get_pointer_position -- shape: void_out_array, since 1
-     * Viewport-local logical pixel x, y, width, height; zero dimensions
-     * indicate unavailable input. The sample is frame-transient and shared by
-     * Editor Game View and standalone runtime.
+     * Viewport-local Canvas pixel x, y, width, height (native drawable or
+     * Editor GameView FBO after render_scale); zero dimensions indicate
+     * unavailable input. The sample is frame-transient and shared by Editor
+     * Game View and standalone runtime.
      */
     [[nodiscard]] std::array<float, 4> get_pointer_position() const noexcept
     {
@@ -1470,6 +1471,20 @@ public:
     [[nodiscard]] bool stat_flush() const noexcept
     {
         return jce_script_api_stat_flush(h_);
+    }
+
+    /* jce.get_viewport_size -- shape: void_out_array, since 1
+     * Host presentation width and height in Canvas pixels (native drawable or
+     * Editor GameView FBO after render_scale), independent of pointer
+     * availability, focus or hover. Persistent until the host replaces or
+     * clears it; unavailable or absent sized-host callbacks return zero,
+     * zero.
+     */
+    [[nodiscard]] std::array<float, 2> get_viewport_size() const noexcept
+    {
+        std::array<float, 2> out{};
+        jce_script_api_get_viewport_size(h_, out.data());
+        return out;
     }
 
 private:

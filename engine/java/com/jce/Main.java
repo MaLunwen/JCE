@@ -29,7 +29,10 @@ public final class Main {
 
         int frameCount = 0;
         JceRuntime.Result result = JceRuntime.Result.SUCCESS;
-        try (JceRuntime runtime = new JceRuntime()) {
+        /* Keep the object in scope even when init and its first close both
+         * fail. AutoCloseable alone cannot finish a deferred native drain. */
+        JceRuntime runtime = new JceRuntime();
+        try {
             runtime.init();
             boolean running = true;
             while (running) {
@@ -37,6 +40,8 @@ public final class Main {
                 boolean reachedMaxFrames = maxFrames > 0 && ++frameCount >= maxFrames;
                 running = result == JceRuntime.Result.CONTINUE && !reachedMaxFrames;
             }
+        } finally {
+            closeOwned(runtime);
         }
 
         // Propagate the engine's own verdict: an error quit must not look
@@ -44,6 +49,27 @@ public final class Main {
         if (result == JceRuntime.Result.FAILURE) {
             System.err.println("[JCE] engine exited with failure");
             System.exit(1);
+        }
+    }
+
+    private static void closeOwned(JceRuntime runtime) {
+        boolean interrupted = false;
+        for (;;) {
+            try {
+                runtime.close();
+                break;
+            } catch (IllegalStateException deferred) {
+                /* One bounded native attempt, then yield. Never run another
+                 * app frame or abandon the owner while cleanup is pending. */
+                try {
+                    Thread.sleep(10L);
+                } catch (InterruptedException pending) {
+                    interrupted = true;
+                }
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

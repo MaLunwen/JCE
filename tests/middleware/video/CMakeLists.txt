@@ -44,3 +44,13 @@ target_include_directories(test_jce_h264_planes PRIVATE
     "${CMAKE_SOURCE_DIR}/engine/src")
 target_compile_definitions(test_jce_h264_planes PRIVATE
     JCE_TEST_BFRAME_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
+# Actual public CPU decode/seek/worker lifecycle, no renderer/window/audio device.
+jce_add_unit_test(test_jce_video_lifecycle_trace
+    KIND integration
+    SOURCES test_jce_video_lifecycle_trace.c
+    LINK jce_core jce_video jce_audio jce_resource
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/video"
+        "${CMAKE_SOURCE_DIR}/engine/src")
+target_compile_definitions(test_jce_video_lifecycle_trace PRIVATE
+    JCE_TEST_VIDEO_TRACE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")

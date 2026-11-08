@@ -7,6 +7,10 @@
 
 #include "jce_scene_components_internal.h"
 #include "jce_scene_rotation_internal.h"
+#include "jce_scene_order_internal.h"
+#include "jce_scene_particle_weather_json.h"
+#include "jce_scene_sky_extras_json.h"
+#include "jce_scene_fog_look_internal.h"
 #include <jce/middleware/scene/jce_material_override.h>
 /* jce_prefab_instantiate{,_file} return JceEntity (uint64_t).  Without this
  * header they were called through an implicit `extern int`, so only EAX came
@@ -16,7 +20,6 @@
  * every entity entry point treats as "no such entity" silently.  Caught
  * 2026-09-21 by /we4013. */
 #include <jce/middleware/scene/jce_prefab.h>
-
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_thread.h>
 
@@ -345,9 +348,8 @@ static void resolve_tex_relative_to_material(const char *mat_path,
     }
 }
 
-
-static cJSON *ser_scene_rendering_settings(
-    const JceSceneRenderingSettings *r)
+static cJSON *ser_scene_rendering_settings(const JceSceneRenderingSettings *r,
+    const JceScene *scene)
 {
     if (!r) return NULL;
 
@@ -379,6 +381,13 @@ static cJSON *ser_scene_rendering_settings(
     cJSON_AddNumberToObject(fog, "end", r->fog_end);
     cJSON_AddNumberToObject(fog, "heightFalloff", r->fog_height_falloff);
     cJSON_AddNumberToObject(fog, "heightOrigin", r->fog_height_origin);
+    if (!jce_scene_fog_look_write_json(fog, scene)) {
+        cJSON_Delete(root);
+        cJSON_Delete(fog);
+        cJSON_Delete(shadows);
+        cJSON_Delete(postfx);
+        return NULL;
+    }
     cJSON_AddItemToObject(root, "fog", fog);
     cJSON_AddBoolToObject(root, "iblEnabled", r->ibl_enabled);
     cJSON_AddNumberToObject(root, "dynamicGI", r->gi_dynamic);
@@ -454,6 +463,11 @@ static cJSON *ser_scene_rendering_settings(
         if (weather) {
             cJSON_AddNumberToObject(weather, "type", r->weather_type);
             cJSON_AddNumberToObject(weather, "intensity", r->weather_intensity);
+            if (!scene_weather_write_precipitation(weather, scene) ||
+                !scene_snow_look_write(weather, scene)) {
+                cJSON_Delete(weather); cJSON_Delete(env); cJSON_Delete(root);
+                return NULL;
+            }
             cJSON_AddItemToObject(env, "weather", weather);
         }
         if (r->temperature_c != 15.0f)
@@ -469,6 +483,12 @@ static cJSON *ser_scene_rendering_settings(
         cJSON *sky = cJSON_CreateObject();
         if (sky) {
             cJSON_AddNumberToObject(sky, "mode", r->sky_mode);
+            if (!jce_scene_sky_extras_write_json(sky, scene)) {
+                cJSON_Delete(sky);
+                cJSON_Delete(env);
+                cJSON_Delete(root);
+                return NULL;
+            }
             cJSON_AddNumberToObject(sky, "turbidity", r->sky_turbidity);
             cJSON_AddNumberToObject(sky, "cloudCoverage", r->cloud_coverage);
             cJSON_AddNumberToObject(sky, "cloudDensity",  r->cloud_density);
@@ -940,6 +960,16 @@ static bool parse_scene_rendering_settings(JceScene *scene,
 
     JceSceneRenderingSettings r = extract_rendering_settings_from_obj(src);
     jce_scene_set_rendering_settings(scene, &r);
+    JceSceneSkyExtras sky;
+    (void)jce_scene_sky_extras_read_json(src, &sky);
+    jce_scene_sky_extras_apply(scene, &sky);
+    JceScenePrecipitationSettings precipitation;
+    const bool valid_precipitation = scene_weather_read_precipitation(src, &precipitation);
+    scene_weather_apply_precipitation(scene, valid_precipitation ? &precipitation : NULL);
+    JceSceneFogLookSettings fog;
+    jce_scene_fog_look_set(scene, jce_scene_fog_look_read_json(src, &fog) ? &fog : NULL);
+    JceSceneTerrainSnowLook snow_look;
+    scene_snow_look_set(scene, scene_snow_look_read(src, &snow_look) ? &snow_look : NULL);
     return true;
 }
 
@@ -1271,26 +1301,6 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_mesh_renderer(s, e, &mr);
 }
 
-static void parse_camera(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCameraComponent cc;
-    memset(&cc, 0, sizeof(cc));
-    cc.fov_deg    = (float)j_num(c, "fov", 60.0);
-    cc.near_plane = (float)j_num2(c, "nearClip", "near_clip", 0.1);
-    cc.far_plane  = (float)j_num2(c, "farClip", "far_clip", 1000.0);
-    cc.is_primary = j_bool(c, "primary", false);
-    cc.ortho      = j_bool(c, "orthographic", false);
-    if (!cc.ortho) cc.ortho = j_bool(c, "ortho", false);
-    if (!cc.ortho) cc.ortho = j_bool(c, "isOrtho", false);
-    /* Orthographic height in world units; 0 leaves the camera default. */
-    cc.ortho_size = (float)j_num(c, "orthoSize", 0.0);
-    cc.stack_index = (uint8_t)(int)j_num(c, "stackIndex", 0);
-    cc.clear_mode  = (uint8_t)(int)j_num(c, "clearMode",  0);
-    /* Absent (an older scene, or one that never masked) parses to 0, which
-     * this field spells as "no filtering" -- see JceCameraComponent. */
-    cc.culling_mask = (uint32_t)j_num(c, "cullingMask", 0.0);
-    jce_scene_set_camera(s, e, &cc);
-}
 
 
 
@@ -1546,24 +1556,6 @@ static void ser_pivot(const JcePivotComponent *p, cJSON *arr)
 }
 
 
-static void ser_camera(const JceCameraComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Camera");
-    cJSON_AddNumberToObject(o, "fov", c->fov_deg);
-    cJSON_AddNumberToObject(o, "nearClip", c->near_plane);
-    cJSON_AddNumberToObject(o, "farClip",  c->far_plane);
-    cJSON_AddBoolToObject(o, "primary", c->is_primary);
-    cJSON_AddBoolToObject(o, "orthographic", c->ortho);
-    cJSON_AddNumberToObject(o, "orthoSize", c->ortho_size);
-    if (c->stack_index != 0)
-        cJSON_AddNumberToObject(o, "stackIndex", c->stack_index);
-    if (c->clear_mode != 0)
-        cJSON_AddNumberToObject(o, "clearMode",  c->clear_mode);
-    if (c->culling_mask != 0u)
-        cJSON_AddNumberToObject(o, "cullingMask", (double)c->culling_mask);
-    cJSON_AddItemToArray(arr, o);
-}
 
 
 
@@ -1746,11 +1738,6 @@ static void serw_pivot(JceScene *s, JceEntity e, cJSON *arr)
 }
 
 
-static void serw_camera(JceScene *s, JceEntity e, cJSON *arr)
-{
-    JceCameraComponent *c = jce_scene_get_camera(s, e);
-    if (c) ser_camera(c, arr);
-}
 
 
 
@@ -1941,7 +1928,7 @@ cJSON *jce_scene_save_json(const JceScene *scene)
         const JceSceneRenderingSettings *rendering =
             jce_scene_get_rendering_settings(scene);
         if (rendering) {
-            cJSON *r = ser_scene_rendering_settings(rendering);
+            cJSON *r = ser_scene_rendering_settings(rendering, scene);
             if (r)
                 cJSON_AddItemToObject(sobj, "rendering", r);
         }
@@ -1956,10 +1943,10 @@ cJSON *jce_scene_save_json(const JceScene *scene)
                 cJSON_AddItemToObject(sobj, "streaming", st);
         }
 
-        SerCtx ctx;
-        ctx.entities = entities;
-        ctx.scene = (JceScene *)scene;
-        jce_scene_each_entity((JceScene *)scene, ser_entity_cb, &ctx);
+        SerCtx ctx = {entities, (JceScene *)scene};
+        if (!jce_scene_internal_each_authored((JceScene *)scene, ser_entity_cb, &ctx)) {
+            cJSON_Delete(root); return NULL;
+        }
     }
 
     return root;
@@ -1967,26 +1954,6 @@ cJSON *jce_scene_save_json(const JceScene *scene)
 
 /* Subtree variant — same envelope, but the entities array contains only
  * `root` and its transitive children. Used by the prefab system. */
-static void collect_subtree(const JceScene *scene, JceEntity e, SerCtx *ctx)
-{
-    ser_entity_cb((JceScene *)scene, e, ctx);
-
-    int n = jce_scene_get_child_count(scene, e);
-    if (n <= 0) return;
-    /* Use a small stack + heap fallback for very wide hierarchies. */
-    JceEntity stack_buf[16];
-    JceEntity *kids = stack_buf;
-    if ((size_t)n > sizeof(stack_buf) / sizeof(stack_buf[0]))
-        kids = (JceEntity *)JCE_MALLOC((size_t)n * sizeof(JceEntity));
-    if (!kids) return;
-
-    int got = jce_scene_get_children(scene, e, kids, n);
-    for (int i = 0; i < got; i++)
-        collect_subtree(scene, kids[i], ctx);
-
-    if (kids != stack_buf) JCE_FREE(kids);
-}
-
 cJSON *jce_scene_save_subtree_json(const JceScene *scene, JceEntity root)
 {
     cJSON *r        = cJSON_CreateObject();
@@ -2010,7 +1977,9 @@ cJSON *jce_scene_save_subtree_json(const JceScene *scene, JceEntity root)
         SerCtx ctx;
         ctx.entities = entities;
         ctx.scene    = (JceScene *)scene;
-        collect_subtree(scene, root, &ctx);
+        if (!jce_scene_internal_each_subtree_authored((JceScene *)scene, root, ser_entity_cb, &ctx)) {
+            cJSON_Delete(r); return NULL;
+        }
     }
     return r;
 }
@@ -2374,10 +2343,8 @@ static void load_fixup_refs(JceScene *scene, EntityRemap *map, int loaded)
     for (int i = 0; i < loaded; i++) {
         JceEntity e = map[i].new_id;
 
-        /* uint64 refs share one resolve loop. */
-        /* 6, not 5: the five below filled it exactly, so BoneAttachment's
-         * ref would have written one past the end of a stack array. */
-        uint64_t *refs64[6];
+        /* uint64 refs share one resolve loop. One slot per field below. */
+        uint64_t *refs64[7];
         int n64 = 0;
         JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(scene, e);
         if (vc) { refs64[n64++] = &vc->follow_target;
@@ -2390,6 +2357,8 @@ static void load_fixup_refs(JceScene *scene, EntityRemap *map, int loaded)
         if (na) refs64[n64++] = &na->target_entity;
         JceBoneAttachmentComponent *ba = jce_scene_get_bone_attachment(scene, e);
         if (ba) refs64[n64++] = &ba->target;
+        JceWaterNearshoreComponent *shore = jce_scene_get_water_nearshore(scene, e);
+        if (shore) refs64[n64++] = &shore->terrain;
         /* An ENTITY-kind script parameter is a cross-entity reference like any
          * other and goes through the same src_id -> new_id map.  Handled in
          * its own loop rather than through refs64[] because the count is
@@ -2778,7 +2747,7 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
 char *jce_scene_rendering_settings_to_json(const JceSceneRenderingSettings *r)
 {
     if (!r) return NULL;
-    cJSON *obj = ser_scene_rendering_settings(r);
+    cJSON *obj = ser_scene_rendering_settings(r, NULL);
     if (!obj) return NULL;
     char *s = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
@@ -2889,6 +2858,15 @@ REG_ACCESSORS(constraint, JceConstraintComponent)
 REG_ACCESSORS(terrain, JceTerrainComponent)
 REG_ACCESSORS(vegetation_scatter, JceVegetationScatterComponent)
 REG_ACCESSORS(water, JceWaterComponent)
+REG_ACCESSORS(water_spectrum, JceWaterSpectrumComponent)
+REG_ACCESSORS(water_foam, JceWaterFoamComponent)
+REG_ACCESSORS(water_crest, JceWaterCrestComponent)
+REG_ACCESSORS(water_caustics, JceWaterCausticsComponent)
+REG_ACCESSORS(water_nearshore, JceWaterNearshoreComponent)
+REG_ACCESSORS(water_motion, JceWaterMotionComponent)
+REG_ACCESSORS(water_optics, JceWaterOpticsComponent)
+REG_ACCESSORS(water_caustic_detail, JceWaterCausticDetailComponent)
+REG_ACCESSORS(water_normal_detail, JceWaterNormalDetailComponent)
 REG_ACCESSORS(grass_field, JceGrassFieldComponent)
 REG_ACCESSORS(foliage_cluster, JceFoliageClusterComponent)
 REG_ACCESSORS(buoyancy, JceBuoyancyComponent)
@@ -3586,6 +3564,45 @@ void jce_scene_components_register_all(void)
         reg_get_fullscreen_effect, reg_set_fullscreen_effect,
         sizeof(JceSceneFullscreenEffect));
 
+    REG("WaterSpectrum", "waterSpectrum", "Water Spectrum", "water_spectrum",
+        0, jce_scene_has_water_spectrum, jce_scene_remove_water_spectrum,
+        parse_water_spectrum, serw_water_spectrum,
+        reg_get_water_spectrum, reg_set_water_spectrum,
+        sizeof(JceWaterSpectrumComponent));
+
+    REG("WaterFoam", "waterFoam", "Water Foam", "water_foam",
+        0, jce_scene_has_water_foam, jce_scene_remove_water_foam,
+        parse_water_foam, serw_water_foam,
+        reg_get_water_foam, reg_set_water_foam, sizeof(JceWaterFoamComponent));
+    REG("WaterCrest", "waterCrest", "Water Crest", "water_crest",
+        0, jce_scene_has_water_crest, jce_scene_remove_water_crest,
+        parse_water_crest, serw_water_crest,
+        reg_get_water_crest, reg_set_water_crest, sizeof(JceWaterCrestComponent));
+    REG("WaterCaustics", "waterCaustics", "Water Caustics", "water_caustics",
+        0, jce_scene_has_water_caustics, jce_scene_remove_water_caustics,
+        parse_water_caustics, serw_water_caustics,
+        reg_get_water_caustics, reg_set_water_caustics, sizeof(JceWaterCausticsComponent));
+    REG("WaterNearshore", "waterNearshore", "Water Nearshore", "water_nearshore",
+        0, jce_scene_has_water_nearshore, jce_scene_remove_water_nearshore,
+        parse_water_nearshore, serw_water_nearshore,
+        reg_get_water_nearshore, reg_set_water_nearshore, sizeof(JceWaterNearshoreComponent));
+    REG("WaterMotion", "waterMotion", "Water Motion", "water_motion",
+        0, jce_scene_has_water_motion, jce_scene_remove_water_motion,
+        parse_water_motion, serw_water_motion,
+        reg_get_water_motion, reg_set_water_motion, sizeof(JceWaterMotionComponent));
+    REG("WaterOptics", "waterOptics", "Water Optics", "water_optics",
+        0, jce_scene_has_water_optics, jce_scene_remove_water_optics,
+        parse_water_optics, serw_water_optics,
+        reg_get_water_optics, reg_set_water_optics, sizeof(JceWaterOpticsComponent));
+    REG("WaterCausticDetail", "waterCausticDetail", "Water Caustic Detail", "water_caustic_detail",
+        0, jce_scene_has_water_caustic_detail, jce_scene_remove_water_caustic_detail,
+        parse_water_caustic_detail, serw_water_caustic_detail,
+        reg_get_water_caustic_detail, reg_set_water_caustic_detail, sizeof(JceWaterCausticDetailComponent));
+    REG("WaterNormalDetail", "waterNormalDetail", "Water Normal Detail", "water_normal_detail",
+        0, jce_scene_has_water_normal_detail, jce_scene_remove_water_normal_detail,
+        parse_water_normal_detail, serw_water_normal_detail,
+        reg_get_water_normal_detail, reg_set_water_normal_detail, sizeof(JceWaterNormalDetailComponent));
+
 #undef REG
 }
 
@@ -3616,95 +3633,19 @@ char *jce_scene_component_to_json(JceScene *s, JceEntity e, const char *type)
     return out;
 }
 
-/* Defined below, next to jce_scene_rendering_apply_json, which has always
- * merged.  This one did not, which is the asymmetry fixed here. */
-static void rs_json_merge(cJSON *dst, const cJSON *patch);
-
-/* comp_set is a PARTIAL update, not a replacement.
- *
- * It used to hand the caller's fragment straight to the component's parse
- * function -- and every parse_* opens with `memset(&x, 0, sizeof x)` and then
- * fills each field from j_num/j_bool with a LITERAL default.  So the most
- * obvious UI scripting call there is,
- *
- *     comp_set(e, "CanvasGroup", '{"alpha": 0.5}')      -- fade a panel
- *
- * also reset interactable to true, blocks_raycasts to true and
- * ignore_parent_groups to false, discarding whatever the scene had authored.
- * Every component was affected, not only UI: any comp_set naming fewer keys
- * than the component has silently reverted the rest to parse-time defaults.
- *
- * jce_scene_rendering_apply_json a few lines below has always done the right
- * thing -- serialize the current state, overlay the patch, apply the result --
- * so the two halves of the same scripting API disagreed about what "set" means.
- * They agree now, through the same merge helper.
- *
- * Unity's JsonUtility.FromJsonOverwrite, Godot's per-property set() and UE's
- * property system are all overwrite-what-is-present for the same reason.
- *
- * A component that is ABSENT has nothing to merge onto, so the patch IS the
- * whole component -- which is how a script ADDS one, and stays exactly as it
- * behaved before. */
-bool jce_scene_component_apply_json(JceScene *s, JceEntity e,
-                                    const char *type, const char *json)
-{
-    if (!s || !type || !json) return false;
-    int comp_id = jce_component_find(type);
-    if (comp_id == JCE_COMP_ID_INVALID) return false;
-    const JceComponentDesc *d = jce_component_desc(comp_id);
-    if (!d || !d->parse) return false;
-
-    cJSON *patch = cJSON_Parse(json);
-    if (!patch) return false;
-
-    cJSON *merged = NULL;
-    if (d->serialize && d->has && d->has(s, e)) {
-        cJSON *arr = cJSON_CreateArray();
-        if (arr) {
-            d->serialize(s, e, arr);
-            cJSON *first = cJSON_GetArrayItem(arr, 0);
-            if (first) merged = cJSON_Duplicate(first, 1);
-            cJSON_Delete(arr);
-        }
-    }
-
-    if (merged) {
-        rs_json_merge(merged, patch);
-        d->parse(s, e, merged);
-        cJSON_Delete(merged);
-    } else {
-        d->parse(s, e, patch);
-    }
-    cJSON_Delete(patch);
-    return true;
-}
+/* Component patch construction and the shared checked merge own their
+ * temporary trees together. Keep this boundary private, not installed. */
+#include "jce_scene_json_patch_internal.h"
 
 char *jce_scene_rendering_to_json(JceScene *s)
 {
     if (!s) return NULL;
     cJSON *obj = ser_scene_rendering_settings(
-        jce_scene_get_rendering_settings(s));
+        jce_scene_get_rendering_settings(s), s);
     if (!obj) return NULL;
     char *out = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
     return out;
-}
-
-/* Shallow-recursive overlay: objects merge key-by-key, everything else
- * (numbers, strings, bools, ARRAYS) replaces wholesale. */
-static void rs_json_merge(cJSON *dst, const cJSON *patch)
-{
-    for (const cJSON *it = patch->child; it; it = it->next) {
-        cJSON *cur = cJSON_GetObjectItemCaseSensitive(dst, it->string);
-        if (cur && cJSON_IsObject(cur) && cJSON_IsObject(it)) {
-            rs_json_merge(cur, it);
-        } else {
-            cJSON *dup = cJSON_Duplicate(it, 1);
-            if (!dup) continue;
-            if (cur) cJSON_ReplaceItemInObjectCaseSensitive(dst, it->string, dup);
-            else     cJSON_AddItemToObject(dst, it->string, dup);
-        }
-    }
 }
 
 bool jce_scene_rendering_apply_json(JceScene *s, const char *json)
@@ -3712,14 +3653,35 @@ bool jce_scene_rendering_apply_json(JceScene *s, const char *json)
     if (!s || !json) return false;
     cJSON *patch = cJSON_Parse(json);
     if (!patch) return false;
+    if (!cJSON_IsObject(patch)) { cJSON_Delete(patch); return false; }
 
     cJSON *cur = ser_scene_rendering_settings(
-        jce_scene_get_rendering_settings(s));
+        jce_scene_get_rendering_settings(s), s);
     if (!cur) { cJSON_Delete(patch); return false; }
 
-    rs_json_merge(cur, patch);
+    if (!rs_json_merge(cur, patch)) {
+        cJSON_Delete(cur);
+        cJSON_Delete(patch);
+        return false;
+    }
+    JceSceneSkyExtras sky;
+    JceSceneFogLookSettings fog;
+    JceScenePrecipitationSettings precipitation;
+    JceSceneTerrainSnowLook snow_look;
+    if (!scene_weather_read_precipitation(cur, &precipitation) ||
+        !scene_snow_look_read(cur, &snow_look) ||
+        !jce_scene_sky_extras_read_json(cur, &sky) ||
+        !jce_scene_fog_look_read_json(cur, &fog)) {
+        cJSON_Delete(cur);
+        cJSON_Delete(patch);
+        return false;
+    }
     JceSceneRenderingSettings merged = extract_rendering_settings_from_obj(cur);
     jce_scene_set_rendering_settings(s, &merged);
+    scene_weather_apply_precipitation(s, &precipitation);
+    jce_scene_sky_extras_apply(s, &sky);
+    jce_scene_fog_look_set(s, &fog);
+    scene_snow_look_set(s, &snow_look);
 
     cJSON_Delete(cur);
     cJSON_Delete(patch);

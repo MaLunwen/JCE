@@ -3,14 +3,17 @@
  */
 
 #include <jce/os/core/jce_async.h>
+#include "jce_async_stats_internal.h"
+#include "jce_async_session_internal.h"
 
-#include <jce/os/core/jce_config.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_trace.h>
 
 #include "jce_memory.h"
+#include "jce_enki_trace_internal.h"
+#include "os/core/jce_worker_budget_internal.h"
 
 #include <enkiTS/TaskScheduler_c.h>
 #include <SDL3/SDL.h>
@@ -174,36 +177,10 @@ static uint32_t async_priority_index(JceAsyncPriority priority)
 
 static uint32_t async_process_worker_budget(void)
 {
-    int configured = jce_config_job_workers();
-    int workers;
-
-    if (configured > 0) {
-        workers = configured;
-    } else if (jce_config_machine_class() == JCE_MACHINE_CLASS_LOW) {
-        workers = 1;
-    } else {
-        workers = jce_thread_pool_default_workers();
-    }
-
-    if (workers < 1)
-        workers = 1;
-    /* The cap was 4, with nothing saying why, and it was the binding
-     * constraint on every machine bigger than a laptop: jce_thread_pool_
-     * default_workers() already answers cores-1-capped-at-8, and this threw
-     * the answer away.  Measured on a 32-core box opening
-     * caged_kingdom/hidden_cove -- 49 glTF decodes, ~92 ms each, 4.5 s of CPU
-     * -- the asset pool ran 4 workers and the first frame waited on work that
-     * eight could have finished in half the time.
-     *
-     * 8 matches the shared frame pool's own ceiling, so the two agree.  Three
-     * threaded executors exist (archive loader, asset decode, streaming), so
-     * the worst case is 24 threads; they are I/O- and burst-bound and asleep
-     * almost always, which is why this is a per-executor cap rather than a
-     * process-wide budget.  LOW machine class (1) and an explicit
-     * [performance] job_workers pin both still win outright -- those are the
-     * knobs for a box that cannot afford this. */
-    if (workers > 8)
-        workers = 8;
+    int workers = jce_thread_pool_shared_worker_budget();
+    /* The existing shared budget is published before either lazy owner exists.
+     * Preserve this executor's ceiling and explicit-pin precedence. */
+    if (workers > 8) workers = 8;
     return (uint32_t)workers;
 }
 
@@ -830,7 +807,11 @@ jce_async_executor_create(const JceAsyncExecutorConfig *config)
     }
 
     scheduler_threads = executor->worker_count + 1u;
-    enkiInitTaskSchedulerNumThreads(executor->scheduler, scheduler_threads);
+    struct enkiTaskSchedulerConfig scheduler_config =
+        enkiGetTaskSchedulerConfig(executor->scheduler);
+    scheduler_config.numTaskThreadsToCreate = scheduler_threads - 1u;
+    scheduler_config.profilerCallbacks.threadStop = jce_enki_trace_worker_stop;
+    enkiInitTaskSchedulerWithConfig(executor->scheduler, scheduler_config);
     executor->scheduler_running = true;
     executor->max_tasks = cfg.max_tasks;
     executor->default_work_items = cfg.cooperative_tasks_per_pump;
@@ -1781,6 +1762,7 @@ void jce_async_executor_destroy(JceAsyncExecutor *executor)
 static JceAsyncExecutor *g_default_executor;
 static SDL_AtomicInt      g_default_lock;
 static bool               g_default_closing;
+static bool               g_default_session_closed;
 
 static void async_default_lock(void)
 {
@@ -1793,12 +1775,43 @@ static void async_default_unlock(void)
     SDL_SetAtomicInt(&g_default_lock, 0);
 }
 
+void jce_async_default_session_open_internal(void)
+{
+    async_default_lock();
+    g_default_session_closed = false;
+    async_default_unlock();
+}
+
+void jce_async_default_session_close_internal(void)
+{
+    async_default_lock();
+    g_default_session_closed = true;
+    async_default_unlock();
+}
+
+bool jce_async_default_stats_internal(JceAsyncExecutorStats *out_stats)
+{
+    bool available = false;
+    if (!out_stats) return false;
+    SDL_zero(*out_stats);
+    /* Same guard/order as publication: default guard, then executor mutex.
+     * Snapshot invokes no callbacks; shutdown drops the default guard before
+     * waiting on the executor and marks closing before any retirement. */
+    async_default_lock();
+    if (!g_default_closing && g_default_executor) {
+        jce_async_executor_get_stats(g_default_executor, out_stats);
+        available = true;
+    }
+    async_default_unlock();
+    return available;
+}
+
 JceAsyncExecutor *jce_async_default_executor(void)
 {
     JceAsyncExecutor *executor;
 
     async_default_lock();
-    if (!g_default_executor && !g_default_closing) {
+    if (!g_default_executor && !g_default_closing && !g_default_session_closed) {
         JceAsyncExecutorConfig config;
         jce_async_executor_config_init(&config);
         config.debug_name = "jce-default-async";

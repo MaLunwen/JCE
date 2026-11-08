@@ -57,6 +57,57 @@ def read(rel: str) -> str:
     return (ROOT / rel).read_text(encoding="utf-8", errors="replace")
 
 
+CPP_QUOTES = r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+CPP_TOKENS = re.compile(r'//[^\n]*|/\*.*?\*/|' + CPP_QUOTES, re.S)
+
+
+def cpp_code(text: str) -> str:
+    """Strip comments while preserving the SDK stamp/path string literals."""
+    return CPP_TOKENS.sub(
+        lambda m: re.sub(r"[^\n]", " ", m.group())
+        if m.group().startswith(("//", "/*")) else m.group(), text)
+
+
+def cpp_mask(text: str) -> str:
+    return re.sub(CPP_QUOTES, lambda m: " " * len(m.group()), text)
+
+
+def cpp_body(code: str, signature: str) -> str:
+    """One actual definition/branch body; comments and strings cannot add braces."""
+    mask = cpp_mask(code)
+    match = re.search(signature + r"\s*\{", mask)
+    if not match:
+        return ""
+    start, depth = match.end() - 1, 0
+    for pos in range(start, len(mask)):
+        if mask[pos] == "{":
+            depth += 1
+        elif mask[pos] == "}":
+            depth -= 1
+            if not depth:
+                return code[start + 1:pos]
+    return ""
+
+
+def cmake_direct_set(text: str, condition: str, variable: str, value: str) -> bool:
+    """A set directly in this condition, never borrowed from a later branch."""
+    stack = []
+    commands = re.finditer(r"(?m)^[ \t]*(if|elseif|else|endif|set)\s*\(([^\n)]*)\)", text)
+    for match in commands:
+        command, argument = match.group(1), " ".join(match.group(2).split())
+        if command == "if":
+            stack.append(argument)
+        elif command in ("elseif", "else"):
+            if stack:
+                stack[-1] = None
+        elif command == "endif":
+            if stack:
+                stack.pop()
+        elif stack and stack[-1] == condition and argument == variable + " " + value:
+            return True
+    return False
+
+
 # ── Clause 3: the preference must be writable exactly once, by the user ──
 #
 # Nothing that runs on every configure may stamp the option, or the opt-out is
@@ -153,8 +204,8 @@ for name in ("libhevc", "openh264", "fdk-aac"):
 
 # ── Clause 1: dist forcing + its asserts must stay in the root ───────────
 root_cml = read("CMakeLists.txt")
-if not re.search(r'JCE_BUILD_VARIANT STREQUAL "dist"[\s\S]{0,400}?set\(\s*'
-                 + EFFECTIVE + r'\s+OFF', root_cml):
+if not cmake_direct_set(root_cml, 'JCE_BUILD_VARIANT STREQUAL "dist"',
+                        EFFECTIVE, "OFF"):
     fail("dist-forced",
          f"CMakeLists.txt no longer forces {EFFECTIVE} OFF for the dist "
          f"variant.")
@@ -168,34 +219,44 @@ if not re.search(r"JCE_PLATFORM_WEB AND " + EFFECTIVE
     fail("dist-forced",
          "CMakeLists.txt lost the assert that Web derived the switch OFF.")
 
-# ── Clause 1, prebuilt-SDK path: variant must be checked against the SDK ─
-#
-# `app` / `package game` and the editor's project build do not compile the
-# engine, so -DJCE_BUILD_VARIANT cannot subtract codecs from the fat lib and
-# the root asserts never run. The only defence is comparing the requested
-# variant against the SDK's own VERSION.txt stamp.
-if "def require_sdk_variant(" not in jce_py:
-    fail("dist-forced",
-         "tools/build/jce.py lost require_sdk_variant(): a dist build against a "
-         "release SDK would ship AAC / H.264 / H.265 in a bundle its own log "
-         "line calls royalty-free.")
-elif "require_sdk_variant(" not in jce_py.split("def require_sdk_variant(")[0]:
-    fail("dist-forced",
-         "tools/build/jce.py defines require_sdk_variant() but resolve_sdk() no "
-         "longer calls it.")
+# ── Clause 1, prebuilt SDK: actual per-archive metadata admission ────────
+# VERSION.txt is explanatory; the archive metadata is the variant authority.
+try:
+    driver_ast = ast.parse(jce_py)
+except SyntaxError:
+    driver_ast = ast.Module(body=[], type_ignores=[])
+resolve = next((node for node in driver_ast.body
+                if isinstance(node, ast.FunctionDef) and node.name == "resolve_sdk"), None)
+calls = [] if resolve is None else [node for node in ast.walk(resolve)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "require_sdk_target"]
+if (len(calls) != 1 or len(calls[0].args) != 6
+    or [ast.unparse(node) for node in calls[0].args][-2:] != ["variant", "delivery"]):
+    fail("dist-forced", "resolve_sdk() lost actual per-archive SDK target/variant admission")
 
-bm = read("editor/src/core/jce_build_manager.cpp")
-# Both halves, separately: a helper nobody calls is exactly as useless as no
-# helper, and deleting the call site is the likelier regression of the two.
-if "std::string sdk_stamped_variant(" not in bm:
-    fail("dist-forced",
-         "editor/src/core/jce_build_manager.cpp lost sdk_stamped_variant(); "
-         "an editor 'dist' build would link whatever SDK the project names.")
-if "sdk_stamped_variant(sdk)" not in bm:
-    fail("dist-forced",
-         "editor/src/core/jce_build_manager.cpp defines sdk_stamped_variant() "
-         "but jce_build_manager_start_project_build() no longer calls it, so "
-         "the requested variant is never compared against the SDK's stamp.")
+variant_owner = "editor/src/core/jce_project_build_target.cpp"
+variant_code = cpp_code(read(variant_owner)) if (ROOT / variant_owner).is_file() else ""
+variant_body = cpp_body(variant_code,
+    r"\bstd::string\s+jce_project_build_sdk_target_error\s*\([^;{}]*\)")
+variant_mask = cpp_mask(variant_body)
+if (not variant_body or '"/jce-sdk-target.json"' not in variant_body
+        or not re.search(r"\bjce_fs_host_read_capped\s*\([^;]*\b16385\b", variant_mask)
+        or not re.search(r"\bjce_fs_buffer_free\s*\(", variant_mask)
+        or not re.search(r"\bjce_json_parse_strict\s*\(", variant_mask)
+        or not re.search(r'\{\s*"variant"\s*,\s*variant\.c_str\s*\(\s*\)\s*\}', variant_body)
+        or not re.search(r"\bstd::strcmp\s*\(\s*text\(expected\.first\),\s*expected\.second\)", variant_mask)):
+    fail("dist-forced", f"{variant_owner} lost actual SDK metadata variant comparison")
+
+bm = cpp_code(read("editor/src/core/jce_build_manager.cpp"))
+admission = cpp_body(bm,
+    r"\bbool\s+jce_build_manager_start_project_build\s*\([^;{}]*\)")
+mismatch = cpp_body(admission,
+    r"\bif\s*\(\s*const\s+auto\s+error\s*=\s*"
+    r"jce_project_build_sdk_target_error\s*\(\s*sdk\s*,\s*selected_arch\s*,\s*"
+    r"build_platform\s*,\s*variant\s*\)\s*;\s*!error\.empty\s*\(\s*\)\s*\)")
+if (not mismatch or not re.search(r"\breturn\s+false\s*;", cpp_mask(mismatch))
+        or not re.search(r"\bset_error\s*\(\s*error\s*\)", cpp_mask(mismatch))):
+    fail("dist-forced", "jce_build_manager_start_project_build() lost SDK target/variant rejection")
 
 # ── Report ──────────────────────────────────────────────────────────────
 if failures:

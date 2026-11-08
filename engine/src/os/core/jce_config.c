@@ -14,6 +14,7 @@
 #include <jce/os/core/jce_thread.h>   /* settings S5: job_workers sizes the pool */
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_worker_budget_internal.h"
 
 #include <ctype.h>
 #include <SDL3/SDL.h>
@@ -33,6 +34,7 @@ JceConfig jce_config_defaults(void)
     cfg.window_height     = 480;
     SDL_strlcpy(cfg.window_title, "JCE", sizeof(cfg.window_title));
     cfg.fullscreen        = false;
+    cfg.maximized         = false;
     cfg.resizable         = true;
 
     cfg.renderer_backend  = JCE_BACKEND_AUTO;
@@ -74,26 +76,27 @@ static int s_perf_job_workers   = 0;
 
 void jce_config_publish_perf(int machine_class, int job_workers)
 {
+    jce_config_publish_perf_resolved(machine_class, job_workers,
+        machine_class == JCE_MACHINE_CLASS_LOW);
+}
+
+void jce_config_publish_perf_resolved(int machine_class, int job_workers,
+                                      bool low_memory)
+{
     if (machine_class < 0 || machine_class > JCE_MACHINE_CLASS_FULL)
         machine_class = JCE_MACHINE_CLASS_AUTO;
     if (job_workers < 0) job_workers = 0;
     s_perf_machine_class = machine_class;
     s_perf_job_workers   = job_workers;
 
-    /* Settings S5: [performance] job_workers sizes the process-wide frame
-     * fork/join pool and is also the upper bound read by structured async
-     * executors. Push it rather than let the frame pool pull it: that pool is
-     * built lazily and set_workers() is a no-op once it exists. This runs
-     * before bgfx init and any frame or background work. Zero leaves the
-     * cores-1 policy in charge; a pin is clamped to 1..16. */
-    if (job_workers > 0) {
-        int w = job_workers > 16 ? 16 : job_workers;
-        LOG_INFO(LOG_TAG, "shared job pool: %d worker(s) "
-                          "(pinned via [performance] job_workers)", w);
-        jce_thread_pool_shared_set_workers(w);
-    } else {
-        LOG_INFO(LOG_TAG, "shared job pool: auto (cores-1, capped at 8)");
-    }
+    /* Keep the authored class for renderer/other public consumers. Only the
+     * shared worker budget receives the effective LOW decision. Always push
+     * the default too, clearing historical pins before a fresh lazy boot. */
+    const int workers = jce_worker_budget_requested(
+        low_memory, SDL_GetNumLogicalCPUCores(), job_workers);
+    jce_thread_pool_shared_set_workers(workers);
+    LOG_INFO(LOG_TAG, "shared job pool: %d worker(s) (%s)",
+             workers, job_workers > 0 ? "explicit pin" : "resolved default");
 }
 
 JceMachineClass jce_config_machine_class(void)
@@ -251,6 +254,7 @@ static void apply(JceConfig *cfg, const char *section,
         SDL_strlcpy(cfg->window_title, value, sizeof(cfg->window_title));
     }
     else if (strcmp(full, "window.fullscreen") == 0) cfg->fullscreen = parse_bool(value);
+    else if (strcmp(full, "window.maximized")  == 0) cfg->maximized  = parse_bool(value);
     else if (strcmp(full, "window.resizable")  == 0) cfg->resizable  = parse_bool(value);
 
     /* Renderer */
@@ -406,6 +410,7 @@ bool jce_config_save(const JceConfig *cfg, const char *path)
         "width = %d\n"
         "height = %d\n"
         "fullscreen = %s\n"
+        "maximized = %s\n"
         "resizable = %s\n"
         "title = %s\n"
         "\n[renderer]\n"
@@ -428,6 +433,7 @@ bool jce_config_save(const JceConfig *cfg, const char *path)
         "job_workers = %d\n",
         cfg->window_width, cfg->window_height,
         cfg->fullscreen ? "true" : "false",
+        cfg->maximized ? "true" : "false",
         cfg->resizable ? "true" : "false",
         cfg->window_title[0] ? cfg->window_title : "JCE",
         backend_to_str(cfg->renderer_backend),

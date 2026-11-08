@@ -86,3 +86,83 @@ Runtime output paths contain the executable. Link/compiler debug symbols stay
 under the existing editor build cache's symbols/<configuration> directory.
 DIST hash receipts stay under build reports/artifacts/<variant>, independent
 of runtime relocation. None is required beside the single editor executable.
+
+Explicit `JCE_KPI_GAME_EVENTS` QA rows are six columns: Play-frame, M/B/W/K,
+x, y, a, b. K routes ordinary editor key events (`a` scancode, `b` down 0/1),
+including F12; x/y are ignored. Invalid rows log ERROR and are not dispatched.
+The stateless decoder is in core/jce_editor_event_fixture.h; it never changes
+viewport focus, application input ownership or OS keyboard state.
+The host-owned core/jce_editor_event_fixture_schedule.h snapshots the event
+path, `JCE_KPI_GAME_EVENTS_CLOCK` and `JCE_KPI_GAME_EVENTS_START` once at GUI
+initialization and releases its state at host exit. Absent/empty/`frame` clock
+retains the visible-Playing frame counter without clock reads or marker polls.
+Explicit `elapsed_ms` interprets the same first integer as elapsed monotonic
+milliseconds; an optional initially absent absolute regular-file start marker
+delays activation until admitted Play observes it. Configuration errors refuse
+only this synthetic fixture. See the evidence reference for marker freshness,
+admission cancellation and the CPU-only verification limits.
+
+Normal GUI host exit first calls the existing idempotent recorder Stop while
+capture, master-audio tap, encoder worker and borrowed view/UI owners are live.
+This precedes Play Stop; headless/invalid-startup routes borrow no GUI recorder.
+Normal host exit reuses jce_state_stop for active or paused Play before releasing
+Game View, Scene View and editor owners. The private Play transaction helper only
+orders existing callbacks; it owns no second runtime or play state. Ordinary Edit
+exit skips simulation Stop. Require actual script teardown evidence in addition
+to the headless sequencing controls.
+
+Editor build asset readers (`CookEditorAssets` and `PackEditorAssets`) depend
+on the i18n normalization writer individually. A prerequisite only on the final
+editor/packer does not order the cooker; concurrent scans can race source JSON
+rewrites. Source graph controls live in tools/tests/test_i18n_pack_order.py.
+
+The existing `should_quit` callback owns one audited Editor CPU-service poll per
+host iterate before headless/minimized/render admission. `cpu_services_ready`
+starts only after successful app initialization and clears before app exit. It
+does not dispatch generic gameplay/update/PlayerLoop callbacks. Headless mode
+retains Build + headless-driver completion only; GUI service membership is
+shared in `core/jce_editor_host_services.h`. Real child/actual-body controls are
+`test_jce_editor_host_services` and its ordinary missing-wire contract control.
+Actual native minimize/restore, OS suspend and GPU suppression still require
+windowed acceptance; MAX_FRAMES benchmark mode is a distinct exception.
+
+The actual editor_app_event callback routes public QUIT and WINDOW_CLOSE through
+that same layout quit-confirmation owner. Headless events return before cadence,
+confirmation or input forwarding; GUI events preserve cadence-before-forwarding
+and each unconfirmed close event requests the existing idempotent layout action.
+The complete callback is consumed by the host-services CPU fixture; its ordinary
+old_quit_only control removes only WINDOW_CLOSE admission. Native OS close,
+unsaved modal behavior and terminal cleanup require current graphical evidence.
+
+The audited CPU service poll and its selected members emit bounded canonical
+static-name spans only when existing trace capture is enabled. These scopes
+cover CPU polling, not external tool success or GPU completion. The normal
+host-services fixture retains its seven behavior groups plus trace-on parent
+closure and trace-off controls; its missing-wire mutant stays a runtime failure.
+
+Editor scene/video simulation consumes public scene_video_advance, while admitted
+SceneRenderer preparation owns its upload. editor_app_update discards a zero
+engine resume interval before its separate fixed-dt Play override can repay
+suspension time; the pre-render/should_quit CPU maintenance owner remains in its
+original position. Do not move the whole editor update or ImGui/draw work into
+maintenance. Play host policy publishes effective background CPU permission
+through the common Engine API, including manual/OS pause and conditional restore.
+Physical minimize/restore, authored background intent, child process maintenance
+and presentation still need rebuilt GUI evidence. Foreground auxiliary engine
+hooks remain independent of runtime pause; do not claim this phase fixes that
+separate consistency boundary.
+
+
+Recorder format-failure retirement belongs only to the initialized pre-render
+CPU-maintenance service in core/jce_editor.cpp. editor_app_update has no second
+Recorder-update wire. This preserves one poll per ordinary host iteration and
+allows rejection retirement while UI admission is skipped. The actual-body
+fixture executes that maintenance call; a separate full-main source-wire count
+and ordinary restored-line control prevent a duplicate direct app-update call.
+That wire count does not execute editor_app_update or certify native scheduling.
+
+The main `EditorState` snapshots only the launch diagnostic selector
+`JCE_EDITOR_CADENCE_DIAG` at host initialization, using `jce_env_flag_enabled`
+(empty/leading-zero disabled). Exit clears admission; reinitialization resets
+its existing bounded transition-log counters. Cadence rates and live engine
+policy retain their ordinary per-generation/per-tick owners.

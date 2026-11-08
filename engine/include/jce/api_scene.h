@@ -30,6 +30,17 @@ extern "C" {
 #include <jce/middleware/scene/jce_water.h>
 #include <jce/middleware/scene/jce_water_fft.h>
 #include <jce/middleware/scene/jce_water_field.h>
+#include <jce/middleware/scene/jce_scene_water_spectrum.h>
+#include <jce/middleware/scene/jce_scene_water_foam.h>
+#include <jce/middleware/scene/jce_scene_water_crest.h>
+#include <jce/middleware/scene/jce_scene_water_caustics.h>
+#include <jce/middleware/scene/jce_scene_water_nearshore.h>
+#include <jce/middleware/scene/jce_scene_water_motion.h>
+#include <jce/middleware/scene/jce_scene_water_optics.h>
+#include <jce/middleware/scene/jce_scene_water_caustic_detail.h>
+#include <jce/middleware/scene/jce_scene_water_normal_detail.h>
+#include <jce/middleware/scene/jce_scene_sky_celestial.h>
+#include <jce/middleware/scene/jce_scene_cloud_shape.h>
 
 /* Completed 2026-08-31.  These headers export JCE_API symbols and were
  * reachable from NO umbrella, so §4's promise -- `#include <jce/api.h>`

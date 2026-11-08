@@ -2,16 +2,91 @@
   "schema": 1,
   "variant": "normal",
   "file": "elemental_serenity.jbundle",
-  "sha256": "2b78da2a10073949bc30b1f58368d1b990c7c5a3e98903f1571f5efdace5ef86",
-  "bytes": 4963990,
+  "sha256": "e46cc9a1b9b5e5a4741b7eb8682fa25befe7ac7d2e462dd027e0e5d77e743395",
+  "bytes": 6874857,
   "single_file": true,
   "consumer_source": "tests/consumers/elemental_serenity",
   "source_terms": "SOURCE_AND_TERMS.md",
   "repository_license": "MPL-2.0",
-  "scope": "Original JCE portable Lua consumer variant; public SDK bundle dependency closure and relocated one-EXE consumption observed. No native multi-language parity claim.",
+  "scope": "Current maintained portable Lua normal content and project RenderPipeline settings. Exact Bundle opened with a blue sky in Windows Editor and completed two Play/Stop cycles with complete CPU trace. A separately built public SDK consumer exercised the content on Windows D3D12/Intel; normal exit was validated in a separate session. No all-feature, pixel parity, GPU completion, performance, physical low-end or all-platform certification.",
   "upstream": "https://github.com/SahilK-027/Elemental-Serenity",
   "asset_provenance": "ASSET_PROVENANCE.json",
   "upstream_notice": "UPSTREAM_NOTICE.md",
   "font_policy": "no font bytes; host default",
-  "qa_muted": false
+  "qa_muted": false,
+  "target_profile": "windows",
+  "source_inputs": {
+    "scene": {
+      "path": "tests/consumers/elemental_serenity/resources/assets/scenes/elemental_serenity.bundle.scene.json",
+      "sha256": "568178db1da6337f17b048c9fc9f7b3951f1df594b8f3c15f1211f78252ea415",
+      "bytes": 268658
+    },
+    "director": {
+      "path": "tests/consumers/elemental_serenity/resources/assets/scripts/es_director_portable.lua",
+      "sha256": "4cd40a965b253ec00b29120c17a39c2e20e1dfba1815016d9e61c08f2c384351",
+      "bytes": 54168
+    },
+    "render_pipeline": {
+      "path": "tests/consumers/elemental_serenity/Settings/RenderPipeline.rp.json",
+      "sha256": "31e7ba4a67c08ef3fdd2d274ed6e13c96fd0614cf8d8f8585bb52c6174c7b43e",
+      "bytes": 499
+    }
+  },
+  "pack_recipe": {
+    "path": "tests/consumers/elemental_serenity/tools/stage_portable_bundle.py",
+    "sha256": "ec4a2d0e0241caad6193fa016fc17b0341ba239e0fc1db1de56ef458337253b4",
+    "target": "windows",
+    "cook_assets": true,
+    "single_file": true,
+    "bundle_id": "elemental_serenity_portable",
+    "qa_muted": false,
+    "capture_seeds": null,
+    "packer_sha256": "49da80a9f45c7a20390eb27174ad1057fd690f7293c1eeb1287fa6b05ec706fe",
+    "inspector_sha256": "5156c14108b2ead7ba1113f498fb596da084e079819b551ae03c151da11cd150"
+  },
+  "content_policy": {
+    "primary_camera_clear_mode": 0,
+    "fxaa": true,
+    "taa": false,
+    "antialiasing_scope": "Requested maintained content correction; not a same-quality performance improvement."
+  },
+  "archive_validation": {
+    "assets": 62,
+    "entries": 63,
+    "verified_entries": 63,
+    "corrupt_entries": 0,
+    "skipped_entries": 0,
+    "fonts": false,
+    "driver": "Lua",
+    "changed_entries_vs_previous": 4,
+    "unchanged_decoded_crc_and_size_vs_previous": 59,
+    "scope": "Public Archive header and decoded entry CRC verification; three selected text payloads also match current source SHA256."
+  },
+  "windows_functional_validation": {
+    "editor_bundle": {
+      "sky_observed": "blue",
+      "play_stop_cycles": 2,
+      "cpu_trace_events": 6007841,
+      "trace_loss": 0
+    },
+    "sdk_consumer": {
+      "exe_bytes": 32360960,
+      "exe_sha256": "39c71db0da492a63b55dfaedf27b45c1a80cdf2e0970518cc7f0359c5784e217",
+      "engine_context": "SDK66 / Engine65",
+      "backend": "D3D12",
+      "adapter": "Intel",
+      "observed_actions": [
+        "day/night",
+        "winter",
+        "spring",
+        "rain",
+        "camera orbit"
+      ],
+      "interactive_session_exit": "budget guard; not manual-exit certification",
+      "normal_exit_separate_session": true,
+      "separate_exit_cpu_trace_events": 464966,
+      "separate_exit_trace_loss": 0,
+      "separate_exit_required_phase_failures": 0
+    }
+  }
 }

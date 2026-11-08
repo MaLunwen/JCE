@@ -191,7 +191,7 @@ void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
         sr->ecull[eci].transform_dynamic = jce_scene_entity_is_dynamic(scene, e);
     const bool e_is_dynamic = sr->ecull[eci].transform_dynamic;
     if (wcache_on && !e_is_dynamic)
-        sr_wcache_store(sr, (uint32_t)e, &sr->ecull[eci],
+        sr_wcache_store(sr, e, &sr->ecull[eci],
                         &sr->ecull_world[eci], struct_epoch, e_gen);
 
     sr_ecull_detail_phase(detail, &start, "ecull_static_store");
@@ -235,7 +235,7 @@ void sr_ecull_build_miss(JceSceneRenderer *sr, JceScene *scene,
      * fused into the build; the standalone post-loop store walk is gone).
      * Serial path => full store (may insert/grow). */
     if (sr->ecull[eci].has_aabb)
-        sr_focus_aabb_store(sr, (uint32_t)e, sr->ecull[eci].wmin,
+        sr_focus_aabb_store(sr, e, sr->ecull[eci].wmin,
                             sr->ecull[eci].wmax);
     sr_ecull_detail_phase(detail, &start, "ecull_focus_store");
 }

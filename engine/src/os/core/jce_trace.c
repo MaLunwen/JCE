@@ -5,24 +5,33 @@
 #include <jce/os/core/jce_trace.h>
 
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_assert.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 
 #include "jce_memory.h"
+#include "jce_trace_capture_internal.h"
+#include "jce_trace_scope_internal.h"
+#include "jce_trace_clock_internal.h"
+#include "os/platform/jce_native_atomic_word_internal.h"
 
 #include <SDL3/SDL.h>
 
 #include <limits.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define TRACE_CAPACITY 16384u
+/* Fixed power-of-two backlog allowance; publication still reports overwrites.
+ * The continuous consumer's bounded final drain covers this entire ring. */
+#define TRACE_CAPACITY 65536u
 #define TRACE_MASK     (TRACE_CAPACITY - 1u)
 
 typedef struct TraceSlot {
-    SDL_AtomicInt published;
+    SDL_SpinLock lock;
+    SDL_AtomicU32 published;
     JceTraceEvent event;
 } TraceSlot;
 
@@ -32,16 +41,25 @@ typedef struct TraceU64 {
     SDL_AtomicInt hi;
 } TraceU64;
 
-typedef struct TraceJsonBuffer {
-    char    *data;
-    size_t   size;
-    size_t   capacity;
-} TraceJsonBuffer;
+/* Capture identity has one process owner. Its selected ID strategy and
+ * registration accounting epoch share the existing quiescent reset boundary. */
+typedef struct TraceIdentityState {
+#if UINTPTR_MAX > UINT32_MAX
+    JceNativeAtomicWord next_id;
+#else
+    SDL_SpinLock next_id_lock;
+    uint64_t next_id;
+#endif
+    /* Enable changes capture generation; only quiescent reset advances this
+     * single-writer epoch and invalidates an older thread's accounting. */
+    TraceU64 registration_epoch;
+} TraceIdentityState;
 
 static TraceSlot s_slots[TRACE_CAPACITY];
 static SDL_AtomicInt s_enabled;
-static SDL_AtomicInt s_write_sequence;
-static SDL_AtomicInt s_next_id;
+/* UINT32_MAX is permanent exhaustion, not a publishable event sequence. */
+static SDL_AtomicU32 s_write_sequence;
+static TraceIdentityState s_identity;
 static SDL_AtomicInt s_generation;
 static SDL_AtomicInt s_active_threads;
 static SDL_AtomicInt s_active_work_items;
@@ -62,9 +80,83 @@ static SDL_AtomicInt s_max_wait_ms;
 static TraceU64 s_last_wall_ns;
 static TraceU64 s_last_sim_ns;
 static TraceU64 s_last_frame_index;
-static SDL_TLSID s_thread_generation;
-static SDL_TLSID s_thread_trace_active;
-static SDL_TLSID s_current_task;
+/* Same compiler-TLS mechanism as the profiler, with one trace context owner.
+ * Full-width IDs must never pass through a 32-bit pointer-sized SDL sentinel. */
+#if JCE_COMPILER_MSVC
+#define JCE_TRACE_TLS __declspec(thread)
+#elif JCE_COMPILER_GCC || JCE_COMPILER_CLANG
+#define JCE_TRACE_TLS __thread
+#else
+#error "Trace context needs a supported compiler TLS implementation"
+#endif
+typedef struct TraceThreadState {
+    uint64_t task;
+    uintptr_t suppression;
+    uint32_t generation;
+    uint64_t registration_epoch;
+    bool registered;
+    bool active;
+} TraceThreadState;
+static JCE_TRACE_TLS TraceThreadState s_thread;
+
+static void trace_id_store_quiescent(uint64_t value)
+{
+#if UINTPTR_MAX > UINT32_MAX
+    jce_native_atomic_word_store(&s_identity.next_id, (size_t)value);
+#else
+    /* Reset/seed is quiescent, just like the ring reset contract. */
+    s_identity.next_id = value;
+#endif
+}
+
+static bool trace_id_reserve(uint64_t *id)
+{
+    uint64_t next;
+#if UINTPTR_MAX > UINT32_MAX
+    size_t current = jce_native_atomic_word_load(&s_identity.next_id);
+    for (;;) {
+        if (current == UINT64_MAX) return false;
+        next = (uint64_t)current + 1u;
+        if (jce_native_atomic_word_compare_exchange(&s_identity.next_id, current,
+                                                     (size_t)next)) break;
+        current = jce_native_atomic_word_load(&s_identity.next_id);
+    }
+#else
+    SDL_LockSpinlock(&s_identity.next_id_lock);
+    if (s_identity.next_id == UINT64_MAX) {
+        SDL_UnlockSpinlock(&s_identity.next_id_lock);
+        return false;
+    }
+    next = ++s_identity.next_id;
+    SDL_UnlockSpinlock(&s_identity.next_id_lock);
+#endif
+    *id = next;
+    return true;
+}
+
+static bool trace_sequence_reserve(uint32_t *sequence)
+{
+    uint32_t current = SDL_GetAtomicU32(&s_write_sequence);
+    for (;;) {
+        if (current == UINT32_MAX) return false;
+        const uint32_t next = current + 1u;
+        if (SDL_CompareAndSwapAtomicU32(&s_write_sequence, current, next)) {
+            if (next == UINT32_MAX) {
+                /* Preserve this invalid state across disable/re-enable. */
+                SDL_SetAtomicInt(&s_enabled, 0);
+                return false;
+            }
+            *sequence = next;
+            return true;
+        }
+        current = SDL_GetAtomicU32(&s_write_sequence);
+    }
+}
+
+bool jce_trace_capture_valid_internal(void)
+{
+    return SDL_GetAtomicU32(&s_write_sequence) != UINT32_MAX;
+}
 
 static uint64_t trace_u64_load(const TraceU64 *value)
 {
@@ -132,20 +224,53 @@ static uint64_t trace_duration_load(SDL_AtomicInt *nanoseconds,
     return result > coarse_ms ? result : coarse_ms;
 }
 
+static bool trace_thread_suppressed(void)
+{
+    return s_thread.suppression != 0;
+}
+
+bool jce_trace_suppress_begin(void)
+{
+    uintptr_t depth = s_thread.suppression;
+    if (depth == UINTPTR_MAX) return false;
+    s_thread.suppression = depth + 1;
+    return true;
+}
+
+bool jce_trace_suppress_end(void)
+{
+    uintptr_t depth = s_thread.suppression;
+    if (!depth) return false;
+    s_thread.suppression = depth - 1;
+    return true;
+}
+
 static uint64_t trace_current_task_id(void)
 {
-    return (uint64_t)(uintptr_t)SDL_GetTLS(&s_current_task);
+    return s_thread.task;
 }
 
 static void trace_set_current_task_id(uint64_t id)
 {
-    SDL_SetTLS(&s_current_task, (void *)(uintptr_t)id, NULL);
+    s_thread.task = id;
 }
 
 static void trace_copy_name(char dst[JCE_TRACE_NAME_CAP], const char *name)
 {
     SDL_strlcpy(dst, name && name[0] ? name : "unnamed",
                 JCE_TRACE_NAME_CAP);
+}
+
+/* Delayed publishers must not replace a newer wrap of the same slot.
+ * Their reserved sequence remains a real missing/overwritten event. */
+static void trace_publish_slot(TraceSlot *slot, const JceTraceEvent *event)
+{
+    SDL_LockSpinlock(&slot->lock);
+    if (SDL_GetAtomicU32(&slot->published) <= event->sequence) {
+        slot->event = *event;
+        SDL_SetAtomicU32(&slot->published, event->sequence);
+    }
+    SDL_UnlockSpinlock(&slot->lock);
 }
 
 static void trace_emit(JceTraceEventType type,
@@ -161,18 +286,19 @@ static void trace_emit(JceTraceEventType type,
     TraceSlot *slot;
     uint32_t sequence;
 
-    if (SDL_GetAtomicInt(&s_enabled) == 0)
+    if (!jce_trace_enabled())
         return;
 
     SDL_zero(event);
-    sequence = (uint32_t)(SDL_AddAtomicInt(&s_write_sequence, 1) + 1);
-    if (sequence == 0u)
-        sequence = (uint32_t)(SDL_AddAtomicInt(&s_write_sequence, 1) + 1);
+    if (!trace_sequence_reserve(&sequence)) return;
 
     event.sequence = sequence;
     event.type = type;
     event.category = category;
-    event.timestamp_ns = jce_time_ticks_ns();
+    /* Reserve before reading: an invalid/overflowing clock leaves an explicit
+     * pending sequence, so full-stream accounting refuses incomplete evidence.
+     * Never fabricate zero/saturated time or reset away a previous session. */
+    if (!jce_trace_clock_now_internal(&event.timestamp_ns)) return;
     event.thread_id = jce_thread_current_id();
     event.id = id;
     event.parent_id = parent_id;
@@ -182,34 +308,39 @@ static void trace_emit(JceTraceEventType type,
     trace_copy_name(event.name, name);
 
     slot = &s_slots[(sequence - 1u) & TRACE_MASK];
-    SDL_SetAtomicInt(&slot->published, 0);
-    slot->event = event;
-    SDL_MemoryBarrierRelease();
-    SDL_SetAtomicInt(&slot->published, (int)sequence);
+    trace_publish_slot(slot, &event);
 }
 
 void jce_trace_set_enabled(bool enabled)
 {
     int was_enabled = SDL_GetAtomicInt(&s_enabled);
 
+    enabled = enabled && jce_trace_capture_valid_internal();
     if (enabled && was_enabled == 0)
         SDL_AddAtomicInt(&s_generation, 1);
     SDL_SetAtomicInt(&s_enabled, enabled ? 1 : 0);
+    /* A producer can exhaust the sequence after the first validity read but
+     * before this store. Keep the repair on this cold configuration path. */
+    if (enabled && !jce_trace_capture_valid_internal())
+        SDL_SetAtomicInt(&s_enabled, 0);
 }
 
 bool jce_trace_enabled(void)
 {
-    return SDL_GetAtomicInt(&s_enabled) != 0;
+    return SDL_GetAtomicInt(&s_enabled) != 0 && !trace_thread_suppressed();
 }
 
 void jce_trace_reset(void)
 {
     uint32_t i;
 
-    for (i = 0; i < TRACE_CAPACITY; ++i)
-        SDL_SetAtomicInt(&s_slots[i].published, 0);
-    SDL_SetAtomicInt(&s_write_sequence, 0);
-    SDL_SetAtomicInt(&s_next_id, 0);
+    /* Public reset requires all producers/consumers to be quiescent. */
+    for (i = 0; i < TRACE_CAPACITY; ++i) {
+        s_slots[i].lock = 0;
+        SDL_SetAtomicU32(&s_slots[i].published, 0);
+    }
+    SDL_SetAtomicU32(&s_write_sequence, 0);
+    trace_id_store_quiescent(0);
     SDL_SetAtomicInt(&s_active_threads, 0);
     SDL_SetAtomicInt(&s_active_work_items, 0);
     SDL_SetAtomicInt(&s_active_waits, 0);
@@ -229,17 +360,20 @@ void jce_trace_reset(void)
     trace_u64_store(&s_last_wall_ns, 0);
     trace_u64_store(&s_last_sim_ns, 0);
     trace_u64_store(&s_last_frame_index, 0);
+    trace_u64_store(&s_identity.registration_epoch,
+                    trace_u64_load(&s_identity.registration_epoch) + 1u);
     SDL_AddAtomicInt(&s_generation, 1);
     trace_set_current_task_id(0);
 }
 
 uint64_t jce_trace_next_id(void)
 {
-    uint32_t id = (uint32_t)(SDL_AddAtomicInt(&s_next_id, 1) + 1);
-
-    if (id == 0u)
-        id = (uint32_t)(SDL_AddAtomicInt(&s_next_id, 1) + 1);
-    return (uint64_t)id;
+    uint64_t id;
+    if (trace_id_reserve(&id)) return id;
+    /* No nonzero unique value remains. Even an assertion handler that returns
+     * must not allow a duplicate/zero ID to escape this public contract. */
+    jce_assert_fail(__FILE__, __LINE__, __func__, "trace ID space available", NULL);
+    abort();
 }
 
 uint64_t jce_trace_task_current_id(void)
@@ -254,21 +388,24 @@ void jce_trace_task_restore_id(uint64_t task_id)
 
 void jce_trace_thread_register(const char *name)
 {
-    uintptr_t generation =
-        (uintptr_t)(uint32_t)SDL_GetAtomicInt(&s_generation) + 1u;
-    uintptr_t registered =
-        (uintptr_t)SDL_GetTLS(&s_thread_generation);
+    if (trace_thread_suppressed()) return;
+    uint32_t generation = (uint32_t)SDL_GetAtomicInt(&s_generation);
+    uint64_t registration_epoch = trace_u64_load(&s_identity.registration_epoch);
 
-    if (registered == generation)
+    if (s_thread.active && s_thread.registration_epoch != registration_epoch)
+        s_thread.active = false; /* Reset already cleared this old accounting. */
+    if (s_thread.registered && s_thread.generation == generation &&
+        s_thread.registration_epoch == registration_epoch)
         return;
-    SDL_SetTLS(&s_thread_generation, (void *)generation, NULL);
-    SDL_SetTLS(&s_thread_trace_active, NULL, NULL);
+    s_thread.generation = generation;
+    s_thread.registration_epoch = registration_epoch;
+    s_thread.registered = true;
     jce_log_set_thread_name(name && name[0] ? name : "jce-thread");
     JCE_PROFILE_THREAD_NAME(name && name[0] ? name : "jce-thread");
 
-    if (!jce_trace_enabled())
+    if (s_thread.active || !jce_trace_enabled())
         return;
-    SDL_SetTLS(&s_thread_trace_active, (void *)(uintptr_t)1u, NULL);
+    s_thread.active = true;
     SDL_AddAtomicInt(&s_active_threads, 1);
     trace_emit(JCE_TRACE_EVENT_THREAD_REGISTER,
                JCE_TRACE_CATEGORY_THREAD,
@@ -277,23 +414,19 @@ void jce_trace_thread_register(const char *name)
 
 void jce_trace_thread_unregister(void)
 {
-    uintptr_t generation =
-        (uintptr_t)(uint32_t)SDL_GetAtomicInt(&s_generation) + 1u;
-    uintptr_t registered =
-        (uintptr_t)SDL_GetTLS(&s_thread_generation);
-    uintptr_t trace_active =
-        (uintptr_t)SDL_GetTLS(&s_thread_trace_active);
+    if (trace_thread_suppressed()) return;
+    uint64_t registration_epoch = trace_u64_load(&s_identity.registration_epoch);
 
-    if (registered == 0u)
+    if (!s_thread.registered)
         return;
-    if (trace_active != 0u && registered == generation) {
+    if (s_thread.active && s_thread.registration_epoch == registration_epoch) {
         trace_emit(JCE_TRACE_EVENT_THREAD_UNREGISTER,
                    JCE_TRACE_CATEGORY_THREAD,
                    jce_thread_current_id(), 0, 0, 0, 0, "thread-exit");
         SDL_AddAtomicInt(&s_active_threads, -1);
     }
-    SDL_SetTLS(&s_thread_generation, NULL, NULL);
-    SDL_SetTLS(&s_thread_trace_active, NULL, NULL);
+    s_thread.registered = false;
+    s_thread.active = false;
 }
 
 void jce_trace_task_submit(uint64_t task_id, uint64_t parent_id,
@@ -389,12 +522,27 @@ void jce_trace_frame_mark(uint64_t frame_index, uint64_t wall_time_ns,
                0, "frame");
 }
 
+void jce_trace_counter_scoped_internal(JceTraceCategory category, const char *name,
+                                        int64_t value, uint64_t id, uint64_t parent)
+{
+    if (SDL_GetAtomicInt(&s_enabled) != 0 && trace_thread_suppressed()) return;
+    JCE_PROFILE_PLOT_I(name && name[0] ? name : "trace.counter", value);
+    trace_emit(JCE_TRACE_EVENT_COUNTER, category, id, parent,
+               (uint64_t)value, 0, 0, name);
+}
+
+void jce_trace_counter_ring_internal(JceTraceCategory category, const char *name,
+                                     int64_t value, uint64_t id, uint64_t parent)
+{
+    trace_emit(JCE_TRACE_EVENT_COUNTER, category, id, parent,
+               (uint64_t)value, 0, 0, name);
+}
+
 void jce_trace_counter(JceTraceCategory category, const char *name,
                        int64_t value)
 {
-    JCE_PROFILE_PLOT_I(name && name[0] ? name : "trace.counter", value);
-    trace_emit(JCE_TRACE_EVENT_COUNTER, category, 0, 0,
-               (uint64_t)value, 0, 0, name);
+    const uint64_t span = jce_trace_enabled() ? trace_current_task_id() : 0;
+    jce_trace_counter_scoped_internal(category, name, value, span, span);
 }
 
 void jce_trace_cursor_init(JceTraceCursor *cursor)
@@ -405,21 +553,25 @@ void jce_trace_cursor_init(JceTraceCursor *cursor)
     cursor->lost_events = 0;
 }
 
-uint32_t jce_trace_read(JceTraceCursor *cursor, JceTraceEvent *out_events,
-                        uint32_t max_events)
+static uint32_t trace_read_impl(JceTraceCursor *cursor, JceTraceEvent *out_events,
+                               uint32_t max_events, JceTraceReadObservation *observation)
 {
-    uint32_t end;
-    uint32_t earliest;
-    uint32_t sequence;
-    uint32_t count = 0;
+    uint32_t end = 0, earliest = 0;
+    uint32_t sequence = cursor ? cursor->next_sequence : 0;
+    uint32_t count = 0, blocked = 0, published_at_stop = 0;
+    const uint32_t before = sequence;
+    const uint64_t lost_before = cursor ? cursor->lost_events : 0;
+    JceTraceReadStop stop = JCE_TRACE_READ_INVALID_ARGS;
+    bool published_valid = false;
 
     if (!cursor || !out_events || max_events == 0)
-        return 0;
-    end = (uint32_t)SDL_GetAtomicInt(&s_write_sequence);
+        goto finished;
+    stop = JCE_TRACE_READ_CAUGHT_UP;
+    end = SDL_GetAtomicU32(&s_write_sequence);
+    if (end == UINT32_MAX) --end; /* The exhaustion sentinel has no event. */
     if (end == 0)
-        return 0;
+        goto finished;
     earliest = end >= TRACE_CAPACITY ? end - TRACE_CAPACITY + 1u : 1u;
-    sequence = cursor->next_sequence;
     if (sequence == 0)
         sequence = earliest;
     else if (sequence < earliest) {
@@ -429,25 +581,55 @@ uint32_t jce_trace_read(JceTraceCursor *cursor, JceTraceEvent *out_events,
 
     while (sequence <= end && count < max_events) {
         TraceSlot *slot = &s_slots[(sequence - 1u) & TRACE_MASK];
-        int published = SDL_GetAtomicInt(&slot->published);
-
-        SDL_MemoryBarrierAcquire();
-        if ((uint32_t)published == sequence) {
-            JceTraceEvent event = slot->event;
-            SDL_MemoryBarrierAcquire();
-            if ((uint32_t)SDL_GetAtomicInt(&slot->published) == sequence &&
-                event.sequence == sequence) {
-                out_events[count++] = event;
-            } else {
-                cursor->lost_events++;
-            }
+        /* A producer can reserve end before publishing its slot. Keep the
+         * cursor at busy/pending slots; never race a non-atomic event copy. */
+        if (!SDL_TryLockSpinlock(&slot->lock)) {
+            stop = JCE_TRACE_READ_SLOT_BUSY; blocked = sequence;
+            break;
+        }
+        uint32_t published = SDL_GetAtomicU32(&slot->published);
+        if (published == sequence) {
+            out_events[count++] = slot->event;
+        } else if (published < sequence) {
+            SDL_UnlockSpinlock(&slot->lock);
+            stop = JCE_TRACE_READ_RESERVED_PENDING; blocked = sequence;
+            published_at_stop = published; published_valid = true;
+            break;
         } else {
             cursor->lost_events++;
         }
+        SDL_UnlockSpinlock(&slot->lock);
         sequence++;
     }
+    if (stop == JCE_TRACE_READ_CAUGHT_UP && sequence <= end && count == max_events)
+        stop = JCE_TRACE_READ_BATCH_LIMIT;
     cursor->next_sequence = sequence;
+finished:
+    if (observation) {
+        observation->write_sequence = end;
+        observation->earliest_sequence = earliest;
+        observation->next_before = before;
+        observation->next_after = cursor ? cursor->next_sequence : 0;
+        observation->count = count;
+        observation->stop = stop;
+        observation->blocked_sequence = blocked;
+        observation->published_sequence = published_at_stop;
+        observation->published_valid = published_valid;
+        observation->lost_delta = cursor ? cursor->lost_events - lost_before : 0;
+    }
     return count;
+}
+
+uint32_t jce_trace_read(JceTraceCursor *cursor, JceTraceEvent *out_events,
+                        uint32_t max_events)
+{
+    return trace_read_impl(cursor, out_events, max_events, NULL);
+}
+
+uint32_t jce_trace_read_observed_internal(JceTraceCursor *cursor,
+    JceTraceEvent *events, uint32_t maximum, JceTraceReadObservation *observation)
+{
+    return trace_read_impl(cursor, events, maximum, observation);
 }
 
 void jce_trace_get_stats(JceTraceStats *out_stats)
@@ -457,7 +639,7 @@ void jce_trace_get_stats(JceTraceStats *out_stats)
     if (!out_stats)
         return;
     SDL_zero(*out_stats);
-    written = (uint32_t)SDL_GetAtomicInt(&s_write_sequence);
+    written = SDL_GetAtomicU32(&s_write_sequence);
     out_stats->enabled = jce_trace_enabled();
     out_stats->capacity = TRACE_CAPACITY;
     out_stats->resident_events =
@@ -497,6 +679,8 @@ static bool trace_json_reserve(TraceJsonBuffer *buffer, size_t extra)
     if (extra > SIZE_MAX - buffer->size)
         return false;
     need = buffer->size + extra;
+    if (buffer->limit && need > buffer->limit)
+        return false;
     if (need <= buffer->capacity)
         return true;
     capacity = buffer->capacity ? buffer->capacity : 4096u;
@@ -505,6 +689,8 @@ static bool trace_json_reserve(TraceJsonBuffer *buffer, size_t extra)
             return false;
         capacity *= 2u;
     }
+    if (buffer->limit && capacity > buffer->limit)
+        capacity = buffer->limit;
     grown = (char *)JCE_REALLOC(buffer->data, capacity);
     if (!grown)
         return false;
@@ -513,11 +699,10 @@ static bool trace_json_reserve(TraceJsonBuffer *buffer, size_t extra)
     return true;
 }
 
-static bool trace_json_append(TraceJsonBuffer *buffer, const char *text)
+static bool trace_json_append_n(TraceJsonBuffer *buffer, const char *text,
+                                size_t length)
 {
-    size_t length = SDL_strlen(text);
-
-    if (!trace_json_reserve(buffer, length + 1u))
+    if (length == SIZE_MAX || !trace_json_reserve(buffer, length + 1u))
         return false;
     SDL_memcpy(buffer->data + buffer->size, text, length);
     buffer->size += length;
@@ -525,18 +710,9 @@ static bool trace_json_append(TraceJsonBuffer *buffer, const char *text)
     return true;
 }
 
-static bool trace_json_append_format(TraceJsonBuffer *buffer,
-                                     const char *format,
-                                     unsigned long long a,
-                                     unsigned long long b,
-                                     unsigned long long c)
+static bool trace_json_append(TraceJsonBuffer *buffer, const char *text)
 {
-    char temp[384];
-    int length = SDL_snprintf(temp, sizeof(temp), format, a, b, c);
-
-    if (length < 0 || (size_t)length >= sizeof(temp))
-        return false;
-    return trace_json_append(buffer, temp);
+    return trace_json_append_n(buffer, text, SDL_strlen(text));
 }
 
 static bool trace_json_append_escaped(TraceJsonBuffer *buffer,
@@ -547,21 +723,27 @@ static bool trace_json_append_escaped(TraceJsonBuffer *buffer,
     if (!trace_json_append(buffer, "\""))
         return false;
     while (*cursor) {
+        const unsigned char *run = cursor;
+        while (*cursor && *cursor >= 0x20u && *cursor != '"' && *cursor != '\\')
+            ++cursor;
+        if (cursor != run &&
+            !trace_json_append_n(buffer, (const char *)run, (size_t)(cursor - run)))
+            return false;
+        if (!*cursor)
+            break;
         char temp[8];
-
+        size_t length;
         if (*cursor == '"' || *cursor == '\\') {
             temp[0] = '\\';
             temp[1] = (char)*cursor;
-            temp[2] = '\0';
-        } else if (*cursor < 0x20u) {
-            SDL_snprintf(temp, sizeof(temp), "\\u%04x", (unsigned)*cursor);
+            length = 2u;
         } else {
-            temp[0] = (char)*cursor;
-            temp[1] = '\0';
+            SDL_snprintf(temp, sizeof(temp), "\\u%04x", (unsigned)*cursor);
+            length = 6u;
         }
-        if (!trace_json_append(buffer, temp))
+        if (!trace_json_append_n(buffer, temp, length))
             return false;
-        cursor++;
+        ++cursor;
     }
     return trace_json_append(buffer, "\"");
 }
@@ -577,6 +759,105 @@ static const char *trace_category_name(JceTraceCategory category)
     case JCE_TRACE_CATEGORY_GPU_SCENE: return "gpu_scene";
     default:                           return "core";
     }
+}
+
+typedef struct TraceIntegerArgs {
+    char *data;
+    size_t size, capacity;
+} TraceIntegerArgs;
+
+static bool trace_integer_literal(TraceIntegerArgs *args, const char *text,
+                                   size_t length)
+{
+    if (!args || !args->data || args->size >= args->capacity ||
+        length > args->capacity - args->size - 1u)
+        return false;
+    for (size_t i = 0; i < length; ++i)
+        args->data[args->size++] = text[i];
+    args->data[args->size] = '\0';
+    return true;
+}
+
+static bool trace_integer_value(TraceIntegerArgs *args, uint64_t magnitude,
+                                 bool negative)
+{
+    char reversed[20];
+    size_t digits = 0;
+    do {
+        reversed[digits++] = (char)('0' + magnitude % UINT64_C(10));
+        magnitude /= UINT64_C(10);
+    } while (magnitude);
+    const size_t length = digits + (negative ? 1u : 0u);
+    if (!args || !args->data || args->size >= args->capacity ||
+        length > args->capacity - args->size - 1u)
+        return false;
+    if (negative) args->data[args->size++] = '-';
+    while (digits) args->data[args->size++] = reversed[--digits];
+    args->data[args->size] = '\0';
+    return true;
+}
+
+/* Only integer args use this checked scratch writer. The common timestamp
+ * printf remains untouched, including its double conversion and rounding. */
+static bool trace_json_append_integer_args(TraceJsonBuffer *json,
+    const JceTraceEvent *event, char *scratch, size_t capacity)
+{
+    TraceIntegerArgs args = {scratch, 0, capacity};
+    bool ok;
+#define TRACE_ARGS_LITERAL(text_) trace_integer_literal(&args, text_, sizeof(text_) - 1u)
+#define TRACE_ARGS_U64(value_) trace_integer_value(&args, (uint64_t)(value_), false)
+    if (event->type == JCE_TRACE_EVENT_TASK_SUBMIT) {
+        ok = TRACE_ARGS_LITERAL(",\"s\":\"t\",\"args\":{\"task\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->id) &&
+            TRACE_ARGS_LITERAL(",\"parent\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->parent_id) &&
+            TRACE_ARGS_LITERAL(",\"kind\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->value_u32[0]) &&
+            TRACE_ARGS_LITERAL("}}");
+    } else if (event->type == JCE_TRACE_EVENT_COUNTER) {
+        const int64_t value = (int64_t)event->value_u64;
+        const bool negative = value < 0;
+        /* Unsigned subtraction handles INT64_MIN without signed overflow. */
+        const uint64_t magnitude = negative ? UINT64_C(0) - (uint64_t)value : (uint64_t)value;
+        ok = TRACE_ARGS_LITERAL(",\"args\":{\"value\":") &&
+            trace_integer_value(&args, magnitude, negative) &&
+            TRACE_ARGS_LITERAL(",\"id\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->id) &&
+            TRACE_ARGS_LITERAL(",\"parent\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->parent_id) &&
+            TRACE_ARGS_LITERAL("}}");
+    } else if (event->type == JCE_TRACE_EVENT_TASK_END) {
+        ok = TRACE_ARGS_LITERAL(",\"args\":{\"id\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->id) &&
+            TRACE_ARGS_LITERAL(",\"parent\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->parent_id) &&
+            TRACE_ARGS_LITERAL(",\"ns\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->value_u64) &&
+            TRACE_ARGS_LITERAL(",\"state\":") &&
+            TRACE_ARGS_U64((unsigned)event->value_u32[0]) &&
+            TRACE_ARGS_LITERAL("}}");
+    } else if (event->type == JCE_TRACE_EVENT_TASK_BEGIN ||
+               event->type == JCE_TRACE_EVENT_WAIT_BEGIN ||
+               event->type == JCE_TRACE_EVENT_WAIT_END) {
+        ok = TRACE_ARGS_LITERAL(",\"args\":{\"id\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->id) &&
+            TRACE_ARGS_LITERAL(",\"parent\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->parent_id) &&
+            TRACE_ARGS_LITERAL(",\"ns\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->value_u64) &&
+            TRACE_ARGS_LITERAL("}}");
+    } else {
+        ok = TRACE_ARGS_LITERAL(",\"s\":\"t\",\"args\":{\"id\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->id) &&
+            TRACE_ARGS_LITERAL(",\"value\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->value_u64) &&
+            TRACE_ARGS_LITERAL(",\"aux\":") &&
+            TRACE_ARGS_U64((unsigned long long)event->value_u32[0]) &&
+            TRACE_ARGS_LITERAL("}}");
+    }
+#undef TRACE_ARGS_U64
+#undef TRACE_ARGS_LITERAL
+    return ok && trace_json_append_n(json, args.data, args.size);
 }
 
 static bool trace_export_event(TraceJsonBuffer *json,
@@ -625,8 +906,7 @@ static bool trace_export_event(TraceJsonBuffer *json,
         break;
     }
 
-    length = SDL_snprintf(prefix, sizeof(prefix), "{\"name\":");
-    if (length < 0 || !trace_json_append(json, prefix) ||
+    if (!trace_json_append(json, "{\"name\":") ||
         !trace_json_append_escaped(json, event_name))
         return false;
     length = SDL_snprintf(
@@ -639,59 +919,55 @@ static bool trace_export_event(TraceJsonBuffer *json,
         !trace_json_append(json, suffix))
         return false;
 
-    if (event->type == JCE_TRACE_EVENT_TASK_SUBMIT) {
-        if (!trace_json_append_format(
-                json,
-                ",\"s\":\"t\",\"args\":{\"task\":%llu,\"parent\":%llu,"
-                "\"kind\":%llu}}",
-                (unsigned long long)event->id,
-                (unsigned long long)event->parent_id,
-                (unsigned long long)event->value_u32[0]))
+    return trace_json_append_integer_args(json, event, suffix, sizeof(suffix));
+}
+
+uint32_t jce_trace_capture_generation(void)
+{
+    return (uint32_t)SDL_GetAtomicInt(&s_generation);
+}
+
+bool jce_trace_chrome_encode_batch_into(const JceTraceEvent *events,
+                                       uint32_t count, bool *first,
+                                       TraceJsonBuffer *json)
+{
+    bool next_first;
+    size_t original_size;
+    if (!events || !first || !json || json->size > json->capacity ||
+        (json->capacity && !json->data) ||
+        (json->limit && json->size > json->limit)) return false;
+    original_size = json->size;
+    next_first = *first;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!memchr(events[i].name, '\0', sizeof(events[i].name)) ||
+            !trace_export_event(json, &events[i], &next_first)) {
+            json->size = original_size;
+            if (json->data && json->capacity > original_size)
+                json->data[original_size] = '\0';
             return false;
-    } else if (event->type == JCE_TRACE_EVENT_COUNTER) {
-        length = SDL_snprintf(
-            suffix, sizeof(suffix),
-            ",\"args\":{\"value\":%lld,\"id\":%llu,\"parent\":%llu}}",
-            (long long)(int64_t)event->value_u64,
-            (unsigned long long)event->id,
-            (unsigned long long)event->parent_id);
-        if (length < 0 || (size_t)length >= sizeof(suffix) ||
-            !trace_json_append(json, suffix))
-            return false;
-    } else if (event->type == JCE_TRACE_EVENT_TASK_END) {
-        length = SDL_snprintf(
-            suffix, sizeof(suffix),
-            ",\"args\":{\"id\":%llu,\"parent\":%llu,\"ns\":%llu,"
-            "\"state\":%u}}",
-            (unsigned long long)event->id,
-            (unsigned long long)event->parent_id,
-            (unsigned long long)event->value_u64,
-            (unsigned)event->value_u32[0]);
-        if (length < 0 || (size_t)length >= sizeof(suffix) ||
-            !trace_json_append(json, suffix))
-            return false;
-    } else if (event->type == JCE_TRACE_EVENT_TASK_BEGIN ||
-               event->type == JCE_TRACE_EVENT_WAIT_BEGIN ||
-               event->type == JCE_TRACE_EVENT_WAIT_END) {
-        if (!trace_json_append_format(
-                json, ",\"args\":{\"id\":%llu,\"parent\":%llu,\"ns\":%llu}}",
-                (unsigned long long)event->id,
-                (unsigned long long)event->parent_id,
-                (unsigned long long)event->value_u64))
-            return false;
-    } else {
-        if (!trace_json_append_format(
-                json, ",\"s\":\"t\",\"args\":{\"id\":%llu,\"value\":%llu,"
-                "\"aux\":%llu}}",
-                (unsigned long long)event->id,
-                (unsigned long long)event->value_u64,
-                (unsigned long long)event->value_u32[0]))
-            return false;
+        }
     }
+    *first = next_first;
     return true;
 }
 
-bool jce_trace_export_chrome_json(const char *host_path)
+bool jce_trace_chrome_encode_batch(const JceTraceEvent *events, uint32_t count,
+                                  bool *first, char **text, size_t *size)
+{
+    TraceJsonBuffer json = {0};
+    if (!events || !first || !text || !size) return false;
+    *text = NULL;
+    *size = 0;
+    if (!jce_trace_chrome_encode_batch_into(events, count, first, &json)) {
+        JCE_FREE(json.data);
+        return false;
+    }
+    *text = json.data;
+    *size = json.size;
+    return true;
+}
+
+static bool trace_export_resident_impl(const char *host_path)
 {
     JceTraceEvent *events;
     JceTraceCursor cursor;
@@ -706,13 +982,13 @@ bool jce_trace_export_chrome_json(const char *host_path)
     bool first = true;
     bool ok;
 
-    if (!host_path || !host_path[0])
+    if (!host_path || !host_path[0] || !jce_trace_capture_valid_internal())
         return false;
     events = JCE_NEW_ARRAY(JceTraceEvent, TRACE_CAPACITY);
     if (!events)
         return false;
     generation = (uint32_t)SDL_GetAtomicInt(&s_generation);
-    recorded = (uint32_t)SDL_GetAtomicInt(&s_write_sequence);
+    recorded = SDL_GetAtomicU32(&s_write_sequence);
     overwritten = recorded > TRACE_CAPACITY ? recorded - TRACE_CAPACITY : 0;
     jce_trace_cursor_init(&cursor);
     /* Existing prefix coverage is separate from loss during this read. */
@@ -726,22 +1002,32 @@ bool jce_trace_export_chrome_json(const char *host_path)
     for (i = 0; ok && i < count; ++i)
         ok = trace_export_event(&json, &events[i], &first);
     if (ok) {
+        const bool sequence_valid = jce_trace_capture_valid_internal();
         length = SDL_snprintf(
             metadata, sizeof(metadata),
-            "],\"jceTrace\":{\"recorded\":%u,\"captured\":%u,"
+            "],\"jceTrace\":{\"capacity\":%u,\"recorded\":%u,\"captured\":%u,"
             "\"overwritten_before_capture\":%llu,\"cursor_lost\":%llu,"
-            "\"lost\":%llu,\"capture_generation_stable\":%s}}",
-            recorded, count, (unsigned long long)overwritten,
+            "\"lost\":%llu,\"capture_generation_stable\":%s,\"sequence_exhausted\":%s}}",
+            (unsigned)TRACE_CAPACITY, recorded, count, (unsigned long long)overwritten,
             (unsigned long long)cursor.lost_events,
             (unsigned long long)(overwritten + cursor.lost_events),
             generation == (uint32_t)SDL_GetAtomicInt(&s_generation)
-                ? "true" : "false");
-        ok = length >= 0 && (size_t)length < sizeof(metadata) &&
+                ? "true" : "false", sequence_valid ? "false" : "true");
+        ok = sequence_valid && length >= 0 && (size_t)length < sizeof(metadata) &&
             trace_json_append(&json, metadata);
     }
     if (ok)
-        ok = jce_fs_host_write_all(host_path, json.data, (uint64_t)json.size);
+        ok = jce_trace_capture_valid_internal() &&
+            jce_fs_host_write_all(host_path, json.data, (uint64_t)json.size);
     JCE_FREE(json.data);
     JCE_FREE(events);
+    return ok && jce_trace_capture_valid_internal();
+}
+
+bool jce_trace_export_chrome_json(const char *host_path)
+{
+    if (!jce_trace_suppress_begin()) return false;
+    bool ok = trace_export_resident_impl(host_path);
+    if (!jce_trace_suppress_end()) return false;
     return ok;
 }

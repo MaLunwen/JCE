@@ -31,9 +31,14 @@ THE RULE.  Every `jce_*_self_test` defined under engine/src/ has a call site
 outside its own file, or is listed in self_test_exempt.txt WITH A REASON on
 the same line.  A bare path with no reason is ignored, not honoured.
 
-SKIPPED, not failed, when tests/ is absent: on `main` the whole suite is
-gitignored, so a clean clone has no callers and there is nothing to have
-un-wired.  Same shape check_agents_md.py uses.
+UNAVAILABLE, not a pass, when engine/src/ or tests/ is absent. Missing source
+cannot certify that the self-tests have callers.
+
+The maintained working tree is enumerated through lint_git_files, including
+new untracked source and excluding ignored generated caches. One local index
+reads each source and strips its comments once for all queried symbols. It is
+never cached across invocations or repositories. This is a lexical caller
+gate, not proof that a test target executes the matched call.
 
 USAGE
     python tools/lint/check_self_tests_run.py
@@ -41,6 +46,7 @@ USAGE
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import sys
 from pathlib import Path
@@ -56,12 +62,57 @@ CALLER_TREES = ("tests", "editor/src", "tools", "engine/src")
 SUFFIXES = (".c", ".h", ".cpp", ".hpp")
 VENDOR = "/third_party/"
 
+_spec = importlib.util.spec_from_file_location(
+    "lint_git_files", Path(__file__).with_name("lint_git_files.py"))
+_lgf = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_lgf)
+
 # A DEFINITION: `<type> [JCE_CALL] jce_x_self_test(void)` with no trailing ';'.
 DEF_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_ *]*?\b(jce_[a-z0-9_]*_self_test)\s*\(\s*void\s*\)\s*$",
     re.M)
 
 EXIT_SKIPPED = 2
+CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+class SourceIndex:
+    """One maintained-source snapshot, owned by one checker invocation."""
+
+    def __init__(self) -> None:
+        self.definitions: dict[str, str] = {}
+        self.caller_files: dict[str, list[str]] = {}
+        self.unavailable_sources: list[str] = []
+
+
+def strip_comments(text: str) -> str:
+    text = re.sub("/[*].*?[*]/", " ", text, flags=re.S)
+    return re.sub("//[^" + chr(92) + "n]*", " ", text)
+
+
+def source_index() -> SourceIndex:
+    """Read publication candidates once; ignored caches are not callers."""
+    index = SourceIndex()
+    prefixes = tuple(tree + "/" for tree in CALLER_TREES)
+    for rel in sorted(_lgf.working_tree()):
+        if not rel.startswith(prefixes) or Path(rel).suffix not in SUFFIXES:
+            continue
+        if VENDOR in "/" + rel or "/vendor/" in "/" + rel:
+            continue
+        path = REPO_ROOT / rel
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            index.unavailable_sources.append(rel)
+            continue
+        if rel.startswith("engine/src/"):
+            for match in DEF_RE.finditer(text):
+                index.definitions.setdefault(match.group(1), rel)
+        for symbol in set(CALL_RE.findall(strip_comments(text))):
+            index.caller_files.setdefault(symbol, []).append(rel)
+    return index
 
 
 def load_exempt() -> dict[str, str]:
@@ -78,27 +129,13 @@ def load_exempt() -> dict[str, str]:
     return out
 
 
-def definitions() -> dict[str, str]:
+def definitions(index: SourceIndex | None = None) -> dict[str, str]:
     """{symbol: repo-relative file that defines it}."""
-    found: dict[str, str] = {}
-    if not ENGINE_SRC.is_dir():
-        return found
-    for p in ENGINE_SRC.rglob("*"):
-        if p.suffix not in SUFFIXES or not p.is_file():
-            continue
-        rel = p.relative_to(REPO_ROOT).as_posix()
-        if VENDOR in "/" + rel:
-            continue
-        try:
-            text = p.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for m in DEF_RE.finditer(text):
-            found.setdefault(m.group(1), rel)
-    return found
+    return (source_index() if index is None else index).definitions.copy()
 
 
-def callers(symbol: str, own_file: str) -> list[str]:
+def callers(symbol: str, own_file: str,
+            index: SourceIndex | None = None) -> list[str]:
     """Files OTHER than the definition's own that name the symbol.
 
     A self-declaration next to the definition -- `void jce_x_self_test(void);`
@@ -107,51 +144,37 @@ def callers(symbol: str, own_file: str) -> list[str]:
     missing-prototype warning, and silencing that warning is how a function
     with no caller stops looking like one.
     """
-    hits = []
     # A CALL, not a mention.  The first version matched the bare name and
     # counted jce_session.c:760 -- a comment reading "jce_lan_discovery_
     # self_test in jce_lan_discovery.h." -- as a caller, reporting 6 of 7
-    # wired when 5 were.  Comments are stripped below for the same reason:
+    # wired when 5 were.  Comments are stripped during indexing for this reason:
     # the call form still matches inside "call jce_x_self_test() from a debug
     # entry".  That is the failure mode this whole gate exists to prevent,
     # one level up.
-    pat = re.compile(r"\b%s\s*\(" % re.escape(symbol))
-    for tree in CALLER_TREES:
-        base = REPO_ROOT / tree
-        if not base.is_dir():
-            continue
-        for p in base.rglob("*"):
-            if p.suffix not in SUFFIXES or not p.is_file():
-                continue
-            rel = p.relative_to(REPO_ROOT).as_posix()
-            if rel == own_file or VENDOR in "/" + rel:
-                continue
-            try:
-                text = p.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            # Strip comments before matching: without this a doc line saying
-            # "call jce_x_self_test() from a debug entry" reads as a call.
-            text = re.sub("/[*].*?[*]/", " ", text, flags=re.S)
-            text = re.sub("//[^" + chr(92) + "n]*", " ", text)
-            if pat.search(text):
-                hits.append(rel)
-    return hits
+    snapshot = source_index() if index is None else index
+    return [rel for rel in snapshot.caller_files.get(symbol, ())
+            if rel != own_file]
 
 
 def main() -> int:
     if not ENGINE_SRC.is_dir():
-        print("self-test-run check: SKIPPED — engine/src is not present.")
+        print("self-test-run check: UNAVAILABLE — engine/src is not present.")
         return EXIT_SKIPPED
     if not (REPO_ROOT / "tests").is_dir():
-        print("self-test-run check: SKIPPED — tests/ is not present.  On "
-              "`main` the suite is gitignored, so a clean clone has no callers "
-              "and there is nothing to have un-wired.  This is NOT a pass.")
+        print("self-test-run check: UNAVAILABLE — tests/ is not present; "
+              "caller coverage cannot be verified. This is NOT a pass.")
         return EXIT_SKIPPED
 
-    defs = definitions()
+    index = source_index()
+    if index.unavailable_sources:
+        print("self-test-run check: UNAVAILABLE — could not read maintained "
+              "source; caller coverage cannot be verified:")
+        for rel in index.unavailable_sources:
+            print("  " + rel)
+        return EXIT_SKIPPED
+    defs = definitions(index)
     if not defs:
-        print("self-test-run check: SKIPPED — found 0 *_self_test definitions; "
+        print("self-test-run check: UNAVAILABLE — found 0 *_self_test definitions; "
               "the pattern no longer matches, fix the extractor before "
               "trusting this gate.")
         return EXIT_SKIPPED
@@ -160,7 +183,7 @@ def main() -> int:
     unwired: list[str] = []
     wired = 0
     for sym in sorted(defs):
-        if callers(sym, defs[sym]):
+        if callers(sym, defs[sym], index):
             wired += 1
         elif sym not in exempt:
             unwired.append("%s  (defined in %s)" % (sym, defs[sym]))

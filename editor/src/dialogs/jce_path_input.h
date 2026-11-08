@@ -76,6 +76,15 @@ struct JcePathInputOpts {
        lands on a button and the edit bypasses the widget's return value. */
     char  *dropped_raw = nullptr;
     size_t dropped_raw_size = 0;
+
+    /* Optional pre-edit value, written only when this call reports a change.
+     * Includes a browse result that changed the stable field before this call.
+     * Capacity must be at least buf_size; buf_size must fit the widget's
+     * 1024-byte change-detection slot. Invalid opted-in capacities reject the
+     * call before drawing or mutating anything. The output is NUL-terminated
+     * and is used only during this call, so a stack output buffer is safe. */
+    char  *changed_before = nullptr;
+    size_t changed_before_size = 0;
 };
 
 /* Draws label + InputText + "..." Browse button.

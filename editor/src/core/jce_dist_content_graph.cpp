@@ -1,16 +1,20 @@
 /* jce_dist_content_graph.cpp  Build one cooked graph, independent of container. */
 
 #include "jce_dist_content_graph.h"
+#include "jce_dist_name_policy.h"
+#include "jce_project_prepared_assets.h"
 
 extern "C" {
 #include <jce/application/jce_project.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/resource/jce_bundle_pack.h>
 }
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -18,12 +22,16 @@ namespace {
 struct GraphLogBridge {
     JceDistContentGraphLogFn fn = nullptr;
     void *user = nullptr;
+    std::string first_error;
 };
 
 void pack_log_bridge(JceBundlePackLogLevel level, const char *message,
                      void *user)
 {
     GraphLogBridge *bridge = (GraphLogBridge *)user;
+    if (bridge && level == JCE_BUNDLE_PACK_LOG_ERROR &&
+        bridge->first_error.empty() && message && message[0])
+        bridge->first_error = message; // Producer callback is bounded to 2047 bytes.
     if (bridge && bridge->fn)
         bridge->fn((int)level, message, bridge->user);
 }
@@ -44,6 +52,23 @@ std::string join_path(const std::string &base, const std::string &leaf)
     if (!result.empty() && !suffix.empty()) result += '/';
     result += suffix;
     return result;
+}
+
+/* Same address/normalization policy as the SDK tool's --shader-root port.
+ * The public packer calls this only after its existing VFS/project reads miss. */
+bool resolve_sdk_stock_shader(const char *vpath, char *out, size_t size, void *user)
+{
+    const char *root = static_cast<const char *>(user);
+    char normalized[1024];
+    if (!root || !vpath || jce_path_is_absolute(vpath) ||
+        !jce_path_normalize(normalized, sizeof(normalized), vpath))
+        return false;
+    const size_t length = std::strlen(normalized);
+    if (std::strncmp(normalized, "shaders/", 8) != 0 || length <= 12 ||
+        std::strcmp(normalized + length - 4, ".bin") != 0)
+        return false;
+    const int written = std::snprintf(out, size, "%s/%s", root, normalized + 8);
+    return written >= 0 && (size_t)written < size && jce_fs_host_exists_file(out);
 }
 
 bool fail(std::string *out_error, const std::string &message)
@@ -80,12 +105,40 @@ bool jce_dist_content_graph_build(const std::string &project_root,
                                   JceDistContentGraphLogFn log_fn,
                                   void *log_user,
                                   JceDistContentGraph *out_graph,
-                                  std::string *out_error)
+                                  std::string *out_error,
+                                  const std::string &sdk_root,
+                                  const std::string &prepared_root)
 {
     if (!out_graph)
         return fail(out_error, "Dist content graph output is null");
     *out_graph = JceDistContentGraph{};
+    if (out_error) out_error->clear();
 
+    // Match the SDK tool's explicit root resolution through the public facade.
+    // Relative UI paths use the actual launch CWD; the resolver always receives
+    // an absolute root, independent of whether an active editor VFS exists.
+    std::string stock_root;
+    if (!sdk_root.empty()) {
+        char absolute_sdk[1024], cwd[1024], joined[2048];
+        bool normalized;
+        if (jce_path_is_absolute(sdk_root.c_str())) {
+            normalized = jce_path_normalize(absolute_sdk, sizeof(absolute_sdk),
+                                             sdk_root.c_str());
+        } else {
+            normalized = jce_fs_host_get_current_dir(cwd, sizeof(cwd)) &&
+                jce_path_join(joined, sizeof(joined), cwd, sdk_root.c_str()) &&
+                jce_path_normalize(absolute_sdk, sizeof(absolute_sdk), joined);
+        }
+        if (!normalized || !jce_path_is_absolute(absolute_sdk))
+            return fail(out_error, "cannot resolve selected SDK root to an absolute host path");
+        stock_root = join_path(absolute_sdk, "share/jce/shaders");
+    }
+
+    // Bound the private declaration before the public project loader reads it.
+    std::vector<std::string> confidential_paths;
+    if (!jce_dist_name_policy_load(join_path(project_root, JCE_PROJECT_FILENAME),
+                                   &confidential_paths, out_error))
+        return false;
     JceProject *project = jce_project_load(project_root.c_str());
     if (!project)
         return fail(out_error, "cannot load project manifest for Dist content graph");
@@ -127,10 +180,20 @@ bool jce_dist_content_graph_build(const std::string &project_root,
     options.zstd_level = 3;
     options.cook_assets = true;
     options.target_platform = target_platform;
+    if (!stock_root.empty()) {
+        options.resolve_fn = resolve_sdk_stock_shader;
+        options.resolve_user = stock_root.data();
+    }
 
-    GraphLogBridge bridge{log_fn, log_user};
+    JceProjectPreparedAssets prepared;
+    if (!jce_project_prepared_assets_bind(project_root, &options, &prepared,
+                                          out_error, prepared_root))
+        return false;
+
+    GraphLogBridge bridge{log_fn, log_user, {}};
     if (jce_bundle_pack_run(&options, pack_log_bridge, &bridge) != 0)
-        return fail(out_error, "Dist content graph build failed");
+        return fail(out_error, "Dist content graph build failed" +
+            (bridge.first_error.empty() ? std::string() : ": " + bridge.first_error));
     if (!jce_fs_host_exists_file(bundle_path.c_str()) ||
         !jce_fs_host_exists_file(generated_snapshot.c_str())) {
         return fail(out_error,
@@ -213,5 +276,16 @@ bool jce_dist_content_graph_build(const std::string &project_root,
     }
     if (out_graph->assets.empty())
         return fail(out_error, "Dist content graph is empty");
+    for (const std::string &path : confidential_paths) {
+        const auto found = std::lower_bound(out_graph->assets.begin(), out_graph->assets.end(), path,
+            [](const JceDistContentGraphAsset &asset, const std::string &address) {
+                return asset.address < address;
+            });
+        if (found == out_graph->assets.end() || found->address != path) {
+            *out_graph = JceDistContentGraph{};
+            return fail(out_error, "confidential_asset_paths: address is not in selected graph: " + path);
+        }
+    }
+    out_graph->confidential_paths = std::move(confidential_paths);
     return true;
 }

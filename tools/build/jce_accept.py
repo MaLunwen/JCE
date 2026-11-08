@@ -35,12 +35,14 @@ Stages, in order, each PASS / FAIL / SKIP with a reason:
 Usage:
 
     python scripts/jce_accept.py --project examples/caged_kingdom
-    python scripts/jce_accept.py --project space --bundle dist/games/... --skip-package
+    python scripts/jce_accept.py --project space --bundle dist/apps/<app>/<platform>-<arch>-<variant> --skip-package
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
+import importlib.util
 import json
 import os
 import shutil
@@ -112,14 +114,72 @@ def read_manifest(project: Path) -> dict:
         return {}
 
 
-def newest_bundle(project: Path):
-    games = project / "dist" / "games"
-    if not games.is_dir():
-        return None
-    dirs = [d for d in games.iterdir() if d.is_dir()]
-    if not dirs:
-        return None
-    return max(dirs, key=lambda d: d.stat().st_mtime)
+@functools.lru_cache(maxsize=1)
+def _build_driver():
+    """Reuse target aliases/platform tags; never create another target table."""
+    path = REPO_ROOT / "tools/build/jce.py"
+    spec = importlib.util.spec_from_file_location("jce_accept_build_driver", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _package_leaf(value, label):
+    if (not isinstance(value, str) or not value or value in (".", "..") or
+            any(c in value for c in "/\\:") or any(ord(c) < 32 for c in value)):
+        raise ValueError("invalid package " + label)
+    return value
+
+
+def _legacy_stamp_matches(directory, expected):
+    """A compatibility declaration, not executable architecture/ABI evidence."""
+    try:
+        with (directory / "VERSION.txt").open("rb") as stream:
+            raw = stream.read(16385)
+        if len(raw) > 16384:
+            return False
+        fields = {}
+        for line in raw.decode("utf-8").splitlines():
+            key, sep, value = line.partition(":")
+            key = key.strip()
+            if not sep or key in fields:
+                return False
+            fields[key] = value.strip()
+        return all(fields.get(key) == value for key, value in expected.items())
+    except (OSError, UnicodeError):
+        return False
+
+
+def select_bundle(project: Path, manifest: dict, arch=None, variant="release", explicit=None):
+    """Select only the requested target/variant; mtime is not artifact identity."""
+    if explicit:
+        return Path(explicit).resolve(), "explicit --bundle; relocation and runtime validation still required"
+    if variant not in ("debug", "release", "dist"):
+        raise ValueError("unsupported acceptance variant: " + str(variant))
+    driver = _build_driver()
+    target = driver.resolve_target(arch)
+    name = _package_leaf(manifest.get("name") or project.name, "name")
+    # Editor package platform names match maintained preset platform prefixes;
+    # SDK_TAG retains the historical platform spelling without an alias table.
+    platform = target["preset_stem"].rsplit("-", 1)[0]
+    tags = dict.fromkeys((platform, driver.SDK_TAG[target["host"]]))
+    candidates = [project / "dist/apps" / name /
+                  (tag + "-" + target["arch"] + "-" + variant) for tag in tags]
+    matches = [path for path in candidates if path.is_dir() and find_exe(path)]
+    if len(matches) > 1:
+        raise ValueError("multiple modern artifacts match the requested target; use --bundle explicitly")
+    if matches:
+        return matches[0], "modern dist/apps artifact: " + platform + "/" + target["arch"] + "/" + variant
+
+    version = _package_leaf(manifest.get("version") or "0.0.0", "version")
+    legacy_tag = driver.SDK_TAG[target["host"]]
+    legacy = project / "dist/games" / (name + "-" + version + "-" + legacy_tag + "-" + target["arch"])
+    expected = {"name": name, "version": version, "platform": legacy_tag,
+                "arch": target["arch"], "variant": variant}
+    if legacy.is_dir() and find_exe(legacy) and _legacy_stamp_matches(legacy, expected):
+        return legacy, "WARN: legacy dist/games compatibility artifact; no matching modern dist/apps artifact; VERSION target/variant declaration matched"
+    return None, "no artifact for " + platform + "/" + target["arch"] + "/" + variant + "; use --bundle for an explicit existing package"
 
 
 def find_exe(bundle: Path):
@@ -345,10 +405,11 @@ def stage_perf(rep, combined, budget):
         st.detail = ("no steady-state perf line -- the run either never got "
                      "there or JCE_PERF_LOG was not set")
         return
-    summary = ("%.2f ms / %d fps, cpu %.1f / gpu %.1f, %d draws, rss %d MB "
+    rss = "N/A" if s["rss_mb"] is None else str(s["rss_mb"])
+    summary = ("%.2f ms / %d fps, cpu %.1f / gpu %.1f, %d draws, rss %s MiB "
                "(last of %d samples)"
                % (s["frame_ms"], s["fps"], s["cpu_ms"], s["gpu_ms"],
-                  s["draws"], s["rss_mb"], s["samples"]))
+                  s["draws"], rss, s["samples"]))
 
     # BUDGETS.  Until 2026-09-01 this stage ended at PASS unconditionally: it
     # parsed six numbers and printed them as prose, so ANY number passed and the
@@ -371,13 +432,18 @@ def stage_perf(rep, combined, budget):
         over.append("%d draws > %d ceiling -- for a fixed scene this is a "
                     "property of the renderer, not the machine"
                     % (s["draws"], budget["draws"]))
-    if s["rss_mb"] > budget["rss_mb"]:
-        over.append("rss %d MB > %d MB ceiling (512 MB charter)"
+    rss_unavailable = s["rss_mb"] is None
+    if not rss_unavailable and s["rss_mb"] > budget["rss_mb"]:
+        over.append("rss %d MiB > %d MiB ceiling (512 MiB charter)"
                     % (s["rss_mb"], budget["rss_mb"]))
 
-    if over:
+    if over or rss_unavailable:
         st.state = FAIL
-        st.detail = summary + " -- OVER: " + "; ".join(over)
+        reasons = ["OVER: " + "; ".join(over)] if over else []
+        if rss_unavailable:
+            reasons.append("UNVERIFIED: RSS unavailable; cannot verify the %d MiB ceiling"
+                           % budget["rss_mb"])
+        st.detail = summary + " -- " + "; ".join(reasons)
         return
     st.state = PASS
     st.detail = summary
@@ -458,8 +524,8 @@ def main(argv=None):
                          "absolute).  Required: this tool knows no project by "
                          "name.")
     ap.add_argument("--bundle", default=None,
-                    help="an already-staged bundle; default is the newest "
-                         "under <project>/dist/games")
+                    help="an explicit staged directory; otherwise select the requested "
+                         "arch/variant under dist/apps, with declared legacy compatibility")
     ap.add_argument("--skip-package", action="store_true",
                     help="do not cook/build/stage; accept an existing bundle")
     ap.add_argument("--arch", default=None)
@@ -499,7 +565,15 @@ def main(argv=None):
     rep = Report()
     stage_package(rep, project, args.arch, args.variant, args.skip_package)
 
-    bundle = Path(args.bundle).resolve() if args.bundle else newest_bundle(project)
+    selection = rep.stage("artifact_selection")
+    try:
+        bundle, detail = select_bundle(project, manifest, args.arch, args.variant, args.bundle)
+        selection.state = PASS if bundle is not None else FAIL
+        selection.detail = detail
+    except ValueError as error:
+        bundle = None
+        selection.state = FAIL
+        selection.detail = str(error)
     dest = stage_relocation(rep, bundle, args.keep)
     exe, combined, shot = stage_boot(rep, dest, args.frames, args.backend)
     stage_scene(rep, combined, manifest)

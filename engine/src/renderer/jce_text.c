@@ -13,6 +13,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/resource/jce_archive.h>
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>
@@ -20,6 +21,7 @@
 
 #include "jce_renderer_internal.h"
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <ft2build.h>
@@ -31,15 +33,110 @@
 #include <hb-ft.h>
 #include <hb.h>
 #include <string.h>
+#include <limits.h>
 
 #define LOG_TAG "jce_text"
 
-static FT_Library s_ft_lib = NULL;
+/* Live references only, inside the existing single-thread font subsystem.
+ * Each FT/HB face stays independent; only immutable source bytes are shared. */
+typedef struct FontBytes {
+    struct FontBytes *next;
+    void *data;
+    size_t size;
+    uint64_t hash, refs, serial;
+} FontBytes;
+static struct {
+    FT_Library library;
+    int next_sdf_spread;
+    FontBytes *blobs;
+    uint64_t unique_bytes, references, next_serial;
+    uint32_t failures_reported;
+} s_text;
+
+static void font_bytes_trace(JceTraceScope scope, uint64_t serial,
+                              uint64_t refs, unsigned operation, unsigned reason)
+{
+    if (!scope.id) return;
+#define BLOB_COUNTER(name, value) jce_trace_counter_scoped_internal( \
+    JCE_TRACE_CATEGORY_RENDER, name, (int64_t)(value), scope.id, scope.parent)
+    BLOB_COUNTER("font.blob.identity", serial);
+    BLOB_COUNTER("font.blob.operation", operation);
+    BLOB_COUNTER("font.blob.references", refs);
+    BLOB_COUNTER("font.blob.live.references", s_text.references);
+    BLOB_COUNTER("font.blob.unique.live.bytes", s_text.unique_bytes);
+    BLOB_COUNTER("font.blob.rejection", reason);
+#undef BLOB_COUNTER
+    jce_trace_scope_end(scope, reason ? JCE_TRACE_TASK_FAILED : JCE_TRACE_TASK_SUCCEEDED);
+}
+
+static void font_bytes_reject(JceTraceScope scope, unsigned reason)
+{
+    const uint32_t bit = 1u << reason;
+    if (!(s_text.failures_reported & bit)) {
+        s_text.failures_reported |= bit;
+        LOG_WARN(LOG_TAG, "font phase=source_blob_rejected reason=%u unique_bytes=%llu refs=%llu",
+                 reason, (unsigned long long)s_text.unique_bytes,
+                 (unsigned long long)s_text.references);
+    }
+    font_bytes_trace(scope, 0, 0, 0, reason);
+}
+
+/* Consumes the owned input on every path. A path, PAK hash or mount identity
+ * cannot bypass reading current bytes; content hash collisions require memcmp. */
+static FontBytes *font_bytes_acquire(void *data, size_t size)
+{
+    JceTraceScope scope = jce_trace_scope_begin("font.blob.acquire");
+    if (!data || !size || size > LONG_MAX) {
+        JCE_FREE(data); font_bytes_reject(scope, 1); return NULL;
+    }
+    const uint64_t hash = jce_archive_content_hash(data, size);
+    for (FontBytes *blob = s_text.blobs; blob; blob = blob->next) {
+        if (blob->size == size && blob->hash == hash && !memcmp(blob->data, data, size)) {
+            if (blob->refs == INT64_MAX || s_text.references == INT64_MAX) {
+                JCE_FREE(data); font_bytes_reject(scope, 2); return NULL;
+            }
+            ++blob->refs; ++s_text.references;
+            JCE_FREE(data);
+            font_bytes_trace(scope, blob->serial, blob->refs, 2, 0);
+            return blob;
+        }
+    }
+    if (s_text.references == INT64_MAX || s_text.next_serial == INT64_MAX ||
+        (uint64_t)size > (uint64_t)INT64_MAX - s_text.unique_bytes) {
+        JCE_FREE(data); font_bytes_reject(scope, 2); return NULL;
+    }
+    FontBytes *blob = JCE_CALLOC(1, sizeof(*blob));
+    if (!blob) { JCE_FREE(data); font_bytes_reject(scope, 3); return NULL; }
+    blob->data = data; blob->size = size; blob->hash = hash; blob->refs = 1;
+    blob->serial = ++s_text.next_serial;
+    blob->next = s_text.blobs; s_text.blobs = blob;
+    s_text.unique_bytes += size; ++s_text.references;
+    font_bytes_trace(scope, blob->serial, blob->refs, 1, 0);
+    return blob;
+}
+
+static void font_bytes_release(FontBytes *blob)
+{
+    if (!blob) return;
+    JceTraceScope scope = jce_trace_scope_begin("font.blob.release");
+    FontBytes **link = &s_text.blobs;
+    while (*link && *link != blob) link = &(*link)->next;
+    if (!*link || !blob->refs || !s_text.references || s_text.unique_bytes < blob->size) {
+        font_bytes_reject(scope, 4); return;
+    }
+    --blob->refs; --s_text.references;
+    const uint64_t serial = blob->serial, refs = blob->refs;
+    if (!refs) {
+        *link = blob->next; s_text.unique_bytes -= blob->size;
+        JCE_FREE(blob->data); JCE_FREE(blob);
+    }
+    font_bytes_trace(scope, serial, refs, refs ? 3 : 4, 0);
+}
 
 static bool ensure_ft_init(void)
 {
-    if (s_ft_lib) return true;
-    FT_Error err = FT_Init_FreeType(&s_ft_lib);
+    if (s_text.library) return true;
+    FT_Error err = FT_Init_FreeType(&s_text.library);
     if (err) {
         LOG_ERROR(LOG_TAG, "FT_Init_FreeType failed: error %d", err);
         return false;
@@ -87,7 +184,7 @@ struct JceFont {
     /* FreeType / HarfBuzz handles kept alive for shaping. */
     FT_Face     ft_face;
     hb_font_t  *hb_font;
-    void       *font_data;            /* decompressed TTF kept for FT */
+    FontBytes  *font_data;            /* shared immutable source reference */
     /* Dynamic overflow atlas (lazily created on first miss). */
     JceTexture  dyn_atlas;
     uint8_t    *dyn_pixels;           /* CPU mirror (DYN_ATLAS_DIM^2 * 4)   */
@@ -97,6 +194,7 @@ struct JceFont {
     int         dyn_pen_x, dyn_pen_y; /* shelf packer cursor                */
     int         dyn_row_h;            /* current shelf row height           */
     bool        dyn_full;            /* atlas exhausted (stop rasterizing)  */
+    uint32_t    dyn_failure_logged;  /* once per transient failure stage    */
     /* 0 = the glyph bitmaps hold COVERAGE (what a font has always held here).
      * > 0 = they hold a signed DISTANCE FIELD with this spread in pixels, so
      * one atlas stays crisp at any size instead of softening as it is scaled
@@ -207,13 +305,11 @@ bool jce_font_add_fallback(JceFont *font, JceFont *fallback)
  * is rasterised during open.  Same shape as jce_ui_canvas_set_default_font,
  * which this subsystem already uses for a process-scoped authoring choice.
  * 0 restores the bitmap path. */
-static int s_next_sdf_spread = 0;
-
 void jce_font_set_sdf_spread(int spread_px)
 {
     if (spread_px < 0)  spread_px = 0;
     if (spread_px > 64) spread_px = 64;   /* FreeType's own ceiling */
-    s_next_sdf_spread = spread_px;
+    s_text.next_sdf_spread = spread_px;
 }
 
 int jce_font_sdf_spread(const JceFont *font)
@@ -305,6 +401,24 @@ static FT_Error text_render_glyph(FT_Face face, uint32_t cp, int spread)
  * creating the atlas on first use.  Re-uploads the CPU mirror after packing
  * (rare — only on the first appearance of each new codepoint).  Returns the
  * cached GlyphInfo (dynamic=1) or NULL if the atlas is full / render failed. */
+enum {
+    FONT_DYN_FAIL_PIXELS = 1u,
+    FONT_DYN_FAIL_MAP = 2u,
+    FONT_DYN_FAIL_TEXTURE = 4u,
+    FONT_DYN_FAIL_UPDATE = 8u
+};
+
+static void font_dynamic_failure(JceFont *font, uint32_t cp, uint32_t reason,
+                                  const char *phase, const char *detail)
+{
+    if (font->dyn_failure_logged & reason) return;
+    font->dyn_failure_logged |= reason;
+    LOG_WARN(LOG_TAG, "font phase=%s reason=%s font=%p atlas=%u cp=U+%08X face=%s",
+              phase, detail, (void *)font, (unsigned)font->atlas.idx,
+              (unsigned)cp, font->ft_face->family_name
+                  ? font->ft_face->family_name : "<unknown>");
+}
+
 static const GlyphInfo *font_render_dynamic_glyph(JceFont *font, uint32_t cp)
 {
     if (font->dyn_full || !font->ft_face)
@@ -313,16 +427,31 @@ static const GlyphInfo *font_render_dynamic_glyph(JceFont *font, uint32_t cp)
     if (!font->dyn_pixels) {
         font->dyn_pixels = (uint8_t *)JCE_CALLOC(
             1, (size_t)DYN_ATLAS_DIM * DYN_ATLAS_DIM * 4u);
-        if (!font->dyn_pixels) { font->dyn_full = true; return NULL; }
+        if (!font->dyn_pixels) {
+            font_dynamic_failure(font, cp, FONT_DYN_FAIL_PIXELS,
+                                   "dynamic_pixels", "allocation");
+            return NULL;
+        }
         font->dyn_cap = 256;
         font->dyn_map = (GlyphEntry *)JCE_CALLOC(font->dyn_cap,
                                                  sizeof(GlyphEntry));
         if (!font->dyn_map) {
             JCE_FREE(font->dyn_pixels); font->dyn_pixels = NULL;
-            font->dyn_full = true; return NULL;
+            font->dyn_cap = 0;
+            font_dynamic_failure(font, cp, FONT_DYN_FAIL_MAP,
+                                   "dynamic_map", "allocation");
+            return NULL;
         }
         font->dyn_atlas = jce_texture_from_rgba(font->dyn_pixels,
                                                 DYN_ATLAS_DIM, DYN_ATLAS_DIM);
+        if (!jce_texture_valid(font->dyn_atlas)) {
+            JCE_FREE(font->dyn_map); font->dyn_map = NULL;
+            JCE_FREE(font->dyn_pixels); font->dyn_pixels = NULL;
+            font->dyn_cap = 0;
+            font_dynamic_failure(font, cp, FONT_DYN_FAIL_TEXTURE,
+                                   "dynamic_texture", "creation");
+            return NULL;
+        }
         font->dyn_pen_x = 0; font->dyn_pen_y = 0; font->dyn_row_h = 0;
     }
     if (font->dyn_count + 1 >= font->dyn_cap) { /* keep load factor < 1 */
@@ -335,19 +464,21 @@ static const GlyphInfo *font_render_dynamic_glyph(JceFont *font, uint32_t cp)
     int bw = (int)slot->bitmap.width;
     int bh = (int)slot->bitmap.rows;
 
-    /* Shelf packer: advance to a new row when the current one is full. */
-    if (font->dyn_pen_x + bw + 1 > DYN_ATLAS_DIM) {
-        font->dyn_pen_y += font->dyn_row_h + 1;
-        font->dyn_pen_x = 0;
-        font->dyn_row_h = 0;
+    /* Stage the shelf cursor locally. A rejected upload must not publish
+     * a glyph or consume capacity that a later retry can still use. */
+    int gx = font->dyn_pen_x, gy = font->dyn_pen_y;
+    int row_h = font->dyn_row_h;
+    if (gx + bw + 1 > DYN_ATLAS_DIM) {
+        gy += row_h + 1;
+        gx = 0;
+        row_h = 0;
     }
-    if (font->dyn_pen_y + bh + 1 > DYN_ATLAS_DIM) {
+    if (gy + bh + 1 > DYN_ATLAS_DIM) {
         font->dyn_full = true;               /* atlas exhausted */
         LOG_WARN(LOG_TAG, "dynamic glyph atlas full (cp U+%04X)", cp);
         return NULL;
     }
 
-    int gx = font->dyn_pen_x, gy = font->dyn_pen_y;
     for (int r = 0; r < bh; r++) {
         for (int c = 0; c < bw; c++) {
             uint8_t a = slot->bitmap.buffer[r * (int)slot->bitmap.pitch + c];
@@ -359,8 +490,19 @@ static const GlyphInfo *font_render_dynamic_glyph(JceFont *font, uint32_t cp)
             font->dyn_pixels[off + 3] = a;
         }
     }
-    if (bh > font->dyn_row_h) font->dyn_row_h = bh;
-    font->dyn_pen_x += bw + 1;
+
+    /* The submitted mirror owns no new glyph until the texture API accepts
+     * the update. The staged region was unused; restore it to transparent
+     * on failure so CPU pixels still match the admitted atlas contents. */
+    if (!jce_texture_update_rgba(font->dyn_atlas, font->dyn_pixels,
+                                  DYN_ATLAS_DIM, DYN_ATLAS_DIM)) {
+        for (int r = 0; r < bh; ++r)
+            memset(font->dyn_pixels + ((size_t)(gy + r) * DYN_ATLAS_DIM
+                   + (size_t)gx) * 4u, 0, (size_t)bw * 4u);
+        font_dynamic_failure(font, cp, FONT_DYN_FAIL_UPDATE,
+                               "dynamic_upload", "rejected");
+        return NULL;
+    }
 
     GlyphInfo g;
     memset(&g, 0, sizeof(g));
@@ -375,11 +517,9 @@ static const GlyphInfo *font_render_dynamic_glyph(JceFont *font, uint32_t cp)
     g.v1 = (float)(gy + bh) / (float)DYN_ATLAS_DIM;
     glyph_map_insert(font->dyn_map, font->dyn_cap, cp, &g);
     font->dyn_count++;
-
-    /* Re-upload the CPU mirror (one full 1 MiB update per NEW codepoint —
-     * amortizes to zero once a string's glyphs are cached). */
-    jce_texture_update_rgba(font->dyn_atlas, font->dyn_pixels,
-                            DYN_ATLAS_DIM, DYN_ATLAS_DIM);
+    font->dyn_row_h = bh > row_h ? bh : row_h;
+    font->dyn_pen_x = gx + bw + 1;
+    font->dyn_pen_y = gy;
     return glyph_map_find(font->dyn_map, font->dyn_cap, cp);
 }
 
@@ -400,6 +540,7 @@ static const GlyphInfo *font_get_or_render_glyph(JceFont *font, uint32_t cp)
 /* -- Atlas construction -------------------------------------------- */
 
 static JceTexture build_atlas(FT_Face face, JceFont *font,
+                               const char *source_label,
                                const uint32_t *extra_cps, int extra_count)
 {
     int total = GLYPH_COUNT + extra_count;
@@ -436,6 +577,12 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
         if (bw > 0 && bh > 0) {
             size_t sz = (size_t)(bw * bh);
             bitmaps[i] = (uint8_t *)JCE_MALLOC(sz);
+            if (!bitmaps[i]) {
+                LOG_ERROR(LOG_TAG, "font phase=static_bitmap reason=allocation "
+                          "source=%s font=%p cp=U+%08X bytes=%zu",
+                          source_label, (void *)font, (unsigned)cp, sz);
+                goto cleanup;
+            }
             if (bitmaps[i]) {
                 /* FreeType bitmap may have padding; copy row by row. */
                 for (int r = 0; r < bh; r++) {
@@ -572,6 +719,7 @@ JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
         LOG_ERROR(LOG_TAG, "font not found in PAK: %s", asset_path);
         return NULL;
     }
+    if (!asset->original_size || asset->original_size > LONG_MAX) return NULL;
 
     /* Decompress from PAK. */
     LOG_DEBUG(LOG_TAG, "decompressing %s (%llu bytes)", asset_path,
@@ -580,7 +728,7 @@ JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
     if (!buf) return NULL;
 
     size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) {
+    if (n != (size_t)asset->original_size) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
         JCE_FREE(buf);
         return NULL;
@@ -599,7 +747,7 @@ JceFont *jce_font_open_mem_ex(const void *data, size_t size, const char *label,
                               float pt_size, const uint32_t *extra_cps,
                               int extra_count)
 {
-    if (!data || size == 0) return NULL;
+    if (!data || size == 0 || size > LONG_MAX) return NULL;
     if (!ensure_ft_init()) return NULL;
     void *buf = JCE_MALLOC(size);
     if (!buf) return NULL;
@@ -608,25 +756,25 @@ JceFont *jce_font_open_mem_ex(const void *data, size_t size, const char *label,
                                  pt_size, extra_cps, extra_count);
 }
 
-/* Build a JceFont from an in-memory TTF/OTF blob.  Takes ownership of `buf`
-   (engine-internal allocation) in every path — FreeType keeps referencing it
-   for the font's lifetime, so it is stored on the font and released by
-   jce_font_close. */
+/* Consume owned source bytes, then acquire an immutable reference. FreeType
+ * receives these bytes but each font has its own face, size and HB state. */
 static JceFont *font_open_from_memory(void *buf, size_t size,
                                       const char *label, float pt_size,
                                       const uint32_t *extra_cps,
                                       int extra_count)
 {
+    FontBytes *source = font_bytes_acquire(buf, size);
+    if (!source) return NULL;
     LOG_DEBUG(LOG_TAG, "FT_New_Memory_Face: %s (%zu bytes)", label, size);
     FT_Face face;
-    FT_Error err = FT_New_Memory_Face(s_ft_lib,
-                                       (const FT_Byte *)buf,
+    FT_Error err = FT_New_Memory_Face(s_text.library,
+                                       (const FT_Byte *)source->data,
                                        (FT_Long)size,
                                        0, &face);
     if (err) {
         LOG_ERROR(LOG_TAG, "FT_New_Memory_Face failed for %s: error %d",
                   label, err);
-        JCE_FREE(buf);
+        font_bytes_release(source);
         return NULL;
     }
 
@@ -636,23 +784,23 @@ static JceFont *font_open_from_memory(void *buf, size_t size,
     JceFont *font = (JceFont *)JCE_CALLOC(1, sizeof(*font));
     if (!font) {
         FT_Done_Face(face);
-        JCE_FREE(buf);
+        font_bytes_release(source);
         return NULL;
     }
 
     font->ft_face   = face;
-    font->font_data = buf; /* keep alive — FreeType references it */
+    font->font_data = source; /* keep alive until after FT_Done_Face */
     /* Captured HERE, not read at draw time: build_atlas below rasterises with
      * it, so a font that changed its mind later would have an atlas that
      * disagreed with its own shader. */
-    font->sdf_spread = s_next_sdf_spread;
+    font->sdf_spread = s_text.next_sdf_spread;
     if (font->sdf_spread > 0) {
         /* FreeType s SDF renderer takes its spread as a module property, not
          * a per-call argument, so it is set per open rather than per glyph.
          * A failure here is not fatal: the module keeps its default spread
          * and the glyphs are still a distance field, just a different one. */
         FT_Int spread = (FT_Int)font->sdf_spread;
-        FT_Property_Set(s_ft_lib, "sdf", "spread", &spread);
+        FT_Property_Set(s_text.library, "sdf", "spread", &spread);
     }
     font->line_height = (int)(face->size->metrics.height >> 6);
     font->ascender    = (int)(face->size->metrics.ascender >> 6);
@@ -666,7 +814,7 @@ static JceFont *font_open_from_memory(void *buf, size_t size,
     font->hb_font = hb_ft_font_create_referenced(face);
 
     LOG_DEBUG(LOG_TAG, "building atlas: %s", label);
-    font->atlas = build_atlas(face, font,
+    font->atlas = build_atlas(face, font, label,
                                extra_cps, extra_count < 0 ? 0 : extra_count);
 
     if (!jce_texture_valid(font->atlas)) {
@@ -674,7 +822,7 @@ static JceFont *font_open_from_memory(void *buf, size_t size,
         hb_font_destroy(font->hb_font);
         FT_Done_Face(face);
         JCE_FREE(font->extra);
-        JCE_FREE(buf);
+        font_bytes_release(source);
         JCE_FREE(font);
         return NULL;
     }
@@ -698,7 +846,7 @@ JceFont *jce_font_open_file_ex(const char *host_path, float pt_size,
     if (!ensure_ft_init()) return NULL;
     uint64_t size = 0;
     void *buf = jce_fs_host_read_all(host_path, &size);
-    if (!buf || size == 0) {
+    if (!buf || size == 0 || size > LONG_MAX) {
         JCE_FREE(buf);
         return NULL;
     }
@@ -722,7 +870,7 @@ void jce_font_close(JceFont *font)
     JCE_FREE(font->extra);
     JCE_FREE(font->dyn_map);
     JCE_FREE(font->dyn_pixels);
-    JCE_FREE(font->font_data);
+    font_bytes_release(font->font_data);
     JCE_FREE(font);
 }
 
@@ -747,10 +895,13 @@ void jce_text_shutdown(void)
                      100.0 * (double)hits / (double)(hits + misses));
     }
     jce_text_shape_shutdown();
-    if (s_ft_lib) {
-        FT_Done_FreeType(s_ft_lib);
-        s_ft_lib = NULL;
+    /* The existing contract requires all fonts closed before shutdown.
+     * Blob counters/list are not cleared here to fabricate release closure. */
+    if (s_text.library) {
+        FT_Done_FreeType(s_text.library);
+        s_text.library = NULL;
     }
+    s_text.failures_reported = 0;
 }
 
 void jce_text_draw(const JceRenderer *r, JceFont *font,
@@ -1417,7 +1568,11 @@ void jce_text_measure_math(const JceFont *font, const char *markup,
     math_ctx_init(&m, NULL, (JceFont *)font, 0u, 0u, false);
     MBox b = math_run(&m, markup, strlen(markup), 0.0f, 0.0f, 1.0f);
     if (out_w) *out_w = b.w;
-    if (out_h) *out_h = (float)font->line_height;
+    if (out_h) {
+        float height = b.ascent + b.descent;
+        if (height < (float)font->line_height) height = (float)font->line_height;
+        *out_h = height;
+    }
 }
 
 void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
@@ -1427,9 +1582,13 @@ void jce_text_draw_math_view(const JceRenderer *r, JceFont *font,
     if (!r || !font || !markup || !jce_texture_valid(font->atlas)) return;
     MathCtx m;
     math_ctx_init(&m, r, font, view_id, color, true);
-    /* y is the line's top (canvas convention); shift to a baseline so
-     * ascenders sit inside the line box. */
-    float baseline = y + (float)font->ascender * scale;
+    /* y is the formula's top. A tall numerator may exceed the font's
+     * ascender, so derive the baseline from the same formula metrics used
+     * by measurement instead of letting it extend above the line box. */
+    m.draw = false;
+    MBox box = math_run(&m, markup, strlen(markup), 0.0f, 0.0f, scale);
+    m.draw = true;
+    float baseline = y + box.ascent;
     (void)math_run(&m, markup, strlen(markup), x, baseline, scale);
     math_flush(&m);
 }

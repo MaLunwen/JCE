@@ -14,6 +14,7 @@
 #include <jce/os/platform/jce_mmap.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_pak_mount_internal.h"
 
 #include <cjson/cJSON.h>
 #include <xxhash.h>
@@ -240,7 +241,8 @@ static const char *runtime_target_profile(void)
 
 static bool content_contract_compatible(const cJSON *root,
                                         uint32_t contract_minor,
-                                        const char *source_label)
+                                        const char *source_label,
+                                        const char *expected_target)
 {
     if (contract_minor < 1u) return true;
 
@@ -267,11 +269,10 @@ static bool content_contract_compatible(const cJSON *root,
                   source_label ? source_label : "(memory)");
         return false;
     }
-    const char *runtime_target = runtime_target_profile();
     if (strcmp(target->valuestring, "auto") != 0 &&
-        strcmp(target->valuestring, runtime_target) != 0) {
-        LOG_ERROR("jce_bundle", "target '%s' is incompatible with runtime '%s' in %s",
-                  target->valuestring, runtime_target,
+        strcmp(target->valuestring, expected_target) != 0) {
+        LOG_ERROR("jce_bundle", "target '%s' is incompatible with requested '%s' in %s",
+                  target->valuestring, expected_target,
                   source_label ? source_label : "(memory)");
         return false;
     }
@@ -421,7 +422,7 @@ JCE_API JceBundleCatalog *jce_bundle_catalog_open(JceFileSystem *fs,
     cat->verify_content = cat->contract_minor >= 1u;
     if (!cat->base_dir) goto invalid_catalog;
     if (!content_contract_compatible(root, cat->contract_minor,
-                                     catalog_path))
+                                     catalog_path, runtime_target_profile()))
         goto invalid_catalog;
 
     uint32_t n = (uint32_t)cJSON_GetArraySize(bundles);
@@ -511,31 +512,10 @@ invalid_catalog:
     return NULL;
 }
 
-static const void *JCE_CALL bundle_pak_find(const JcePakArchive *pak,
-                                            const char *path)
-{
-    return jce_pak_find(pak, path);
-}
-
-static uint64_t JCE_CALL bundle_pak_asset_size(const void *asset)
-{
-    return ((const JcePakAsset *)asset)->original_size;
-}
-
-static size_t JCE_CALL bundle_pak_decompress(const void *asset, void *buffer,
-                                             size_t size)
-{
-    return jce_pak_decompress((const JcePakAsset *)asset, buffer, size);
-}
-
-static const JceFsPakProvider BUNDLE_PAK_PROVIDER = {
-    bundle_pak_find, bundle_pak_asset_size, bundle_pak_decompress
-};
-
 static void ensure_pak_provider(void)
 {
     if (!jce_fs_get_pak_provider())
-        jce_fs_set_pak_provider(&BUNDLE_PAK_PROVIDER);
+        jce_pak_register_filesystem_provider_internal();
 }
 
 JCE_API void jce_bundle_catalog_close(JceBundleCatalog *cat) {
@@ -876,7 +856,8 @@ struct JceBundleFile {
     char          *kind;          /* from manifest (nullable)            */
 };
 
-static bool verify_standalone_sidecar(const char *bundle_path)
+static bool verify_standalone_sidecar(const char *bundle_path,
+                                     const char *expected_target)
 {
     char sidecar_path[1152];
     int written = snprintf(sidecar_path, sizeof(sidecar_path), "%s.json",
@@ -921,6 +902,11 @@ static bool verify_standalone_sidecar(const char *bundle_path)
     if (minor->valueint < 1) {
         cJSON_Delete(root);
         return true;
+    }
+    if (!content_contract_compatible(root, (uint32_t)minor->valueint,
+                                     sidecar_path, expected_target)) {
+        cJSON_Delete(root);
+        return false;
     }
 
     const cJSON *hash = cJSON_GetObjectItemCaseSensitive(
@@ -1202,7 +1188,7 @@ static bool catalog_bundle_manifest_valid(const JcePakArchive *pak,
         valid = cJSON_IsString(build_j) && entry->build_hash &&
             strcmp(build_j->valuestring, entry->build_hash) == 0 &&
             content_contract_compatible(root, (uint32_t)minor->valueint,
-                                        source_label);
+                                        source_label, runtime_target_profile());
     }
     if (valid && cJSON_GetArraySize(depends_j) != (int)entry->dep_count)
         valid = false;
@@ -1237,7 +1223,9 @@ static JceBundleFile *bundle_file_open_pak(JceFileSystem *fs,
                                            JcePakArchive *pak,
                                            const char *fallback_name,
                                            const char *mount_name_or_null,
-                                           const char *source_label)
+                                           const char *source_label,
+                                           const char *expected_target,
+                                           bool inspection_only)
 {
     if (!pak) return NULL;
     ensure_pak_provider();
@@ -1308,7 +1296,7 @@ static JceBundleFile *bundle_file_open_pak(JceFileSystem *fs,
          (cJSON_IsString(scene_j) && scene_j->valuestring[0]));
     if (manifest_ok)
         manifest_ok = content_contract_compatible(
-            root, (uint32_t)minor->valueint, source_label);
+            root, (uint32_t)minor->valueint, source_label, expected_target);
     if (manifest_ok)
         manifest_ok = manifest_assets_valid(
             pak, assets_j, (uint32_t)minor->valueint, true, source_label);
@@ -1320,6 +1308,7 @@ static JceBundleFile *bundle_file_open_pak(JceFileSystem *fs,
         return NULL;
     }
 
+    if (inspection_only) jce_pak_mark_inspection_only_internal(pak);
     bool had_scene = cJSON_IsString(scene_j);
     id_str = dup_str(id_j->valuestring);
     kind_str = dup_str(kind_j->valuestring);
@@ -1372,19 +1361,21 @@ static JceBundleFile *bundle_file_open_pak(JceFileSystem *fs,
     bf->id         = id_str    ? id_str    : dup_str(mname);
     bf->scene_path = scene_str;
     bf->kind       = kind_str;
-    LOG_INFO("jce_bundle", "mounted standalone '%s' from %s",
-             bf->mount_name,
+    LOG_INFO("jce_bundle", "%s standalone '%s' from %s",
+             fs ? "mounted" : "validated", bf->mount_name,
              source_label ? source_label : "(memory)");
     return bf;
 }
 
-JCE_API JceBundleFile *jce_bundle_file_open(JceFileSystem *fs,
-                                            const char *jbundle_path,
-                                            const char *mount_name_or_null)
+static JceBundleFile *bundle_file_open_path(JceFileSystem *fs,
+                                          const char *jbundle_path,
+                                          const char *mount_name_or_null,
+                                          const char *expected_target,
+                                          bool inspection_only)
 {
     if (!jbundle_path) return NULL;
 
-    if (!verify_standalone_sidecar(jbundle_path)) return NULL;
+    if (!verify_standalone_sidecar(jbundle_path, expected_target)) return NULL;
 
     JcePakArchive *pak = jce_pak_open_file(jbundle_path);
     if (!pak) {
@@ -1397,7 +1388,16 @@ JCE_API JceBundleFile *jce_bundle_file_open(JceFileSystem *fs,
         if (*p == '/' || *p == '\\') base = p + 1;
 
     return bundle_file_open_pak(fs, pak, base,
-                                mount_name_or_null, jbundle_path);
+                                mount_name_or_null, jbundle_path, expected_target,
+                                inspection_only);
+}
+
+JCE_API JceBundleFile *jce_bundle_file_open(JceFileSystem *fs,
+                                            const char *jbundle_path,
+                                            const char *mount_name_or_null)
+{
+    return bundle_file_open_path(fs, jbundle_path, mount_name_or_null,
+                                runtime_target_profile(), false);
 }
 
 JCE_API JceBundleFile *jce_bundle_file_open_memory(
@@ -1416,7 +1416,35 @@ JCE_API JceBundleFile *jce_bundle_file_open_memory(
     }
 
     return bundle_file_open_pak(fs, pak, mount_name_or_null,
-                                mount_name_or_null, "(memory)");
+                                mount_name_or_null, "(memory)", runtime_target_profile(), false);
+}
+
+static bool inspection_target_valid(const char *target)
+{
+    static const char *const allowed[] = {
+        "windows", "linux", "macos", "android", "ios", "web", "auto"
+    };
+    if (!target) return false;
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i)
+        if (strcmp(target, allowed[i]) == 0) return true;
+    return false;
+}
+
+JCE_API JceBundleFile *jce_bundle_file_inspect_memory(const void *data,
+                                                    size_t size,
+                                                    const char *expected_target)
+{
+    if (!inspection_target_valid(expected_target) || !data || !size) return NULL;
+    JcePakArchive *pak = jce_pak_open(data, size);
+    return bundle_file_open_pak(NULL, pak, "inspection", "inspection",
+                                "(inspection memory)", expected_target, true);
+}
+
+JCE_API JceBundleFile *jce_bundle_file_inspect_file(const char *jbundle_path,
+                                                  const char *expected_target)
+{
+    if (!inspection_target_valid(expected_target)) return NULL;
+    return bundle_file_open_path(NULL, jbundle_path, NULL, expected_target, true);
 }
 
 JCE_API void jce_bundle_file_close(JceBundleFile *bf)

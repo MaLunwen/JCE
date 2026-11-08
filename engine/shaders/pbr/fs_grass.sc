@@ -57,12 +57,18 @@ SAMPLER2D(s_csmShadow1, 10);
 SAMPLER2D(s_csmShadow2, 11);
 SAMPLER2D(s_csmShadow3, 12);
 
-float grass_csm_depth(int cascade, vec2 uv)
+float grass_csm_filter(sampler2D shadow_map, vec2 uv, float z,
+                       float dbias, float inv_map)
 {
-    if      (cascade == 0) return texture2D(s_csmShadow0, uv).r;
-    else if (cascade == 1) return texture2D(s_csmShadow1, uv).r;
-    else if (cascade == 2) return texture2D(s_csmShadow2, uv).r;
-    return texture2D(s_csmShadow3, uv).r;
+    // 2x2 PCF.
+    float sum = 0.0;
+    for (int y = 0; y <= 1; y++)
+    for (int x = 0; x <= 1; x++)
+    {
+        vec2 off = (vec2(float(x), float(y)) - 0.5) * inv_map * 1.5;
+        sum += (z - dbias > texture2D(shadow_map, uv + off).r) ? 0.0 : 1.0;
+    }
+    return sum * 0.25;
 }
 
 float grass_sample_csm(int cascade, vec3 world_pos, vec3 to_light)
@@ -109,15 +115,14 @@ float grass_sample_csm(int cascade, vec3 world_pos, vec3 to_light)
                   * (1.0 + slope * 8.0);
     dbias = min(dbias, mix(0.01, 0.08, clerp));
 
-    // 2x2 PCF.
-    float sum = 0.0;
-    for (int y = 0; y <= 1; y++)
-    for (int x = 0; x <= 1; x++)
-    {
-        vec2 off = (vec2(float(x), float(y)) - 0.5) * inv_map * 1.5;
-        sum += (z - dbias > grass_csm_depth(cascade, uv + off)) ? 0.0 : 1.0;
-    }
-    return sum * 0.25;
+    // Select once, outside the unchanged four-tap filter.
+    BRANCH if (cascade == 0)
+        return grass_csm_filter(s_csmShadow0, uv, z, dbias, inv_map);
+    else BRANCH if (cascade == 1)
+        return grass_csm_filter(s_csmShadow1, uv, z, dbias, inv_map);
+    else BRANCH if (cascade == 2)
+        return grass_csm_filter(s_csmShadow2, uv, z, dbias, inv_map);
+    return grass_csm_filter(s_csmShadow3, uv, z, dbias, inv_map);
 }
 
 void main()

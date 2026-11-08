@@ -51,7 +51,8 @@ SCAN_PREFIXES = (
     "tools/",
 )
 
-SRC_EXT = (".c", ".cc", ".cpp", ".cxx", ".m", ".mm")
+CPP_EXT = (".cc", ".cpp", ".cxx", ".mm")
+SRC_EXT = (".c", ".m", *CPP_EXT)
 
 # Path fragments that are never first-party.
 SKIP_FRAGMENTS = ("/third_party/", "/generated/")
@@ -87,6 +88,17 @@ DEF_RE = re.compile(
 )
 
 
+# Lexical trivia can contain braces but must not change source line numbers.
+NON_CODE_RE = re.compile(
+    r"(?P<comment>/\*.*?\*/|//[^\n]*)"
+    r'|(?:u8|[uUL])?R"(?P<delimiter>[^()\s\\]{0,16})\(.*?\)(?P=delimiter)"'
+    r"""|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'""",
+    re.S,
+)
+SCOPE_TOKEN_RE = re.compile(
+    r"^[ \t]*#(?:[^\\\n]|\\[^\n]|\\\n)*|\bnamespace\s*\{|[{}]", re.M)
+
+
 def rel(p: Path) -> str:
     return p.relative_to(REPO_ROOT).as_posix()
 
@@ -95,10 +107,35 @@ def is_vendored(name: str) -> bool:
     return name.startswith(VENDOR_PREFIXES)
 
 
+def blank_non_newlines(text: str) -> str:
+    return re.sub(r"[^\n]", " ", text)
+
+
 def strip_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"//[^\n]*", "", text)
-    return text
+    return NON_CODE_RE.sub(
+        lambda m: blank_non_newlines(m[0]) if m.lastgroup == "comment" else m[0],
+        text)
+
+
+def anonymous_namespace_lines(text: str) -> set[int]:
+    """Lines inside balanced C++ unnamed namespaces have internal linkage."""
+    masked = NON_CODE_RE.sub(lambda m: blank_non_newlines(m[0]), text)
+    stack: list[int | None] = []
+    internal: set[int] = set()
+    line, previous = 1, 0
+    for token in SCOPE_TOKEN_RE.finditer(masked):
+        line += masked.count("\n", previous, token.end())
+        previous = token.end()
+        kind = token[0]
+        if kind == "{":
+            stack.append(None)
+        elif kind.startswith("namespace"):
+            stack.append(line)
+        elif kind == "}" and stack:
+            start = stack.pop()
+            if start is not None:
+                internal.update(range(start + 1, line + 1))
+    return internal
 
 
 def base_stem(stem: str) -> tuple[str, bool]:
@@ -117,6 +154,7 @@ def extract_defs(path: Path) -> list[tuple[str, int, bool]]:
         return []
     text = strip_comments(raw)
     lines = text.splitlines()
+    internal = anonymous_namespace_lines(text) if path.suffix in CPP_EXT else set()
     out: list[tuple[str, int, bool]] = []
     for i, line in enumerate(lines, start=1):
         if not line or line[0].isspace() or line[0] == "#":
@@ -137,7 +175,7 @@ def extract_defs(path: Path) -> list[tuple[str, int, bool]]:
         # A macro invocation like FOO(x) at column 0 usually has no return type.
         if not pre.strip():
             continue
-        is_static = bool(re.search(r"\bstatic\b", pre))
+        is_static = i in internal or bool(re.search(r"\bstatic\b", pre))
         out.append((name, i, is_static))
     return out
 
@@ -208,6 +246,59 @@ def classify(name: str, defs: list[dict]) -> str | None:
 HARD_SIGNALS = {"cross_consumer", "external_multi_owner"}
 
 
+def self_check() -> None:
+    from tempfile import TemporaryDirectory
+
+    cpp = """
+/* namespace {
+   A multiline comment does not open a scope. */
+const char *plain = "namespace {";
+namespace /* gap */ {
+bool visit(const char *name)
+{
+    const char *url = "https://example.test/}";
+    return name != url;
+}
+namespace nested {
+int nested_helper() {
+    return 1;
+}
+}
+const char *literal = R"tag( }
+namespace {
+)tag";
+}
+namespace public_scope {
+int external_owner() {
+    return 1;
+}
+}
+static int explicit_local() {
+    return 2;
+}
+"""
+    with TemporaryDirectory() as temporary:
+        first = Path(temporary) / "first.cpp"
+        second = Path(temporary) / "second.cpp"
+        first.write_text(cpp, encoding="utf-8")
+        second.write_text(
+            "static bool visit(const char *name) {\n    return name != nullptr;\n}\n"
+            "namespace public_scope {\nint external_owner() {\n    return 2;\n}\n}\n",
+            encoding="utf-8")
+        left = {name: (line, static) for name, line, static in extract_defs(first)}
+        right = {name: (line, static) for name, line, static in extract_defs(second)}
+        assert left["visit"] == (cpp.splitlines().index("bool visit(const char *name)") + 1, True)
+        assert left["nested_helper"][1] and left["explicit_local"][1]
+        assert not left["external_owner"][1]
+        for name, expected in (
+            ("visit", "static_helper_collision"), ("external_owner", "external_multi_owner"),
+        ):
+            defs = [{"file": p.name, "root": "editor", "stem": p.stem, "platform": False,
+                     "static": observed[name][1]}
+                    for p, observed in ((first, left), (second, right))]
+            assert classify(name, defs) == expected, (name, defs)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
@@ -215,7 +306,12 @@ def main() -> int:
                     help="exit 1 if any hard-signal collision exists")
     ap.add_argument("--min-name-len", type=int, default=4,
                     help="ignore short names (init/run/...) below this length")
+    ap.add_argument("--self-check", action="store_true", help="check internal linkage classification")
     args = ap.parse_args()
+    if args.self_check:
+        self_check()
+        print("duplicate-symbol self-check: PASS")
+        return 0
 
     table = scan()
     grouped: dict[str, list[tuple[str, list[dict]]]] = defaultdict(list)

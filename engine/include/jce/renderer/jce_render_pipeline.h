@@ -249,6 +249,11 @@ JCE_API void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc);
 /* Copy the currently-applied descriptor (or LOW preset on cold call). */
 JCE_API void jce_render_pipeline_get(JceRenderPipelineDesc *out);
 
+/* Copy the last applied request before hardware/backend cost clamps, or LOW
+ * before the first apply. Deferred edits are excluded until end_frame commits
+ * them. Useful for temporary overrides that must restore authored intent. */
+JCE_API void JCE_CALL jce_render_pipeline_get_requested(JceRenderPipelineDesc *out);
+
 /* Per-feature query — render-graph code can gate passes off this. */
 JCE_API bool jce_render_pipeline_is_feature_enabled(const char *feature);
 
@@ -261,7 +266,7 @@ JCE_API bool jce_render_pipeline_is_feature_enabled(const char *feature);
  * apply(). */
 JCE_API float jce_render_pipeline_motion_blur_intensity(void);
 
-/* The sun soft size in force, in shadow-map texels.  0 = contact hardening
+/* The sun angular diameter in force, in degrees.  0 = contact hardening
  * OFF, which is what every .rp.json written before the key existed loads to
  * and what every preset below ULTRA states.  Unlike the motion-blur length,
  * 0 here is a MEANINGFUL value rather than "unset": a fixed-radius filter is
@@ -309,12 +314,13 @@ JCE_API void jce_render_pipeline_scene_extent(uint32_t surface_w,
 JCE_API void jce_render_pipeline_notify_tier_changed(void);
 
 /* ── P4-E.2: deferred feature toggle ─────────────────────────────
- * jce_render_pipeline_set_feature_enabled() writes into a shadow
- * (pending) descriptor so mid-frame changes don't race with in-flight
- * draw calls.  jce_render_pipeline_end_frame() promotes the pending
- * descriptor to the active one at a safe point (end of frame) and fires
- * the observer if anything changed.  Callers that update the full
- * descriptor at once should continue to use jce_render_pipeline_apply(). */
+ * Setters accumulate the unclamped USER REQUEST, not the active cost budget.
+ * end_frame() clears its snapshot before the sole apply owner re-resolves
+ * capabilities, budgets and existing QA forces; observers may queue work for
+ * the following frame. A complete apply() replaces older pending edits, while
+ * a tier notification preserves them. Unchanged requests do not notify.
+ * stylized_look honors requested MID/HIGH/ULTRA even when bloom is budgeted
+ * LOW; an explicit requested LOW stays neutral unless boolean QA-forced. */
 JCE_API void jce_render_pipeline_set_feature_enabled(const char *feature, bool enabled);
 /* Numeric sibling of set_feature_enabled — same deferred pending-desc path.
  * Knobs: "shadow_resolution" (256..8192), "csm_cascade_count" (1..4),
@@ -361,6 +367,16 @@ JCE_API void jce_render_pipeline_apply_boot_mounted(const struct JcePakArchive *
                                                     const char *pak_key);
 JCE_API bool jce_render_pipeline_load(const char *host_path,
                                       JceRenderPipelineDesc *out);
+
+/* Read one descriptor from the supplied VFS's PAK mounts, without global
+ * PhysFS directories, active FS or host fallback. Uses read_pak_bounded.
+ * Empty inputs, IO/parse failure and payloads over 1 MiB refuse. On every
+ * failure a non-NULL out is all-zero; success retains LOW defaults for absent
+ * fields, like the other loaders. This does not apply the descriptor. */
+struct JceFileSystem;
+JCE_API bool JCE_CALL jce_render_pipeline_load_fs(const struct JceFileSystem *fs,
+                                                 const char *key,
+                                                 JceRenderPipelineDesc *out);
 
 /* Pretty-print `desc` to `host_path`. */
 JCE_API bool jce_render_pipeline_save(const char *host_path,

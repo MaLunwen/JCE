@@ -59,6 +59,102 @@ void main()
         }
     }
 #endif
+    // --- Base color ---
+    // The albedo texture is sRGB-ENCODED (glTF spec §5.19) and the SAMPLER
+    // decodes it: the texture carries a hardware sRGB view (JCE_TEX_SRGB,
+    // set for s_albedo and s_emissive only).  There is no pow(2.2) here any
+    // more, and putting one back double-decodes.
+    //
+    // It moved because the decode has to happen BEFORE filtering.  Bilinear
+    // taps and every mip level are averaged by fixed-function hardware, and
+    // averaging is a linear-space operation -- doing it on encoded values is
+    // simply the wrong answer, worst where a texture is minified, which is
+    // most of the frame.  The shader could never have run first.  The sRGB
+    // view also uses the real transfer function, whose linear toe below
+    // 0.04045 pow(2.2) does not have.
+#ifdef JCE_GRAPH_MATERIAL
+    /* No albedo fetch here: whether this material samples a texture at all is
+     * the graph's decision, and it already made it. */
+    vec4 texColor = jce_g_base;
+#elif defined(JCE_TEX_ARRAY)
+    // Texture-diverse instancing: the vertex shader packs this instance's albedo
+    // 2D-array layer into v_tint.x (the array variant carries no colour tint).
+    vec4 texColor = texture2DArray(s_albedo, vec3(mat_uv, v_tint.x));
+#else
+    vec4 texColor = texture2D(s_albedo, mat_uv);
+#endif
+    bool useCheckerFallback = (u_normalScale.x < 0.0);
+    if (useCheckerFallback)
+    {
+        texColor = vec4(missing_texture_checker(v_localpos, v_texcoord0), 1.0);
+    }
+
+    // One branch now: the checker fallback was the only case that already
+    // arrived linear, and every case does.
+    /* The factor is NOT applied to a graph's output.  compile_to_material
+     * writes the graph's evaluated base colour into u_baseColorFactor so the
+     * .mat.json still describes the material for anything that reads it
+     * without the program (thumbnails, the inspector, a fallback); applying it
+     * here as well would square it. */
+#ifdef JCE_GRAPH_MATERIAL
+    vec3 albedo = clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0));
+    float alpha = texColor.a;
+#else
+    vec3 albedo = clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0))
+                * u_baseColorFactor.rgb;
+    float alpha = texColor.a * u_baseColorFactor.a;
+#endif
+
+#ifdef JCE_INST_TINT
+    /* Per-instance tint (large-world-opt P1 #7).  v_tint carries the entity's
+     * baseColor RGBA; multiplying here is the SAME operation a solo draw applies
+     * via u_baseColorFactor (the bound material for a batched run is the model's
+     * embedded material, so albedo = model_base * entity_tint == the solo
+     * override material's base color when that override only diverges in color).
+     * Tints are authored linear (like base_color_factor), so no gamma applied. */
+    albedo *= v_tint.rgb;
+    alpha  *= v_tint.a;
+#endif
+
+    // --- View-mode dispatch ---------------------------------------------
+    // u_normalScale.z carries JceSceneViewModeKind:
+    //   0 SHADED              → fall through to full PBR lighting below
+    //   1 WIREFRAME           → handled by host (no fill); shader path
+    //                            is unused for plain-wireframe entities
+    //   2 TEXTURED            → unlit albedo-only: emit gamma-corrected
+    //                            raw albedo and return BEFORE lighting,
+    //                            so the user can inspect base-color
+    //                            textures / UVs independent of lights
+    //   3 WIREFRAME_TEXTURED  → same unlit-albedo branch (host overlays
+    //                            the wireframe pass)
+    // All view modes load textures; missing albedo is shown as the
+    // UV-space pink/black checker via useCheckerFallback above (never
+    // a flat white loading surface).
+    float viewMode = u_normalScale.z;
+
+    if (viewMode > 1.5 && viewMode < 3.5)
+    {
+        // Modes 2/3 (TEXTURED / WIREFRAME_TEXTURED): unlit albedo only.
+        // Output albedo without lighting (gamma-correct for display).
+        // Streaming LOD cross-fade screen-door (no-op unless activated).
+        if (jce_lod_fade_discard(gl_FragCoord.xy)) discard;
+        vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
+        gl_FragColor = vec4(outRgb, alpha);
+        return;
+    }
+    // Debug channel views (4+) fall through to after the material values
+    // (normal/metallic/roughness/ao) are computed, then emit one channel.
+
+    // --- Alpha mode ---
+    float alphaMode = u_emissiveFactor.w;
+    float alphaCutoff = u_pbrParams.w;
+
+    // Mask mode: discard fragments below cutoff
+    if (alphaMode == 1.0 && alpha < alphaCutoff)
+    {
+        discard;
+    }
+
     // --- Shadow calculation ---
     float shadow = 1.0;
     /* Which cascade this fragment was shadowed by, for view mode 9.  Function
@@ -66,10 +162,12 @@ void main()
      * debug branch is further down; -1 means no cascade covered it, which is
      * a different reason to be lit than "nothing occluded it". */
     float dbgCascade = -1.0;
+#if !defined(JCE_PBR_GL21_STOCK)
     float shadowDirSlot = u_lightCounts.w;
     int shadowDirIndex = int(clamp(shadowDirSlot - 1.0, 0.0, 1.0));
     vec3 toLightDir = safe_normalize_vec3(-u_dirLights[shadowDirIndex * 2].xyz,
                                           vec3(0.0, 1.0, 0.0));
+#endif
     vec3 baseNormal = normalize(v_normal);
 
     if (u_normalScale.y > 0.0)
@@ -86,6 +184,7 @@ void main()
             baseNormal = -baseNormal;
     }
 
+#if !defined(JCE_PBR_GL21_STOCK)
     /* THE CASCADE BLOCK, and the one axis worth compiling out.
      *
      * MEASURED with `python scripts/jce.py shader-inspect`, not assumed:
@@ -298,101 +397,7 @@ void main()
         shadow *= texture2D(s_aoMap, cloudUV).b;
     }
 
-    // --- Base color ---
-    // The albedo texture is sRGB-ENCODED (glTF spec §5.19) and the SAMPLER
-    // decodes it: the texture carries a hardware sRGB view (JCE_TEX_SRGB,
-    // set for s_albedo and s_emissive only).  There is no pow(2.2) here any
-    // more, and putting one back double-decodes.
-    //
-    // It moved because the decode has to happen BEFORE filtering.  Bilinear
-    // taps and every mip level are averaged by fixed-function hardware, and
-    // averaging is a linear-space operation -- doing it on encoded values is
-    // simply the wrong answer, worst where a texture is minified, which is
-    // most of the frame.  The shader could never have run first.  The sRGB
-    // view also uses the real transfer function, whose linear toe below
-    // 0.04045 pow(2.2) does not have.
-#ifdef JCE_GRAPH_MATERIAL
-    /* No albedo fetch here: whether this material samples a texture at all is
-     * the graph's decision, and it already made it. */
-    vec4 texColor = jce_g_base;
-#elif defined(JCE_TEX_ARRAY)
-    // Texture-diverse instancing: the vertex shader packs this instance's albedo
-    // 2D-array layer into v_tint.x (the array variant carries no colour tint).
-    vec4 texColor = texture2DArray(s_albedo, vec3(mat_uv, v_tint.x));
-#else
-    vec4 texColor = texture2D(s_albedo, mat_uv);
 #endif
-    bool useCheckerFallback = (u_normalScale.x < 0.0);
-    if (useCheckerFallback)
-    {
-        texColor = vec4(missing_texture_checker(v_localpos, v_texcoord0), 1.0);
-    }
-
-    // One branch now: the checker fallback was the only case that already
-    // arrived linear, and every case does.
-    /* The factor is NOT applied to a graph's output.  compile_to_material
-     * writes the graph's evaluated base colour into u_baseColorFactor so the
-     * .mat.json still describes the material for anything that reads it
-     * without the program (thumbnails, the inspector, a fallback); applying it
-     * here as well would square it. */
-#ifdef JCE_GRAPH_MATERIAL
-    vec3 albedo = clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0));
-    float alpha = texColor.a;
-#else
-    vec3 albedo = clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0))
-                * u_baseColorFactor.rgb;
-    float alpha = texColor.a * u_baseColorFactor.a;
-#endif
-
-#ifdef JCE_INST_TINT
-    /* Per-instance tint (large-world-opt P1 #7).  v_tint carries the entity's
-     * baseColor RGBA; multiplying here is the SAME operation a solo draw applies
-     * via u_baseColorFactor (the bound material for a batched run is the model's
-     * embedded material, so albedo = model_base * entity_tint == the solo
-     * override material's base color when that override only diverges in color).
-     * Tints are authored linear (like base_color_factor), so no gamma applied. */
-    albedo *= v_tint.rgb;
-    alpha  *= v_tint.a;
-#endif
-
-    // --- View-mode dispatch ---------------------------------------------
-    // u_normalScale.z carries JceSceneViewModeKind:
-    //   0 SHADED              → fall through to full PBR lighting below
-    //   1 WIREFRAME           → handled by host (no fill); shader path
-    //                            is unused for plain-wireframe entities
-    //   2 TEXTURED            → unlit albedo-only: emit gamma-corrected
-    //                            raw albedo and return BEFORE lighting,
-    //                            so the user can inspect base-color
-    //                            textures / UVs independent of lights
-    //   3 WIREFRAME_TEXTURED  → same unlit-albedo branch (host overlays
-    //                            the wireframe pass)
-    // All view modes load textures; missing albedo is shown as the
-    // UV-space pink/black checker via useCheckerFallback above (never
-    // a flat white loading surface).
-    float viewMode = u_normalScale.z;
-
-    if (viewMode > 1.5 && viewMode < 3.5)
-    {
-        // Modes 2/3 (TEXTURED / WIREFRAME_TEXTURED): unlit albedo only.
-        // Output albedo without lighting (gamma-correct for display).
-        // Streaming LOD cross-fade screen-door (no-op unless activated).
-        if (jce_lod_fade_discard(gl_FragCoord.xy)) discard;
-        vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
-        gl_FragColor = vec4(outRgb, alpha);
-        return;
-    }
-    // Debug channel views (4+) fall through to after the material values
-    // (normal/metallic/roughness/ao) are computed, then emit one channel.
-
-    // --- Alpha mode ---
-    float alphaMode = u_emissiveFactor.w;
-    float alphaCutoff = u_pbrParams.w;
-
-    // Mask mode: discard fragments below cutoff
-    if (alphaMode == 1.0 && alpha < alphaCutoff)
-    {
-        discard;
-    }
 
     // --- Normal ---
     vec3 N = baseNormal;
@@ -446,7 +451,13 @@ void main()
     float metallic  = jce_g_metallic;
     float roughness = jce_g_roughness;
 #else
+#ifdef JCE_TOON
+    vec4 mrSample = vec4_splat(1.0);
+    if (u_toonAtlas[1].w < 0.5)
+        mrSample = texture2D(s_metalRough, mat_uv);
+#else
     vec4 mrSample = texture2D(s_metalRough, mat_uv);
+#endif
     float metallic  = mrSample.b * u_pbrParams.x;
     float roughness = mrSample.g * u_pbrParams.y;
 #endif
@@ -465,12 +476,15 @@ void main()
     roughness  = clamp(snow_roughness(roughness, snow), 0.04, 1.0);
     roughness = clamp(roughness, 0.04, 1.0);
 
+#if !defined(JCE_PBR_GL21_STOCK)
     // Low-cost specular AA from normal derivatives (Toksvig-like).
     vec3 dndx = dFdx(N);
     vec3 dndy = dFdy(N);
     float normal_variance = clamp(max(dot(dndx, dndx), dot(dndy, dndy)), 0.0, 1.0);
     float aa_roughness = sqrt(normal_variance * 0.5);
     roughness = clamp(max(roughness, aa_roughness), 0.04, 1.0);
+
+#endif
 
     // --- AO ---
     // When SSAO is active (u_ssaoParams.x > 0.5) the screen-space AO render
@@ -517,6 +531,17 @@ void main()
     // --- Lighting accumulation ---
     vec3 Lo = vec3_splat(0.0);
 
+#if defined(JCE_PBR_GL21_STOCK)
+#include "fs_pbr_gl21_lighting.sh"
+#else
+#ifdef JCE_TOON
+    bool toonAtlasOn = u_toonAtlas[0].w > 0.5;
+    // R direct light, G MatCap, B body glint or face structure, A ramp row.
+    vec4 toonLightMap = vec4(1.0, 1.0, 0.0, 1.0);
+    if (toonAtlasOn)
+        toonLightMap = toon_atlas_sample(vec2(1.0, 1.0), mat_uv);
+#endif
+
     // --- Directional lights ---
     int numDirLights = int(u_lightCounts.x);
     for (int i = 0; i < 2; i++)
@@ -529,6 +554,7 @@ void main()
 
         vec3 radiance = lightColor * intensity;
 
+#if !JCE_SHADER_COMPATIBILITY
         // ── P3-E.5b: directional light cookie projection ───────────
         // Only the directional light selected by u_cookieDirParams.z
         // receives the cookie sampler bind (v1 single-bind shared
@@ -565,10 +591,12 @@ void main()
             }
         }
 
+#endif
+
         float lightShadow = (abs(float(i) - float(shadowDirIndex)) < 0.5) ? shadow : 1.0;
 #ifdef JCE_TOON
-        // Soft-cel: quantize N·L into u_toonParams.x bands with a smoothstep
-        // edge of width u_toonParams.y, then add a small spec glint step.
+        // Legacy soft cel quantizes N·L. Atlas materials use authored palettes
+        // and can mask a directional glint or a face structure tone.
         {
             float ndl   = max(dot(N, lightDir), 0.0);
             float bands = max(u_toonParams.x, 2.0);
@@ -579,7 +607,27 @@ void main()
             float frac   = scaled - floor(scaled);
             float celNdL = lower + smoothstep(0.5 - soft, 0.5 + soft, frac) / bands;
             celNdL = clamp(celNdL, 0.0, 1.0);
-            Lo += albedo * radiance * celNdL * lightShadow;
+            if (toonAtlasOn) {
+                bool toonFace = u_toonAtlas[0].w > 1.5;
+                float rampKey = ndl;
+                if (toonFace)
+                    rampKey = toon_face_direction(lightDir, mat_uv, ndl);
+                vec3 ramp = toon_ramp_color(rampKey, toonLightMap.a);
+                if (toonFace && i == 0 && u_toonAtlas[1].w > 0.5)
+                    ramp *= mix(0.50, 1.0, toon_hair_visibility(v_worldpos, lightDir, v_viewdepth));
+                float glint = 0.0;
+                if (toonLightMap.b > 0.0) {
+                    if (toonFace)
+                        ramp *= 1.0 - 0.32 * toonLightMap.b;
+                    else
+                        glint = toonLightMap.b * toon_body_glint(N, V, lightDir, ndl);
+                }
+                Lo += albedo * radiance * ramp * (lightShadow * toonLightMap.r);
+                if (glint > 0.0)
+                    Lo += radiance * (glint * lightShadow);
+            } else {
+                Lo += albedo * radiance * celNdL * lightShadow;
+            }
         }
 #else
         Lo += cookTorranceBRDFWrap(N, V, lightDir, F0, albedo, metallic, roughness, u_lookWrap.x) * radiance * lightShadow;
@@ -593,6 +641,12 @@ void main()
         float NdotV_rim = clamp(dot(N, V), 0.0, 1.0);
         float rim = pow(1.0 - NdotV_rim, max(u_toonParams.z, 0.01));
         Lo += u_toonRimColor.xyz * (rim * u_toonParams.w);
+        if (toonAtlasOn && toonLightMap.g > 0.0) {
+            vec2 viewNormal = mul(u_view, vec4(N, 0.0)).xy;
+            vec2 matcapUV = vec2(viewNormal.x, -viewNormal.y) * 0.5 + 0.5;
+            vec3 matcap = toon_atlas_sample(vec2(0.0, 1.0), matcapUV).rgb;
+            Lo += albedo * matcap * (0.25 * toonLightMap.g);
+        }
     }
 #endif
 
@@ -729,6 +783,8 @@ void main()
         float attenuation = clamp(1.0 - (dist * dist) / (radius * radius), 0.0, 1.0);
         attenuation *= attenuation;
 
+        if (attenuation == 0.0) continue;
+
         vec3 radiance = lightColor * intensity * attenuation;
 
         // ── P1: local point shadow (slot in u_pointShadowSlot[i/4][i%4]) ──
@@ -788,6 +844,7 @@ void main()
 
         vec3 radiance = lightColor * intensity * attenuation * cone;
 
+#if !JCE_SHADER_COMPATIBILITY
         // ── P3-E.5: light cookie projection ────────────────────────
         /* EVERY spot light with a slot, not just the one that won the
          * sampler.  u_spotLights[i*4+3].y is this light's own atlas layer and
@@ -854,6 +911,8 @@ void main()
                 radiance *= cookieRGB;
             }
         }
+
+#endif
 
         // ── P3-E.5: IES photometric profile ────────────────────────
         // Sample the 1-D LUT (256x1) by the angle between the light's
@@ -1207,6 +1266,8 @@ void main()
         }
     }
 
+#endif
+
     // --- Emissive ---
     // Emissive is sRGB-encoded too, and decoded by the sampler for the same
     // reason as the albedo above -- s_emissive carries the sRGB view.
@@ -1220,12 +1281,15 @@ void main()
     // --- Final color ---
     vec3 color = ambient + Lo + emissive;
 
+#if !defined(JCE_PBR_GL21_STOCK)
     // --- Aerial-perspective fog (linear, before gamma) ---
     // toLightDir is the unit dir from surface toward the shadow-casting sun
     // (computed at the top of main, line ~514). v_viewdepth is positive
     // view-space distance. No-op when u_fogParams.x < 0.5 (default).
     color = apply_aerial_fog(color, v_viewdepth, v_worldpos,
                              u_cameraPos.xyz, toLightDir);
+
+#endif
 
     // --- Gamma correction (linear -> sRGB) ---
     // When postfx tonemap is enabled, keep linear output for post-processing.

@@ -4,7 +4,7 @@ body {
     width: 100%;
     height: 100%;
     margin: 0;
-    font-family: "JCE";
+    font-family: "JCE-UI";
     font-size: 18dp;
     color: #eef3f7;
 }

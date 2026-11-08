@@ -598,6 +598,7 @@ bool rt_try_spawn_terrain(JceRuntime *rt, JceScene *scene, JceEntity e,
 			jce_free(world_y);
 
 			if (jce_body_valid(body)) {
+				jce_physics_body_set_entity(rt->physics, body, (uint64_t)e);
 				if (rt->body_count < rt->body_cap || rt_grow_bodies(rt))
 					rt_track_body(rt, e, body, tf, (uint8_t)JCE_BODY_STATIC);
 				LOG_INFO(LOG_TAG,
@@ -685,6 +686,7 @@ bool rt_try_spawn_terrain(JceRuntime *rt, JceScene *scene, JceEntity e,
 
 		JceBodyHandle body = jce_physics_body_create_compound(rt->physics, &desc);
 		if (jce_body_valid(body)) {
+			jce_physics_body_set_entity(rt->physics, body, (uint64_t)e);
 			if (rt->body_count < rt->body_cap || rt_grow_bodies(rt))
 				rt_track_body(rt, e, body, tf, (uint8_t)JCE_BODY_STATIC);
 			ok = true;

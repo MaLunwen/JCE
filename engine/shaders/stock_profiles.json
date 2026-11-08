@@ -1,0 +1,347 @@
+{
+  "profiles": {
+    "compatibility": {
+      "cook": {
+        "compute": [],
+        "fragment": [
+          "fs_bloom_blur",
+          "fs_bloom_combine",
+          "fs_bloom_down",
+          "fs_bloom_extract",
+          "fs_bloom_up",
+          "fs_chromatic",
+          "fs_color",
+          "fs_composite",
+          "fs_foliage",
+          "fs_foliage_shadow",
+          "fs_fxaa",
+          "fs_grass",
+          "fs_grass_shadow",
+          "fs_grayscale",
+          "fs_grid",
+          "fs_imgui",
+          "fs_mesh",
+          "fs_motion_vec",
+          "fs_particle",
+          "fs_pbr",
+          "fs_pbr_noshadow",
+          "fs_pick",
+          "fs_present",
+          "fs_rcas",
+          "fs_reveal_dissolve",
+          "fs_shadow",
+          "fs_sky",
+          "fs_sky_physical_compat",
+          "fs_taa",
+          "fs_text_sdf",
+          "fs_textured",
+          "fs_tsr",
+          "fs_vignette",
+          "fs_water",
+          "fs_water_physical"
+        ],
+        "unrestricted": false,
+        "vertex": [
+          "vs_color",
+          "vs_foliage",
+          "vs_foliage_cards",
+          "vs_foliage_cards_shadow",
+          "vs_foliage_shadow",
+          "vs_grass",
+          "vs_grass_expanded",
+          "vs_grid",
+          "vs_imgui",
+          "vs_mesh",
+          "vs_particle",
+          "vs_particle_expanded",
+          "vs_pbr",
+          "vs_pick",
+          "vs_postfx",
+          "vs_shadow",
+          "vs_sky",
+          "vs_textured",
+          "vs_water",
+          "vs_water_physical"
+        ]
+      },
+      "id": 1,
+      "pbr_cells": [
+        {
+          "fragment": "pbr",
+          "key": 0,
+          "variant": 0,
+          "variant_name": "pbr",
+          "vertex": "pbr"
+        },
+        {
+          "fragment": "pbr_noshadow",
+          "key": 2,
+          "variant": 0,
+          "variant_name": "pbr",
+          "vertex": "pbr"
+        }
+      ],
+      "stock_pairs": [
+        {
+          "fragment": "color",
+          "member": "color",
+          "vertex": "color"
+        },
+        {
+          "fragment": "textured",
+          "member": "textured",
+          "vertex": "textured"
+        },
+        {
+          "fragment": "text_sdf",
+          "member": "text_sdf",
+          "vertex": "textured"
+        },
+        {
+          "fragment": "mesh",
+          "member": "mesh",
+          "vertex": "mesh"
+        },
+        {
+          "fragment": "shadow",
+          "member": "shadow",
+          "vertex": "shadow"
+        }
+      ]
+    },
+    "full": {
+      "cook": {
+        "compute": [],
+        "fragment": [],
+        "unrestricted": true,
+        "vertex": []
+      },
+      "id": 0,
+      "pbr_cells": [
+        {
+          "fragment": "pbr",
+          "key": 0,
+          "variant": 0,
+          "variant_name": "pbr",
+          "vertex": "pbr"
+        },
+        {
+          "fragment": "pbr_fwdplus",
+          "key": 1,
+          "variant": 0,
+          "variant_name": "pbr",
+          "vertex": "pbr"
+        },
+        {
+          "fragment": "pbr_noshadow",
+          "key": 2,
+          "variant": 0,
+          "variant_name": "pbr",
+          "vertex": "pbr"
+        },
+        {
+          "fragment": "pbr_fwdplus_noshadow",
+          "key": 3,
+          "variant": 0,
+          "variant_name": "pbr",
+          "vertex": "pbr"
+        },
+        {
+          "fragment": "pbr",
+          "key": 0,
+          "variant": 1,
+          "variant_name": "pbr_inst",
+          "vertex": "pbr_inst"
+        },
+        {
+          "fragment": "pbr_fwdplus",
+          "key": 1,
+          "variant": 1,
+          "variant_name": "pbr_inst",
+          "vertex": "pbr_inst"
+        },
+        {
+          "fragment": "pbr_noshadow",
+          "key": 2,
+          "variant": 1,
+          "variant_name": "pbr_inst",
+          "vertex": "pbr_inst"
+        },
+        {
+          "fragment": "pbr_fwdplus_noshadow",
+          "key": 3,
+          "variant": 1,
+          "variant_name": "pbr_inst",
+          "vertex": "pbr_inst"
+        },
+        {
+          "fragment": "pbr",
+          "key": 0,
+          "variant": 2,
+          "variant_name": "pbr_skinned",
+          "vertex": "pbr_skinned"
+        },
+        {
+          "fragment": "pbr_fwdplus",
+          "key": 1,
+          "variant": 2,
+          "variant_name": "pbr_skinned",
+          "vertex": "pbr_skinned"
+        },
+        {
+          "fragment": "pbr_noshadow",
+          "key": 2,
+          "variant": 2,
+          "variant_name": "pbr_skinned",
+          "vertex": "pbr_skinned"
+        },
+        {
+          "fragment": "pbr_fwdplus_noshadow",
+          "key": 3,
+          "variant": 2,
+          "variant_name": "pbr_skinned",
+          "vertex": "pbr_skinned"
+        },
+        {
+          "fragment": "pbr_tint",
+          "key": 0,
+          "variant": 3,
+          "variant_name": "pbr_inst_tint",
+          "vertex": "pbr_inst_tint"
+        },
+        {
+          "fragment": "pbr_tint",
+          "key": 1,
+          "variant": 3,
+          "variant_name": "pbr_inst_tint",
+          "vertex": "pbr_inst_tint"
+        },
+        {
+          "fragment": "pbr_tint_noshadow",
+          "key": 2,
+          "variant": 3,
+          "variant_name": "pbr_inst_tint",
+          "vertex": "pbr_inst_tint"
+        },
+        {
+          "fragment": "pbr_tint_noshadow",
+          "key": 3,
+          "variant": 3,
+          "variant_name": "pbr_inst_tint",
+          "vertex": "pbr_inst_tint"
+        },
+        {
+          "fragment": "pbr_fade",
+          "key": 0,
+          "variant": 4,
+          "variant_name": "pbr_inst_fade",
+          "vertex": "pbr_inst_fade"
+        },
+        {
+          "fragment": "pbr_fade",
+          "key": 1,
+          "variant": 4,
+          "variant_name": "pbr_inst_fade",
+          "vertex": "pbr_inst_fade"
+        },
+        {
+          "fragment": "pbr_fade_noshadow",
+          "key": 2,
+          "variant": 4,
+          "variant_name": "pbr_inst_fade",
+          "vertex": "pbr_inst_fade"
+        },
+        {
+          "fragment": "pbr_fade_noshadow",
+          "key": 3,
+          "variant": 4,
+          "variant_name": "pbr_inst_fade",
+          "vertex": "pbr_inst_fade"
+        },
+        {
+          "fragment": "pbr_inst_tex_array",
+          "key": 0,
+          "variant": 5,
+          "variant_name": "pbr_inst_tex_array",
+          "vertex": "pbr_inst_tex_array"
+        },
+        {
+          "fragment": "pbr_inst_tex_array",
+          "key": 1,
+          "variant": 5,
+          "variant_name": "pbr_inst_tex_array",
+          "vertex": "pbr_inst_tex_array"
+        },
+        {
+          "fragment": "pbr_inst_tex_array_noshadow",
+          "key": 2,
+          "variant": 5,
+          "variant_name": "pbr_inst_tex_array",
+          "vertex": "pbr_inst_tex_array"
+        },
+        {
+          "fragment": "pbr_inst_tex_array_noshadow",
+          "key": 3,
+          "variant": 5,
+          "variant_name": "pbr_inst_tex_array",
+          "vertex": "pbr_inst_tex_array"
+        }
+      ],
+      "stock_pairs": [
+        {
+          "fragment": "color",
+          "member": "color",
+          "vertex": "color"
+        },
+        {
+          "fragment": "textured",
+          "member": "textured",
+          "vertex": "textured"
+        },
+        {
+          "fragment": "text_sdf",
+          "member": "text_sdf",
+          "vertex": "textured"
+        },
+        {
+          "fragment": "mesh",
+          "member": "mesh",
+          "vertex": "mesh"
+        },
+        {
+          "fragment": "pbr_toon",
+          "member": "pbr_toon",
+          "vertex": "pbr_skinned"
+        },
+        {
+          "fragment": "outline",
+          "member": "outline_skinned",
+          "vertex": "pbr_skinned_outline"
+        },
+        {
+          "fragment": "shadow",
+          "member": "shadow",
+          "vertex": "shadow"
+        },
+        {
+          "fragment": "shadow",
+          "member": "shadow_inst",
+          "vertex": "shadow_inst"
+        },
+        {
+          "fragment": "shadow",
+          "member": "shadow_skinned",
+          "vertex": "shadow_skinned"
+        },
+        {
+          "fragment": "terrain",
+          "member": "terrain",
+          "vertex": "terrain"
+        }
+      ]
+    }
+  },
+  "schema": 1,
+  "scope": "Declared shader acquisition/cook policy, not verified device capabilities or GUI acceptance",
+  "source_authority": "contracts/shader-keywords.json"
+}

@@ -28,10 +28,17 @@ static void xfree(void *p) { if (p) jce_free(p); }
 
 static void *xcalloc(size_t n, size_t sz)
 {
+	if (sz && n > SIZE_MAX / sz) return NULL;
 	size_t total = n * sz;
 	void  *p = jce_malloc(total);
 	if (p) memset(p, 0, total);
 	return p;
+}
+
+static bool project_copy_string(char **out, const char *value)
+{
+	*out = value ? jce_strdup(value) : NULL;
+	return !value || *out != NULL;
 }
 
 /* Path helpers live in jce_app_path.h (shared with jce_cook.c — they were
@@ -90,15 +97,17 @@ static void free_str_array(char **arr, int n)
 	xfree(arr);
 }
 
-static char **read_str_array(const JceJson *obj, const char *key, int *out_n)
+static bool read_str_array(const JceJson *obj, const char *key, char ***out, int *out_n)
 {
+	*out = NULL;
 	*out_n = 0;
 	JceJson *arr = jce_json_get(obj, key);
-	if (!arr || !jce_json_is_array(arr)) return NULL;
+	if (!arr || !jce_json_is_array(arr)) return true;
 	int n = jce_json_array_size(arr);
-	if (n <= 0) return NULL;
+	if (n <= 0) return true;
+	if ((size_t)n > SIZE_MAX / sizeof(char *)) return false;
 	char **dst = (char **)jce_malloc(sizeof(char *) * (size_t)n);
-	if (!dst) return NULL;
+	if (!dst) return false;
 	int kept = 0;
 	for (int i = 0; i < n; ++i) {
 		JceJson *it = jce_json_array_at(arr, i);
@@ -106,22 +115,37 @@ static char **read_str_array(const JceJson *obj, const char *key, int *out_n)
 		const char *s = jce_json_string_value(it, NULL);
 		if (!s) continue;
 		dst[kept] = jce_strdup(s);
-		if (dst[kept]) ++kept;
+		if (!dst[kept]) {
+			free_str_array(dst, kept);
+			return false;
+		}
+		++kept;
 	}
 	*out_n = kept;
-	if (kept == 0) { xfree(dst); return NULL; }
-	return dst;
+	if (kept == 0) xfree(dst);
+	else *out = dst;
+	return true;
 }
 
-static void write_str_array(JceJson *obj, const char *key, char **arr, int n)
+static bool write_str_array(JceJson *obj, const char *key, char **arr, int n)
 {
-	if (!arr || n <= 0) return;
+	if (n <= 0) return true;
+	if (!arr) return false;
 	JceJson *a = jce_json_array();
-	if (!a) return;
+	if (!a) return false;
 	for (int i = 0; i < n; ++i) {
-		if (arr[i]) jce_json_array_push_string(a, arr[i]);
+		if (!arr[i]) continue;
+		int count = jce_json_array_size(a);
+		jce_json_array_push_string(a, arr[i]);
+		if (jce_json_array_size(a) != count + 1) {
+			jce_json_free(a);
+			return false;
+		}
 	}
 	jce_json_set_child(obj, key, a);
+	if (jce_json_get(obj, key) == a) return true;
+	jce_json_free(a);
+	return false;
 }
 
 /* ── load ───────────────────────────────────────────────────────────── */
@@ -132,8 +156,9 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 
 	JceProject *p = (JceProject *)xcalloc(1, sizeof *p);
 	if (!p) return NULL;
+	JceJson *root = NULL;
 
-	p->project_root  = jce_strdup(project_root);
+	if (!project_copy_string(&p->project_root, project_root)) goto fail;
 	jce_app_normalise_slashes(p->project_root);
 	jce_app_strip_trailing_slash(p->project_root);
 
@@ -169,76 +194,70 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 
 	if (!p->project_root || !p->manifest_path) goto fail;
 
-	JceJson *root = jce_json_parse_file(p->manifest_path);
+	root = jce_json_parse_file(p->manifest_path);
 	if (!root) {
 		goto fail;
 	}
 	if (!jce_json_is_object(root)) {
 		LOG_WARN(PROJECT_TAG, "%s: not a JSON object", p->manifest_path);
-		jce_json_free(root);
 		goto fail;
 	}
 
 	p->schema_version           = jce_json_get_int   (root, "schema",   JCE_PROJECT_SCHEMA_VERSION);
-	p->name                     = jce_strdup(jce_json_get_string(root, "name",     "untitled"));
-	p->version                  = jce_strdup(jce_json_get_string(root, "version",  "0.1.0"));
-	p->target_name              = jce_strdup(jce_json_get_string(root, "target",   p->name));
-	p->output_exe               = jce_strdup(jce_json_get_string(root, "exe",      ""));
-	{
-		const char *sdk = jce_json_get_string(root, "sdk", NULL);
-		p->sdk_path = sdk ? jce_strdup(sdk) : NULL;
-	}
-	p->default_target_platform  = jce_strdup(jce_json_get_string(root, "platform", "win"));
+	if (!project_copy_string(&p->name, jce_json_get_string(root, "name", "untitled")) ||
+	    !project_copy_string(&p->version, jce_json_get_string(root, "version", "0.1.0")) ||
+	    !project_copy_string(&p->target_name, jce_json_get_string(root, "target", p->name)) ||
+	    !project_copy_string(&p->output_exe, jce_json_get_string(root, "exe", "")) ||
+	    !project_copy_string(&p->sdk_path, jce_json_get_string(root, "sdk", NULL)) ||
+	    !project_copy_string(&p->default_target_platform, jce_json_get_string(root, "platform", "win")))
+		goto fail;
 
-	p->asset_dirs     = read_str_array(root, "assets",   &p->asset_dirs_count);
-	p->build_variants = read_str_array(root, "variants", &p->build_variants_count);
+	if (!read_str_array(root, "assets", &p->asset_dirs, &p->asset_dirs_count) ||
+	    !read_str_array(root, "variants", &p->build_variants, &p->build_variants_count))
+		goto fail;
 
 	/* ── v2 fields (optional; sensible defaults so v1 manifests still work) ── */
 	{
 		const char *s = jce_json_get_string(root, "source_assets", NULL);
-		if (s && *s) {
-			p->source_assets = jce_strdup(s);
-		} else if (p->asset_dirs_count > 0 && p->asset_dirs[0]) {
-			p->source_assets = jce_strdup(p->asset_dirs[0]);
-		} else {
-			p->source_assets = jce_strdup("assets");
-		}
+		if (!s || !*s)
+			s = p->asset_dirs_count > 0 && p->asset_dirs[0] ? p->asset_dirs[0] : "assets";
+		if (!project_copy_string(&p->source_assets, s)) goto fail;
 	}
 	{
 		const char *s = jce_json_get_string(root, "cooked_assets", NULL);
-		p->cooked_assets = jce_strdup(s && *s ? s : "resources/_cooked");
+		if (!project_copy_string(&p->cooked_assets, s && *s ? s : "resources/_cooked")) goto fail;
 	}
 	{
 		const char *s = jce_json_get_string(root, "startup_scene", NULL);
-		p->startup_scene = (s && *s) ? jce_strdup(s) : NULL;
+		if (!project_copy_string(&p->startup_scene, s && *s ? s : NULL)) goto fail;
 	}
 
 	/* v3: bundles array (optional). */
-	p->bundles = read_str_array(root, "bundles", &p->bundles_count);
+	if (!read_str_array(root, "bundles", &p->bundles, &p->bundles_count)) goto fail;
 
 	/* v3: script_modules array (optional).  Read here and NEVER derived: a
 	 * default would name a shared object this project may not build, and the
 	 * editor would then report a missing file for every project that has no
 	 * C++ scripts at all. */
-	p->script_modules = read_str_array(root, "script_modules",
-	                                   &p->script_modules_count);
+	if (!read_str_array(root, "script_modules", &p->script_modules,
+	                    &p->script_modules_count)) goto fail;
 
 	/* v5: script_assemblies array (optional).  Same shape and same silence
 	 * as script_modules: absent means this project has no C# scripts, which
 	 * is the common case and not a condition worth a message. */
-	p->script_assemblies = read_str_array(root, "script_assemblies",
-	                                      &p->script_assemblies_count);
+	if (!read_str_array(root, "script_assemblies", &p->script_assemblies,
+	                    &p->script_assemblies_count)) goto fail;
 
 	/* v4: ui_default_font (optional).  Absent => the engine's built-in face. */
 	{
 		const char *s = jce_json_get_string(root, "ui_default_font", NULL);
-		p->ui_default_font = (s && *s) ? jce_strdup(s) : NULL;
+		if (!project_copy_string(&p->ui_default_font, s && *s ? s : NULL)) goto fail;
 		/* Same optional shape as the font above: absent => no chain, and a
 		 * project written before this key existed loads unchanged. */
 		{
 			const char *fb = jce_json_get_string(root, "ui_font_fallbacks",
 			                                     NULL);
-			p->ui_font_fallbacks = (fb && *fb) ? jce_strdup(fb) : NULL;
+			if (!project_copy_string(&p->ui_font_fallbacks, fb && *fb ? fb : NULL)) goto fail;
 		}
 	}
 
@@ -246,6 +265,7 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	return p;
 
 fail:
+	jce_json_free(root);
 	jce_project_free(p);
 	return NULL;
 }
@@ -258,79 +278,167 @@ JceProject *JCE_CALL jce_project_new(const char *project_root, const char *name)
 	JceProject *p = (JceProject *)xcalloc(1, sizeof *p);
 	if (!p) return NULL;
 
-	p->project_root  = jce_strdup(project_root);
+	if (!project_copy_string(&p->project_root, project_root)) goto fail;
 	jce_app_normalise_slashes(p->project_root);
 	jce_app_strip_trailing_slash(p->project_root);
 	p->manifest_path = jce_app_path_join(p->project_root, JCE_PROJECT_FILENAME);
+	if (!p->manifest_path) goto fail;
 	p->schema_version           = JCE_PROJECT_SCHEMA_VERSION;
-	p->name                     = jce_strdup(name);
-	p->version                  = jce_strdup("0.1.0");
-	p->target_name              = jce_strdup(name);
-	p->output_exe               = NULL;
-	p->sdk_path                 = NULL;
-	p->default_target_platform  = jce_strdup("win");
+	if (!project_copy_string(&p->name, name) ||
+	    !project_copy_string(&p->version, "0.1.0") ||
+	    !project_copy_string(&p->target_name, name) ||
+	    !project_copy_string(&p->default_target_platform, "win")) goto fail;
 
 	/* Seed with conventional defaults the new-project template will use. */
-	p->asset_dirs = (char **)jce_malloc(sizeof(char *) * 1);
-	if (p->asset_dirs) {
-		p->asset_dirs[0] = jce_strdup("assets");
-		p->asset_dirs_count = p->asset_dirs[0] ? 1 : 0;
-	}
-	p->build_variants = (char **)jce_malloc(sizeof(char *) * 2);
-	if (p->build_variants) {
-		p->build_variants[0] = jce_strdup("debug");
-		p->build_variants[1] = jce_strdup("release");
-		p->build_variants_count = (p->build_variants[0] && p->build_variants[1]) ? 2 : 0;
+	p->asset_dirs = (char **)xcalloc(1, sizeof(char *));
+	if (!p->asset_dirs || !project_copy_string(&p->asset_dirs[0], "assets")) goto fail;
+	p->asset_dirs_count = 1;
+	p->build_variants = (char **)xcalloc(2, sizeof(char *));
+	if (!p->build_variants) goto fail;
+	static const char *const variants[] = {"debug", "release"};
+	for (int i = 0; i < 2; ++i) {
+		if (!project_copy_string(&p->build_variants[i], variants[i])) goto fail;
+		++p->build_variants_count;
 	}
 
 	/* v2 defaults — new projects always use the canonical layout. */
-	p->source_assets  = jce_strdup("assets");
-	p->cooked_assets  = jce_strdup("resources/_cooked");
-	p->startup_scene  = NULL;
+	if (!project_copy_string(&p->source_assets, "assets") ||
+	    !project_copy_string(&p->cooked_assets, "resources/_cooked")) goto fail;
 	return p;
+
+fail:
+	jce_project_free(p);
+	return NULL;
 }
 
 /* ── save ───────────────────────────────────────────────────────────── */
 
+static int project_key_compare(const void *a, const void *b)
+{
+	return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static bool project_unique_root_keys(const JceJson *root)
+{
+	size_t count = 0;
+	for (JceJson *node = jce_json_first_child(root); node;
+	     node = jce_json_next_sibling(node)) {
+		if (!jce_json_member_key(node) || count == SIZE_MAX / sizeof(char *))
+			return false;
+		++count;
+	}
+	if (count < 2) return true;
+	const char **keys = (const char **)jce_malloc(count * sizeof(*keys));
+	if (!keys) return false;
+	size_t i = 0;
+	for (JceJson *node = jce_json_first_child(root); node;
+	     node = jce_json_next_sibling(node)) keys[i++] = jce_json_member_key(node);
+	qsort(keys, count, sizeof(*keys), project_key_compare);
+	bool unique = true;
+	for (i = 1; i < count; ++i)
+		if (!strcmp(keys[i - 1], keys[i])) { unique = false; break; }
+	jce_free(keys);
+	return unique;
+}
+
+static JceJson *project_root_for_save(const char *path, bool *create)
+{
+	const JceFsPresence presence = jce_fs_probe_read(path);
+	*create = presence == JCE_FS_PRESENCE_ABSENT;
+	if (*create) return jce_json_object();
+	if (presence == JCE_FS_PRESENCE_PRESENT) {
+		uint64_t original_size = 0;
+		char *bytes = jce_fs_host_read_all(path, &original_size);
+		bool lossless = bytes && original_size <= SIZE_MAX;
+		const size_t size = lossless ? (size_t)original_size : 0;
+		/* The public JSON string facade cannot losslessly print decoded NUL.
+		 * Reject that source before decoding; escaped backslash text is valid.
+		 * This is serialization admission, not private path-schema validation. */
+		if (lossless && memchr(bytes, '\0', size)) lossless = false;
+		for (size_t i = 0; lossless && i < size; ++i) {
+			if (bytes[i] != '\\') continue;
+			if (size - i >= 6 && !memcmp(bytes + i, "\\u0000", 6)) {
+				lossless = false;
+				break;
+			}
+			if (i + 1 < size) ++i;
+		}
+		JceJson *original = lossless ? jce_json_parse_strict(bytes, size) : NULL;
+		jce_fs_buffer_free(bytes);
+		if (original && jce_json_is_object(original) && project_unique_root_keys(original))
+			return original;
+		jce_json_free(original);
+	}
+	LOG_WARN(PROJECT_TAG, "%s: refusing save; existing manifest is unreadable, invalid or ambiguous", path);
+	return NULL;
+}
+
+static bool project_write_string(JceJson *root, const char *key, const char *value)
+{
+	if (!value) return true;
+	jce_json_set_string(root, key, value);
+	const char *saved = jce_json_get_string(root, key, NULL);
+	return saved && !strcmp(saved, value);
+}
+
 bool JCE_CALL jce_project_save(const JceProject *p)
 {
-	if (!p || !p->manifest_path) return false;
+	if (!p || !p->manifest_path || !*p->manifest_path) return false;
+	char *path = NULL;
+	if (jce_path_is_absolute(p->manifest_path)) {
+		path = jce_strdup(p->manifest_path);
+	} else {
+		char cwd[4096];
+		if (jce_fs_host_get_current_dir(cwd, sizeof(cwd)))
+			path = jce_app_path_join(cwd, p->manifest_path);
+	}
+	if (!path) return false;
+	bool create = false;
+	JceJson *root = project_root_for_save(path, &create);
+	if (!root) { xfree(path); return false; }
 
-	JceJson *root = jce_json_object();
-	if (!root) return false;
+	/* Replace only fields owned by this public structure. Every other node,
+	 * including nested extension metadata, stays in the original JSON tree. */
+	static const char *const owned_keys[] = {
+		"schema", "name", "version", "target", "exe", "sdk", "platform",
+		"assets", "variants", "source_assets", "cooked_assets", "startup_scene",
+		"ui_default_font", "ui_font_fallbacks", "bundles", "script_modules", "script_assemblies"
+	};
+	for (size_t i = 0; i < sizeof(owned_keys) / sizeof(owned_keys[0]); ++i)
+		jce_json_remove(root, owned_keys[i]);
 
 	jce_json_set_int   (root, "schema",  JCE_PROJECT_SCHEMA_VERSION);
-	if (p->name)                    jce_json_set_string(root, "name",     p->name);
-	if (p->version)                 jce_json_set_string(root, "version",  p->version);
-	if (p->target_name)             jce_json_set_string(root, "target",   p->target_name);
-	if (p->output_exe)              jce_json_set_string(root, "exe",      p->output_exe);
-	if (p->sdk_path)                jce_json_set_string(root, "sdk",      p->sdk_path);
-	if (p->default_target_platform) jce_json_set_string(root, "platform", p->default_target_platform);
+	bool complete = jce_json_get_int(root, "schema", -1) == JCE_PROJECT_SCHEMA_VERSION &&
+		project_write_string(root, "name", p->name) &&
+		project_write_string(root, "version", p->version) &&
+		project_write_string(root, "target", p->target_name) &&
+		project_write_string(root, "exe", p->output_exe) &&
+		project_write_string(root, "sdk", p->sdk_path) &&
+		project_write_string(root, "platform", p->default_target_platform) &&
+		write_str_array(root, "assets", p->asset_dirs, p->asset_dirs_count) &&
+		write_str_array(root, "variants", p->build_variants, p->build_variants_count) &&
+		project_write_string(root, "source_assets", p->source_assets && *p->source_assets ? p->source_assets : NULL) &&
+		project_write_string(root, "cooked_assets", p->cooked_assets && *p->cooked_assets ? p->cooked_assets : NULL) &&
+		project_write_string(root, "startup_scene", p->startup_scene && *p->startup_scene ? p->startup_scene : NULL) &&
+		project_write_string(root, "ui_default_font", p->ui_default_font && *p->ui_default_font ? p->ui_default_font : NULL) &&
+		project_write_string(root, "ui_font_fallbacks", p->ui_font_fallbacks && *p->ui_font_fallbacks ? p->ui_font_fallbacks : NULL) &&
+		write_str_array(root, "bundles", p->bundles, p->bundles_count) &&
+		write_str_array(root, "script_modules", p->script_modules, p->script_modules_count) &&
+		write_str_array(root, "script_assemblies", p->script_assemblies, p->script_assemblies_count);
+	if (!complete) { jce_json_free(root); xfree(path); return false; }
 
-	write_str_array(root, "assets",   p->asset_dirs,     p->asset_dirs_count);
-	write_str_array(root, "variants", p->build_variants, p->build_variants_count);
-
-	if (p->source_assets  && *p->source_assets)  jce_json_set_string(root, "source_assets",  p->source_assets);
-	if (p->cooked_assets  && *p->cooked_assets)  jce_json_set_string(root, "cooked_assets",  p->cooked_assets);
-	if (p->startup_scene  && *p->startup_scene)  jce_json_set_string(root, "startup_scene",  p->startup_scene);
-	if (p->ui_default_font && *p->ui_default_font)
-		jce_json_set_string(root, "ui_default_font", p->ui_default_font);
-	if (p->ui_font_fallbacks && *p->ui_font_fallbacks)
-		jce_json_set_string(root, "ui_font_fallbacks", p->ui_font_fallbacks);
-
-	write_str_array(root, "bundles", p->bundles, p->bundles_count);
-	/* WRITTEN BACK EVEN THOUGH NOTHING IN THE EDITOR EDITS IT.  The saver
-	 * rebuilds the manifest from this struct rather than patching the file, so
-	 * a key that is read but not written is a key that DISAPPEARS the first
-	 * time any unrelated field is saved — a project whose C++ scripts stop
-	 * loading because someone renamed the startup scene. */
-	write_str_array(root, "script_modules",
-	                p->script_modules, p->script_modules_count);
-	write_str_array(root, "script_assemblies",
-	                p->script_assemblies, p->script_assemblies_count);
-
-	return jce_json_write_file(p->manifest_path, root, /*pretty*/ true,
-	                           /*take_ownership*/ true);
+	bool saved;
+	if (create) {
+		/* Exclusive creation cannot overwrite a file appearing after the probe. */
+		char *text = jce_json_print(root, true);
+		jce_json_free(root);
+		saved = text && jce_fs_host_write_new(path, text, strlen(text));
+		jce_json_free_string(text);
+	} else {
+		saved = jce_json_write_file(path, root, /*pretty*/ true, /*take_ownership*/ true);
+	}
+	xfree(path);
+	return saved;
 }
 
 /* ── free ───────────────────────────────────────────────────────────── */

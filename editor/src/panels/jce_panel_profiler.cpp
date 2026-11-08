@@ -1,19 +1,8 @@
 /*
- * jce_panel_profiler.cpp  Lightweight in-editor performance panel.
- *
- * Visualises:
- *   - rolling frame-time / FPS history (PlotLines)
- *   - min / max / average frame-time over the window
- *   - ImGui IO counters (vertices / indices / draw lists)
- *   - editor uptime, current display & viewport size
- *   - GPU memory used (when bgfx exposes it via the engine renderer
- *     stats hook — currently a placeholder until that API lands)
- *
- * Deliberately lightweight: samples DeltaTime each frame instead of
- * hooking the Tracy/profile API, so the panel works in shipping
- * builds where Tracy is disabled.  Once the engine exposes a stable
- * stats query (`jce_renderer_get_stats(...)` etc.), the empty
- * "Renderer" section below is the place to wire it in.
+ * Lightweight profiler with rolling host intervals and public backend stats.
+ * Backend CPU intervals, latched GPU timings and the two thread waits have
+ * independent scopes. They do not constitute a joined engine/GPU frame or
+ * a measured CPU/GPU bottleneck. Missing timers stay explicitly unavailable.
  */
 
 #include "jce_panel_common.h"
@@ -25,6 +14,7 @@
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
+#include "jce_profiler_observation.h"
 
 #include <jce/os/core/jce_async.h>
 #include <jce/renderer/jce_lowlevel.h>
@@ -50,6 +40,11 @@ struct ProfilerState {
     float   cpu_ms  [kHistoryLen] = {};
     float   gpu_ms  [kHistoryLen] = {};
     float   wait_ms [kHistoryLen] = {};
+    float   submit_wait_ms[kHistoryLen] = {};
+    bool    cpu_available[kHistoryLen] = {}, gpu_available[kHistoryLen] = {};
+    bool    api_wait_available[kHistoryLen] = {}, submit_wait_available[kHistoryLen] = {};
+    JceProfilerObservation observation{};
+    JceProfilerHistoryEpoch history_epoch{};
     float   vram_mb [kHistoryLen] = {};
     int     head      = 0;
     int     filled    = 0;
@@ -58,7 +53,6 @@ struct ProfilerState {
     int64_t  cpu_freq         = 1;
     int64_t  gpu_freq         = 1;
     int64_t  cpu_time_frame   = 0;
-    int64_t  cpu_submit       = 0;
     int64_t  gpu_time_total   = 0;
     int64_t  wait_render      = 0;
     int64_t  wait_submit      = 0;
@@ -84,6 +78,7 @@ struct ProfilerState {
         char    name[64];
         float   cpu_ms;
         float   gpu_ms;
+        bool    cpu_available, gpu_available;
         uint32_t draws;
     };
     std::vector<ViewRow> view_rows;
@@ -95,7 +90,7 @@ struct ProfilerState {
 ProfilerState s_prof;
 
 /* Rebuild the per-view row snapshot from a fresh stats capture.  Shared
- * by the CPU tab's sampler and the Frame Debugger tab (whose own copy of
+ * by the CPU tab presentation and the Frame Debugger tab (whose own copy of
  * this table was removed — single implementation, see
  * jce_panel_profiler_draw_view_table). */
 void refill_view_rows(const JceFrameStats *st)
@@ -107,25 +102,42 @@ void refill_view_rows(const JceFrameStats *st)
         ProfilerState::ViewRow r;
         r.id = v->view_id;
         std::snprintf(r.name, sizeof(r.name), "%s", v->name);
-        r.cpu_ms = (float)((double)(v->cpu_time_end - v->cpu_time_begin) * 1000.0 / (double)s_prof.cpu_freq);
-        r.gpu_ms = (float)((double)(v->gpu_time_end - v->gpu_time_begin) * 1000.0 / (double)s_prof.gpu_freq);
+        r.cpu_available=s_prof.cpu_freq>0 && v->cpu_time_begin>=0 && v->cpu_time_end>0 && v->cpu_time_end>=v->cpu_time_begin;
+        r.gpu_available=s_prof.gpu_freq>0 && v->gpu_time_begin>=0 && v->gpu_time_end>v->gpu_time_begin;
+        r.cpu_ms=r.cpu_available?static_cast<float>((static_cast<double>(v->cpu_time_end)-static_cast<double>(v->cpu_time_begin))*1000.0/static_cast<double>(s_prof.cpu_freq)):0;
+        r.gpu_ms=r.gpu_available?static_cast<float>(static_cast<double>(v->gpu_time_end-v->gpu_time_begin)*1000.0/static_cast<double>(s_prof.gpu_freq)):0;
         r.draws  = 0; /* per-view draw count not in this stats struct */
         s_prof.view_rows.push_back(r);
     }
     s_prof.view_rows_frame = ImGui::GetFrameCount();
 }
 
-void push_sample(float dt_ms)
+const JceFrameStats *push_sample(float dt_ms)
 {
     /* Capture stats first (in head slot), then advance head. */
     const JceFrameStats *st = jce_gfx_stats_capture();
-    float cpu_ms = 0.0f, gpu_ms = 0.0f, wait_ms = 0.0f, vram_mb = 0.0f;
+    JceGpuTimingObservation gpu_observation{};
+    const bool observed_gpu=jce_renderer_get_gpu_timing_observation(
+        &gpu_observation,sizeof(gpu_observation));
+    /* A device/context transition invalidates backend timing history, not UI
+     * wall intervals. CPU-side frame IDs never imply GPU completion. */
+    if (jce_profiler_history_epoch_changed(&s_prof.history_epoch,
+        observed_gpu ? &gpu_observation : nullptr)) {
+        std::memset(s_prof.cpu_available,0,sizeof(s_prof.cpu_available));
+        std::memset(s_prof.gpu_available,0,sizeof(s_prof.gpu_available));
+        std::memset(s_prof.api_wait_available,0,sizeof(s_prof.api_wait_available));
+        std::memset(s_prof.submit_wait_available,0,sizeof(s_prof.submit_wait_available));
+    }
+    s_prof.observation=jce_profiler_observe(st,
+        observed_gpu ? &gpu_observation : nullptr);
+    const auto &sample=s_prof.observation;
+    float cpu_ms=static_cast<float>(sample.cpu_interval_ms),gpu_ms=static_cast<float>(sample.gpu_ms);
+    float wait_ms=static_cast<float>(sample.api_wait_ms),vram_mb=0;
     if (st) {
-        s_prof.cpu_freq = st->cpu_timer_freq > 0 ? st->cpu_timer_freq : 1;
-        s_prof.gpu_freq = st->gpu_timer_freq > 0 ? st->gpu_timer_freq : 1;
+        s_prof.cpu_freq = st->cpu_timer_freq;
+        s_prof.gpu_freq = s_prof.observation.gpu_available ? gpu_observation.timer_frequency : 0;
         s_prof.cpu_time_frame = st->cpu_time_frame;
-        s_prof.cpu_submit     = st->cpu_time_frame; /* aggregate; submit-only no longer surfaced */
-        s_prof.gpu_time_total = st->gpu_time_end - st->gpu_time_begin;
+        s_prof.gpu_time_total = s_prof.observation.gpu_available ? gpu_observation.raw_end-gpu_observation.raw_begin : 0;
         s_prof.wait_render    = st->wait_render;
         s_prof.wait_submit    = st->wait_submit;
         s_prof.vram_used      = st->gpu_memory_used;
@@ -145,54 +157,44 @@ void push_sample(float dt_ms)
         s_prof.bb_w           = st->backbuffer_width;
         s_prof.bb_h           = st->backbuffer_height;
 
-        /* True CPU work: bgfx cpuTimeFrame is WALL time between frames
-         * (includes GPU waits) — subtracting the waits is what lets the
-         * panel distinguish CPU-bound from GPU-bound. */
-        {
-            int64_t cpu_work = s_prof.cpu_time_frame
-                             - s_prof.wait_render - s_prof.wait_submit;
-            if (cpu_work < 0) cpu_work = 0;
-            cpu_ms = (float)((double)cpu_work * 1000.0 / (double)s_prof.cpu_freq);
-        }
-        gpu_ms = (float)((double)s_prof.gpu_time_total * 1000.0 / (double)s_prof.gpu_freq);
-        wait_ms = (float)((double)(s_prof.wait_render + s_prof.wait_submit) * 1000.0
-                          / (double)s_prof.cpu_freq);
+        /* Backend frame intervals, API waits and render-thread submit waits
+         * are separate observations, not additive engine-frame subphases. */
         int64_t vram = s_prof.vram_used > 0
                           ? s_prof.vram_used
                           : (s_prof.tex_mem + s_prof.rt_mem);
         vram_mb = (float)((double)vram / (1024.0 * 1024.0));
-
-        /* View rows snapshot (rebuilt each frame, then sorted on demand) */
-        refill_view_rows(st);
-    }
+    } else { s_prof.view_rows.clear(); s_prof.view_rows_frame=ImGui::GetFrameCount(); }
 
     s_prof.frame_ms[s_prof.head] = dt_ms;
     s_prof.cpu_ms  [s_prof.head] = cpu_ms;
     s_prof.gpu_ms  [s_prof.head] = gpu_ms;
     s_prof.wait_ms [s_prof.head] = wait_ms;
+    s_prof.submit_wait_ms[s_prof.head]=static_cast<float>(sample.submit_wait_ms);
+    s_prof.cpu_available[s_prof.head]=sample.cpu_available;
+    s_prof.gpu_available[s_prof.head]=sample.gpu_available;
+    s_prof.api_wait_available[s_prof.head]=sample.api_wait_available;
+    s_prof.submit_wait_available[s_prof.head]=sample.submit_wait_available;
     s_prof.vram_mb [s_prof.head] = vram_mb;
     s_prof.head = (s_prof.head + 1) % kHistoryLen;
     if (s_prof.filled < kHistoryLen) ++s_prof.filled;
+    return st;
 }
 
-void compute_stats(const float *ring, float &out_min, float &out_max, float &out_avg)
+void compute_stats(const float *ring, float &out_min, float &out_max, float &out_avg, const bool *available=nullptr)
 {
     if (s_prof.filled == 0) {
         out_min = out_max = out_avg = 0.0f;
         return;
     }
-    float mn = ring[0];
-    float mx = ring[0];
-    double sum = 0.0;
-    for (int i = 0; i < s_prof.filled; ++i) {
-        float v = ring[i];
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
-        sum += v;
+    float mn=0,mx=0; double sum=0; int count=0;
+    for (int i=0;i<s_prof.filled;++i) {
+        if ((available && !available[i]) || !std::isfinite(ring[i])) continue;
+        const float v=ring[i];
+        if (!count || v<mn) mn=v;
+        if (!count || v>mx) mx=v;
+        sum+=v; ++count;
     }
-    out_min = mn;
-    out_max = mx;
-    out_avg = static_cast<float>(sum / s_prof.filled);
+    out_min=mn; out_max=mx; out_avg=count?static_cast<float>(sum/count):0;
 }
 
 /* PlotLines callbacks per series. Walk the ring chronologically. */
@@ -202,9 +204,9 @@ float ring_idx(int idx)
     return (float)((start + idx) % kHistoryLen);
 }
 float ring_frame (void *, int idx) { return s_prof.frame_ms[(int)ring_idx(idx)]; }
-float ring_cpu   (void *, int idx) { return s_prof.cpu_ms  [(int)ring_idx(idx)]; }
-float ring_gpu   (void *, int idx) { return s_prof.gpu_ms  [(int)ring_idx(idx)]; }
-float ring_wait  (void *, int idx) { return s_prof.wait_ms [(int)ring_idx(idx)]; }
+float ring_cpu   (void *, int idx) { return jce_profiler_history_value(s_prof.cpu_ms[(int)ring_idx(idx)], s_prof.cpu_available[(int)ring_idx(idx)]); }
+float ring_gpu   (void *, int idx) { return jce_profiler_history_value(s_prof.gpu_ms[(int)ring_idx(idx)], s_prof.gpu_available[(int)ring_idx(idx)]); }
+float ring_wait  (void *, int idx) { return jce_profiler_history_value(s_prof.wait_ms[(int)ring_idx(idx)], s_prof.api_wait_available[(int)ring_idx(idx)]); }
 float ring_vram  (void *, int idx) { return s_prof.vram_mb [(int)ring_idx(idx)]; }
 
 void format_bytes(char *buf, size_t n, int64_t b)
@@ -215,13 +217,13 @@ void format_bytes(char *buf, size_t n, int64_t b)
     else              std::snprintf(buf, n, "%.1f MB", mb);
 }
 
-void draw_bars_block(const char *id, float cpu, float gpu, float wait, float frame)
+void draw_bars_block(const char *id, float cpu, float gpu, float wait, float submit_wait, float frame)
 {
-    /* Stacked bars: cpu / gpu / wait / frame_total. */
-    float maxv = std::max({cpu, gpu, wait, frame, 16.7f}) * 1.2f;
+    /* Independent backend scopes; these bars must never be stacked or summed. */
+    float maxv = std::max({cpu, gpu, wait, submit_wait, frame, 16.7f}) * 1.2f;
     if (maxv < 1.0f) maxv = 1.0f;
 
-    auto bar = [&](const char *label, float ms, ImU32 col) {
+    auto bar = [&](const char *label, float ms, ImU32 col, bool available=true) {
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         float full_w = ImGui::GetContentRegionAvail().x - 120.0f;
         if (full_w < 40.0f) full_w = 40.0f;
@@ -234,14 +236,16 @@ void draw_bars_block(const char *id, float cpu, float gpu, float wait, float fra
         dl->AddRectFilled(p0, ImVec2(p0.x + w,      p0.y + h), col);
         ImGui::Dummy(ImVec2(full_w, h));
         ImGui::SameLine();
-        ImGui::Text("%-6s %6.2f ms", label, ms);
+        if (available) ImGui::Text("%-6s %6.2f ms",label,ms);
+        else ImGui::TextDisabled("%s: %s",label,jce_editor_i18n("profiler.value.unavailable"));
     };
 
     ImGui::PushID(id);
     bar(jce_editor_i18n("profiler.bar.frame"), frame, IM_COL32(220, 220, 220, 255));
-    bar(jce_editor_i18n("profiler.bar.cpu"),   cpu,   JCE_COL32_STATUS_OK);
-    bar(jce_editor_i18n("profiler.bar.gpu"),   gpu,   IM_COL32( 80, 160, 230, 255));
-    bar(jce_editor_i18n("profiler.bar.wait"),  wait,  IM_COL32(220, 160,  60, 255));
+    bar(jce_editor_i18n("profiler.bar.cpu"),cpu,JCE_COL32_STATUS_OK,s_prof.observation.cpu_available);
+    bar(jce_editor_i18n("profiler.bar.gpu"),gpu,IM_COL32(80,160,230,255),s_prof.observation.gpu_available);
+    bar(jce_editor_i18n("profiler.bar.wait"),wait,JCE_COL32_STATUS_WARN,s_prof.observation.api_wait_available);
+    bar(jce_editor_i18n("profiler.bar.submitWait"),submit_wait,JCE_COL32_STATUS_WARN,s_prof.observation.submit_wait_available);
     ImGui::PopID();
 }
 
@@ -286,38 +290,51 @@ void draw_area_chart(const char *label, float (*get)(void *, int), int count,
         }
     }
 
+    int known=0;
+    for (int i=0;i<count;++i)
+        if (jce_profiler_history_known(get(nullptr,i))) ++known;
     if (count >= 2) {
         ImU32 fill = (line_col & IM_COL32(255, 255, 255, 0)) | IM_COL32(0, 0, 0, 46);
         float step = gw / (float)(count - 1);
         for (int i = 0; i < count - 1; ++i) {
+            const float a=get(nullptr,i), b=get(nullptr,i+1);
+            if (!jce_profiler_history_known(a) || !jce_profiler_history_known(b)) continue;
             float x0 = gx0 + step * i, x1 = gx0 + step * (i + 1);
-            float y0 = yof(get(nullptr, i)), y1 = yof(get(nullptr, i + 1));
+            float y0 = yof(a), y1 = yof(b);
             ImVec2 quad[4] = { ImVec2(x0, y0), ImVec2(x1, y1),
                                ImVec2(x1, gy1), ImVec2(x0, gy1) };
             dl->AddConvexPolyFilled(quad, 4, fill);
+            dl->AddLine(ImVec2(x0, y0), ImVec2(x1, y1), line_col, 1.7f);
         }
-        for (int i = 0; i < count - 1; ++i) {
-            float x0 = gx0 + step * i, x1 = gx0 + step * (i + 1);
-            dl->AddLine(ImVec2(x0, yof(get(nullptr, i))),
-                        ImVec2(x1, yof(get(nullptr, i + 1))), line_col, 1.7f);
-        }
-        dl->AddCircleFilled(ImVec2(gx1, yof(get(nullptr, count - 1))), 2.6f, line_col);
     }
+    if (count>0 && jce_profiler_history_known(get(nullptr,count-1)))
+        dl->AddCircleFilled(ImVec2(gx1,yof(get(nullptr,count-1))),2.6f,line_col);
 
     /* label + current (left), avg·max (right) */
     char buf[80];
     ImVec2 lp = ImVec2(p0.x + 7.0f, p0.y + 3.0f);
     dl->AddText(lp, jce_theme::text_secondary(), label);
     float lw = ImGui::CalcTextSize(label).x;
-    std::snprintf(buf, sizeof buf, "%.2f%s", cur, unit);
+    if (count>0 && jce_profiler_history_known(cur))
+        std::snprintf(buf,sizeof buf,"%.2f%s",cur,unit);
+    else std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("profiler.value.unavailable"));
     dl->AddText(ImVec2(lp.x + lw + 8.0f, lp.y), line_col, buf);
-    std::snprintf(buf, sizeof buf, "%s %.1f  \xC2\xB7  %s %.1f",
-                  jce_editor_i18n("profiler.stat.avg"), avg,
-                  jce_editor_i18n("profiler.stat.max"), peak);
+    if (known)
+        std::snprintf(buf, sizeof buf, "%s %.1f  \xC2\xB7  %s %.1f",
+                      jce_editor_i18n("profiler.stat.avg"), avg,
+                      jce_editor_i18n("profiler.stat.max"), peak);
+    else std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("profiler.value.unavailable"));
     float rw = ImGui::CalcTextSize(buf).x;
     dl->AddText(ImVec2(p1.x - rw - 7.0f, lp.y), jce_theme::text_secondary(), buf);
 
     ImGui::Dummy(ImVec2(w, height));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s: %d/%d; %s: %d",
+            jce_editor_i18n("profiler.row.samples"),known,count,
+            jce_editor_i18n("profiler.value.unavailable"),count-known);
+    ImGui::TextDisabled("%s: %d/%d; %s: %d",
+        jce_editor_i18n("profiler.row.samples"),known,count,
+        jce_editor_i18n("profiler.value.unavailable"),count-known);
 }
 
 /* View-id ownership conflicts detected this frame.
@@ -435,9 +452,12 @@ void draw_view_table()
             ImU32 c_gpu = (r.gpu_ms > 5.0f) ? IM_COL32(255, 120, 80, 255)
                                              : IM_COL32(160, 200, 240, 255);
             ImGui::PushStyleColor(ImGuiCol_Text, c_gpu);
-            ImGui::Text("%.3f", r.gpu_ms);
+            if (r.gpu_available) ImGui::Text("%.3f",r.gpu_ms);
+            else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
             ImGui::PopStyleColor();
-            ImGui::TableNextColumn(); ImGui::Text("%.3f", r.cpu_ms);
+            ImGui::TableNextColumn();
+            if (r.cpu_available) ImGui::Text("%.3f",r.cpu_ms);
+            else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
         }
         ImGui::EndTable();
     }
@@ -456,7 +476,7 @@ void append_fmt(std::string &out, const char *fmt, ...)
 
 std::string build_clipboard_snapshot(float dt_ms,
                                      float mn,  float avg, float mx,
-                                     float cpu_avg, float gpu_avg, float w_avg)
+                                     float cpu_avg, float gpu_avg, float w_avg, float submit_wait_avg)
 {
     std::string s;
     s.reserve(4096);
@@ -469,15 +489,20 @@ std::string build_clipboard_snapshot(float dt_ms,
     append_fmt(s, "Backbuffer       : %u x %u\n",
                (unsigned)s_prof.bb_w, (unsigned)s_prof.bb_h);
     append_fmt(s, "Samples          : %d / %d\n", s_prof.filled, kHistoryLen);
-    s += "\n[Frame timing]\n";
-    append_fmt(s, "  Current        : %.2f ms (%.1f FPS)\n", dt_ms,
-               dt_ms > 0.0f ? 1000.0f / dt_ms : 0.0f);
-    append_fmt(s, "  Frame min/avg/max : %.2f / %.2f / %.2f ms (%.1f FPS avg)\n",
-               mn, avg, mx, fps_avg);
-    append_fmt(s, "  CPU avg        : %.2f ms\n", cpu_avg);
-    append_fmt(s, "  GPU avg        : %.2f ms\n", gpu_avg);
-    append_fmt(s, "  Wait avg       : %.2f ms\n", w_avg);
-    append_fmt(s, "  ImGui FPS      : %.1f\n", io.Framerate);
+    append_fmt(s,"\n[%s]\n",jce_editor_i18n("profiler.bar.frame"));
+    append_fmt(s,"  %s: %.2f ms (%.1f %s)\n",
+               jce_editor_i18n("profiler.row.current"),dt_ms,
+               dt_ms>0?1000.0f/dt_ms:0,jce_editor_i18n("profiler.label.uiCadence"));
+    append_fmt(s,"  %s: %.2f / %.2f / %.2f ms (%.1f %s)\n",
+               jce_editor_i18n("profiler.row.frameMinAvgMax"),mn,avg,mx,
+               fps_avg,jce_editor_i18n("profiler.label.uiCadence"));
+    append_fmt(s,"  %s\n",jce_editor_i18n("profiler.label.uiScope"));
+    append_fmt(s,"  Backend interval avg: %.2f ms (latest available=%d)\n",cpu_avg,s_prof.observation.cpu_available);
+    append_fmt(s,"  Latched GPU avg : %.2f ms (latest available=%d)\n",gpu_avg,s_prof.observation.gpu_available);
+    append_fmt(s,"  API render wait : %.2f ms (latest available=%d)\n",w_avg,s_prof.observation.api_wait_available);
+    append_fmt(s,"  Render submit wait: %.2f ms (latest available=%d)\n",submit_wait_avg,s_prof.observation.submit_wait_available);
+    s+="  Scope: backend timers may be latched; waits are on different threads. No exact engine-frame join or CPU/GPU bottleneck verdict.\n";
+    append_fmt(s,"  %s: %.1f\n",jce_editor_i18n("profiler.row.imguiFps"),io.Framerate);
 
     /* Engine CPU-phase breakdown — the panel's headline table, so it must ride
      * along in the copied snapshot too (was missing). */
@@ -660,7 +685,12 @@ void reset_history(void)
     std::memset(s_prof.frame_ms, 0, sizeof(s_prof.frame_ms));
     std::memset(s_prof.cpu_ms,   0, sizeof(s_prof.cpu_ms));
     std::memset(s_prof.gpu_ms,   0, sizeof(s_prof.gpu_ms));
-    std::memset(s_prof.wait_ms,  0, sizeof(s_prof.wait_ms));
+    std::memset(s_prof.wait_ms,0,sizeof(s_prof.wait_ms));
+    std::memset(s_prof.submit_wait_ms,0,sizeof(s_prof.submit_wait_ms));
+    std::memset(s_prof.cpu_available,0,sizeof(s_prof.cpu_available));
+    std::memset(s_prof.gpu_available,0,sizeof(s_prof.gpu_available));
+    std::memset(s_prof.api_wait_available,0,sizeof(s_prof.api_wait_available));
+    std::memset(s_prof.submit_wait_available,0,sizeof(s_prof.submit_wait_available));
     std::memset(s_prof.vram_mb,  0, sizeof(s_prof.vram_mb));
     s_prof.head   = 0;
     s_prof.filled = 0;
@@ -687,8 +717,18 @@ void draw_content(void)
 
     /* Sample current frame. */
     float dt_ms = io.DeltaTime * 1000.0f;
-    push_sample(dt_ms);
+    const JceFrameStats *frame_stats = push_sample(dt_ms);
     s_prof.uptime_s += io.DeltaTime;
+
+    /* The same-host Game overlay covers this presentation, not its history.
+     * Detached profiler windows remain visible and keep their normal UI. */
+    if (jce_editor_game_view_maximized() &&
+        ImGui::GetWindowViewport() == ImGui::GetMainViewport()) {
+        return;
+    }
+
+    /* View rows are derived presentation, not rolling history. */
+    if (frame_stats) refill_view_rows(frame_stats);
 
     float mn, mx, avg;
     compute_stats(s_prof.frame_ms, mn, mx, avg);
@@ -696,16 +736,17 @@ void draw_content(void)
 
     float cpu_mn, cpu_mx, cpu_avg;
     float gpu_mn, gpu_mx, gpu_avg;
-    float w_mn,   w_mx,   w_avg;
+    float w_mn,w_mx,w_avg,sw_mn,sw_mx,sw_avg;
     float v_mn,   v_mx,   v_avg;
-    compute_stats(s_prof.cpu_ms,  cpu_mn, cpu_mx, cpu_avg);
-    compute_stats(s_prof.gpu_ms,  gpu_mn, gpu_mx, gpu_avg);
-    compute_stats(s_prof.wait_ms, w_mn,   w_mx,   w_avg);
+    compute_stats(s_prof.cpu_ms,cpu_mn,cpu_mx,cpu_avg,s_prof.cpu_available);
+    compute_stats(s_prof.gpu_ms,gpu_mn,gpu_mx,gpu_avg,s_prof.gpu_available);
+    compute_stats(s_prof.wait_ms,w_mn,w_mx,w_avg,s_prof.api_wait_available);
+    compute_stats(s_prof.submit_wait_ms,sw_mn,sw_mx,sw_avg,s_prof.submit_wait_available);
     compute_stats(s_prof.vram_mb, v_mn,   v_mx,   v_avg);
 
     float plot_max = std::max(33.4f, mx * 1.2f);
 
-    /* ── Summary header: FPS · frame time · bottleneck verdict · actions ── */
+    /* UI update wall interval and independent backend wait observations. */
     {
         float fps_now = (dt_ms > 0.0f) ? 1000.0f / dt_ms : 0.0f;
         ImU32 fps_col;
@@ -725,12 +766,14 @@ void draw_content(void)
             ImGui::Dummy(ImVec2(sz.x + px * 2, sz.y + py * 2));
         };
 
-        char b[48];
-        std::snprintf(b, sizeof b, "%.0f FPS", fps_now);
+        char b[192];
+        std::snprintf(b,sizeof b,"%.0f %s",fps_now,jce_editor_i18n("profiler.label.uiCadence"));
         pill(b, fps_col);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s",jce_editor_i18n("profiler.label.uiScope"));
         ImGui::SameLine();
         ImGui::AlignTextToFramePadding();
-        std::snprintf(b, sizeof b, "%.2f ms", dt_ms);
+        std::snprintf(b,sizeof b,"%s %.2f ms",jce_editor_i18n("profiler.row.current"),dt_ms);
         ImGui::TextUnformatted(b);
         ImGui::SameLine();
         std::snprintf(b, sizeof b, "%s %.1f  \xC2\xB7  %s %.1f",
@@ -738,18 +781,17 @@ void draw_content(void)
                       jce_editor_i18n("profiler.stat.max"), mx);
         ImGui::TextDisabled("%s", b);
 
-        /* Bottleneck verdict — the panel's headline answer (CPU vs GPU work,
-         * waits excluded).  Amber = balanced, green = CPU-bound, blue = GPU. */
+        /* Describe an observed wait. Unjoined CPU/GPU samples cannot prove
+         * a bottleneck, even when their numerical averages are different. */
         ImGui::SameLine();
-        const char *verdict; ImU32 vcol;
-        if (cpu_avg + gpu_avg < 0.05f) {
-            verdict = jce_editor_i18n("profiler.verdict.measuring"); vcol = jce_theme::track_even();
-        } else if (cpu_avg > gpu_avg * 1.25f) {
-            verdict = jce_editor_i18n("profiler.verdict.cpuBound");  vcol = IM_COL32(70, 130, 72, 255);
-        } else if (gpu_avg > cpu_avg * 1.25f) {
-            verdict = jce_editor_i18n("profiler.verdict.gpuBound");  vcol = IM_COL32(58, 112, 168, 255);
-        } else {
-            verdict = jce_editor_i18n("profiler.verdict.balanced");  vcol = IM_COL32(150, 122, 52, 255);
+        const char *verdict; const ImU32 vcol=jce_theme::header_bg();
+        switch (jce_profiler_observation_verdict(s_prof.observation)) {
+        case JceProfilerObservationVerdict::SubmissionWait:
+            verdict=jce_editor_i18n("profiler.verdict.submissionWait"); break;
+        case JceProfilerObservationVerdict::BackendWait:
+            verdict=jce_editor_i18n("profiler.verdict.backendWait"); break;
+        default:
+            verdict=jce_editor_i18n("profiler.verdict.unknown"); break;
         }
         pill(verdict, vcol);
         if (ImGui::IsItemHovered())
@@ -773,7 +815,7 @@ void draw_content(void)
         ImGui::SameLine();
         if (ImGui::Button(copy_lbl)) {
             std::string snap = build_clipboard_snapshot(
-                dt_ms, mn, avg, mx, cpu_avg, gpu_avg, w_avg);
+                dt_ms,mn,avg,mx,cpu_avg,gpu_avg,w_avg,sw_avg);
             ImGui::SetClipboardText(snap.c_str());
             jce_toast_success("%s (%zu B)",
                               jce_editor_i18n("profiler.toast.copied"),
@@ -792,7 +834,8 @@ void draw_content(void)
     /* ── Frame budget (avg cpu/gpu/wait/frame over the window) ─── */
     ImGui::Spacing();
     ImGui::SeparatorText(jce_editor_i18n("profiler.section.frameBudget"));
-    draw_bars_block("avg_bars", cpu_avg, gpu_avg, w_avg, avg);
+    ImGui::TextWrapped("%s",jce_editor_i18n("profiler.verdict.tip"));
+    draw_bars_block("avg_bars",cpu_avg,gpu_avg,w_avg,sw_avg,avg);
 
     /* ── Per-series mini-plots ─────────────────────────────────── */
     ImGui::Spacing();
@@ -833,6 +876,7 @@ void draw_content(void)
      * always-visible breakdown below the charts + budget (NOT collapsed). */
     ImGui::Spacing();
     ImGui::SeparatorText(jce_editor_i18n("profiler.section.cpuPhases"));
+    ImGui::TextWrapped("%s", jce_editor_i18n("profiler.phases.scope"));
     {
         struct PhaseRow { const char *name; double ms; };
         PhaseRow rows[JCE_PERF_PHASE_MAX_SLOTS]; int rn = 0;
@@ -848,13 +892,10 @@ void draw_content(void)
         if (rn == 0) {
             ImGui::TextDisabled("%s", jce_editor_i18n("profiler.phases.accumulating"));
         } else {
-            /* Clean horizontal bar-list: each phase a rounded bar whose LENGTH is
-             * its share of the biggest phase, name inset left, "ms · %" right.
-             * Top row (the bottleneck) amber, the rest CPU-green — one coherent
-             * breakdown, cohesive with the series charts. */
+            /* Nested wall spans are independent observations. Bar lengths are
+             * relative to the longest span; neither their sum nor the longest
+             * inclusive span identifies a frame total or a bottleneck. */
             const int shown = rn < 14 ? rn : 14;
-            double total = 0.0;
-            for (int i = 0; i < rn; ++i) total += rows[i].ms;
             double maxms = rows[0].ms > 0.0 ? rows[0].ms : 1.0;
             ImDrawList *dl = ImGui::GetWindowDrawList();
             float rowh = ImGui::GetTextLineHeight() + 7.0f;
@@ -874,9 +915,7 @@ void draw_content(void)
                 dl->AddText(ImVec2(p0.x + 7.0f, p0.y + 3.5f),
                             jce_theme::text_primary(), rows[i].name);
                 char b[64];
-                std::snprintf(b, sizeof b, "%.2f ms  \xC2\xB7  %.0f%%",
-                              rows[i].ms,
-                              total > 0.0 ? 100.0 * rows[i].ms / total : 0.0);
+                std::snprintf(b, sizeof b, "%.2f ms", rows[i].ms);
                 float tw = ImGui::CalcTextSize(b).x;
                 dl->AddText(ImVec2(p1.x - tw - 7.0f, p0.y + 3.5f),
                             jce_theme::text_secondary(), b);
@@ -903,9 +942,11 @@ void draw_content(void)
         row(jce_editor_i18n("profiler.row.current"),   buf);
         std::snprintf(buf, sizeof(buf), "%.2f / %.2f / %.2f ms", mn, avg, mx);
         row(jce_editor_i18n("profiler.row.frameMinAvgMax"), buf);
-        std::snprintf(buf, sizeof(buf), "%.2f / %.2f / %.2f ms", cpu_mn, cpu_avg, cpu_mx);
+        if (s_prof.observation.cpu_available) std::snprintf(buf,sizeof buf,"%.2f / %.2f / %.2f ms",cpu_mn,cpu_avg,cpu_mx);
+        else std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("profiler.value.unavailable"));
         row(jce_editor_i18n("profiler.row.cpuMinAvgMax"), buf);
-        std::snprintf(buf, sizeof(buf), "%.2f / %.2f / %.2f ms", gpu_mn, gpu_avg, gpu_mx);
+        if (s_prof.observation.gpu_available) std::snprintf(buf,sizeof buf,"%.2f / %.2f / %.2f ms",gpu_mn,gpu_avg,gpu_mx);
+        else std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("profiler.value.unavailable"));
         row(jce_editor_i18n("profiler.row.gpuMinAvgMax"), buf);
         std::snprintf(buf, sizeof(buf), "%.1f", io.Framerate);
         row(jce_editor_i18n("profiler.row.imguiFps"), buf);
@@ -1464,10 +1505,12 @@ extern "C" void jce_panel_profiler_draw_view_table(void)
 {
     if (s_prof.view_rows_frame != ImGui::GetFrameCount()) {
         if (const JceFrameStats *st = jce_gfx_stats_capture()) {
-            s_prof.cpu_freq = st->cpu_timer_freq > 0 ? st->cpu_timer_freq : 1;
-            s_prof.gpu_freq = st->gpu_timer_freq > 0 ? st->gpu_timer_freq : 1;
+            s_prof.cpu_freq = st->cpu_timer_freq;
+            JceGpuTimingObservation gpu{};
+            s_prof.gpu_freq = jce_renderer_get_gpu_timing_observation(&gpu,sizeof(gpu)) &&
+                gpu.timer_available ? gpu.timer_frequency : 0;
             refill_view_rows(st);
-        }
+        } else { s_prof.view_rows.clear(); s_prof.view_rows_frame=ImGui::GetFrameCount(); }
     }
     draw_view_table();
 }

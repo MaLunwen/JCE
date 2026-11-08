@@ -4,6 +4,9 @@
 
 #include "jce_scene_render_internal.h"
 #include "core/jce_editor_project_state.h"
+#include <jce/middleware/scene/jce_component_registry.h>
+
+#include <cmath>
 
 #include <cstdlib>   /* getenv/atof — headless vista camera env overrides */
 #include <cstdio>    /* snprintf for the spin-capture path */
@@ -449,6 +452,7 @@ void jce_editor_scene_camera_set_state(const float target3[3], float yaw,
                                        float pitch, float distance)
 {
     if (!s_sr.initialized) return;
+    s_sr.tsr_history.valid = false;
     orbit_cancel_focus_anim();
     if (target3) s_sr.orbit_target = jce_v3(target3[0], target3[1], target3[2]);
     s_sr.orbit_yaw = yaw;
@@ -510,6 +514,7 @@ bool jce_editor_scene_camera_restore_pose(const char *scene_path)
 void jce_editor_scene_camera_snap_view(JceCamPresetView preset)
 {
     if (!s_sr.initialized) return;
+    s_sr.tsr_history.valid = false;
     orbit_cancel_focus_anim();
 
     switch (preset) {
@@ -526,6 +531,7 @@ void jce_editor_scene_camera_snap_view(JceCamPresetView preset)
 void jce_editor_scene_camera_reset(void)
 {
     if (!s_sr.initialized) return;
+    s_sr.tsr_history.valid = false;
     orbit_cancel_focus_anim();
     s_sr.focus_last_bounds_valid = false;
     s_sr.focus_zoom_step = 0;
@@ -572,10 +578,8 @@ void jce_editor_scene_frame_overview(void)
 {
     if (!s_sr.initialized || !s_sr.camera) return;
 
-    /* World AABB: union of all authored streaming chunks (center ± radius).
-     * This covers the FULL world, not just the chunks currently loaded.
-     * Fall back to the known ±2757 m world span when no streaming settings
-     * exist (non-streaming scenes), with a sensible vertical range. */
+    /* Authored streaming chunks frame the whole world, including unloaded
+     * chunks. Otherwise use this scene's enabled renderable focus bounds. */
     float wmin[3];
     float wmax[3];
     bool  have_bounds = false;
@@ -607,9 +611,63 @@ void jce_editor_scene_frame_overview(void)
         }
     }
 
+    if (!have_bounds && scene) {
+        /* The registry owns presence/enable state, including renderers added
+         * after the legacy flag mask filled. Logic, lights, sky and screen UI
+         * do not contribute a world-geometry framing bound. */
+        static const char *const renderable_names[] = {
+            "MeshRenderer", "SpriteRenderer", "Terrain", "VegetationScatter",
+            "GrassField", "FoliageCluster", "Water", "ParticleEmitter",
+            "LineRenderer", "TrailRenderer", "BillboardRenderer", "Tilemap",
+        };
+        constexpr int renderable_count =
+            int(sizeof(renderable_names) / sizeof(renderable_names[0]));
+        int component_ids[renderable_count];
+        for (int i = 0; i < renderable_count; ++i)
+            component_ids[i] = jce_component_find(renderable_names[i]);
+
+        struct OverviewBounds {
+            float *min3;
+            float *max3;
+            const int *component_ids;
+            int component_count;
+            bool have_bounds;
+        } bounds = { wmin, wmax, component_ids, renderable_count, false };
+        jce_scene_each_entity(scene,
+            [](JceScene *current, JceEntity entity, void *user) {
+                auto *bounds = static_cast<OverviewBounds *>(user);
+                const JceEditorMeta *meta =
+                    jce_scene_get_editor_meta(current, entity);
+                if (meta && !meta->enabled) return;
+
+                bool renderable = false;
+                for (int i = 0; i < bounds->component_count; ++i) {
+                    int id = bounds->component_ids[i];
+                    if (id != JCE_COMP_ID_INVALID &&
+                        jce_scene_has_comp(current, entity, id) &&
+                        jce_scene_comp_enabled(current, entity, id)) {
+                        renderable = true;
+                        break;
+                    }
+                }
+                if (!renderable) return;
+
+                float lo[3], hi[3];
+                if (!jce_editor_scene_camera_get_entity_focus_bounds(
+                        uint32_t(entity), lo, hi)) return;
+                for (int k = 0; k < 3; ++k) {
+                    if (!bounds->have_bounds || lo[k] < bounds->min3[k])
+                        bounds->min3[k] = lo[k];
+                    if (!bounds->have_bounds || hi[k] > bounds->max3[k])
+                        bounds->max3[k] = hi[k];
+                }
+                bounds->have_bounds = true;
+            }, &bounds);
+        have_bounds = bounds.have_bounds;
+    }
     if (!have_bounds) {
-        wmin[0] = -2757.0f; wmin[1] = -50.0f;  wmin[2] = -2757.0f;
-        wmax[0] =  2757.0f; wmax[1] =  400.0f; wmax[2] =  2757.0f;
+        jce_editor_scene_camera_reset();
+        return;
     }
 
     /* Steep bird's-eye angle, anchored regardless of the current orbit.
@@ -641,6 +699,7 @@ void jce_editor_scene_frame_overview(void)
 void jce_editor_scene_frame_vista(void)
 {
     if (!s_sr.initialized || !s_sr.camera) return;
+    s_sr.tsr_history.valid = false;
     /* Fixed eye-level-ish vista for headless visual QA (JCE_DBG_VISTA): a few
      * metres above the meadow centre, looking across the grass toward the
      * backdrop + sky.  Set directly (no focus anim) so a one-shot capture is
@@ -709,11 +768,22 @@ bool jce_editor_scene_camera_get_entity_focus_bounds(uint32_t entity_id,
 {
     if (!out_min3 || !out_max3) return false;
 
+    const auto bounds_valid = [&]() {
+        for (int k = 0; k < 3; ++k) {
+            if (!std::isfinite(out_min3[k]) || !std::isfinite(out_max3[k]) ||
+                out_min3[k] > out_max3[k]) return false;
+        }
+        return true;
+    };
+
     JceScene *scene = jce_state_get_scene();
     if (!scene || entity_id == 0 || !jce_state_entity_exists(entity_id))
         return false;
 
-    JceEntity e = (JceEntity)entity_id;
+    /* Editor IDs are bare indices. Recover the current live generation
+     * before querying components; the Overview traversal retains full IDs. */
+    JceEntity e = jce_scene_entity_from_index(scene, entity_id);
+    if (!e) return false;
     JceTransform *t = jce_scene_get_transform(scene, e);
     if (!t) return false;
 
@@ -733,7 +803,7 @@ bool jce_editor_scene_camera_get_entity_focus_bounds(uint32_t entity_id,
                                                       t->scale,
                                                       out_min3,
                                                       out_max3);
-                return true;
+                return bounds_valid();
             }
         }
     }
@@ -752,7 +822,7 @@ bool jce_editor_scene_camera_get_entity_focus_bounds(uint32_t entity_id,
                                           scale,
                                           out_min3,
                                           out_max3);
-    return true;
+    return bounds_valid();
 }
 
 void jce_editor_scene_camera_focus_entity(uint32_t entity_id)

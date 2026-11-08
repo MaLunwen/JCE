@@ -27,6 +27,7 @@
 #include "dialogs/jce_editor_dialogs.h"
 #include "dialogs/jce_dialog_asset_picker.h"
 #include "core/jce_editor.h"
+#include "core/jce_editor_hotkey_diag.h"
 #include "core/jce_editor_scene_file_watch.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_layout_scene_commands.h"
@@ -48,6 +49,7 @@ extern "C" {
 #include "core/jce_editor_toast.h"
 #include "core/jce_editor_assert_bridge.h"
 #include "core/jce_hotkeys.h"
+#include "core/jce_editor_viewport_trace.h"
 #include "scene/jce_editor_game_render.h"   /* jce_editor_game_render_is_mouse_captured */
 #include "core/jce_workspace.h"
 #include "panels/jce_panel_common.h"         /* multi-select duplicate / delete */
@@ -156,6 +158,9 @@ static void run_gated_action(PendingGatedAction act, const char *path)
         break;
     case PGA_OPEN_PROJECT:
         s_show_open_project = true;
+        break;
+    case PGA_NEW_PROJECT:
+        s_show_new_project = true;
         break;
     case PGA_OPEN_RECENT_SCENE:
         if (path && path[0])
@@ -298,9 +303,12 @@ static void resolve_startup_welcome_once(void)
     const JceProject *project = jce_editor_project_get();
     bool has_project = project && project->project_root
                     && project->project_root[0] != '\0';
+    const char *scene_path = jce_state_get_current_scene_path();
+    bool has_current_content = has_project || (scene_path && scene_path[0] != '\0')
+                            || jce_state_is_scene_loading();
     s_show_welcome = jce_editor_welcome_should_open_on_startup(
         jce_editor_prefs_startup_behavior(),
-        has_project,
+        has_current_content,
         has_known_startup_project());
 }
 
@@ -549,8 +557,10 @@ static void handle_global_edit_shortcuts(void)
     }
 
     /* Avoid stealing shortcuts while typing in a text field. */
-    if (io.WantTextInput)
+    if (io.WantTextInput) {
+        jce_editor_hotkey_diag_gate(ImGui::GetFrameCount(), "text_input", (int)io.KeyMods);
         return;
+    }
 
     /* Suppress editor shortcuts whenever the Game View is actively DRIVING input
        — i.e. the user clicked into it to control its free-fly / WASD free-cam (or
@@ -566,12 +576,17 @@ static void handle_global_edit_shortcuts(void)
        other panel (Hierarchy Ctrl+A / Ctrl+Z, …), shortcuts work normally. The
        UI keys above (F9/F11/F12) are handled earlier so they stay live. */
     if (jce_editor_game_view_is_input_active() ||
-        jce_editor_game_render_is_mouse_captured())
+        jce_editor_game_render_is_mouse_captured()) {
+        jce_editor_hotkey_diag_gate(ImGui::GetFrameCount(), "game_input_or_capture", (int)io.KeyMods);
         return;
+    }
 
     /* Modal dialogs must block background state changes. */
-    if (should_block_editor_interaction())
+    if (should_block_editor_interaction()) {
+        jce_editor_hotkey_diag_gate(ImGui::GetFrameCount(), "modal", (int)io.KeyMods);
         return;
+    }
+    jce_editor_hotkey_diag_gate(ImGui::GetFrameCount(), "ready", (int)io.KeyMods);
 
     if (jce_hotkey_pressed(JCE_HK_FILE_SAVE_AS)) {
         s_show_save_as = true;
@@ -717,12 +732,10 @@ static void cmd_new_scene_(void)         { request_gated_action(PGA_NEW_SCENE); 
 static void cmd_open_scene_(void)        { request_gated_action(PGA_OPEN_SCENE); }
 static void cmd_save_scene_(void)        { save_scene_or_open_save_as(); }
 static void cmd_save_scene_as_(void)     { s_show_save_as = true; }
-static void cmd_new_project_(void)       { s_show_new_project = true; }
+static void cmd_new_project_(void)       { jce_editor_layout_request_new_project(); }
 static void cmd_open_project_(void)      { request_gated_action(PGA_OPEN_PROJECT); }
 
 /* Public entry points for the Welcome screen. */
-extern "C" void jce_editor_layout_request_new_project(void)
-    { s_show_new_project = true; }
 extern "C" void jce_editor_layout_request_open_project(void)
     { request_gated_action(PGA_OPEN_PROJECT); }
 static void cmd_build_settings_(void)    { s_show_build = true; }
@@ -740,7 +753,7 @@ static void cmd_toggle_fullscreen_(void) { jce_editor_toggle_fullscreen(); }
 
 /* F12 — capture the editor window to .jce/screenshots/jce_screenshot_<ts>.png.
  * The capture is deferred one frame and written by the renderer's bgfx
- * screen_shot callback; the toast confirms the request + destination.
+ * screen_shot callback; the success toast follows actual PNG file-write completion.
  * Uses engine wrappers only (no platform-specific calls): the host-FS
  * directory helper (mkdir -p) and the engine's local-time formatter, which
  * hide the localtime_r/localtime_s fork. */
@@ -773,11 +786,7 @@ static void cmd_screenshot_(void)
      * bgfx_request_screen_shot completes and captures the FULL window, not just
      * the scene viewport.  (The scene-FBO variant that replaced this was meant for
      * headless capture but regressed the user-facing F12 into a viewport-only shot.) */
-    bool ok = jce_screenshot_save(path, JCE_SCREENSHOT_PNG);
-    if (ok)
-        jce_toast_info(jce_editor_i18n("toast.screenshot"), path);
-    else
-        jce_toast_error("%s", jce_editor_i18n("toast.screenshotFailed"));
+    jce_editor_request_screenshot(path, true, 0);
 }
 
 /* F9 — toggle screen recording to a VP9 .webm (backbuffer -> VP9 -> WebM on a
@@ -978,17 +987,22 @@ enum { PALETTE_CMD_COUNT = (int)(sizeof s_palette_cmds / sizeof s_palette_cmds[0
  * the stable command id ("palette.cmd.<id>") and category
  * ("palette.cat.<category>"); the English table literals stay as the
  * fallback so unknown ids degrade gracefully. */
+static const char *palette_i18n_key(char (&key)[96], const char *part, const char *id)
+{
+    snprintf(key, sizeof key, "palette.%s.%s", part, id);
+    return key;
+}
+
 static const char *palette_cmd_label_(const PaletteCmd &c)
 {
     char key[96];
-    snprintf(key, sizeof key, "palette.cmd.%s", c.id);
-    return jce_editor_i18n_or(key, c.label);
+    return jce_editor_i18n_or(palette_i18n_key(key, "cmd", c.id), c.label);
 }
+
 static const char *palette_cmd_category_(const PaletteCmd &c)
 {
-    char key[64];
-    snprintf(key, sizeof key, "palette.cat.%s", c.category);
-    return jce_editor_i18n_or(key, c.category);
+    char key[96];
+    return jce_editor_i18n_or(palette_i18n_key(key, "cat", c.category), c.category);
 }
 
 /* Lower-case substring match: returns true iff every char of `q` appears
@@ -1056,16 +1070,31 @@ static void draw_command_palette(void)
         s_palette_sel = 0;
     }
 
-    /* Build filtered list each frame (cheap, ~50 cmds). */
-    int  filt_idx[PALETTE_CMD_COUNT];
-    int  filt_n = 0;
-    for (int i = 0; i < PALETTE_CMD_COUNT; i++) {
-        const PaletteCmd &c = s_palette_cmds[i];
-        if (palette_match(palette_cmd_label_(c), s_palette_query)
-            || palette_match(c.id, s_palette_query)
-            || palette_match(palette_cmd_category_(c), s_palette_query))
-        {
-            filt_idx[filt_n++] = i;
+    /* Rebuild translated matches only when their inputs change. */
+    static int filt_idx[PALETTE_CMD_COUNT];
+    static int filt_n = -1;
+    static char cached_query[sizeof s_palette_query] = {0};
+    static JceLocale cached_locale = JCE_LOCALE_INVALID;
+    static int cached_locale_count = -1;
+    const JceLocale locale = jce_editor_i18n_get_locale();
+    const int locale_count = jce_editor_i18n_locale_count();
+    if (filt_n < 0 || locale != cached_locale || locale_count != cached_locale_count ||
+        strcmp(cached_query, s_palette_query) != 0) {
+        memcpy(cached_query, s_palette_query, sizeof cached_query);
+        cached_locale = locale;
+        cached_locale_count = locale_count;
+        filt_n = 0;
+        for (int i = 0; i < PALETTE_CMD_COUNT; ++i) {
+            const PaletteCmd &c = s_palette_cmds[i];
+            char key[96];
+            if (palette_match(palette_cmd_label_(c), cached_query) ||
+                palette_match(c.id, cached_query) ||
+                palette_match(palette_cmd_category_(c), cached_query) ||
+                jce_editor_i18n_search_match(palette_i18n_key(key, "cmd", c.id),
+                                             c.label, cached_query, nullptr) ||
+                jce_editor_i18n_search_match(palette_i18n_key(key, "cat", c.category),
+                                             c.category, cached_query, nullptr))
+                filt_idx[filt_n++] = i;
         }
     }
     if (filt_n == 0) {
@@ -1502,6 +1531,9 @@ static void setup_profiling_docking_layout(ImGuiID dockspace_id)
     ImGuiID left_id = 0, right_id = 0;
     ImGui::DockBuilderSplitNode(top_id, ImGuiDir_Left, 0.55f, &left_id, &right_id);
 
+    /* Apply shared fallback routes before this preset's explicit cluster. */
+    dock_extension_panels(left_id, right_id, right_id, bottom_id);
+
     /* Cluster all profiling tools as tabs in the left node so users can
        cycle through profilers without rearranging the layout. */
     ImGui::DockBuilderDockWindow("###profiler",                  left_id);
@@ -1515,7 +1547,6 @@ static void setup_profiling_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderDockWindow("Inspector###inspector",            bottom_id);
     ImGui::DockBuilderDockWindow("Asset Browser###assets",           bottom_id);
     ImGui::DockBuilderDockWindow("Timeline###timeline",              bottom_id);
-    dock_extension_panels(left_id, right_id, right_id, bottom_id);
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
@@ -1656,7 +1687,7 @@ static inline void panel_phase(const char *name, uint64_t *t)
     *t = now;
 }
 
-static void draw_panel_windows(void)
+static void draw_panel_windows(JceEditorPanel frame_maximized)
 {
     uint64_t ed_pt = jce_time_perf_counter();
     char lbl[256];
@@ -1702,12 +1733,8 @@ static void draw_panel_windows(void)
     if (s_dbg_focus_game) s_focus_game_view = true;
 
     /* ── Scene View ───────────────────────────────────────────────── */
-    /* No Scene View maximise is offered yet, so the slot can never name it and
-     * this guard is always true today. It is kept because the guard, not the UI
-     * that sets the slot, is what makes the mode correct -- adding the button
-     * back must not also require remembering to add this. */
+    /* Retain dock membership even when an overlay owns viewport rendering. */
     if (!s_dbg_focus_game &&
-        !jce_editor_panel_is_maximized(JCE_PANEL_SCENE_VIEW) &&
         *jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
         snprintf(lbl, sizeof(lbl), "%s###scene_view", jce_editor_i18n("Scene"));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
@@ -1717,7 +1744,8 @@ static void draw_panel_windows(void)
         }
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW), ImGuiWindowFlags_NoFocusOnAppearing)) {
-            jce_editor_panel_scene_view_content();
+            if (frame_maximized != JCE_PANEL_SCENE_VIEW)
+                jce_editor_panel_scene_view_content(frame_maximized == JCE_PANEL_COUNT);
         }
         ImGui::End();
         ImGui::PopStyleVar();
@@ -1748,18 +1776,23 @@ static void draw_panel_windows(void)
          * on top of it, so nothing of the empty window is ever seen. The
          * content function still runs exactly once per frame -- there, not
          * here -- because it drives the game render target. */
-        const bool maximized = jce_editor_panel_is_maximized(JCE_PANEL_GAME_VIEW);
+        const bool maximized = frame_maximized == JCE_PANEL_GAME_VIEW;
         const bool docked_open = ImGui::Begin(
             lbl, jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW),
             ImGuiWindowFlags_NoFocusOnAppearing);
-        if (docked_open && !maximized) {
+        if (docked_open && frame_maximized == JCE_PANEL_COUNT) {
             jce_editor_panel_game_view_content();
         } else if (!maximized) {
+            jce_editor_game_render_observation_policy(static_cast<uint32_t>(docked_open
+                ? JceEditorViewportPolicyReason::Clipped : JceEditorViewportPolicyReason::Collapsed));
             jce_editor_game_input_bridge_publish(
                 jce_editor_game_input_bridge_shared(), nullptr);
         }
         ImGui::End();
         ImGui::PopStyleVar();
+    } else {
+        jce_editor_game_render_observation_policy(
+            static_cast<uint32_t>(JceEditorViewportPolicyReason::Hidden));
     }
 
     panel_phase("ed_p_game_view", &ed_pt);
@@ -1802,7 +1835,9 @@ static void draw_panel_windows(void)
         snprintf(lbl, sizeof(lbl), "%s###console", jce_editor_i18n("Console"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_CONSOLE), ImGuiWindowFlags_NoFocusOnAppearing)) {
-            jce_editor_panel_console_content();
+            const bool presentation_admitted = frame_maximized == JCE_PANEL_COUNT ||
+                ImGui::GetWindowViewport()->ID != ImGui::GetMainViewport()->ID;
+            jce_editor_panel_console_content_admitted(presentation_admitted);
         }
         ImGui::End();
     }
@@ -2521,10 +2556,14 @@ void jce_editor_layout_draw(void)
 
     ImGui::End(); /* DockSpace */
 
+    /* Lock viewport ownership for this UI frame. A toolbar toggle changes the
+     * next frame; dock content and its overlay must not both run on activation. */
+    const JceEditorPanel frame_maximized = s_maximized_panel;
+
     /* Draw all panel windows (dockable). */
     {
         uint64_t _t0_panels = jce_time_perf_counter();
-        draw_panel_windows();
+        draw_panel_windows(frame_maximized);
         jce_perf_phase_add("ed_panels", jce_time_perf_to_ms(_t0_panels,
                                                             jce_time_perf_counter()));
     }
@@ -2541,11 +2580,16 @@ void jce_editor_layout_draw(void)
      * jce_editor_panel_game_view_content() drives jce_editor_game_render_frame()
      * and publishes the input-bridge viewport, so it must run EXACTLY once per
      * frame -- the docked block above is skipped whenever this one runs. */
-    if (s_maximized_panel != JCE_PANEL_COUNT) {
-        if (!*jce_editor_panel_visible_ptr(s_maximized_panel)) {
+    if (frame_maximized != JCE_PANEL_COUNT) {
+        if (!*jce_editor_panel_visible_ptr(frame_maximized)) {
             /* The panel was hidden while maximised; leave the mode rather than
              * showing a window the user just closed. */
             s_maximized_panel = JCE_PANEL_COUNT;
+            if (frame_maximized == JCE_PANEL_GAME_VIEW)
+                jce_editor_game_input_bridge_publish(
+                    jce_editor_game_input_bridge_shared(), nullptr);
+            else if (frame_maximized == JCE_PANEL_SCENE_VIEW)
+                jce_editor_panel_scene_view_content(false);
         } else {
             const ImGuiViewport *mv = ImGui::GetMainViewport();
             ImGui::SetNextWindowPos(mv->WorkPos);
@@ -2561,11 +2605,13 @@ void jce_editor_layout_draw(void)
             ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
             if (ImGui::Begin("###viewport_maximized", nullptr, mflags)) {
-                if (s_maximized_panel == JCE_PANEL_SCENE_VIEW)
-                    jce_editor_panel_scene_view_content();
+                if (frame_maximized == JCE_PANEL_SCENE_VIEW)
+                    jce_editor_panel_scene_view_content(true);
                 else
                     jce_editor_panel_game_view_content();
-            } else if (s_maximized_panel == JCE_PANEL_GAME_VIEW) {
+            } else if (frame_maximized == JCE_PANEL_GAME_VIEW) {
+                jce_editor_game_render_observation_policy(
+                    static_cast<uint32_t>(JceEditorViewportPolicyReason::Collapsed));
                 jce_editor_game_input_bridge_publish(
                     jce_editor_game_input_bridge_shared(), nullptr);
             }

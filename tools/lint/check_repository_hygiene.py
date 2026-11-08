@@ -21,6 +21,8 @@ GENERATED = {"build", "dist", "out", "build_standalone", "node_modules",
              "__pycache__", "bin", "obj", "artifacts", "_cooked",
              ".vs", ".scannerwork", ".binsize_history", ".playwright-mcp", ".jce"}
 PROTECTED = {"third_party", ".git", "ZKM-VMP"}
+# Root-only local reference workspace may contain immutable upstream copies.
+PROTECTED_LOCAL_ROOTS = {"_workspace"}
 ATTR_PROBES = {
     "engine/src/jce-policy-probe.c": ("auto", "lf"),
     "scripts/jce-policy-probe.py": ("auto", "lf"),
@@ -35,7 +37,7 @@ ATTR_PROBES = {
     "resources/jce-policy-probe.woff2": ("unset", "lf"),
 }
 VISIBLE = [
-    ".gitignore", ".gitattributes", ".editorconfig", "AGENTS.md", "CLAUDE.md",
+    ".gitignore", ".gitattributes", "AGENTS.md", "CLAUDE.md",
     ".github/workflows/jce-policy-probe.yml",
     "engine/src/build/jce-policy-probe.c", "editor/src/jce-policy-probe.cpp",
     "tools/lint/jce-policy-probe.py", "tools/audit/jce-policy-probe.py",
@@ -50,6 +52,7 @@ VISIBLE = [
     "examples/caged_kingdom/resources/assets/scenes/black_hole_lab.scene.json",
 ]
 IGNORED = [
+    ".editorconfig",
     "tests/consumers/minesweeper/build/jce-policy-probe.txt",
     "tests/consumers/snake_seven/csharp/bin/jce-policy-probe.dll",
     "tests/consumers/elemental_serenity/build/jce-policy-probe.c",
@@ -143,7 +146,8 @@ def owned_paths(root, skipped):
         for name in dirs:
             p = Path(base) / name
             linked = is_link(p)
-            if name in PROTECTED or linked or (p / ".git").exists():
+            if (name in PROTECTED or linked or (p / ".git").exists()
+                    or (Path(base) == root and name in PROTECTED_LOCAL_ROOTS)):
                 skipped["protected_roots"] += 1
             elif name in GENERATED or (Path(base) == root and name == "reports"):
                 skipped["generated_roots"] += 1
@@ -229,7 +233,6 @@ def self_check():
                      "scripting/csharp/.gitignore"):
             (root / name).parent.mkdir(parents=True, exist_ok=True)
             (root / name).write_bytes((ROOT / name).read_bytes())
-        (root / ".editorconfig").write_bytes((ROOT / ".editorconfig").read_bytes())
         def put(name, data):
             p = root / name
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -238,10 +241,11 @@ def self_check():
         put("scripts/sample.bat", b"a\r\nb\n")
         put("src/sample.bin", b"\0\r\n\xff")
         put("engine/third_party/original.h", b"upstream\r\n")
+        put("_workspace/reference/original.js", b"upstream\r\n")
         put("project/reports/notes.md", b"owned\r\n")
         put("build/generated.c", b"generated\r\n")
         put("reports/generated.log", b"generated\r\n")
-        git(root, "add", "--", ".gitignore", ".gitattributes", ".editorconfig")
+        git(root, "add", "--", ".gitignore", ".gitattributes")
         assert not policy_errors(root)
         assert len(inspect(root)["violations"]) == 3
         result = inspect(root, all_owned=True, fix=True)
@@ -253,6 +257,7 @@ def self_check():
         for name, data in [
             ("src/sample.bin", b"\0\r\n\xff"),
             ("engine/third_party/original.h", b"upstream\r\n"),
+            ("_workspace/reference/original.js", b"upstream\r\n"),
             ("build/generated.c", b"generated\r\n"),
             ("reports/generated.log", b"generated\r\n")]:
             assert (root / name).read_bytes() == data

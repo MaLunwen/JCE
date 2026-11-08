@@ -94,10 +94,42 @@ static void os_cfg(const JceOceanSpectrumParams *p, OsCfg *c)
     /* alpha is dimensionless: U^2/(F*g) is the inverse dimensionless fetch. */
     c->alpha = 0.076 * pow((c->u * c->u) / (c->f * c->g), 0.22);
 
+    /* Fully developed Pierson-Moskowitz is wind-limited, not fetch-limited.
+     * U19.5 ~= 1.026 U10 and omega_p = 0.877 g/U19.5. Keeping JONSWAP's
+     * fetch-derived peak/alpha with gamma=1 is only a generalized PM shape.
+     * The explicit PM model uses the fully developed parameters. */
+    if (c->type == (int)JCE_OCEAN_SPECTRUM_PM) {
+        c->wp = (0.877 / 1.026) * c->g / c->u;
+        c->alpha = 0.0081;
+    }
+
     /* Both are strictly positive for the clamped ranges above; the guard exists
      * so a future range change cannot silently divide by zero downstream. */
     if (!(c->wp > 0.0) || !isfinite(c->wp))       c->wp = 1.0;
     if (!(c->alpha > 0.0) || !isfinite(c->alpha)) c->alpha = 0.0081;
+}
+
+/* Frequency and group velocity use the same depth convention as the
+ * spectral density. Only TMA changes the historical deep-water mapping. */
+static double os_dispersion(const OsCfg *c, double k, double *group_velocity)
+{
+    double omega, derivative;
+    if (!(k > 0.0) || !isfinite(k)) {
+        if (group_velocity) *group_velocity = 0.0;
+        return 0.0;
+    }
+    if (c->type == (int)JCE_OCEAN_SPECTRUM_TMA && c->h > 0.0) {
+        const double kh = k * c->h;
+        const double th = tanh(kh);
+        omega = sqrt(c->g * k * th);
+        derivative = omega > 0.0
+            ? c->g * (th + kh * (1.0 - th * th)) / (2.0 * omega) : 0.0;
+    } else {
+        omega = sqrt(c->g * k);
+        derivative = 0.5 * sqrt(c->g / k);
+    }
+    if (group_velocity) *group_velocity = derivative;
+    return omega;
 }
 
 /* Kitaigorodskii depth attenuation, the TMA factor.  Shallow water cannot hold
@@ -285,6 +317,18 @@ float jce_ocean_spectrum_spreading(const JceOceanSpectrumParams *p,
     return (float)os_spreading_d(&c, (double)omega, (double)theta);
 }
 
+double jce_ocean_spectrum_dispersion(const JceOceanSpectrumParams *p,
+                                    double k, double *group_velocity)
+{
+    if (!p) {
+        if (group_velocity) *group_velocity = 0.0;
+        return 0.0;
+    }
+    OsCfg c;
+    os_cfg(p, &c);
+    return os_dispersion(&c, k, group_velocity);
+}
+
 float jce_ocean_spectrum_amplitude(const JceOceanSpectrumParams *p,
                                    float kx, float kz,
                                    float wind_dir_x, float wind_dir_z)
@@ -304,11 +348,10 @@ float jce_ocean_spectrum_amplitude(const JceOceanSpectrumParams *p,
 
     os_cfg(p, &c);
 
-    /* Deep-water dispersion and its Jacobian.  dw/dk = g/(2*w) = 0.5*sqrt(g/k)
+    /* Dispersion and its Jacobian. In deep water dw/dk = 0.5*sqrt(g/k)
      * converts the frequency-space density S(w) into wavenumber space; omitting
      * it is the classic error that makes the small waves too strong. */
-    w    = sqrt(c.g * k);
-    dwdk = 0.5 * sqrt(c.g / k);
+    w = os_dispersion(&c, k, &dwdk);
 
     wlen = sqrt((double)wind_dir_x * (double)wind_dir_x +
                 (double)wind_dir_z * (double)wind_dir_z);

@@ -2,14 +2,18 @@
  * jce_path.c  Implementation of the cross-platform path-string utilities
  * declared in jce/os/core/jce_path.h.
  *
- * All functions are pure string ops — no syscalls, no allocations.
+ * String-only operations: no syscalls. normalize snapshots rare forward
+ * overlap through the JCE allocator; ordinary/in-place/backward paths do not
+ * allocate.
  * Canonical separator is '/'; '\\' is accepted on read.
  */
 
 #include "jce/os/core/jce_path.h"
+#include <jce/os/core/jce_alloc.h>
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
@@ -93,10 +97,10 @@ bool jce_path_is_absolute(const char *path)
 {
     if (s_empty(path)) return false;
     if (s_is_sep(path[0])) return true;
-    /* Windows-style "C:" or "C:/..." */
+    /* C: and C:file are drive-relative, not rooted absolute paths. */
     if (((path[0] >= 'A' && path[0] <= 'Z') ||
          (path[0] >= 'a' && path[0] <= 'z')) &&
-        path[1] == ':')
+        path[1] == ':' && s_is_sep(path[2]))
         return true;
     return false;
 }
@@ -286,10 +290,28 @@ bool jce_path_replace_extension(char *out, size_t out_size,
 bool jce_path_normalize(char *out, size_t out_size, const char *path)
 {
     if (!out || out_size == 0) return false;
-    out[0] = '\0';
-    if (s_empty(path)) return true;
+    if (s_empty(path)) { out[0] = '\0'; return true; }
 
-    /* Detect absolute prefix (drive letter or leading /). */
+    /* Normalization only contracts its input. In-place and backward overlap
+     * can stream safely; forward overlap must preserve future source bytes. */
+    char *source_copy = NULL;
+    const size_t input_len = strlen(path);
+    const uintptr_t output_address = (uintptr_t)(void *)out;
+    const uintptr_t input_address = (uintptr_t)(const void *)path;
+    if (output_address > input_address &&
+        output_address - input_address <= input_len) {
+        if (input_len == SIZE_MAX) return false;
+        source_copy = (char *)jce_malloc(input_len + 1);
+        if (!source_copy) return false; /* Borrowed input is still intact. */
+        if (!s_copy_n(source_copy, input_len + 1, path, input_len)) {
+            jce_free(source_copy);
+            return false;
+        }
+        path = source_copy;
+    }
+    bool succeeded = false;
+
+    /* Preserve the existing drive/absolute-prefix conventions. */
     size_t prefix = 0;
     bool absolute = false;
     if (((path[0] >= 'A' && path[0] <= 'Z') ||
@@ -303,69 +325,56 @@ bool jce_path_normalize(char *out, size_t out_size, const char *path)
         absolute = true;
     }
 
-    /* Walk tokens, maintain a stack of segment offsets in `out`. */
     size_t out_len = 0;
-    if (prefix + 1 > out_size) return false;
+    if (prefix >= out_size) goto cleanup;
     for (size_t i = 0; i < prefix; ++i)
         out[out_len++] = (path[i] == '\\') ? '/' : path[i];
-
-    size_t segs[256];
-    size_t nseg = 0;
-    size_t seg_start = out_len;
+    const size_t seg_start = out_len;
 
     size_t i = prefix;
     while (path[i]) {
-        /* Skip separator runs. */
         while (path[i] && s_is_sep(path[i])) ++i;
         if (!path[i]) break;
-        /* Read one segment. */
-        size_t s = i;
+        const size_t start = i;
         while (path[i] && !s_is_sep(path[i])) ++i;
-        size_t seg_len = i - s;
+        const size_t seg_len = i - start;
 
-        if (seg_len == 1 && path[s] == '.') continue; /* drop "." */
-        if (seg_len == 2 && path[s] == '.' && path[s + 1] == '.') {
-            if (nseg > 0) {
-                /* Pop one segment. */
-                --nseg;
-                out_len = (nseg > 0) ? segs[nseg - 1] + 0 : seg_start;
-                /* Recompute end of previous segment. */
-                if (nseg > 0) {
-                    size_t prev = segs[nseg - 1];
-                    out_len = prev;
-                    while (out_len < out_size && out[out_len] && !s_is_sep(out[out_len])) ++out_len;
-                } else {
-                    out_len = seg_start;
-                }
+        if (seg_len == 1 && path[start] == '.') continue;
+        if (seg_len == 2 && path[start] == '.' && path[start + 1] == '.') {
+            /* Inspect only already-written bytes. No depth cap or second
+             * segment registry is needed, and every ordinary segment pops once. */
+            size_t last = out_len;
+            while (last > seg_start && !s_is_sep(out[last - 1])) --last;
+            const size_t last_len = out_len - last;
+            const bool last_is_parent = last_len == 2 &&
+                                       out[last] == '.' && out[last + 1] == '.';
+            if (out_len > seg_start && !last_is_parent) {
+                out_len = last > seg_start ? last - 1 : seg_start;
                 continue;
             }
-            if (absolute) return false; /* underflow */
-            /* Relative path: keep ".." literally. */
+            if (absolute) goto cleanup;
+            /* Relative leading '..' remains a parent; it cannot cancel '..'. */
         }
 
-        /* Append separator if needed. */
         if (out_len > seg_start) {
-            if (out_len + 1 >= out_size) return false;
+            if (out_len + 1 >= out_size) goto cleanup;
             out[out_len++] = '/';
         }
-        if (out_len + seg_len + 1 > out_size) return false;
-        if (nseg < (sizeof(segs) / sizeof(segs[0]))) segs[nseg++] = out_len;
+        if (seg_len >= out_size - out_len) goto cleanup;
         for (size_t k = 0; k < seg_len; ++k)
-            out[out_len + k] = (path[s + k] == '\\') ? '/' : path[s + k];
+            out[out_len + k] = (path[start + k] == '\\') ? '/' : path[start + k];
         out_len += seg_len;
     }
 
     if (out_len == 0) {
-        if (absolute) {
-            if (1 + 1 > out_size) return false;
-            out[out_len++] = '/';
-        } else {
-            if (1 + 1 > out_size) return false;
-            out[out_len++] = '.';
-        }
+        if (out_size < 2) goto cleanup;
+        out[out_len++] = absolute ? '/' : '.';
     }
     out[out_len] = '\0';
-    return true;
+    succeeded = true;
+cleanup:
+    if (source_copy) jce_free(source_copy);
+    return succeeded;
 }
 
 /* Compare two path characters for prefix matching.

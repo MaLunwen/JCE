@@ -26,6 +26,7 @@
 #include <jce/os/core/jce_timer.h>
 
 #include "os/core/jce_memory.h"
+#include "os/core/jce_trace_scope_internal.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -48,6 +49,13 @@ typedef struct {
     JceProcess  *proc;
     uint64_t     t0;
     int          timeout_ms;
+
+    /* Request wall lifetime is an external ASYNC span, not CPU work. IDs are
+     * capture-owned and independent of public handles. No TLS state crosses
+     * submit/tick/cancel boundaries. */
+    uint64_t     trace_task_id;
+    uint64_t     trace_span_id;
+    uint64_t     trace_started;
 
     char         prompt_path[JCE_LLM_PATH_CAP];
     char         response_path[JCE_LLM_PATH_CAP];
@@ -81,6 +89,61 @@ static void llm_reset_slot(void)
     memset(&g_llm, 0, sizeof g_llm);
     g_llm.next_handle = next ? next : 1u;
     memcpy(g_llm.last_error, err, sizeof err);
+}
+
+/* Numeric terminal outcomes are intentionally payload-free. */
+enum {
+    LLM_TRACE_ANSWER = 1,
+    LLM_TRACE_PROVIDER_FAILED = 2,
+    LLM_TRACE_RESPONSE_FAILED = 3,
+    LLM_TRACE_TIMEOUT = 4,
+    LLM_TRACE_CANCEL = 5
+};
+
+static int64_t llm_trace_size(size_t bytes)
+{
+    return bytes > (size_t)INT64_MAX ? INT64_MAX : (int64_t)bytes;
+}
+
+static void llm_trace_request_begin(uint64_t parent)
+{
+    if (!jce_trace_enabled()) return;
+    const uint64_t restore = jce_trace_task_current_id();
+    g_llm.trace_task_id = jce_trace_next_id();
+    g_llm.trace_span_id = jce_trace_next_id();
+    g_llm.trace_started = jce_time_perf_counter();
+    jce_trace_task_submit(g_llm.trace_task_id, parent,
+                          JCE_TRACE_TASK_ASYNC, "llm.request");
+    jce_trace_task_begin(g_llm.trace_span_id, g_llm.trace_task_id,
+                         "llm.request", 0);
+    jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.handle",
+                                      g_llm.handle, g_llm.trace_span_id, g_llm.trace_task_id);
+    jce_trace_task_restore_id(restore);
+}
+
+static void llm_trace_request_finish(JceTraceTaskState state, int outcome)
+{
+    const uint64_t span = g_llm.trace_span_id;
+    if (!span) return;
+    /* Consume once before emitting; release/shutdown cannot emit another end. */
+    g_llm.trace_span_id = 0;
+    const uint64_t restore = jce_trace_task_current_id();
+    if (jce_trace_enabled()) {
+        const uint64_t task = g_llm.trace_task_id;
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.outcome", outcome, span, task);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.stdout_bytes",
+                                          llm_trace_size(g_llm.stdout_bytes), span, task);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.log_bytes",
+                                          llm_trace_size(g_llm.log_len), span, task);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.dropped_bytes",
+                                          llm_trace_size(g_llm.stdout_bytes - g_llm.log_len), span, task);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.response_bytes",
+                                          llm_trace_size(g_llm.response_len), span, task);
+        const double ms = jce_time_perf_to_ms(g_llm.trace_started, jce_time_perf_counter());
+        jce_trace_task_end(span, task, "llm.request", state,
+                           ms > 0.0 ? (uint64_t)(ms * 1000000.0) : 0);
+    }
+    jce_trace_task_restore_id(restore);
 }
 
 /* ── helpers ─────────────────────────────────────────────────────── */
@@ -194,6 +257,8 @@ static void llm_drain(void)
 
 static void llm_finish_process(void)
 {
+    if (!g_llm.proc && !g_llm.prompt_path[0]) return;
+    JceTraceScope cleanup_scope = jce_trace_scope_begin_parent("llm.process_destroy", g_llm.trace_task_id);
     if (g_llm.proc) {
         jce_process_destroy(g_llm.proc);
         g_llm.proc = NULL;
@@ -201,25 +266,32 @@ static void llm_finish_process(void)
     /* The prompt file carried the user's brief.  It is not ours to leave
      * lying in their project directory once the child has read it. */
     if (g_llm.prompt_path[0]) {
-        (void)jce_fs_host_remove_file(g_llm.prompt_path);
+        const bool removed = jce_fs_host_remove_file(g_llm.prompt_path);
+        if (cleanup_scope.id)
+            jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.prompt_remove_ok",
+                                              removed ? 1 : 0, cleanup_scope.id, cleanup_scope.parent);
         g_llm.prompt_path[0] = 0;
     }
+    jce_trace_scope_end(cleanup_scope, JCE_TRACE_TASK_SUCCEEDED);
 }
 
 /* Read what the provider wrote.  A file that exists and is empty is the
  * failure this function exists to name: exit code 0 with no answer. */
 static bool llm_take_response(void)
 {
+    JceTraceScope response_scope = jce_trace_scope_begin_parent("llm.response_io", g_llm.trace_task_id);
     uint64_t size = 0;
     void *data = jce_fs_host_read_all(g_llm.response_path, &size);
     if (!data) {
         llm_set_message("the provider exited without writing %s",
                         g_llm.response_path);
+        jce_trace_scope_end(response_scope, JCE_TRACE_TASK_FAILED);
         return false;
     }
     if (size == 0) {
         jce_fs_buffer_free(data);
         llm_set_message("the provider wrote an empty answer");
+        jce_trace_scope_end(response_scope, JCE_TRACE_TASK_FAILED);
         return false;
     }
     char *copy = (char *)JCE_MALLOC((size_t)size + 1u);
@@ -227,6 +299,7 @@ static bool llm_take_response(void)
         jce_fs_buffer_free(data);
         llm_set_message("out of memory taking a %llu byte answer",
                         (unsigned long long)size);
+        jce_trace_scope_end(response_scope, JCE_TRACE_TASK_FAILED);
         return false;
     }
     memcpy(copy, data, (size_t)size);
@@ -235,6 +308,7 @@ static bool llm_take_response(void)
 
     g_llm.response     = copy;
     g_llm.response_len = (size_t)size;
+    jce_trace_scope_end(response_scope, JCE_TRACE_TASK_SUCCEEDED);
     return true;
 }
 
@@ -242,20 +316,24 @@ static bool llm_take_response(void)
 
 JCE_API JceLlmHandle JCE_CALL jce_llm_submit(const JceLlmRequest *req)
 {
+    JceTraceScope submit_scope = jce_trace_scope_begin("llm.submit");
     g_llm.last_error[0] = 0;
 
     if (!req || !req->prompt || !req->prompt[0]) {
         llm_set_error("submit: no prompt");
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
     if (!req->provider.executable || !req->provider.executable[0] ||
         !req->provider.arguments  || !req->provider.arguments[0]) {
         llm_set_error("submit: the provider needs an executable and an "
                       "argument template naming {prompt} and {response}");
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
     if (g_llm.in_use && g_llm.status == JCE_LLM_RUNNING) {
         llm_set_error("submit: a request is already in flight");
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
     /* A terminal handle nobody released still owns the slot.  Reclaiming it
@@ -263,6 +341,7 @@ JCE_API JceLlmHandle JCE_CALL jce_llm_submit(const JceLlmRequest *req)
      * caller may still be reading. */
     if (g_llm.in_use) {
         llm_set_error("submit: the previous handle has not been released");
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
 
@@ -277,10 +356,14 @@ JCE_API JceLlmHandle JCE_CALL jce_llm_submit(const JceLlmRequest *req)
      * question's answer. */
     (void)jce_fs_host_remove_file(g_llm.response_path);
 
-    if (!jce_fs_host_write_all(g_llm.prompt_path, req->prompt,
-                               strlen(req->prompt))) {
+    JceTraceScope prompt_scope = jce_trace_scope_begin("llm.prompt_io");
+    const bool written = jce_fs_host_write_all(g_llm.prompt_path, req->prompt,
+                                               strlen(req->prompt));
+    jce_trace_scope_end(prompt_scope, written ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    if (!written) {
         llm_set_error("submit: cannot write the prompt to %s",
                       g_llm.prompt_path);
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
 
@@ -289,6 +372,7 @@ JCE_API JceLlmHandle JCE_CALL jce_llm_submit(const JceLlmRequest *req)
     if (!args) {
         (void)jce_fs_host_remove_file(g_llm.prompt_path);
         llm_set_error("submit: out of memory expanding the argument template");
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
 
@@ -307,6 +391,7 @@ JCE_API JceLlmHandle JCE_CALL jce_llm_submit(const JceLlmRequest *req)
         llm_set_error("submit: cannot start '%s': %s",
                       req->provider.executable,
                       jce_process_get_last_spawn_error());
+        jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_FAILED);
         return 0u;
     }
 
@@ -321,6 +406,8 @@ JCE_API JceLlmHandle JCE_CALL jce_llm_submit(const JceLlmRequest *req)
 
     LOG_INFO(LOG_TAG, "submitted h=%u exe=%s timeout=%dms",
              g_llm.handle, req->provider.executable, g_llm.timeout_ms);
+    llm_trace_request_begin(submit_scope.id);
+    jce_trace_scope_end(submit_scope, JCE_TRACE_TASK_SUCCEEDED);
     return g_llm.handle;
 }
 
@@ -347,17 +434,22 @@ JCE_API void JCE_CALL jce_llm_tick(void)
             LOG_ERROR(LOG_TAG, "h=%u failed: %s", g_llm.handle, g_llm.message);
         }
         llm_finish_process();
+        llm_trace_request_finish(ok ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED,
+            ok ? LLM_TRACE_ANSWER : (exit_code ? LLM_TRACE_PROVIDER_FAILED : LLM_TRACE_RESPONSE_FAILED));
         return;
     }
 
     const double ms = jce_time_perf_to_ms(g_llm.t0, jce_time_perf_counter());
     if (ms >= (double)g_llm.timeout_ms) {
+        JceTraceScope timeout_scope = jce_trace_scope_begin_parent("llm.timeout", g_llm.trace_task_id);
         jce_process_force_kill(g_llm.proc);
         g_llm.status = JCE_LLM_FAILED;
         llm_set_message("no answer within %d ms; the provider was stopped",
                         g_llm.timeout_ms);
         LOG_ERROR(LOG_TAG, "h=%u %s", g_llm.handle, g_llm.message);
         llm_finish_process();
+        jce_trace_scope_end(timeout_scope, JCE_TRACE_TASK_FAILED);
+        llm_trace_request_finish(JCE_TRACE_TASK_FAILED, LLM_TRACE_TIMEOUT);
     }
 }
 
@@ -379,11 +471,14 @@ JCE_API void JCE_CALL jce_llm_cancel(JceLlmHandle h)
 {
     if (h == 0u || !g_llm.in_use || h != g_llm.handle) return;
     if (g_llm.status != JCE_LLM_RUNNING) return;
+    JceTraceScope cancel_scope = jce_trace_scope_begin_parent("llm.cancel", g_llm.trace_task_id);
     if (g_llm.proc) jce_process_force_kill(g_llm.proc);
     g_llm.status = JCE_LLM_CANCELLED;
     llm_set_message("cancelled");
     llm_finish_process();
     LOG_INFO(LOG_TAG, "h=%u cancelled", h);
+    jce_trace_scope_end(cancel_scope, JCE_TRACE_TASK_CANCELLED);
+    llm_trace_request_finish(JCE_TRACE_TASK_CANCELLED, LLM_TRACE_CANCEL);
 }
 
 JCE_API const char *JCE_CALL jce_llm_response(JceLlmHandle h, size_t *out_len)
@@ -404,11 +499,19 @@ JCE_API const char *JCE_CALL jce_llm_output_log(JceLlmHandle h)
 JCE_API void JCE_CALL jce_llm_release(JceLlmHandle h)
 {
     if (h == 0u || !g_llm.in_use || h != g_llm.handle) return;
+    JceTraceScope release_scope = jce_trace_scope_begin_parent("llm.release", g_llm.trace_task_id);
     if (g_llm.status == JCE_LLM_RUNNING) jce_llm_cancel(h);
     llm_finish_process();
+    if (release_scope.id) {
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.released_log_capacity",
+                                          llm_trace_size(g_llm.log_cap), release_scope.id, release_scope.parent);
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.released_response_bytes",
+                                          llm_trace_size(g_llm.response_len), release_scope.id, release_scope.parent);
+    }
     if (g_llm.log)      JCE_FREE(g_llm.log);
     if (g_llm.response) JCE_FREE(g_llm.response);
     llm_reset_slot();
+    jce_trace_scope_end(release_scope, JCE_TRACE_TASK_SUCCEEDED);
 }
 
 JCE_API const char *JCE_CALL jce_llm_last_error(void)
@@ -418,7 +521,12 @@ JCE_API const char *JCE_CALL jce_llm_last_error(void)
 
 JCE_API void JCE_CALL jce_llm_shutdown(void)
 {
+    JceTraceScope shutdown_scope = jce_trace_scope_begin("llm.shutdown");
     if (g_llm.in_use) jce_llm_release(g_llm.handle);
     memset(&g_llm, 0, sizeof g_llm);
     g_llm.next_handle = 1u;
+    if (shutdown_scope.id)
+        jce_trace_counter_scoped_internal(JCE_TRACE_CATEGORY_CORE, "llm.live_process",
+                                          g_llm.proc ? 1 : 0, shutdown_scope.id, shutdown_scope.parent);
+    jce_trace_scope_end(shutdown_scope, JCE_TRACE_TASK_SUCCEEDED);
 }

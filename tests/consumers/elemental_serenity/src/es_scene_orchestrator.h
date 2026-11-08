@@ -21,6 +21,11 @@ bool es_scene_orchestrator_request_next(
 void es_scene_orchestrator_update(EsSceneOrchestrator *orchestrator,
                                   double delta_seconds);
 
+/* 0 pending/none, 1 validated plan, -1 failed. Consumes only the plan result;
+ * applying it and acknowledging the authored state belongs to serialized Lua. */
+int es_scene_orchestrator_take_result(EsSceneOrchestrator *orchestrator,
+                                     int *state, int *error);
+
 uint64_t es_scene_orchestrator_last_plan_hash(
     const EsSceneOrchestrator *orchestrator);
 

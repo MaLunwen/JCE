@@ -86,6 +86,96 @@ static void ensure_parent_dir(const char *path)
     if (buf[0]) jce_fs_host_create_directory(buf);
 }
 
+/* Both supported formats have four-byte-aligned faces. Keep the backend's
+ * uint16 edge and uint32 upload limits at this shared read/write boundary. */
+struct KtxCubeLayout {
+    uint32_t edge;
+    uint32_t mips;
+    uint32_t bpp;
+    uint32_t face_bytes[16];
+    size_t per_face;
+    size_t total;
+};
+
+static bool ktx_cube_layout(uint32_t edge, uint32_t mips, uint32_t bpp,
+                            KtxCubeLayout *layout)
+{
+    if (!edge || edge > UINT16_MAX || !mips || (bpp != 4u && bpp != 8u))
+        return false;
+    uint32_t levels = 0;
+    for (uint32_t side = edge; side; side >>= 1u) ++levels;
+    if (mips > levels) return false;
+    if (mips != 1u && mips != levels) return false;
+    uint64_t per_face = 0;
+    for (uint32_t mip = 0; mip < mips; ++mip) {
+        const uint32_t side = edge >> mip;
+        const uint64_t face = (uint64_t)side * side * bpp;
+        if (face > UINT32_MAX) return false;
+        layout->face_bytes[mip] = (uint32_t)face;
+        per_face += face;
+    }
+    const uint64_t total = per_face * 6u;
+    if (total > UINT32_MAX || total > SIZE_MAX) return false;
+    layout->edge = edge;
+    layout->mips = mips;
+    layout->bpp = bpp;
+    layout->per_face = (size_t)per_face;
+    layout->total = (size_t)total;
+    return true;
+}
+
+static bool ktx_cube_header_matches(const uint32_t *header)
+{
+    const bool rgba8 = header[4] == 0x8058u;
+    const bool rgba16f = header[4] == 0x881au;
+    const bool legacy = header[1] == 0u && header[2] == 1u && header[3] == 0u;
+    const bool typed = header[3] == 0x1908u &&
+        ((rgba8 && header[1] == 0x1401u && header[2] == 1u) ||
+         (rgba16f && header[1] == 0x140bu && header[2] == 2u));
+    return (rgba8 || rgba16f) && (legacy || typed) &&
+        header[5] == 0x1908u && header[7] == header[6] &&
+        header[8] == 0u && header[9] == 0u && header[10] == 6u;
+}
+
+/* Preflight the entire wire layout before allocation or publishing outputs.
+ * Legacy zero-type bimg files remain readable, but new writes are typed KTX1. */
+static bool ktx_cube_preflight(const uint8_t *file, size_t length,
+                               KtxCubeLayout *layout, size_t *payload_offset)
+{
+    static const uint8_t identifier[12] = {
+        0xab, 0x4b, 0x54, 0x58, 0x20, 0x31,
+        0x31, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a
+    };
+    if (!file || length < 64u || memcmp(file, identifier, sizeof(identifier)))
+        return false;
+    uint32_t hdr[13];
+    memcpy(hdr, file + sizeof(identifier), sizeof(hdr));
+    if (hdr[0] != 0x04030201u) return false;
+    if (!ktx_cube_header_matches(hdr)) return false;
+    const uint32_t bpp = hdr[4] == 0x881au ? 8u : 4u;
+    if (!ktx_cube_layout(hdr[6], hdr[11] ? hdr[11] : 1u, bpp, layout))
+        return false;
+    if ((hdr[12] & 3u) || hdr[12] > length - 64u) return false;
+    const size_t start = 64u + (size_t)hdr[12];
+    const uint64_t payload = (uint64_t)layout->total + 4u * layout->mips;
+    if (payload != (uint64_t)(length - start)) return false;
+    size_t offset = start;
+    for (uint32_t mip = 0; mip < layout->mips; ++mip) {
+        uint32_t face_bytes;
+        memcpy(&face_bytes, file + offset, sizeof(face_bytes));
+        if (face_bytes != layout->face_bytes[mip]) return false;
+        offset += 4u + (size_t)face_bytes * 6u;
+    }
+    *payload_offset = start;
+    return true;
+}
+
+static void ktx_write_u32_le(uint8_t *destination, uint32_t value)
+{
+    for (uint32_t byte = 0; byte < 4u; ++byte)
+        destination[byte] = (uint8_t)(value >> (byte * 8u));
+}
+
 } // namespace
 
 extern "C" bool jce__ktx2_write_cubemap(const char    *path,
@@ -94,9 +184,14 @@ extern "C" bool jce__ktx2_write_cubemap(const char    *path,
                                          const uint8_t *faces,
                                          uint32_t       bytes_per_pixel)
 {
-    if (!path || !path[0] || !faces || face_size == 0 || mip_count == 0) {
+    KtxCubeLayout requested;
+    if (!path || !path[0] || !faces ||
+        !ktx_cube_layout(face_size, mip_count, bytes_per_pixel, &requested)) {
         return false;
     }
+    const uint64_t encoded_bytes = (uint64_t)requested.total + 64u + 4u * mip_count;
+    /* bimg's encoder accumulates its result in int32_t. */
+    if (encoded_bytes > INT32_MAX || encoded_bytes > SIZE_MAX) return false;
     /* 4 = RGBA8, 8 = RGBA16F.  The second exists because an 8-bit container
      * clamps every value above 1.0, and a reflection probe's whole job is the
      * values above 1.0 -- a sun, a lamp, a bright window.  Anything else is
@@ -144,6 +239,21 @@ extern "C" bool jce__ktx2_write_cubemap(const char    *path,
         return false;
     }
 
+    KtxCubeLayout encoded;
+    size_t payload_offset = 0;
+    if ((uint64_t)w.size > SIZE_MAX ||
+        !ktx_cube_preflight(w.data, (size_t)w.size, &encoded, &payload_offset) ||
+        encoded.edge != requested.edge || encoded.mips != requested.mips ||
+        encoded.bpp != requested.bpp) {
+        LOG_ERROR(JCE_KTX_TAG, "unexpected bimg cubemap layout");
+        return false;
+    }
+    /* KTX1 requires an actual type/format for uncompressed pixels. The pinned
+     * bimg writer uses zeros; normalize only our checked, owned output blob. */
+    ktx_write_u32_le(w.data + 16u, bytes_per_pixel == 8u ? 0x140bu : 0x1401u);
+    ktx_write_u32_le(w.data + 20u, bytes_per_pixel == 8u ? 2u : 1u);
+    ktx_write_u32_le(w.data + 24u, 0x1908u);
+
     ensure_parent_dir(path);
     if (!jce_fs_host_write_all(path, w.data, (uint64_t)w.size)) {
         LOG_ERROR(JCE_KTX_TAG, "write failed: %s", path);
@@ -155,7 +265,7 @@ extern "C" bool jce__ktx2_write_cubemap(const char    *path,
     return true;
 }
 
-/* Minimal KTX1 reader for the RGBA8 cubemaps the bake worker emits via
+/* Minimal KTX1 reader for the RGBA8/RGBA16F cubemaps the bake worker emits via
  * bimg::imageWriteKtx (above).  It read MIP 0 ONLY and created the texture
  * with hasMips=false, so the probe bake's specular roughness chain -- once it
  * became real -- would have been written and never sampled.  We deliberately
@@ -168,113 +278,33 @@ extern "C" bool jce__ktx2_write_cubemap(const char    *path,
  * www.khronos.org/registry/KTX/specs/1.0/ktxspec_v1.html
  */
 extern "C" bool jce__ktx_parse_cubemap(const void *bytes_in, size_t len,
-                                       uint32_t *out_face_size,
-                                       uint32_t *out_mips,
-                                       uint8_t **out_data, size_t *out_size,
-                                       uint32_t *out_bpp)
+                              uint32_t *out_face_size, uint32_t *out_mips,
+                              uint8_t **out_data, size_t *out_size,
+                              uint32_t *out_bpp)
 {
+    if (!out_data) return false;
     const uint8_t *file = (const uint8_t *)bytes_in;
-    if (!file || len < 64u) return false;
-
-    static const uint8_t kKtx1Id[12] = {
-        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31,
-        0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
-    };
-    if (memcmp(file, kKtx1Id, sizeof(kKtx1Id)) != 0) return false;
-
-    const uint8_t *p = file + sizeof(kKtx1Id);
-    uint32_t hdr[13];
-    memcpy(hdr, p, sizeof(hdr));
-    p += sizeof(hdr);
-
-    const uint32_t endianness  = hdr[0];
-    const uint32_t glType      = hdr[1];
-    const uint32_t glIntFormat = hdr[4];
-    const uint32_t pixelWidth  = hdr[6];
-    const uint32_t numFaces    = hdr[10];
-    const uint32_t numMips     = hdr[11] ? hdr[11] : 1u;
-    const uint32_t kvdBytes    = hdr[12];
-
-    if (endianness != 0x04030201u || pixelWidth == 0u || numFaces != 6u)
-        return false;
-
-    /* THE FORMAT IS IN THE FILE.  This reader used to assume four bytes per
-     * pixel in three separate places -- the total size, the per-mip size
-     * check, and the upload format -- which was true while the writer could
-     * only emit RGBA8 and stopped being true the moment an HDR probe could be
-     * baked.  KTX1 states glType and glInternalFormat; ask them.
-     *
-     *   GL_UNSIGNED_BYTE 0x1401 + GL_RGBA8  0x8058 -> 4 bytes
-     *   GL_HALF_FLOAT    0x140B + GL_RGBA16F 0x881A -> 8 bytes
-     *
-     * Anything else is refused rather than guessed: a wrong stride reads a
-     * container as a differently-shaped one and produces a texture that
-     * uploads without complaint. */
-    uint32_t bpp;
-    /* glInternalFormat is the discriminator, not glType.  bimg writes glType
-     * 0 for RGBA8 -- measured on its own output -- because it emits these
-     * through its sized-format path, and a check that required
-     * GL_UNSIGNED_BYTE there rejected every container this engine has ever
-     * written.  glType is cross-checked only when the writer bothered to set
-     * it. */
-    if (glIntFormat == 0x8058u &&                                  /* RGBA8   */
-        (glType == 0u || glType == 0x1401u))      bpp = 4u;
-    else if (glIntFormat == 0x881Au &&                             /* RGBA16F */
-             (glType == 0u || glType == 0x140Bu)) bpp = 8u;
-    else {
-        LOG_WARN(JCE_KTX_TAG,
-                 "unsupported KTX pixel format (glType=0x%X internal=0x%X); "
-                 "only RGBA8 and RGBA16F cubemaps are read",
-                 glType, glIntFormat);
-        return false;
-    }
-    if ((size_t)(p - file) + kvdBytes > len) return false;
-    p += kvdBytes;
-
-    /* Total side-major size, and the per-face stride. */
-    size_t per_face = 0;
-    for (uint32_t m = 0; m < numMips; ++m) {
-        uint32_t ms = pixelWidth >> m;
-        if (ms < 1u) ms = 1u;
-        per_face += (size_t)ms * ms * bpp;
-    }
-    const size_t total = per_face * 6u;
-    uint8_t *dst = (uint8_t *)jce_malloc(total);
-    if (!dst) return false;
-
-    size_t face_off = 0;   /* offset of this mip within one face's chain */
-    for (uint32_t m = 0; m < numMips; ++m) {
-        uint32_t ms = pixelWidth >> m;
-        if (ms < 1u) ms = 1u;
-        const uint32_t expect = ms * ms * bpp;
-
-        if ((size_t)(p - file) + 4u > len) { jce_free(dst); return false; }
-        uint32_t faceBytes;
-        memcpy(&faceBytes, p, 4u);
-        p += 4u;
-        if (faceBytes != expect) { jce_free(dst); return false; }
-
-        /* 0 for both formats -- every mip's face size is a multiple of 4 --
-         * but computed rather than assumed, because that is what the spec
-         * says and the next format may not be. */
-        const uint32_t cubePad = (4u - (faceBytes & 3u)) & 3u;
-        if ((size_t)(p - file) + (size_t)(faceBytes + cubePad) * 6u > len) {
-            jce_free(dst);
-            return false;
+    KtxCubeLayout layout;
+    size_t offset = 0;
+    if (!ktx_cube_preflight(file, len, &layout, &offset)) return false;
+    uint8_t *destination = (uint8_t *)jce_malloc(layout.total);
+    if (!destination) return false;
+    size_t face_offset = 0;
+    for (uint32_t mip = 0; mip < layout.mips; ++mip) {
+        const size_t face_bytes = layout.face_bytes[mip];
+        offset += 4u;
+        for (uint32_t face = 0; face < 6u; ++face) {
+            memcpy(destination + (size_t)face * layout.per_face + face_offset,
+                   file + offset, face_bytes);
+            offset += face_bytes;
         }
-        /* MIP-MAJOR in, SIDE-MAJOR out. */
-        for (uint32_t f = 0; f < 6u; ++f) {
-            memcpy(dst + (size_t)f * per_face + face_off, p, faceBytes);
-            p += faceBytes + cubePad;
-        }
-        face_off += expect;
+        face_offset += face_bytes;
     }
-
-    if (out_face_size) *out_face_size = pixelWidth;
-    if (out_mips)      *out_mips      = numMips;
-    if (out_size)      *out_size      = total;
-    if (out_bpp)       *out_bpp       = bpp;
-    *out_data = dst;
+    if (out_face_size) *out_face_size = layout.edge;
+    if (out_mips) *out_mips = layout.mips;
+    if (out_size) *out_size = layout.total;
+    if (out_bpp) *out_bpp = layout.bpp;
+    *out_data = destination;
     return true;
 }
 
@@ -288,6 +318,11 @@ extern "C" uint16_t jce__ktx_load_cubemap(const char *path, uint32_t *out_mips)
     uint8_t  *file  = (uint8_t *)jce_fs_host_read_all(path, &bytes);
     if (!file) {
         LOG_WARN(JCE_KTX_TAG, "cubemap read failed: %s", path);
+        return kInvalid;
+    }
+    if (bytes > SIZE_MAX) {
+        jce_fs_buffer_free(file);
+        LOG_WARN(JCE_KTX_TAG, "cubemap exceeds addressable size: %s", path);
         return kInvalid;
     }
 

@@ -16,6 +16,8 @@
 #include <string.h>
 #include "renderer/jce_render_encoder.h"
 #include "jce_lighting_system_internal.h"
+#include "jce_light_cookie_internal.h"
+#include "jce_renderer_shader_profile_internal.h"
 
 #define LOG_TAG "jce_lighting_system"
 
@@ -158,11 +160,7 @@ static struct {
     bgfx_uniform_handle_t cookie_dir_params;
     bgfx_uniform_handle_t cookie_dir_vp;    /* mat4: clip-from-world, dir cookie */
     bgfx_uniform_handle_t s_cookie;         /* sampler slot 13 (2D ARRAY) */
-    /* Always a valid array texture, so sampler 13 never holds the wrong
-     * TYPE: the real 16-layer atlas when cookie_array_ok, a 1x1 white
-     * one-layer placeholder when not. */
-    bgfx_texture_handle_t cookie_atlas_array;
-    bool                  cookie_array_ok;
+    JceLightCookieTexture cookie_texture; /* Owned atlas or typed white array. */
     bgfx_uniform_handle_t s_ies_lut;        /* sampler slot 14 */
     bgfx_texture_handle_t white_1x1;        /* default 1x1 white bind */
     /* P4-E.3b — Cookie atlas promoted to texture2DArray when the backend
@@ -218,115 +216,41 @@ static void ensure_light_uniforms(void)
     s_lu.ies_params        = bgfx_create_uniform("u_iesParams",    BGFX_UNIFORM_TYPE_VEC4, 1);
     s_lu.cookie_dir_params = bgfx_create_uniform("u_cookieDirParams", BGFX_UNIFORM_TYPE_VEC4, 1);
     s_lu.cookie_dir_vp     = bgfx_create_uniform("u_cookieDirVP",     BGFX_UNIFORM_TYPE_MAT4, 1);
-    s_lu.s_cookie            = bgfx_create_uniform("s_cookie",          BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    s_lu.s_cookie.idx        = UINT16_MAX;
     s_lu.s_ies_lut           = bgfx_create_uniform("s_iesLut",          BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
-    /* Default 1x1 white texture for safe bind even when no cookie/IES
-     * is active (avoids undefined sampler reads on tight backends). */
+    /* IES uses a distinct 2D white texture. Never submit a NULL payload as
+     * a white initializer or treat the zero-initialized handle as owned. */
     static const uint32_t kWhitePix = 0xFFFFFFFFu;
     const bgfx_memory_t *mem = bgfx_copy(&kWhitePix, sizeof(kWhitePix));
-    s_lu.white_1x1 = bgfx_create_texture_2d(1, 1, false, 1,
-                                          BGFX_TEXTURE_FORMAT_RGBA8,
-                                          BGFX_TEXTURE_NONE
-                                          | BGFX_SAMPLER_U_CLAMP
-                                          | BGFX_SAMPLER_V_CLAMP, mem, 0);
+    s_lu.white_1x1.idx = UINT16_MAX;
+    if (mem)
+        s_lu.white_1x1 = bgfx_create_texture_2d(1, 1, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, mem, 0);
+    if (!BGFX_HANDLE_IS_VALID(s_lu.white_1x1))
+        LOG_ERROR(LOG_TAG, "IES white texture allocation failed; empty IES bind unavailable");
 
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    const bool compatibility = jce_renderer_shader_profile_compatibility(
+        &api, bgfx_get_renderer_type());
+    const char *no_arr = getenv("JCE_COOKIE_NO_ARRAY");
+    const bool forced_off = no_arr && no_arr[0] && no_arr[0] != '0';
+    s_lu.cookie_texture = jce_light_cookie_texture_create(
+        bgfx_get_caps(), compatibility, forced_off);
+    if (BGFX_HANDLE_IS_VALID(s_lu.cookie_texture.texture))
+        s_lu.s_cookie = bgfx_create_uniform("s_cookie", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    if (s_lu.cookie_texture.atlas_enabled)
+        LOG_INFO(LOG_TAG, "cookie atlas array ready (%d layers of %dx%d)",
+            JCE_COOKIE_ATLAS_CAPACITY, JCE_COOKIE_ATLAS_DIM, JCE_COOKIE_ATLAS_DIM);
+    else
+        LOG_WARN(LOG_TAG, "light cookies unavailable (%s); authored data retained; sampler 13 %s",
+            jce_light_cookie_texture_reason(s_lu.cookie_texture.reason),
+            BGFX_HANDLE_IS_VALID(s_lu.cookie_texture.texture) ? "uses a two-layer white array" : "not bound");
+    if (BGFX_HANDLE_IS_VALID(s_lu.cookie_texture.texture) &&
+        !BGFX_HANDLE_IS_VALID(s_lu.s_cookie))
+        LOG_ERROR(LOG_TAG, "cookie sampler allocation failed; sampler 13 not bound");
     s_lu.init = true;
-
-    /* ── The per-light cookie ARRAY ─────────────────────────────────
-     *
-     * 16 layers of 256x256, cleared white, so layer 0 (the reserved "no
-     * cookie" slot) and every un-filled layer sample as 1.0 and multiply
-     * radiance by nothing.
-     *
-     * BGFX_TEXTURE_BLIT_DST is the ONLY flag this needs.  The code that used
-     * to live here said the layers could not be filled without
-     * BGFX_TEXTURE_BLIT_SRC on every cookie texture, and bgfx asks for no
-     * such thing -- its own assert names the destination flag and nothing
-     * else.  A feature sat half-built behind a blocker that did not exist.
-     *
-     * Gated on BGFX_CAPS_TEXTURE_2D_ARRAY, which every backend this engine
-     * targets has: the graphics tier floor is GL 3.1 / GLES 3.0 at its
-     * lowest (conan/hooks/hook_bgfx_wasm_fix.py), and array textures are core
-     * in both.
-     *
-     * THERE IS NO 2D FALLBACK ANY MORE, and removing it is part of the fix.
-     * s_cookie is SAMPLER2DARRAY in every program this tree compiles, so a
-     * plain 2D texture bound here is not a substitute that merely loses the
-     * per-light slot -- it is a sampler TYPE mismatch, which desktop D3D and
-     * GL tolerate silently and WebGL2 rejects for the whole draw (the same
-     * trap the dummy cubemap in jce_scene_renderer.c exists to avoid).  When
-     * the caps bit or the allocation is missing we therefore still bind an
-     * ARRAY: a 1x1 white single-layer placeholder, with every slot forced to
-     * 0, so cookies switch off cleanly instead of becoming a
-     * backend-dependent draw failure. */
-    {
-        const bgfx_caps_t *caps = bgfx_get_caps();
-        /* JCE_COOKIE_NO_ARRAY=1 takes the atlas away on a backend that has
-         * it, which switches every cookie off.  This is the ABLATION the
-         * claim needs -- the same scene with and without cookies, no scene
-         * edit -- and a knob that exists only in a patch is a measurement
-         * nobody can re-run. */
-        const char *no_arr = getenv("JCE_COOKIE_NO_ARRAY");
-        const bool forced_off = no_arr && no_arr[0] && no_arr[0] != '0';
-        s_lu.cookie_array_ok =
-            !forced_off &&
-            caps && (caps->supported & BGFX_CAPS_TEXTURE_2D_ARRAY) != 0
-                 && caps->limits.maxTextureLayers >= JCE_COOKIE_ATLAS_CAPACITY;
-        if (s_lu.cookie_array_ok) {
-            const uint16_t dim = JCE_COOKIE_ATLAS_DIM;
-            const uint32_t bytes = (uint32_t)dim * dim * 4u
-                                 * JCE_COOKIE_ATLAS_CAPACITY;
-            const bgfx_memory_t *mem = bgfx_alloc(bytes);
-            if (mem) {
-                memset(mem->data, 0xFF, bytes);
-                s_lu.cookie_atlas_array = bgfx_create_texture_2d(
-                    dim, dim, false, JCE_COOKIE_ATLAS_CAPACITY,
-                    BGFX_TEXTURE_FORMAT_RGBA8,
-                    BGFX_TEXTURE_BLIT_DST
-                    | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-                    mem, 0);
-            }
-            s_lu.cookie_array_ok =
-                BGFX_HANDLE_IS_VALID(s_lu.cookie_atlas_array);
-        }
-        if (s_lu.cookie_array_ok) {
-            LOG_INFO(LOG_TAG, "cookie atlas array: ready (%d layers of %dx%d)",
-                     (int)JCE_COOKIE_ATLAS_CAPACITY,
-                     (int)JCE_COOKIE_ATLAS_DIM, (int)JCE_COOKIE_ATLAS_DIM);
-        } else {
-            uint32_t white = 0xFFFFFFFFu;
-            const bgfx_memory_t *wmem = bgfx_copy(&white, 4);
-            s_lu.cookie_atlas_array = bgfx_create_texture_2d(
-                1, 1, false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
-                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, wmem, 0);
-            LOG_INFO(LOG_TAG, "cookie atlas unavailable (%s); light cookies "
-                              "are OFF and sampler 13 holds a 1x1 white array",
-                     forced_off ? "JCE_COOKIE_NO_ARRAY" : "backend caps");
-        }
-    }
-
-    /* P4-E.3b, REMOVED 2026-09-17, and the removal is the fix.
-     *
-     * A 16-layer 256x256 RGBA array texture was created here and bound to
-     * sampler 13 in place of the real cookie -- 4 MB of VRAM on an engine
-     * whose stated baseline is 512 MB, holding nothing.  Its own TODO said
-     * the layers were never populated ("pending per-cookie re-import flag"),
-     * and the shader side that would have sampled them is behind
-     * JCE_RENDER_COOKIE_2D_ARRAY, a macro defined nowhere in the tree.
-     *
-     * Half a feature that merely does nothing is cheap.  This half DISABLED
-     * the working one: the bind was unconditional on BGFX_CAPS_TEXTURE_2D_
-     * ARRAY, i.e. every desktop backend, so the 2D atlas the shader actually
-     * samples never reached sampler 13.
-     *
-     * The atlas SLOT bookkeeping above stays -- it is correct, it is uploaded
-     * per light, and it is what a real array path would consume.  What is
-     * gone is the texture with no writer.  Reviving the array path means
-     * doing all three halves together: populate the layers, define the macro
-     * so the SAMPLER2DARRAY declaration compiles, and bind the array.  Any
-     * two of the three reproduce this defect.  The pending axis is recorded
-     * in tools/lint/shader_axis_exempt.txt with that sentence. */
 
     LOG_DEBUG(LOG_TAG, "light uniforms initialized");
 }
@@ -374,10 +298,8 @@ void jce_lighting_system_shutdown(void)
         uniforms[i]->idx = UINT16_MAX;
     }
     if (BGFX_HANDLE_IS_VALID(s_lu.white_1x1)) bgfx_destroy_texture(s_lu.white_1x1);
-    if (BGFX_HANDLE_IS_VALID(s_lu.cookie_atlas_array)) bgfx_destroy_texture(s_lu.cookie_atlas_array);
+    jce_light_cookie_texture_destroy(&s_lu.cookie_texture);
     s_lu.white_1x1.idx = UINT16_MAX;
-    s_lu.cookie_atlas_array.idx = UINT16_MAX;
-    s_lu.cookie_array_ok = false;
     s_lu.init = false;
 }
 
@@ -679,7 +601,8 @@ static void light_env_repack(JceLightEnv *env)
         }
         for (uint32_t i = 0; i < env->num_dir; i++) {
             const JceDirLightDesc *dl = &env->dir_lights[i];
-            if (cookie_dir < 0 && jce_texture_valid(dl->cookie_texture)) {
+            if (s_lu.cookie_texture.atlas_enabled && cookie_dir < 0 &&
+                jce_texture_valid(dl->cookie_texture)) {
                 cookie_dir = (int)i;
                 cookie_strength_dir = clamp01(dl->cookie_strength);
             }
@@ -898,22 +821,10 @@ static void light_env_upload(JceLightEnv *mut,
     jce_enc_set_uniform(s_lu.ies_params,        mut->packed_ies_params, 1);
     jce_enc_set_uniform(s_lu.cookie_dir_params, mut->packed_cookie_dir_params, 1);
 
-    /* THE ARRAY, ALWAYS -- there is no other kind of texture this sampler
-     * can legally hold.  Each light's layer rides in u_dirLights[i*2+1].w /
-     * u_spotLights[i*4+3].y, so one bind serves every cookie-bearing light;
-     * a single 2D bind could only ever carry one image, which is what made
-     * "every light has its own cookie" untestable before.
-     *
-     * fs_pbr_decl.sh declares s_cookie to match, unconditionally: bgfx
-     * rewrites the shader's #version to 140 on this engine's GL floor (3.1,
-     * the lowest of the three graphics tiers) and emits
-     * `#define texture2DArray texture`, so profile-120 source compiles to
-     * valid GLSL 1.40 on every backend here.  That is why this needs no
-     * shader permutation -- checked in bgfx's renderer_gl.cpp, not assumed. */
     cookie_sync_layers(mut);
-    jce_enc_set_texture(13, s_lu.s_cookie, s_lu.cookie_atlas_array,
-                        UINT32_MAX);
-    jce_enc_set_texture(14, s_lu.s_ies_lut, mut->packed_ies_tex, UINT32_MAX);
+    jce_light_cookie_texture_bind(&s_lu.cookie_texture, s_lu.s_cookie);
+    if (BGFX_HANDLE_IS_VALID(mut->packed_ies_tex))
+        jce_enc_set_texture(14, s_lu.s_ies_lut, mut->packed_ies_tex, UINT32_MAX);
 }
 
 void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
@@ -948,10 +859,10 @@ bool jce_light_env_has_layer_masks(const JceLightEnv *env)
     return mut->any_layer_mask;
 }
 
-void jce_light_env_apply_for_layer(const JceLightEnv *env, const JceRenderer *r,
-                                   uint32_t layer_index)
+static JceLightEnv *light_env_prepare_layer(const JceLightEnv *env,
+    const JceRenderer *r, uint32_t layer_index)
 {
-    if (!env) return;
+    if (!env) return NULL;
     JceLightEnv *mut = (JceLightEnv *)env;
 
     light_env_ensure_pack(mut, r);
@@ -968,22 +879,48 @@ void jce_light_env_apply_for_layer(const JceLightEnv *env, const JceRenderer *r,
        optimisation -- it is the guarantee that a project which never touches
        rendering layers uploads exactly the bytes it uploaded before the
        feature existed. */
-    if (!mut->any_layer_mask) {
-        light_env_upload(mut, mut->packed_dir, mut->packed_point,
-                         mut->packed_spot, mut->packed_area);
-        return;
-    }
-
-    if (!mut->masked_valid || mut->masked_layer != layer_index)
+    if (mut->any_layer_mask &&
+        (!mut->masked_valid || mut->masked_layer != layer_index))
         light_env_build_masked(mut, layer_index);
+    return mut;
+}
 
-    light_env_upload(mut, mut->masked_dir, mut->masked_point,
-                     mut->masked_spot, mut->masked_area);
+void jce_light_env_apply_for_layer(const JceLightEnv *env, const JceRenderer *r,
+    uint32_t layer_index)
+{
+    JceLightEnv *mut = light_env_prepare_layer(env, r, layer_index);
+    if (!mut) return;
+    if (mut->any_layer_mask)
+        light_env_upload(mut, mut->masked_dir, mut->masked_point,
+            mut->masked_spot, mut->masked_area);
+    else
+        light_env_upload(mut, mut->packed_dir, mut->packed_point,
+            mut->packed_spot, mut->packed_area);
+}
+
+void jce_light_env_apply_directional_for_layer(const JceLightEnv *env,
+    const JceRenderer *renderer, uint32_t layer_index)
+{
+    JceLightEnv *mut = light_env_prepare_layer(env, renderer, layer_index);
+    if (!mut) return;
+    jce_enc_set_uniform(s_lu.ambient_color, mut->packed_ambient, 1);
+    if (mut->num_dir > 0u)
+        jce_enc_set_uniform(s_lu.dir_lights,
+            mut->any_layer_mask ? mut->masked_dir : mut->packed_dir,
+            (uint16_t)(mut->num_dir * 2u));
+    jce_enc_set_uniform(s_lu.light_counts, mut->packed_counts, 1);
 }
 
 void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos)
 {
     if (env) env->camera_pos = pos;
+}
+
+void jce_lighting_system_bind_camera(jce_vec3 position)
+{
+    ensure_light_uniforms();
+    const float camera[4] = {position.x, position.y, position.z, 0.0f};
+    jce_enc_set_uniform(s_lu.camera_pos, camera, 1u);
 }
 
 /* ================================================================== */
@@ -1009,7 +946,7 @@ void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos)
  * eviction reused a slot. */
 static void cookie_sync_layers(JceLightEnv *env)
 {
-    if (!env || !s_lu.cookie_array_ok) return;
+    if (!env || !s_lu.cookie_texture.atlas_enabled) return;
     for (int i = 1; i < (int)JCE_COOKIE_ATLAS_CAPACITY; i++) {
         const uint16_t want = env->cookie_slot_handle[i];
         if (want == JCE_COOKIE_SLOT_EMPTY || want == JCE_COOKIE_SLOT_RESERVED)
@@ -1018,7 +955,7 @@ static void cookie_sync_layers(JceLightEnv *env)
 
         bgfx_texture_handle_t src = { want };
         bgfx_blit(JCE_VIEW_MORPH_DEFORM,
-                  s_lu.cookie_atlas_array, 0,
+                  s_lu.cookie_texture.texture, 0,
                   0, 0, (uint16_t)i,          /* dstZ = the layer */
                   src, 0, 0, 0, 0,
                   JCE_COOKIE_ATLAS_DIM, JCE_COOKIE_ATLAS_DIM, 1);
@@ -1033,7 +970,7 @@ int jce_light_env_register_cookie(JceLightEnv *env, JceTexture cookie)
      * white layer, so answering 0 is what switches the shader's per-light
      * gate off; without it the lights would gate on a layer the 1x1
      * placeholder does not have. */
-    if (!env || !s_lu.cookie_array_ok || !jce_texture_valid(cookie)) return 0;
+    if (!env || !s_lu.cookie_texture.atlas_enabled || !jce_texture_valid(cookie)) return 0;
 
     env->cookie_frame_counter++;
 

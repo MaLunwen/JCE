@@ -25,6 +25,7 @@
 #include "stream_route.h"
 #include "load_witness.h"
 #include "async_load_witness.h"
+#include "probe_capture_witness.h"
 
 #include <errno.h>
 #include <math.h>
@@ -40,6 +41,7 @@
 #define LOG_TAG "benchmark_player"
 
 typedef struct Benchmark {
+    const JceServices *services;
     JceScene *scene;
     JceRuntime *runtime;
     JceCamera *camera;
@@ -111,8 +113,9 @@ static bool workload_desc(JceSceneStressDesc *desc, bool *requested)
 static void benchmark_exit(void *user)
 {
     Benchmark *s = user;
+    bench_probe_capture_exit();
     jce_renderer_readback_capture_flush();
-    if (s->scene) bench_metrics_sample(s->scene, s->renderer, s->frame,
+    if (s->scene) bench_metrics_sample(s->services, s->scene, s->renderer, s->frame,
                                         s->simulation_seconds, "exit");
     bench_particle_readback_destroy(&s->particle_readback);
     bench_async_load_destroy(&s->async_load);
@@ -139,6 +142,7 @@ static void benchmark_exit(void *user)
 static bool benchmark_init(const JceServices *svc, void *user)
 {
     Benchmark *s = user;
+    s->services = svc;
     bool preparing_load = false;
     if (!bench_load_prepare(&preparing_load)) goto failed;
     if (preparing_load) {
@@ -154,6 +158,14 @@ static bool benchmark_init(const JceServices *svc, void *user)
         return true;
     }
     if (probe && probe[0]) {
+        if (strcmp(probe, "metrics-selftest") == 0) {
+            if (!jce_renderer_is_headless(svc->renderer) || !bench_metrics_self_test())
+                goto failed;
+            s->probe_only = true;
+            LOG_INFO(LOG_TAG, "benchmark-probe: completed name=%s", probe);
+            jce_engine_request_quit();
+            return true;
+        }
         BenchProbeConfig config = {0};
         if (!jce_renderer_is_headless(svc->renderer) ||
             !probe_number("JCE_BENCH_COUNT", 1000, &config.count) ||
@@ -236,8 +248,9 @@ static bool benchmark_init(const JceServices *svc, void *user)
     if (!bench_stream_route_init(&s->stream_route, s->scene, s->renderer, svc->renderer)) goto failed;
     if (!bench_gpu_survivors_create(&s->survivors, svc->renderer)) goto failed;
     if (!bench_asset_readiness_initialize(&s->asset_readiness)) goto failed;
+    if (!bench_probe_capture_prepare(s->scene)) goto failed;
     LOG_INFO(LOG_TAG, "benchmark-player: initialized viewport=%ux%u", BENCH_WIDTH, BENCH_HEIGHT);
-    bench_metrics_sample(s->scene, s->renderer, 0, 0, "initialized");
+    bench_metrics_sample(s->services, s->scene, s->renderer, 0, 0, "initialized");
     s->next_metrics_ms = jce_time_ticks_ms() + 5000u;
     return true;
 failed:
@@ -274,7 +287,9 @@ static void benchmark_update(float dt, void *user)
         LOG_ERROR(LOG_TAG, "benchmark-player: LOD camera route failed");
     if (!bench_asset_start(s->scene, s->renderer, s->frame))
         LOG_ERROR(LOG_TAG, "benchmark-player: asset was not ready at the fixed start frame");
-    if (s->frame == s->play_frame) LOG_INFO(LOG_TAG, "benchmark-player: entered Play");
+    if (s->frame == s->play_frame)
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+                      "benchmark-player: entered Play");
     if (s->frame >= s->play_frame) {
         bench_physics_pressure_before(&s->physics_pressure, s->frame);
         jce_runtime_step(s->runtime, dt);
@@ -288,7 +303,7 @@ static void benchmark_update(float dt, void *user)
     if (s->shot_submitted) jce_renderer_readback_capture_poll();
     uint64_t now = jce_time_ticks_ms();
     if (now >= s->next_metrics_ms) {
-        bench_metrics_sample(s->scene, s->renderer, s->frame, s->simulation_seconds, "periodic");
+        bench_metrics_sample(s->services, s->scene, s->renderer, s->frame, s->simulation_seconds, "periodic");
         s->next_metrics_ms = now + 5000u;
     }
 }
@@ -297,6 +312,7 @@ static void benchmark_draw(const JceServices *svc, void *user)
 {
     (void)svc;
     Benchmark *s = user;
+    if (bench_probe_capture_draw(svc, s->scene, s->renderer, s->frame)) return;
     if (s->hiz_probe.active) {
         if (!bench_hiz_probe_draw(&s->hiz_probe, &s->survivors, s->frame))
             LOG_ERROR(LOG_TAG, "benchmark-hiz-npot: GPU dispatch/readback failed");

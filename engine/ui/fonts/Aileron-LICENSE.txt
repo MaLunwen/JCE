@@ -1,0 +1,9 @@
+Aileron Regular, by Sora Sagano (dot colon).
+No Rights Reserved.
+The provider permits use, modification and redistribution without restriction
+and supplies this font without warranty: https://dotcolon.net/fonts/aileron/
+
+This is the unmodified 12,676-byte Latin subset included in Pillow 12.3.0.
+The font name table copyright is "No Rights Reserved.".
+It covers 113 glyphs and does not contain Chinese, Japanese or Korean glyphs.
+SHA-256: 69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f

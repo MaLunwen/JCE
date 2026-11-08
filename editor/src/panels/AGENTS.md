@@ -1,7 +1,134 @@
 # editor/src/panels/ — ImGui Dock Panels
 
+Project Settings Quality offers only the renderer's supported VSync requests:
+Off and Every VBlank. Legacy positive counts display as enabled, but opening
+or refreshing the panel must not normalize stored values. Only an actual
+selection change writes zero or one through the existing dirty/save owner.
+This control does not promise alternate-VBlank synchronization.
+
+Asset Browser scene activation delegates content binding entirely to the normal
+scene loader. The grid must not reassign the scene directory from the file's
+direct parent after loading: the loader owns the shared Scenes-parent rule and
+an unsuccessful load retains its previous content base. Actual whole-entry CPU
+controls live in loose_scene_content_controls.cmake; file/viewer/directory ports
+do not certify native double-click delivery or complete scene deserialization.
+
+Console output keeps the two existing bounded log rings authoritative. Its CPU
+viewport controls compile the complete Console and shared ring owners with real
+ImGui layout. Full-history filters, collapse, selection and copy are independent
+of visible-text submission. Preserve every original Selectable and context-menu
+submission so native ImGui keyboard navigation can reach offscreen records.
+Derived intrinsic text bounds belong to ConsoleUiState;
+font/context/size/spacing/DPI and exact text changes invalidate it. Mid-row Clear
+must leave that draw's borrowed records and layout alive. A rejected output child
+still has matching EndChild, while the existing sink drain remains outside the
+output-body admission. Ordinary full-Text, ignored-child and early-clear controls
+must fail actual assertions after compilation. These controls do not establish
+native interaction, dynamic pixels, GPU work or complete-scene frame gains.
+The font key consumes ImGui's existing FontId and atlas identity counters as
+well as context, current point size, spacing and viewport DPI; never hash the
+glyph atlas each frame. Output clipping retains the full multiline height and
+maximum horizontal width. Real ItemSize owns each row's fractional-pixel
+rounding; do not accumulate an independent Y prefix. Clear invalidates derived
+geometry but does not destroy its active frame snapshot; the next admitted draw
+rebuilds it. The actual same-owner full-Text CPU reference must match fractional
+row Y and ScrollMax, and actual keyboard Home/End/Page events must retain reach.
+
+Console subscription starts through the shared panels-init owner before project
+restoration, independently of whether its dock is drawn. The existing GUI CPU
+host poll drains its bounded pending ring into the same display ring while the
+dock is hidden; it performs no ImGui work and cannot initialize after shutdown.
+Headless membership stays unchanged. Filter and Clear-on-Play preferences retain
+their meanings; log collection must not silently override user visibility choices.
+This observes logs emitted after subscription, not earlier Engine boot history.
+
+Console shutdown belongs to the shared panels shutdown sequence. Disarm the
+static, null-userdata command callbacks, then use the existing logger's
+synchronous sink-removal barrier before destroying the hand-off mutex. Clear
+the output hook, destroy the session and release the existing UI owner's cache.
+The core command registry has no unregister operation; these executable-resident
+callbacks must remain inert until Console reinitializes. Do not tear down the
+core registry or introduce a second logger owner. Missing-owner-wire CPU
+controls must fail after actual panels shutdown, including repeated shutdown
+and reinit; they are not proof of in-flight native logger races or GPU release.
+Owned shutdown publishes the existing Editor CPU scope
+`editor.console.shutdown` and Core trace counters for sink/session/mutex/cache
+ownership before detach and after each real release. Repeated empty shutdown
+emits no synthetic cleanup. The CPU fixture consumes the actual public bounded
+trace ring, verifies parent restoration and balanced work, and keeps these
+observations distinct from heap completeness, GPU completion and native races.
+
+Render Pipeline content and its existing tick refresh the current requested
+descriptor before immediate widget edits. Never seed authoring controls from
+the hardware-clamped effective descriptor or retain a prior project's policy.
+Path/status drafts remain local; accepted descriptor edits still publish in the
+same draw. The applied-policy summary queries the effective descriptor once
+after those edits, displaying authored/applied HDR, TAA, cascades and scale.
+This local read-only snapshot must never enter authoring state, Save or apply;
+applied policy does not certify an active shader pass or GPU execution.
+All four authored/applied values use normal text contrast; read-only data is
+not a disabled widget and its display style must not change policy ownership.
+Dedicated actual-body CPU controls use real RP/Bundle ownership and
+typed UI observations; they do not certify physical widget input or GPU output.
+
+Profiler CPU phase rows show independent, possibly nested wall spans. Keep the
+legacy app_update aggregate distinct from its app_simulation and app_draw parts;
+never sum rows for a total or normalize percentages by that sum. Bar lengths are
+relative only to the longest visible candidate span, not a frame budget or a
+bottleneck verdict. The localized scope note explains this in all shipped locales.
+
+When maximized Game View covers the main host viewport, only CPU Profiler
+presentation returns early. Keep the CPU tab's phase capture, stale-history
+reset and one current-frame sample before that gate. Detached Profiler windows
+still present normally; other Workbench tabs retain their existing maintenance.
+The CPU control consumes the actual draw prefix and six ring reductions with
+counted public/viewport ports. It proves presentation admission and retained
+history, not whole-frame speed, native visibility or GPU work.
+Per-view row conversion is derived presentation: the sampler returns its existing
+borrowed frame-stats pointer and retains every history/epoch observation. Only
+admitted CPU presentation copies/formats rows; Frame Debugger retains its
+existing once-per-UI-frame lazy capture. No second query is added to CPU sampling.
+
+
+Bundle Browser and the Dist graph producer bind the same private
+`core/jce_project_prepared_assets` adapter before the public Bundle pack call.
+It merges existing canonical render settings, physics layers, project settings,
+render pipeline and input actions as required dependency roots; the public packer
+still owns cooking and closure.
+Keep VFS/source precedence and the existing asset-index fallback. Prepared
+configuration discovery or canonical mappings belong in that shared adapter.
+
 ## Identity
-- **Language**: C++17 + ImGui (via `jce_tools_imgui`)
+
+Scene content takes explicit viewport admission from its layout caller. A
+covered Scene services pending material results, cancels stale gizmo/pick and
+selection state, closes terrain/foliage strokes and stops camera piloting before
+returning without toolbar or viewport work. Its own maximized overlay remains
+admitted once, with no preceding dock-shell cancellation. Standalone Scene
+wrappers explicitly admit their existing content. Probe maintenance is owned
+by the admitted host pump before panel layout, not this content path.
+
+Game Canvas pointer input retains its existing native ImGui position/button,
+Play and capture gates. An explicit virtual Game source may replace only the
+parameters to that same Canvas pointer setter via the core non-consuming peek;
+its admitted display/FBO geometry must match the current visible Play view.
+Never consume the runtime sample again, move the OS cursor, overwrite hover or
+focus, or invoke a widget/script directly. Native text and wheel retain their
+original separate gates. Typed actual-block controls do not prove physical input.
+
+Game View backend selection and restart hints consume the existing startup
+name-to-backend resolver. Compare resolved enums, including aliases and case,
+before persisting a different choice. Auto accepts the live selection; an
+unknown request or unknown live backend does not establish a restart need.
+An unrecognized or currently unlisted configured choice retains its raw preview
+and no selected row instead of silently appearing as Auto. Backend changes
+still take effect on the next Editor launch; the selector never hot-swaps.
+The exact-source CPU controls in tools/tests/test_game_view_backend_selection.py
+exercise the actual selector and helpers with the real resolver. Counted UI and
+config ports plus ordinary old-comparison negatives are not physical GUI input
+or backend-creation evidence.
+
+- **Language**: C++20 + ImGui (via `jce_tools_imgui`)
 - **Role**: every dockable editor window. One TU per panel; instantiated via `jce_editor_panels.cpp` registry.
 
 ## File map (selected)
@@ -14,7 +141,7 @@
 - `jce_panel_assets_thumb.{h,cpp}`     — LRU thumbnail cache (256 entries / 64 MB, 128 px box-downscale). Decodes images via `jce_image_decode`, materials via `jce_pbr_material_load_json`. Main-thread, budget 2 decodes/frame (`jce_thumb_pump(2)` from editor loop). Eligible extensions: `.png/.jpg/.jpeg/.tga/.bmp/.hdr/.mat.json`.
 - `jce_panel_console.cpp`              — log sink + filter.
 - `jce_panel_profiler.cpp` (44 KB) / `jce_panel_profiler_trace.cpp` — frame profiler plus bounded live Threads & Tasks view. The trace tab consumes `jce_trace` cursors, shows queue/run/wait timing and GPU Scene/MDI counters, and exports Chrome/Perfetto JSON only on explicit request.
-- `jce_panel_memory_profiler.cpp`      — tag-categorised memory profiler (P3-A.5). Reads `jce_mem_profile_*` + `mi_process_info`; sortable per-tag table, 512 MB baseline bar, Reset Peaks / Snapshot (JSON) buttons, 0.1–5 s refresh combo.
+- `jce_panel_memory_profiler.cpp`      — memory profiler. Reads public `jce_mem_profile_*` observations; sortable per-tag table, process-RSS 512 MiB target, Reset Peaks / Snapshot (JSON) buttons, 0.1–5 s refresh combo.
 - `jce_panel_systems.cpp`              — Unity-parity Systems window (P3-B.5). Two tabs: **Player Loop** (8-phase collapsible groups, per-entry enable toggle / priority / last-frame ms via `jce_player_loop_iterate`) and **ECS Systems** (sortable table over `jce_scene_iterate_systems`, columns: enabled / name / group / last_ms / matched). Top strip: filter + 0.1–5 s refresh combo. All visible strings flow through `jce_editor_i18n("panel.systems.*")`.
 - `jce_panel_material_graph.cpp` (panel entry only; impl split under `material_graph/`) / `jce_panel_shader_graph.cpp` — node editors.
 - `jce_panel_particle_editor.cpp` / `jce_panel_vfx_graph.cpp` — VFX authoring. The VFX Graph panel is a node front-end for the standard particle pipeline: **Export** compiles the graph to `*.particles.json` (canonical `JceParticleEmitterDesc` keys) for a Particle Emitter component's asset path; SubEmitter/Trail nodes are lossy (warned, dropped). The former `.vfx.json` interpreter (`jce_vfx_graph.c`) and the `VfxGraph` component were retired in the v0.9.9 consolidation (scene loads migrate `graphPath` → ParticleEmitter `asset_path`).
@@ -41,7 +168,31 @@
 9. **Frame budget**: each panel `Draw()` ≤ 0.5 ms on baseline HW; heavy work goes to `jce_thread_pool_*` (engine/include/jce/os/core/jce_thread.h).
 10. **No `ImGui::ShowDemoWindow()`** in shipping builds (gate behind `JCE_EDITOR_DEV`).
 
+Use `jce_editor_i18n_id` only for widget labels that ImGui parses for identity.
+Formatted text and tooltip contents use `jce_editor_i18n` or
+`jce_editor_i18n_or`; these display strings verbatim and must not receive the
+hidden-ID suffix. Preserve existing widget IDs when correcting display text.
+
 ## Don't
+
+Scene/Game policy samples distinguish called wrapper visibility, collapsed
+ImGui Begin, invalid layout, focus loss, clipping and explicit capture using the
+shared private viewport-work/trace helpers. A hidden panel skipped by the outer
+registry has no wrapper sample. Preserve existing admission, layout, pointer
+release and capture behavior; policy samples do not certify render-owner calls
+or GPU work. Rendering and its final refusal reason belong to the actual Scene/
+Game render owners, not the panel's inferred texture availability.
+
+Reflection Probe Inspector reuses its existing Cancel button during its own
+capture phase, including a zero bake handle. It retains the shared Scene owner's
+successful request token and matches that Scene/entity/token before displaying
+capture controls. A stale component pointer plus another global capture is not
+ownership; the batch panel also begins through the same owner. It calls the
+safe cancel adapter; a different or superseded request cannot cancel it. Capture has no
+public fractional progress, so display only its existing status rather than a
+fabricated percentage. Existing bake handles retain their progress/cancel path.
+The handle created when captured faces transfer to convolution is not exposed
+by the current capture API; do not claim that subsequent UI tracking is complete.
 - Don't share global statics across panels — use `jce_editor_state`.
 - Don't allocate per frame with `new`/`malloc` — reuse buffers or use `jce_alloc_frame`.
 - Don't call SDL / bgfx directly — go through engine public API or `jce_imgui_renderer`.
@@ -260,3 +411,294 @@ under operation metrics report actual eligible/reused/row/root observations;
 rebuild phase timings count only executed rebuilds, not synthetic zero-cost work.
 
 Play without a CharacterController still owns pointer input when it uses an ordinary primary Camera; an active VirtualCamera is not required. Displayed image coordinates and deltas map to the actual render dimensions, including scaled captures.
+
+The Memory Profiler shows N/A for unavailable allocator-specific heap counters;
+zero does not prove an empty heap. Process RSS/commit retain their process scope.
+
+Memory Profiler aggregate current/peak use one simultaneous tagged snapshot.
+Snapshot JSON separately exports the legacy per-tag peak sum, with explicit
+voluntary-tagged scope; process counters and per-tag rows remain independent.
+
+Asset-browser explicit refresh uses `request_asset_resource_refresh`; the index
+owner notifies Canvas resources after completion. Ordinary folder navigation or
+periodic listing must not retire font atlases unconditionally. Final project
+packages use the core package path owner; build intermediates/reports stay under
+build and verified application outputs publish under dist/apps.
+
+
+Build Profiles uses the core native target/layout policy for edited Target/Exe,
+selected architecture and release/dist previews. Its build output prediction is
+separate from package output under the existing dist/apps default-path owner.
+Only engine workspace mode consumes the global workspace target override and
+requires Conan; SDK-native projects require CMake/Ninja. Re-check uses the same
+public toolchain discovery paths as actual native execution, including explicit
+overrides. CPU helper/port controls do not certify GUI input or a real compiler.
+
+Grass continuous fields track the actual edited item on every draw; flags and reseed use discrete undo. Density-mask edits consume the canonical path widget pre-edit port, including asynchronous browse results. A CPU history-port test is distinct from real GUI Undo/Redo acceptance.
+
+Preferences Fonts consumes the shared searchable picker. A font choice persists through the canonical config and requests the existing deferred font reload, outside the active draw frame. Explicit unlisted paths remain visible and cannot silently appear as Auto.
+
+Scene View navigation chrome submits real ImGui items before the full viewport
+input item. Cube and visible axis clicks are item-owned; reuse the existing
+selection, deferred-pick, brush and cancellation gates. Canonical overlay
+geometry is shared by drawing and hit admission. The viewport remains
+LastItemData for the existing asset drop path. A chrome press cannot start a
+new gizmo operation, while an already-active gizmo still updates and releases.
+Real ImGui context controls and fresh native GUI checks are separate evidence.
+
+Scene View click priority is helper icon, ECS UI, GPU ID, then a finite CPU
+ray. The CPU query uses the rendered model's retained triangles where
+available, compares them with visible proxy geometry, and preserves exact
+misses. The viewport camera's clip convention sets the segment endpoints.
+Marquee and drag/drop keep their independent request and hover paths.
+
+Scene navigation registration ends with the real full-viewport item and its ItemSize cursor advance; never restore an unsubmitted post-Image cursor past CursorMaxPos. Actual-context tests cover Image/fallback, modal, End and Render with zero recorded ImGui errors; soft error recovery is not acceptance.
+
+## Preferences hotkey capture consumption
+
+Preferences consumes the central `jce_hotkeys_capture_*` owner. Poll once before
+drawing binding rows; only a committed result saves the binding. Begin is the
+Bind button's only capture mutation. Tab changes away from Hotkeys, modal
+Close/X/hidden state, root-and-child focus loss and Reset cancel through the
+same owner. The registry keeps the cancellation/completion frame blocked, so
+background actions cannot run later in that frame. Preserve the existing red
+duplicate-binding marker and tooltip; do not silently remove another action's
+binding. Real ImGui CPU controls verify the registry port, while native GUI
+checks must verify these actual modal/tab/focus hooks and save/reopen behavior.
+
+Build Profiles restores its one-time persisted root before adopting the open
+project. Restoring after adoption can overwrite the active root with an empty
+preference and emit a false CMakePresets warning before the synthetic project
+profile loads. Project mode and engine-workspace mode retain their existing
+build authority; tool discovery alone is not a complete compiler/sysroot gate.
+
+Test Runner consumes private core/jce_editor_test_run and its existing .test.json suites. Run/Run All queues one child at a time; Rescan/input are disabled while queued/running, and Cancel clears queued work plus requests child stop. The layout ticks even while hidden, and the actual editor panels shutdown closes the owner. Logs use the shared profile build/editor-test-runs directory, not CWD temp files or project output. Public JSON string values are encoded losslessly for public process argv; unsupported empty/oversized tokens fail explicitly. Case previews are bounded at 64 KiB with a visible shortened marker and retained full log; incomplete captured/logged evidence cannot PASS. Native self-child controls cover argv, stdout/stderr, real exit codes, missing executable, cancel, timeout (including a first poll after actual 2-second children exit with 0 or 17), output overflow and filesystem failures. Exclusive-create refusal preserves prior results and existing bytes; private filesystem fault controls remain distinct from real OS failure. Separate runtime mutations disable exit-code and observed-deadline gates; compilation failure is not an accepted negative. These controls do not certify GUI click/hidden/restart consumption.
+
+
+Preferences General persists three authoring FPS rates through the existing
+canonical ui_int/config publication. Scene and Game viewport work shares private
+`core/jce_editor_viewport_work.h`: positive finite dimensions, actual ImGui clip
+visibility and app focus gate offscreen rendering. The engine already skips
+minimized host frames. Empty Game layout clears pointer/viewport ownership rather
+than rendering a clamped 16-pixel target. Positive explicitly requested KPI
+captures bypass clip/focus suppression; empty layout cannot certify a capture.
+These observations do not prove OS occlusion, DWM composition or physical GPU
+presentation, and playing simulation retains its existing runtime owner.
+
+
+Game View's GPU admission no longer drives module lifecycle or simulation.
+Module selection delegates to the existing Play host; custom update proceeds
+without an admitted view while the project background policy allows simulation.
+Pause/Stop/focus input cleanup still runs when viewport rendering is clipped.
+Preferences idle FPS also supplies the temporary paused-preview cadence;
+background FPS is temporary even for a running background-enabled project.
+Foreground resume and Stop restore the session/authoring values via one deadline
+mechanism, without rewriting authored FPS/VSync or lowering rendering quality.
+
+Preferences centers within the viewport work area and uses stacked captions for frame-rate, font and GPU-vendor fields so translated labels remain readable. The GPU combo uses the stable hidden ID `##gpu_adapter` and the available content width; its help describes next-launch selection without exposing implementation settings. Auto font help names Ink Free consistently with the shared host-font owner. Verify these fields by actual GUI consumption, including a smaller work area and font reload; source strings alone do not prove readability.
+
+Preferences Appearance authors the existing `editor.gpu_adapter` integer state
+through the shared startup owner: Auto/Intel/NVIDIA/AMD are vendor requests for
+the next launch, not exact devices or a live renderer switch. Missing state shows
+Auto without writing or overriding environment policy; explicitly clicking Auto
+stores zero. Invalid saved state stays visibly invalid until a valid choice is
+made. Preserve normal debounced config publication, full-table refusal, and the
+actual-device log rather than claiming the requested vendor was selected. All
+four labels/help keys remain synchronized across shipped locales.
+
+Preferences restores its last selected category from the canonical session
+`ui_state_int` key `preferences.active_tab` after loading its existing config
+mirror. Admit IDs from the same tab table used by the UI; missing or invalid
+values open General, with invalid values diagnosed only on load. Only actual
+category clicks update the key and request the existing debounced config save;
+table/publication failures retain the config owner's diagnostics. Seeded-profile
+restore and whole-editor captures do not prove native menu or keyboard input.
+
+Profiler timing interpretation uses `jce_profiler_observation.h`: backend frame
+intervals, latched GPU timings, API-thread render waits and render-thread submit
+waits are separate observations. Missing timers show N/A. No exact engine-frame
+join is available, so do not infer CPU/GPU bottlenecks from their averages or
+subtract both thread waits from an interval. Wait labels describe observed waits.
+
+Memory target bars use available process RSS only, not voluntary tagged totals
+or allocator-specific counters. The target is process scope, not whole-device
+usage or a physical 512 MiB acceptance claim. `jce_panel_memory_snapshot.h` owns
+complete bounded JSON, exact unsigned counters, escaped tag names, availability
+flags/nulls and atomic publication under the existing profile reports/memory
+path. Invalid explicit profiles and incomplete serialization never publish a
+successful snapshot or fall back to CWD. Snapshot requests refresh observations
+before encoding; actual UI, hardware and allocator-completeness evidence remain
+separate from the CPU owner fixtures and ordinary-failing wire controls.
+
+Build Profiles defaults user-project requests to Dist, with explicit Release
+selection retained on all native project platforms. Build shows its cache
+executable; Pack separately publishes the verified single executable through the
+existing Dist publisher. Explicit Release packages may retain development
+companion files. Both direct Play and Cook-completed Play require the native or
+workspace dispatcher bool before entering BUILDING; rejected preflight/start
+requests publish visible FAILED through the same manager owner. Refresh the
+status snapshot after GUI dispatch before showing success or rewriting Run paths.
+
+Bundle Browser Open exposes explicit asynchronous package or cached-snapshot
+inspection over the public Bundle inspector APIs and private shared summary
+owner. File inspection retains target/content/available-sidecar admission.
+Snapshots are content-only, capped at 64 MiB, captured only on user action and
+reused without another disk read or whole-pack copy. Exact target selection is
+independent of the ordinary host-runtime Open action; Auto admits only portable
+content. Request generations reject stale path/target/clear results. Task cleanup
+releases owned bytes, and panel shutdown disarms completion before teardown.
+No scene/VFS mutation, second parser, registry or per-frame IO is introduced.
+CPU ownership controls are separate from actual graphical reachability.
+
+## GPU timing consumption
+
+Profiler and Profile Analyzer admit GPU times only through the public bounded
+`JceGpuTimingObservation`, retaining the existing localized delayed-value and
+unavailable labels. Unavailable samples are excluded from summaries and written
+as blank CSV values with explicit availability flags; incomplete Analyzer plots
+do not draw unavailable values as zero-cost work. The common
+`jce_profiler_observation.h` owns CPU interval and separate thread-wait
+interpretation. Profile Analyzer must not subtract render/submit waits from the
+backend CPU interval or turn missing timer frequency into denominator 1. These
+changes repair measurement semantics, not the application's execution speed.
+
+## Benchmark observation clocks
+
+`jce_benchmark_observation.h` owns panel-to-panel monotonic wall cadence,
+continuous UI/CPU host-frame/context admission and the existing Lifecycle
+listener. Registration is unique, failed registration leaves no handle, explicit
+Reset retries it, and WILL_QUIT/destruction unregisters once. Hidden frame gaps,
+focus/pause/device events, modal states and clock/profile changes count missing
+coverage; consecutive long intervals remain in the distribution. These are UI
+observations, not presentation FPS, GPU completion or joined CPU/GPU frames.
+Backend CPU interval and qualified latched GPU timing have separate availability.
+`benchmark_ui_cadence_v1.txt` never migrates or overwrites the legacy metric file;
+save/compare requires continuous coverage and the exact bounded profile. Workload
+isolation means scene workload isolation, not exclusive OS/GPU access.
+
+
+
+## Profiler interval and history scope
+
+The Profiler header and Frame graph expose the wall interval between Editor UI
+updates, while the status bar displays ImGui's rolling UI cadence. Their rates
+are not presentation FPS. The clipboard uses the same localized interval/rate
+labels. Keep backend intervals, latched GPU timings and the two thread waits
+independent; an observed submission wait is not a GPU bottleneck verdict.
+
+The existing per-slot CPU/GPU/API/submit availability masks remain authoritative.
+Charts join only adjacent finite known values and draw an endpoint only when it
+is known; a known zero remains valid. Unknown slots show a gap, explicit
+unavailable text and known/total plus unavailable counts in the caption/tooltip.
+A change of the existing public observation's context availability/generation
+invalidates backend timing masks while preserving UI wall history. This does
+not establish a CPU/GPU frame join or a GPU completion witness. Preserve the
+continuous render path and the existing Benchmark wall-clock observer.
+
+## Analyzer CSV publication
+
+`jce_panel_profile_analyzer.h` is the private bounded CSV producer consumed by
+the existing Analyzer export button. It preserves the eight CSV columns,
+oldest-to-newest ring order, blank unavailable fields and available zero values.
+Locale-independent numeric encoding retains three decimal places and exact
+unsigned frame IDs. Invalid known metrics or any incomplete encoding refuse
+publication; a fixed 64 KiB heap buffer admits all 256 finite float records.
+
+The existing profile resolver selects `reports/profiler/profile_export.csv`;
+invalid profiles never fall back to CWD. The UI thread publishes a complete
+buffer using the public atomic host writer and releases it exactly once. The
+existing Analyzer state retains each request's result and path. Empty input,
+encoding, profile-path, allocation and write failures have localized visible
+statuses and one ordinary WARN per request; success logs INFO even in DIST.
+A failed write preserves the previous complete report and permits retry.
+This is complete CSV publication, not GPU completion or exact frame joining.
+
+Native controls consume the full private producer and strict extracts of the
+actual ring, export, result-key and toolbar bodies with real profile/host IO.
+Their UI and fault ports do not certify physical button input or rendered text.
+The sampler itself is unchanged and is outside this CSV fixture's scope.
+
+## Trace panel registration and memory qualification
+
+The Threads & Tasks owner treats trace registration as three observations:
+unknown prefix, registered, and unregistration observed. None is an OS thread
+liveness result. The summary counts current producer registrations; table rows
+cover this cursor's observed history. Clear starts a new prefix; cursor loss
+invalidates registration/name qualification and discards unpaired open spans
+before consuming the retained events. Auto refresh only polls the trace cursor;
+turning it off intentionally retains history and never changes recording.
+The toolbar always displays the public stats.enabled recording state. When
+recording is off, a localized hint identifies retained history and explains
+that automatic refresh does not enable recording. No panel polling or refresh
+widget sets/resets the producer or changes application capture defaults.
+Clear saturates the next public cursor sequence at UINT32_MAX, including when
+the producer reports its exhausted endpoint; never wrap to the uninitialized
+zero cursor and replay retained history. Clear does not reset the producer.
+
+Most recent counters preserve signed raw trace values. Negative sentinels for
+adapter-reported used bytes, texture estimates and render-target estimates
+display unavailable; a valid zero and unrelated negative counters remain
+numeric. This panel neither substitutes process/GPU memory nor changes the
+renderer producer or the legacy performance-log memory presentation.
+
+The registration-scope hint consumes `profiler.trace.scopeNote` directly
+through `jce_editor_i18n`; all fifteen locales define that key. Keep the scope
+semantics in the translations rather than a long private-wrapper fallback.
+
+## Game observation consumption
+
+Game View reports the current requested extent and its existing layout/focus/clip
+refusal, then notes the exact Image texture after the real Image call. Hidden,
+collapsed and unvisited intervals cannot inherit a previous completed render.
+Do not substitute valid texture handles or capture-note callbacks for the
+GameRender CPU-tail or optional renderer submit observations.
+
+## LAN discovery draw boundary
+
+The Discovery tab requests Refresh from the private Editor LAN lifecycle service
+and displays the public transport's current scanning state. Drawing never ticks
+the transport or owns expiry; switching tabs, hiding the panel or skipping a UI
+frame cannot retain a scan beyond the next CPU-maintenance poll. Do not add a
+second cached scanning flag or start discovery during panel initialization.
+
+## Console presentation admission
+
+`jce_editor_panel_console_content_admitted` retains initialization, actual log
+drain and Clear-on-Play/last-play updates before an inadmitted presentation
+returns. The gate precedes toolbar, merge/filter/collapse, row-layout cache and
+widget work. The no-argument content wrapper keeps ordinary callers admitted.
+The independent host Console poll continues draining logs without changing
+retention, filtering or Clear-on-Play timing; it never takes ownership of that
+play transition. Admission does not retire or recreate the Console session.
+
+## Bounded live trace view
+
+The existing trace panel owns at most 1024 observed thread rows, 2048 counter
+names and 8192 active span IDs, alongside its existing task/completed limits.
+Existing keys keep updating at capacity. New-key refusals are counted as events,
+not distinct identities; there is no refused-ID set or invented overflow thread.
+The toolbar marks the local view partial and separates these refusals from Core
+cursor loss. Thread registration stays unknown/registered/unregistration observed;
+these historical rows are not an OS roster. The open-work column counts only
+locally paired cached work begins. An unmatched or wrong-kind end cannot consume
+another tracked begin; updating an existing begin transfers its local accounting.
+Clear releases every view cache and resets local refusal counts without resetting
+the producer. Prefix loss keeps refusal history while invalidating registrations
+and clearing unpaired begins as before. Public cursor/stats expose no generation
+token: a quiescent external producer reset followed by explicit Clear is supported;
+automatic detection of every external reset is not claimed. Counters retain signed
+int64 values and the public uint32 cursor endpoint remains unchanged. Core trace,
+canonical capture and export are independent of these local retention limits.
+
+## Covered Threads and Tasks presentation
+
+The existing trace content entry always polls its passive Core cursor before
+checking same-host maximized Game presentation. Covered content skips the
+summary stats read, GPU Scene query and all widgets/row formatting. The local
+bounded history, live-off setting and cursor-loss qualification retain their
+owners; Core recording/export and application async work remain independent.
+Detached profiler windows and normal presentation consume the current history.
+This gate adds no producer, cache, timer, public API or performance guarantee.
+
+The WaterNearshore Inspector picks terrain entities through the scene SDK.
+The selector is undoable and the scene registry owns component persistence.

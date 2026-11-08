@@ -5,6 +5,12 @@
 > four-language history, kept because every superseded paragraph is the
 > measurement that motivated the engine change that superseded it.
 
+Current fixture entry: `jce_project.multilang.json`, selected by explicit
+`ES_MULTILANG=ON` in the shared consumer CMake owner. Ordinary project-open and
+`build-project` now select portable Lua through `jce_project.json`; see README
+for the installed-SDK fixture route. These historical five-language observations
+do not certify the default Lua product or a refreshed fixture executable.
+
 **Historical evidence.** These measurements predate the 2026-09-28 move to
 tests/consumers/elemental_serenity. Current ownership is in README.md and
 SOURCE_AND_TERMS.md. Generator source formerly in build/ is now in tools/.

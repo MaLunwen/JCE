@@ -82,7 +82,13 @@ static bool js_take_exception(JceJsScript *s, const char *what)
     char line[JCE_JS_VM_MSG_MAX];
 
     if (!s || !s->ctx) return false;
+#if !defined(JCE_QUICKJS_LEGACY_EXCEPTION_API) || !JCE_QUICKJS_LEGACY_EXCEPTION_API
     if (!JS_HasException(s->ctx)) return false;
+#elif JCE_QUICKJS_LEGACY_EXCEPTION_API != 1
+#error Unsupported QuickJS exception capability
+#endif
+    /* Legacy callers already observed JS_EXCEPTION or a failed pending job.
+     * Consume that known exception directly, including thrown null/undefined. */
 
     exc = JS_GetException(s->ctx);
     msg = JS_ToCString(s->ctx, exc);

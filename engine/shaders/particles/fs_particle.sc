@@ -25,6 +25,11 @@ $input v_pcolor, v_texcoord0
  */
 
 #include <bgfx_shader.sh>
+#if BGFX_SHADER_LANGUAGE_HLSL
+#define JCE_PARTICLE_RAIN_FRAGMENT
+#include "particle_rain_surface.sh"
+#undef JCE_PARTICLE_RAIN_FRAGMENT
+#endif
 
 SAMPLER2D(s_particleTex, 0);
 SAMPLER2D(s_sceneDepth,  1);
@@ -77,6 +82,20 @@ void main()
 {
 	float soft = jce_particle_soft_fade(gl_FragCoord.xy, gl_FragCoord.z);
 
+#if BGFX_SHADER_LANGUAGE_HLSL
+	if (v_texcoord0.x > 1.5) {
+		float surface_y;
+		if (!particle_rain_surface(v_pcolor.xy, surface_y)) discard;
+		vec2 local = (v_texcoord0 - vec2(2.0, 0.0)) * 2.0 - 1.0;
+		float radius = length(local);
+		// Soft crest with conserved subpixel coverage; no flat white core.
+		float aa = max(fwidth(radius), 0.006);
+		float ring = 1.0 - smoothstep(0.0, 0.04 + aa, abs(radius - 0.76));
+		ring *= min(1.0, 0.08 / aa);
+		if (ring <= 0.0) discard;
+		gl_FragColor = vec4(vec3(0.38, 0.49, 0.55) * v_pcolor.z, v_pcolor.a * ring * soft);
+	} else
+#endif
 	if (u_particle_misc.x > 0.5) {
 		vec4 t = texture2D(s_particleTex, v_texcoord0);
 		vec4 c = v_pcolor * t;

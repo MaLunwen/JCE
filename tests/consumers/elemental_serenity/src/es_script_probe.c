@@ -49,15 +49,25 @@ typedef struct {
     int         found;
 } EsProbe;
 
-/* ONE ROW PER SCRIPTED LANGUAGE IN THE SCENE.  Adding a language to
- * elemental_serenity means adding a row here too; a language with no row is
- * a language nothing counts, which is the state this file exists to end. */
+/* One row per original independently probed script owner. The Mood protocol
+ * has its separate request/plan/ack acceptance and is not counted here. */
+/* Probe entity names are shared by the equivalent portable owners. Their
+ * labels and script addresses describe the selected scene, not the historical
+ * language of the entity name. */
 static EsProbe s_probes[] = {
+#if defined(ES_MULTILANG) && ES_MULTILANG
     { "lua",    "EsLuaProbe",  "scripts/es_director.lua",  0, 0, 0, 0 },
     { "python", "EsPyProbe",   "scripts/es_fireflies.py",  0, 0, 0, 0 },
     { "java",   "EsJavaProbe", "scripts/EsCampfire.java",  0, 0, 0, 0 },
     { "cpp",    "EsCppProbe",  "scripts/EsFlowerSway.jcecpp", 0, 0, 0, 0 },
     { "c",      "EsCProbe",    "scripts/EsPropSurface.jcec",  0, 0, 0, 0 },
+#else
+    { "lua", "EsLuaProbe",  "scripts/es_director_portable.lua",  0, 0, 0, 0 },
+    { "lua", "EsPyProbe",   "scripts/es_fireflies_portable.lua", 0, 0, 0, 0 },
+    { "lua", "EsJavaProbe", "scripts/es_campfire_portable.lua",  0, 0, 0, 0 },
+    { "lua", "EsCppProbe",  "scripts/es_flowers_portable.lua",   0, 0, 0, 0 },
+    { "lua", "EsCProbe",    "scripts/es_surfaces_portable.lua",  0, 0, 0, 0 },
+#endif
 };
 #define ES_PROBE_COUNT ((int)(sizeof s_probes / sizeof s_probes[0]))
 
@@ -119,7 +129,7 @@ void es_script_probe_report(const char *why)
     int i;
     int live = 0;
 
-    fprintf(stderr, "\n=== ES multi-language script probe (%s) ===\n",
+    fprintf(stderr, "\n=== ES script-owner probe (%s) ===\n",
             why ? why : "");
     fprintf(stderr, "%-8s %-28s %8s %8s %8s\n",
             "language", "scriptPath", "on_start", "on_update", "resolved");
@@ -131,7 +141,7 @@ void es_script_probe_report(const char *why)
                              : (p->starts == 0 ? "   [NEVER RAN]" : ""));
         if (p->starts > 0 && p->updates > 0) ++live;
     }
-    fprintf(stderr, "=== %d of %d languages live ===\n\n",
+    fprintf(stderr, "=== %d of %d script owners live ===\n\n",
             live, ES_PROBE_COUNT);
 }
 

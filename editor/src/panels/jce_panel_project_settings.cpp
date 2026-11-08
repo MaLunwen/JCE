@@ -15,6 +15,8 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "jce_panel_common.h"
+#include "jce_panel_hotkey_search.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
 #include <jce/os/core/jce_log.h>
@@ -33,7 +35,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <cctype>
 #include <cfloat>
 #include <string>
 #include <vector>
@@ -79,6 +80,10 @@ struct State {
     bool                dirty  = false;
     int                 tab    = TAB_INPUT;
     char                filter[64] = {0};
+    char                cached_filter[64] = {0};
+    bool                tab_matches[TAB_COUNT] = {false};
+    int                 filter_locale_count = -1;
+    JceLocale           filter_locale = JCE_LOCALE_INVALID;
     JceProjectSettings  ps;
     JceEditorConfig     cfg;
     int                 hk_recording_id = -1;
@@ -1009,8 +1014,15 @@ void draw_localization(void)
         const int nkeys = jce_editor_gl10n_key_count();
         for (int r = 0; r < nkeys; ++r) {
             const char *key = jce_editor_gl10n_key_at(r);
-            if (g_st.loc_filter[0] && !std::strstr(key, g_st.loc_filter))
-                continue;
+            if (g_st.loc_filter[0] && !jce_panel_contains_ci(key, g_st.loc_filter)) {
+                bool value_match = false;
+                for (int c = 0; c < nloc && !value_match; ++c) {
+                    const char *locale = jce_editor_gl10n_locale_code_at(c);
+                    value_match = jce_panel_contains_ci(jce_editor_gl10n_get(locale, key),
+                                                        g_st.loc_filter);
+                }
+                if (!value_match) continue;
+            }
             const bool prot = jce_editor_gl10n_key_protected(key);
 
             ImGui::TableNextRow();
@@ -1334,8 +1346,9 @@ void draw_build(void)
      * a build.  Removed from the UI to stop implying a live setting; the
      * persisted fields stay inert and "repack on save" is governed solely by
      * Preferences > auto_repack_on_save.  Output Dir + CMake Target below ARE
-     * consumed: Output Dir feeds the launcher's executable search, and CMake
-     * Target overrides the Build Profiles target (see refresh_prefill_from_project). */
+     * consumed by External Run's executable search. Ordinary-project Build
+     * Profiles derives its initial target from the manifest; engine-workspace
+     * builds may use this configured target. */
     if (jce_draw_path_input_folder(
             jce_editor_i18n("projectSettings.build.outputDir"),
             g_st.cfg.build_output_path,
@@ -1401,19 +1414,9 @@ void draw_hotkeys(void)
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableHeadersRow();
         for (int i = 0; i < JCE_HK_COUNT; ++i) {
-            const char *name = jce_hotkey_name((JceHotkeyId)i);
-            if (g_st.hk_filter[0]) {
-                char lname[128]; char lflt[64];
-                int n = (int)std::strlen(name);
-                for (int j = 0; j < n && j < 127; ++j)
-                    lname[j] = (char)std::tolower((unsigned char)name[j]);
-                lname[n < 127 ? n : 127] = '\0';
-                int m = (int)std::strlen(g_st.hk_filter);
-                for (int j = 0; j < m && j < 63; ++j)
-                    lflt[j] = (char)std::tolower((unsigned char)g_st.hk_filter[j]);
-                lflt[m < 63 ? m : 63] = '\0';
-                if (!std::strstr(lname, lflt)) continue;
-            }
+            const auto id = static_cast<JceHotkeyId>(i);
+            if (!jce_panel_hotkey_matches_filter(id, g_st.hk_filter)) continue;
+            const char *name = jce_hotkey_name(id);
             ImGui::TableNextRow();
             ImGui::PushID(i);
             ImGui::TableSetColumnIndex(0);
@@ -1660,10 +1663,16 @@ void draw_quality_levels(void)
                 const char *vs[] = {
                     jce_editor_i18n_or(PS_KEY "msaa.off", "Off"),
                     jce_editor_i18n_or(PS_KEY "vsync.everyVblank", "Every VBlank"),
-                    jce_editor_i18n_or(PS_KEY "vsync.every2nd",    "Every 2nd VBlank"),
                 };
+                /* The renderer supports a boolean VSync request. Display
+                 * legacy positive counts as enabled without rewriting the
+                 * authored value until the user actually changes selection. */
+                int vsync_choice = lv->vsync_count > 0 ? 1 : 0;
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.vsync"),
-                                 &lv->vsync_count, vs, 3)) mark_dirty();
+                                 &vsync_choice, vs, 2)) {
+                    lv->vsync_count = vsync_choice;
+                    mark_dirty();
+                }
                 if (ImGui::DragInt(jce_editor_i18n("projectSettings.quality.targetFramerate"),
                                    &lv->target_framerate, 1, -1, 480)) mark_dirty();
                 /* The LIVE cap, so a designer can tell an authored number from
@@ -1876,20 +1885,20 @@ void draw_tab_content(int t)
     }
 }
 
-bool tab_matches_filter(int t)
+void refresh_tab_matches()
 {
-    if (g_st.filter[0] == '\0') return true;
-    const char *label = jce_editor_i18n_or(tab_i18n_key(t), tab_fallback(t));
-    /* Case-insensitive contains. */
-    char a[64]; char b[64];
-    size_t la = std::strlen(g_st.filter);
-    size_t lb = std::strlen(label);
-    if (la >= sizeof(a) || lb >= sizeof(b)) return true;
-    for (size_t i = 0; i <= la; ++i)
-        a[i] = (char)std::tolower((unsigned char)g_st.filter[i]);
-    for (size_t i = 0; i <= lb; ++i)
-        b[i] = (char)std::tolower((unsigned char)label[i]);
-    return std::strstr(b, a) != nullptr;
+    const int locale_count = jce_editor_i18n_locale_count();
+    const JceLocale locale = jce_editor_i18n_get_locale();
+    if (g_st.filter_locale_count == locale_count && g_st.filter_locale == locale &&
+        std::strcmp(g_st.cached_filter, g_st.filter) == 0)
+        return;
+
+    g_st.filter_locale_count = locale_count;
+    g_st.filter_locale = locale;
+    std::memcpy(g_st.cached_filter, g_st.filter, sizeof(g_st.filter));
+    for (int t = 0; t < TAB_COUNT; ++t)
+        g_st.tab_matches[t] = jce_editor_i18n_search_match(
+            tab_i18n_key(t), tab_fallback(t), g_st.filter, nullptr);
 }
 
 } /* namespace */
@@ -1907,9 +1916,10 @@ extern "C" void jce_editor_panel_project_settings_content(void)
     ImGui::InputTextWithHint("##ps_filter",
                              jce_editor_i18n_or("panel.project_settings.filter_hint", "Filter..."),
                              g_st.filter, sizeof(g_st.filter));
+    refresh_tab_matches();
     ImGui::Separator();
     for (int t = 0; t < TAB_COUNT; ++t) {
-        if (!tab_matches_filter(t)) continue;
+        if (!g_st.tab_matches[t]) continue;
         const char *label = jce_editor_i18n_or(tab_i18n_key(t),
                                                tab_fallback(t));
         char row[96];

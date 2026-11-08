@@ -28,10 +28,38 @@
 #include <stdint.h>
 #include <string.h>
 
+/* Private scene lifetime observation from jce_scene_internal.h. */
+uint64_t jce_scene_internal_instance_id(const JceScene *s);
+
 static JceScene *g_s;
 
 void setUp(void)    { g_s = jce_scene_create(); }
 void tearDown(void) { if (g_s) { jce_scene_destroy(g_s); g_s = NULL; } }
+
+static void test_scene_instance_id_is_independent_of_mutation_epochs(void)
+{
+    TEST_ASSERT_NOT_NULL(g_s);
+    const uint64_t first = jce_scene_internal_instance_id(g_s);
+    TEST_ASSERT_NOT_EQUAL_UINT64(0u, first);
+    TEST_ASSERT_EQUAL_UINT64(0u, jce_scene_internal_instance_id(NULL));
+    JceScene *other = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(other);
+    const uint64_t other_id = jce_scene_internal_instance_id(other);
+    const uint64_t other_epoch = jce_scene_get_structural_epoch(other);
+    jce_scene_destroy(other);
+    TEST_ASSERT_EQUAL_UINT64(jce_scene_get_structural_epoch(g_s), other_epoch);
+    TEST_ASSERT_GREATER_THAN_UINT64(first, other_id);
+
+    TEST_ASSERT_NOT_EQUAL_UINT64(JCE_ENTITY_INVALID,
+                                 jce_scene_create_entity(g_s, "instance"));
+    TEST_ASSERT_EQUAL_INT(1, jce_scene_clear(g_s));
+    TEST_ASSERT_EQUAL_UINT64(first, jce_scene_internal_instance_id(g_s));
+
+    jce_scene_destroy(g_s);
+    g_s = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(g_s);
+    TEST_ASSERT_GREATER_THAN_UINT64(other_id, jce_scene_internal_instance_id(g_s));
+}
 
 /* Force index reuse: create, destroy, create again until a new entity lands
  * on the same index as the destroyed one.  Returns 0 if flecs never reused
@@ -164,6 +192,7 @@ static void test_from_index_resolves_current_occupant_by_design(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_scene_instance_id_is_independent_of_mutation_epochs);
     RUN_TEST(test_live_entity_is_alive);
     RUN_TEST(test_destroyed_entity_is_not_alive);
     RUN_TEST(test_generation_zero_handle_is_generation_checked);

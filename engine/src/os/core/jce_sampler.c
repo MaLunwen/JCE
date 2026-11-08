@@ -21,11 +21,18 @@
 /* Native thread suspend + dbghelp, the same class of platform work the crash
  * handler does, and listed alongside it in the lint allowlists for the same
  * reason: there is no portable way to read another thread's program counter. */
+#if defined(JCE_SAMPLER_TEST_PORT)
+/* Private deterministic owner tests provide only the native observation port. */
+#include JCE_SAMPLER_TEST_PORT
+#else
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>   /* thread enumeration for the all-thread sweep */
 #pragma comment(lib, "dbghelp.lib")
+#endif
 
+#include "os/platform/jce_thread_description_native_internal.h"
+#include "os/platform/jce_dbghelp_native_internal.h"
 #include <jce/os/core/jce_filesystem.h>
 
 #include <stdint.h>
@@ -66,6 +73,12 @@ static struct {
     int         all_threads;    /* JCE_SAMPLER_ALL: sweep the whole process */
     uint64_t    total;          /* samples taken */
     uint64_t    missed;         /* suspends that produced no usable context */
+    uint64_t    thread_cap_skipped; /* refresh observations beyond session cap */
+    uint64_t    thread_open_failed;
+    uint64_t    thread_identity_failed;
+    uint64_t    thread_snapshot_failed;
+    uint64_t    resume_failed;
+    bool        target_suspended; /* only the increment acquired by this sampler */
 } g_s;
 
 static void samp_record(uint64_t pc, uint16_t tidx)
@@ -82,15 +95,25 @@ static void samp_record(uint64_t pc, uint16_t tidx)
      * as total > sum(count), which the report prints. */
 }
 
-/* Every thread in this process except the sampler itself.
+/* At most 128 thread lifetimes in this process, excluding the sampler itself.
  *
  * Lock contention does not happen on the thread you are profiling -- it happens
  * on the ones waiting. A main-thread-only profile shows the SYMPTOM (a wait) and
  * never the holder, so JCE_SAMPLER_ALL=1 sweeps the whole process. The list is
- * refreshed periodically because pools spawn and retire threads. */
-#define SAMP_MAX_THREADS 64u
+ * refreshed periodically because pools spawn and retire threads. A retained
+ * entry owns its histogram identity until shutdown, even after thread exit.
+ * New lifetimes beyond this bounded session table are explicitly skipped. */
+#define SAMP_MAX_THREADS 128u
 
-typedef struct { HANDLE h; DWORD tid; uint64_t samples; char name[48]; } SampThread;
+typedef struct {
+    HANDLE h;
+    DWORD tid;
+    uint64_t created; /* OS creation timestamp distinguishes reused TIDs */
+    uint64_t samples;
+    char name[48];
+    bool seen;
+    bool suspended; /* sampler owns exactly one acquired suspend increment */
+} SampThread;
 static SampThread g_thr[SAMP_MAX_THREADS];
 static uint32_t   g_thr_count;
 
@@ -98,63 +121,89 @@ static void samp_close_threads(void)
 {
     for (uint32_t i = 0; i < g_thr_count; i++)
         if (g_thr[i].h) CloseHandle(g_thr[i].h);
+    memset(g_thr, 0, sizeof g_thr);
     g_thr_count = 0;
 }
 
 static void samp_refresh_threads(DWORD self_tid)
 {
-    /* Keep the accumulated per-thread counts across refreshes by tid. */
-    SampThread prev[SAMP_MAX_THREADS];
-    const uint32_t prev_n = g_thr_count;
-    memcpy(prev, g_thr, sizeof prev);
-    for (uint32_t i = 0; i < prev_n; i++) prev[i].h = NULL;   /* handles reused below */
-
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
+    if (snap == INVALID_HANDLE_VALUE) { g_s.thread_snapshot_failed++; return; }
     const DWORD pid = GetCurrentProcessId();
-
-    SampThread fresh[SAMP_MAX_THREADS];
-    memset(fresh, 0, sizeof fresh);
-    uint32_t n = 0;
-
     THREADENTRY32 te;
     memset(&te, 0, sizeof te);
     te.dwSize = sizeof te;
-    if (Thread32First(snap, &te)) {
-        do {
-            if (te.th32OwnerProcessID != pid) continue;
-            if (te.th32ThreadID == self_tid) continue;
-            if (n >= SAMP_MAX_THREADS) break;
+    BOOL have_thread = Thread32First(snap, &te);
+    if (!have_thread && GetLastError() != ERROR_NO_MORE_FILES) {
+        g_s.thread_snapshot_failed++;
+        CloseHandle(snap);
+        return;
+    }
+    for (uint32_t t = 0; t < g_thr_count; t++) g_thr[t].seen = false;
+    while (have_thread) {
+        if (te.th32OwnerProcessID == pid && te.th32ThreadID != self_tid) {
             HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                  THREAD_QUERY_LIMITED_INFORMATION,
+                                  THREAD_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                                   FALSE, te.th32ThreadID);
-            if (!h) continue;
-            fresh[n].h   = h;
-            fresh[n].tid = te.th32ThreadID;
-            for (uint32_t p = 0; p < prev_n; p++)
-                if (prev[p].tid == te.th32ThreadID) {
-                    fresh[n].samples = prev[p].samples;
-                    memcpy(fresh[n].name, prev[p].name, sizeof fresh[n].name);
-                    break;
+            if (!h) {
+                g_s.thread_open_failed++;
+            } else {
+                FILETIME created, exited, kernel, user;
+                if (!GetThreadTimes(h, &created, &exited, &kernel, &user)) {
+                    /* A TID alone cannot safely recover historical ownership. */
+                    g_s.thread_identity_failed++;
+                    CloseHandle(h);
+                } else {
+                    const uint64_t identity = ((uint64_t)created.dwHighDateTime << 32) |
+                                              (uint64_t)created.dwLowDateTime;
+                    uint32_t t = 0;
+                    for (; t < g_thr_count; t++)
+                        if (g_thr[t].tid == te.th32ThreadID &&
+                            g_thr[t].created == identity) break;
+                    if (t == g_thr_count && t == SAMP_MAX_THREADS) {
+                        g_s.thread_cap_skipped++;
+                        CloseHandle(h);
+                    } else {
+                        SampThread *thread = &g_thr[t];
+                        if (t == g_thr_count) {
+                            memset(thread, 0, sizeof *thread);
+                            thread->tid = te.th32ThreadID;
+                            thread->created = identity;
+                            PWSTR desc = NULL;
+                            if (SUCCEEDED(jce_native_get_thread_description_internal(h, &desc)) &&
+                                desc && desc[0])
+                                WideCharToMultiByte(CP_UTF8, 0, desc, -1, thread->name,
+                                                    (int)sizeof thread->name, NULL, NULL);
+                            if (desc) LocalFree(desc);
+                            thread->name[sizeof thread->name - 1u] = '\0';
+                            if (!thread->name[0])
+                                snprintf(thread->name, sizeof thread->name, "tid-%lu",
+                                         (unsigned long)thread->tid);
+                            g_thr_count++;
+                        }
+                        /* Keep handles and immutable indexes for retained lives.
+                         * A transient observation handle cannot rekey samples. */
+                        if (thread->h) CloseHandle(h);
+                        else thread->h = h;
+                        thread->seen = true;
+                    }
                 }
-            if (!fresh[n].name[0]) {
-                PWSTR desc = NULL;
-                if (SUCCEEDED(GetThreadDescription(h, &desc)) && desc && desc[0])
-                    WideCharToMultiByte(CP_UTF8, 0, desc, -1, fresh[n].name,
-                                        (int)sizeof fresh[n].name, NULL, NULL);
-                if (desc) LocalFree(desc);
-                if (!fresh[n].name[0])
-                    snprintf(fresh[n].name, sizeof fresh[n].name, "tid-%lu",
-                             (unsigned long)te.th32ThreadID);
             }
-            n++;
-        } while (Thread32Next(snap, &te));
+        }
+        have_thread = Thread32Next(snap, &te);
+    }
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        /* An incomplete enumeration must not retire the unobserved handles. */
+        g_s.thread_snapshot_failed++;
+        CloseHandle(snap);
+        return;
     }
     CloseHandle(snap);
-    if (!n) return;
-    samp_close_threads();
-    memcpy(g_thr, fresh, sizeof fresh);
-    g_thr_count = n;
+    for (uint32_t t = 0; t < g_thr_count; t++) {
+        if (g_thr[t].seen || !g_thr[t].h) continue;
+        CloseHandle(g_thr[t].h);
+        g_thr[t].h = NULL; /* name, lifetime and histogram index remain retained */
+    }
 }
 
 static DWORD WINAPI samp_thread(LPVOID unused)
@@ -184,6 +233,7 @@ static DWORD WINAPI samp_thread(LPVOID unused)
 
     while (!InterlockedCompareExchange(&g_s.stop, 0, 0)) {
         Sleep(sleep_ms);
+        if (InterlockedCompareExchange(&g_s.stop, 0, 0)) break;
 
         if (g_s.all_threads) {
             if (refresh_countdown == 0) {
@@ -193,22 +243,30 @@ static DWORD WINAPI samp_thread(LPVOID unused)
             }
             refresh_countdown--;
             for (uint32_t t = 0; t < g_thr_count; t++) {
+                if (InterlockedCompareExchange(&g_s.stop, 0, 0)) break;
                 HANDLE h = g_thr[t].h;
-                if (!h || SuspendThread(h) == (DWORD)-1) { g_s.missed++; continue; }
+                if (!h) continue; /* historical entry, no live thread to sample */
+                if (SuspendThread(h) == (DWORD)-1) { g_s.missed++; continue; }
+                g_thr[t].suspended = true;
                 CONTEXT ctx;
                 memset(&ctx, 0, sizeof ctx);
                 ctx.ContextFlags = CONTEXT_CONTROL;
                 uint64_t pc = 0;
                 if (GetThreadContext(h, &ctx)) {
-#if defined(_M_X64) || defined(__x86_64__)
+#if JCE_ARCH_X64
                     pc = (uint64_t)ctx.Rip;
-#elif defined(_M_IX86)
+#elif JCE_ARCH_X86
                     pc = (uint64_t)ctx.Eip;
-#elif defined(_M_ARM64)
+#elif JCE_ARCH_ARM64
                     pc = (uint64_t)ctx.Pc;
 #endif
                 }
-                ResumeThread(h);
+                if (ResumeThread(h) == (DWORD)-1) {
+                    g_s.resume_failed++; g_s.missed++;
+                    InterlockedExchange(&g_s.stop, 1);
+                    break; /* reject this PC and retain the acquired suspend */
+                }
+                g_thr[t].suspended = false;
                 if (pc) { g_s.total++; g_thr[t].samples++;
                          samp_record(pc, (uint16_t)t); }
                 else    { g_s.missed++; }
@@ -217,20 +275,26 @@ static DWORD WINAPI samp_thread(LPVOID unused)
         }
 
         if (SuspendThread(g_s.target) == (DWORD)-1) { g_s.missed++; continue; }
+        g_s.target_suspended = true;
         CONTEXT ctx;
         memset(&ctx, 0, sizeof ctx);
         ctx.ContextFlags = CONTEXT_CONTROL;
         uint64_t pc = 0;
         if (GetThreadContext(g_s.target, &ctx)) {
-#if defined(_M_X64) || defined(__x86_64__)
+#if JCE_ARCH_X64
             pc = (uint64_t)ctx.Rip;
-#elif defined(_M_IX86)
+#elif JCE_ARCH_X86
             pc = (uint64_t)ctx.Eip;
-#elif defined(_M_ARM64)
+#elif JCE_ARCH_ARM64
             pc = (uint64_t)ctx.Pc;
 #endif
         }
-        ResumeThread(g_s.target);
+        if (ResumeThread(g_s.target) == (DWORD)-1) {
+            g_s.resume_failed++; g_s.missed++;
+            InterlockedExchange(&g_s.stop, 1);
+            break;
+        }
+        g_s.target_suspended = false;
         /* Record AFTER resuming: the hash insert must not extend the window the
          * profiled thread is stopped for. */
         if (pc) { g_s.total++; samp_record(pc, SAMP_TIDX_MAIN); }
@@ -248,6 +312,7 @@ void jce_sampler_init(void)
     if (g_s.worker) return;
     const char *hz_env = getenv("JCE_SAMPLER");
     if (!hz_env || !hz_env[0] || hz_env[0] == '0') return;
+    memset(&g_s, 0, sizeof g_s);
     g_s.hz = atoi(hz_env);
     if (g_s.hz <= 0)   g_s.hz = 1000;
     if (g_s.hz > 8000) g_s.hz = 8000;
@@ -267,7 +332,7 @@ void jce_sampler_init(void)
 
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
                          GetCurrentProcess(), &g_s.target,
-                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | SYNCHRONIZE,
                          FALSE, 0)) {
         LOG_WARN(LOG_TAG, "sampler: cannot duplicate the target thread handle");
         JCE_FREE(g_s.slots); g_s.slots = NULL;
@@ -284,9 +349,9 @@ void jce_sampler_init(void)
     /* Above normal so a busy main thread cannot starve the sampler and quietly
      * bias the profile toward whatever runs while the machine is idle. */
     SetThreadPriority(g_s.worker, THREAD_PRIORITY_ABOVE_NORMAL);
-    LOG_INFO(LOG_TAG, "DEBUG TOGGLE: JCE_SAMPLER=%d Hz, %d ms warm-up, %s%s%s",
+    LOG_INFO(LOG_TAG, "JCE_SAMPLER=%d Hz, %d ms warm-up, %s%s%s",
              g_s.hz, g_s.delay_ms,
-             g_s.all_threads ? "ALL threads" : "main thread only",
+             g_s.all_threads ? "process sweep (128 thread lifetimes per session)" : "main thread only",
              g_s.out_path[0] ? " -> " : "", g_s.out_path);
 }
 
@@ -348,11 +413,49 @@ static bool mod_exports_only(HANDLE proc, uint64_t pc)
            mi.SymType == SymDeferred;
 }
 
-void jce_sampler_shutdown(void)
+/* Only after a true join may the owner retry a suspend the sampler acquired.
+ * Never resume on a timeout: the live worker may still own that operation. */
+static bool samp_recover_suspends(void)
 {
-    if (!g_s.worker) return;
+    bool recovered = true;
+    if (g_s.target_suspended) {
+        if (ResumeThread(g_s.target) == (DWORD)-1) {
+            g_s.resume_failed++;
+            /* Only a signaled retained thread handle proves termination.
+             * GetThreadTimes exit time is undefined while a thread is live. */
+            if (WaitForSingleObject(g_s.target, 0) == WAIT_OBJECT_0)
+                g_s.target_suspended = false;
+            else recovered = false;
+        } else g_s.target_suspended = false;
+    }
+    for (uint32_t t = 0; t < g_thr_count; t++) {
+        if (!g_thr[t].suspended) continue;
+        if (ResumeThread(g_thr[t].h) == (DWORD)-1) {
+            g_s.resume_failed++;
+            if (WaitForSingleObject(g_thr[t].h, 0) == WAIT_OBJECT_0)
+                g_thr[t].suspended = false;
+            else recovered = false;
+        } else g_thr[t].suspended = false;
+    }
+    return recovered;
+}
+
+bool jce_sampler_shutdown(void)
+{
+    if (!g_s.worker) return true;
     InterlockedExchange(&g_s.stop, 1);
-    WaitForSingleObject(g_s.worker, 2000);
+    const DWORD joined = WaitForSingleObject(g_s.worker, 2000);
+    if (joined != WAIT_OBJECT_0) {
+        /* Native suspend/context requests have no local deadline. A timed-out
+         * wait is not cancellation or proof that shared state is unused. */
+        LOG_WARN(LOG_TAG, "sampler: worker join incomplete (wait=%lu); retaining state for shutdown retry",
+                 (unsigned long)joined);
+        return false;
+    }
+    if (!samp_recover_suspends()) {
+        LOG_WARN(LOG_TAG, "sampler: owned suspend recovery incomplete; retaining state for shutdown retry");
+        return false;
+    }
     CloseHandle(g_s.worker); g_s.worker = NULL;
     if (g_s.target) { CloseHandle(g_s.target); g_s.target = NULL; }
     /* g_thr stays alive until after the report; closed at the end. */
@@ -372,7 +475,7 @@ void jce_sampler_shutdown(void)
      * module directories only, which is enough for this engine's own PDBs and
      * is why system modules resolve to exports rather than private symbols. */
     const BOOL sym_fresh = SymInitialize(proc, NULL, TRUE);
-    SymRefreshModuleList(proc);
+    (void)jce_native_sym_refresh_module_list_internal(proc);
     const BOOL sym_ok = TRUE;
 
     /* Flatten, sort by count, then fold into per-function totals. */
@@ -506,7 +609,7 @@ void jce_sampler_shutdown(void)
         /* lines[].fn indexes the PRE-sort order; the sort moved the rows, so
          * build orig -> sorted and rewrite them. Reading fns[lines[q].fn] after
          * an in-place sort attributes every line to the wrong function. */
-        if (lines) {
+        if (lines || tfn) {
             uint32_t *remap = (uint32_t *)JCE_CALLOC(nf ? nf : 1u, sizeof(uint32_t));
             if (remap) {
                 for (uint32_t i = 0; i < nf; i++)
@@ -517,7 +620,7 @@ void jce_sampler_shutdown(void)
                     if (tfn[q].fn < nf) tfn[q].fn = remap[tfn[q].fn];
                 JCE_FREE(remap);
             } else {
-                nl = 0;   /* cannot remap: drop the per-line table, do not lie */
+                nl = ntf = 0; /* cannot remap: omit both indexed summaries */
             }
         }
     }
@@ -551,15 +654,35 @@ void jce_sampler_shutdown(void)
              } else if (rep) { rep_full = true; } } while (0)
 
     LOG_INFO(LOG_TAG,
-             "sampler: %llu samples at %d Hz (%llu missed, %u distinct PCs, "
+             "sampler: %llu samples at requested %d Hz (%llu missed, %u distinct PCs, "
              "%u functions)%s",
              (unsigned long long)g_s.total, g_s.hz,
              (unsigned long long)g_s.missed, n, nf,
              sum != g_s.total ? "  [HISTOGRAM FULL -- samples dropped]" : "");
-    SAMP_APPEND("# jce sampler: %llu samples at %d Hz, %llu missed, "
+    SAMP_APPEND("# jce sampler: %llu samples at requested %d Hz, %llu missed, "
                 "%d ms warm-up\n# percent  samples  function  [lines]\n",
                 (unsigned long long)g_s.total, g_s.hz,
                 (unsigned long long)g_s.missed, g_s.delay_ms);
+    if (g_s.all_threads) {
+        LOG_INFO(LOG_TAG, "sampler: thread lifetime cap %u, %u admitted, %llu capacity-skipped refresh observations, "
+                 "%llu open failures, %llu identity failures, %llu snapshot failures",
+                 SAMP_MAX_THREADS, g_thr_count,
+                 (unsigned long long)g_s.thread_cap_skipped,
+                 (unsigned long long)g_s.thread_open_failed,
+                 (unsigned long long)g_s.thread_identity_failed,
+                 (unsigned long long)g_s.thread_snapshot_failed);
+        SAMP_APPEND("# thread lifetime cap %u, %u admitted, %llu capacity-skipped refresh observations, "
+                    "%llu open failures, %llu identity failures, %llu snapshot failures\n",
+                    SAMP_MAX_THREADS, g_thr_count,
+                    (unsigned long long)g_s.thread_cap_skipped,
+                    (unsigned long long)g_s.thread_open_failed,
+                    (unsigned long long)g_s.thread_identity_failed,
+                    (unsigned long long)g_s.thread_snapshot_failed);
+    }
+    if (g_s.resume_failed) LOG_WARN(LOG_TAG, "sampler: %llu resume failures; failed-resume PCs were discarded",
+                                   (unsigned long long)g_s.resume_failed);
+    SAMP_APPEND("# resume failures %llu; only PCs resumed successfully are accepted\n",
+                (unsigned long long)g_s.resume_failed);
 
     if (g_s.all_threads && g_thr_count && tfn) {
         /* Per thread, where its samples actually landed. The first version of
@@ -569,7 +692,9 @@ void jce_sampler_shutdown(void)
         SAMP_APPEND("%s", "\n# per-thread hotspots (whole-process sweep)\n");
         for (uint32_t t = 0; t < g_thr_count; t++) {
             if (!g_thr[t].samples) continue;
-            SAMP_APPEND("# %s  (%llu samples)\n", g_thr[t].name,
+            SAMP_APPEND("# %s [tid=%lu created=0x%llx%s]  (%llu samples)\n", g_thr[t].name,
+                        (unsigned long)g_thr[t].tid, (unsigned long long)g_thr[t].created,
+                        g_thr[t].h ? "" : " retired",
                         (unsigned long long)g_thr[t].samples);
             for (uint32_t shown = 0; shown < 4u; shown++) {
                 uint32_t best = SAMP_THRFN_MAX, bestc = 0;
@@ -648,11 +773,12 @@ void jce_sampler_shutdown(void)
     JCE_FREE(flat); JCE_FREE(fns); JCE_FREE(lines); JCE_FREE(tfn);
     JCE_FREE(g_s.slots); g_s.slots = NULL;
     memset(&g_s, 0, sizeof g_s);
+    return true;
 }
 
 #else /* !JCE_PLATFORM_WINDOWS */
 
 void jce_sampler_init(void) { }
-void jce_sampler_shutdown(void) { }
+bool jce_sampler_shutdown(void) { return true; }
 
 #endif

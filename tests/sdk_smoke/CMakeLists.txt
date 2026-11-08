@@ -24,11 +24,12 @@ if(NOT JCE_HOST_TOOLS_FOUND)
 		"degraded. The smoke gate intentionally refuses to test it.")
 endif()
 
-add_executable(JceSdkSmoke src/main.c)
+add_executable(JceSdkSmoke src/main.c src/water_spectrum.c)
 set_target_properties(JceSdkSmoke PROPERTIES
 	OUTPUT_NAME          jce_sdk_smoke
 	C_STANDARD           99
-	C_STANDARD_REQUIRED  YES)
+	C_STANDARD_REQUIRED  YES
+	C_EXTENSIONS         OFF)
 target_link_libraries(JceSdkSmoke PRIVATE JCE::JCE)
 
 # Turnkey cook + pack + embed — the exact consumer path under test.

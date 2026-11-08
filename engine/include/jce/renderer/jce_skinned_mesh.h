@@ -38,20 +38,14 @@ typedef struct JceRenderer    JceRenderer;
  * per-level cap so a level index is always bindable). */
 #define JCE_SM_MAX_LOD 8
 
-/* GPU bone-palette ceiling. The skinned vertex shaders address bones through
- * the bgfx u_model[] predefined-uniform array, whose size is fixed at compile
- * time by BGFX_CONFIG_MAX_BONES (see tools/compile_shaders.cmake). This define
- * MUST stay equal to that value: vs_pbr_skinned.sc / vs_shadow_skinned.sc clamp
- * the joint index to JCE_MAX_BONES-1, and a skeleton exceeding it is rejected
- * with a load-time LOG_ERROR in jce_skeleton_create() so artists see the cause
- * instead of silently-collapsed bones.
+/* Supported bone-palette size. Stock GPU skinning addresses bones through
+ * the bgfx u_model[] predefined-uniform array. Keep this value equal to
+ * BGFX_CONFIG_MAX_BONES in tools/compile_shaders.cmake. Higher joint indices
+ * exceed the supported render palette and are diagnosed at skeleton creation.
  *
- * 128 is the practical ceiling for the uniform-array path: 128 mat4 = 512 vec4,
- * which fits every real desktop GL / GLES3 / D3D11 / Metal / SPIR-V vertex
- * uniform budget the engine targets. Going higher (256) would require a bone-
- * matrix TEXTURE sampled via texelFetch, which the desktop glsl=120 profile
- * cannot compile (texelFetch needs GLSL 1.30+) and which has no free sampler
- * stage in the 16-stage fs_pbr fragment program. */
+ * The 128 mat4 values consume 512 vertex uniform vectors. Compatibility
+ * GL/ES uses CPU deformation so that the same palette can be rendered on
+ * devices with smaller uniform budgets. */
 #define JCE_MAX_BONES           128
 
 /* ================================================================== */
@@ -83,11 +77,9 @@ typedef struct {
 /* Create a skinned mesh from raw vertex/index data.
  * Copies the data; caller retains ownership.
  *
- * retain_cpu: when true the source vertex array is ALSO kept in a CPU-side copy
- * (jce_skinned_mesh_base_verts) so a per-instance morph deform can read the
- * undeformed base and re-upload into a dynamic VB.  Default (false) keeps the
- * legacy behavior byte-identical with zero extra RAM — callers MUST only opt in
- * for morph-bearing primitives (FEATURE 3.1). */
+ * retain_cpu: opt in for morph-bearing primitives that need an immutable
+ * CPU copy of the source vertices. Compatibility GL/ES retains skinned
+ * vertices regardless of this flag for the CPU skinning fallback. */
 JCE_API JceSkinnedMesh *jce_skinned_mesh_create(
     const JceSkinnedVertex *vertices, uint32_t num_verts,
     const uint32_t *indices, uint32_t num_indices,
@@ -306,18 +298,13 @@ JCE_API void JCE_CALL jce_skinned_mesh_submit_shadow_lod(const JceSkinnedMesh *m
                                                          uint32_t level);
 
 /* ================================================================== */
-/* Morph deform support (FEATURE 3.1, opt-in via retain_cpu)            */
+/* Retained source vertices for morphing and compatibility skinning     */
 /* ================================================================== */
 /*
- * When a mesh was created with retain_cpu == true, the following accessors
- * expose the retained, undeformed base vertex array and the exact interleaved
- * layout it was uploaded with, so a per-instance CPU morph deform
- * (jce_morph_apply) can produce a deformed copy and push it into a dynamic
- * vertex buffer that the SAME skinned program then reads.  All return 0 / NULL
- * when retain_cpu was false (the legacy default).  The deform MUST write the
- * SAME stride/layout — the trailing joints/weights bytes are copied through
- * untouched by jce_morph_apply (it only touches pos/normal at the offsets
- * reported here).
+ * These accessors expose undeformed vertices and their interleaved layout
+ * when retention was requested by the caller or required for CPU skinning.
+ * A deformed copy uploaded to a dynamic vertex buffer must preserve the
+ * stride and layout.
  */
 
 /* Retained base vertex bytes (num_verts * stride), or NULL when not retained.

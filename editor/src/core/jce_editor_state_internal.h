@@ -42,6 +42,8 @@ extern "C" {
 
 /* Observations belong to the existing editor lifecycle, not a second service. */
 struct JceEditorOperationMetricsState {
+    bool selector_initialized = false;
+    bool enabled = false;
     unsigned tick = 0;
     uint64_t generation = 0, pending = 0, requested_at = 0;
     uint32_t requested_entity = 0;
@@ -191,12 +193,16 @@ void rebuild_entity_order_from_ecs(void);
  * the JceScene that a running runtime still references, which is a
  * use-after-free during Play.  Call this at the START of every
  * user-facing scene-swap entry point so the runtime is torn down first.
- * Safe (no-op) when already stopped.  Defined in jce_editor_play.cpp.
+ * Also retries a stopped session's retained restore point. False preserves
+ * that point and forbids scene/root/mount replacement; STOPPED alone is not
+ * completion. Safe (no-op) after successful retirement.
  *
  * NOTE: do NOT call this from clear_scene_entities() itself or from the
  * history/undo path — clear_scene_entities() is legitimately invoked
  * during jce_state_stop()'s snapshot restore, when the runtime is gone. */
-void stop_play_before_scene_swap(void);
+bool stop_play_before_scene_swap(void);
+/* Terminal state destruction only; reports failed restoration before discard. */
+void jce_editor_play_finish_shutdown(void);
 
 /* ── History functions (defined in jce_editor_history.cpp) ─────────── */
 

@@ -41,8 +41,11 @@ JCE_API void JCE_CALL jce_path_canonicalise_inplace(char *s);
 /* True if `path` already uses only '/' separators. */
 JCE_API bool JCE_CALL jce_path_is_canonical(const char *path);
 
-/* True if `path` starts with a drive letter (Windows: "C:") or '/'
-   (POSIX-style absolute).  Empty / NULL is false. */
+/* True for a rooted path (POSIX '/', Windows drive plus root separator,
+   or a leading path separator). Windows C: and C:file are drive-relative and
+   return false. Empty / NULL is false. This is a lexical path predicate;
+   callers requiring a native fully-qualified Windows path must also reject
+   paths rooted on an unspecified current drive. */
 JCE_API bool JCE_CALL jce_path_is_absolute(const char *path);
 
 /* ------------------------------------------------------------------ */
@@ -127,7 +130,10 @@ JCE_API bool jce_path_replace_extension(char *out, size_t out_size,
 
 /* Collapse "." and ".." segments and duplicate separators; emit
    canonical ('/') form.  Returns false on buffer overflow or
-   underflow ('..' that would escape root).  `out` and `path` may alias. */
+   underflow ('..' that would escape root).  `out` and `path` may alias.
+   When out starts inside path at a higher address, a temporary JCE allocation
+   preserves unread input; allocation failure returns false without overwriting
+   that input. Ordinary, in-place and backward-overlap calls do not allocate. */
 JCE_API bool jce_path_normalize(char *out, size_t out_size,
                                 const char *path);
 

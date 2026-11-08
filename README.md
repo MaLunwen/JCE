@@ -41,15 +41,28 @@ Local `docs/`, `.docs/`, generated outputs and unpublished workflows under `priv
 
 `python tools/benchmark_suite.py --profile standard --kind all` runs the five
 Profiler benchmark workloads through their shared UI/script implementation.
-It exports raw frames, controls and manifests under ignored `reports/`.
+It exports bounded raw frames, controls and manifests under ignored
+`build/validation/benchmark/`. Cache, test, evidence and final-delivery roles
+follow [the generated output layout](contracts/build-output-layout.md).
 See [benchmark methodology](tools/BENCHMARK.md) for paired backend comparisons,
 timed Soak runs and the limits of these editor-only measurements.
 
 ### Native single-EXE Windows editor
 
 ```bash
-python scripts/jce.py package editor --arch x64 --variant dist --standalone
+python scripts/jce.py package editor --arch x64 --variant dist
 ```
+
+Editor and application shipments default to one native executable.
+`--standalone` is a compatibility alias for the same embedded policy;
+`--delivery-profile authoring` explicitly selects the optional development
+SDK/runtime bundle. Embedded delivery supports Lua, JavaScript, C and C++.
+The editor executable goes to `build/desktop/<target>/<variant>`, with
+`windows-x64` and `windows-x64-xp` as separate target identities. New native
+Release caches use `obj/` and `conan/` under the target directory. Compatible
+historical caches are reused in place under their existing leases.
+The direct SDK app builder uses the same target naming under each project's
+`build/desktop/<target>/<variant>`.
 
 Copy only `dist/editor/JCE-editor-windows-x64.exe` to another directory and run
 it. The editor, engine, native runtimes and editor assets are linked into that
@@ -57,9 +70,17 @@ EXE. There is no extraction launcher, embedded SDK, or required companion DLL.
 Windows system libraries and graphics drivers remain OS dependencies. The
 current Windows recipe is tested on Windows 10/11; older target compatibility
 requires separate validation.
-The optional `.manifest.json` beside the EXE records its SHA-256, OS imports,
-and a byte-verified inventory of embedded assets and license notices. The
-manifest is a release check, not a runtime dependency.
+The default Windows 7+ target uses MSVC. An explicit Windows XP target lane uses
+LLVM-MinGW-XP GNU/MSVCRT for x86 (NT 5.1) and x64 (NT 5.2), preserving the C99
+engine/runtime and C++20 Editor. Full XP Editor and graphics qualification is
+still in progress; successful core, OS and resource probes are separate evidence.
+See [Windows target compatibility](contracts/windows-targets.md) for the build
+and acceptance boundaries.
+The packaging receipt under `build/reports/delivery/<target>/<variant>/` records
+the EXE SHA-256, OS imports, and a byte-verified inventory of embedded assets
+and license notices. Match its hash and byte count to the actual EXE before
+using it; an older adjacent manifest can be stale. The receipt is a release
+check, not a runtime dependency or proof of compiled source identity.
 
 Set `JCE_EDITOR_PROFILE_DIR` to an absolute configuration directory before
 launch for a portable profile or an isolated editor instance. Preferences,
@@ -91,7 +112,7 @@ model response alone proves neither development nor runtime acceptance.
 
 ### Caged Kingdom: the game consumer in `examples/caged_kingdom/`
 
-Caged Kingdom is the owned final game project. Its current checkout contains frozen design documents; a runnable consumer is unavailable until implementation sources return. The intended SDK boundary remains the same as other projects: it consumes JCE exactly the way your project would, through the installed SDK headers, with no privileged access. It is in the repository as *evidence that the engine is usable*, and nothing in `engine/` or `editor/` knows it exists — `grep -rw caged engine/` returns nothing, and a lint keeps it that way.
+Caged Kingdom is the owned final game project. The public catalog currently retains its project scaffold; frozen design and reference materials remain local and untracked. A runnable consumer is unavailable until implementation sources return. Its intended SDK boundary matches other projects: public installed headers, no engine or editor internals. This scaffold is not runtime acceptance evidence. Reusable engine and editor code remains independent of the game.
 
 ## Example content and SDK regressions
 
@@ -174,14 +195,14 @@ artifacts still require their own relocation and system-dependency validation.
 
 | | |
 | --- | --- |
-| Version | `0.13.4` (authoritative: `CMakeLists.txt`) |
-| Engine (C99) | 417 tracked `.c` under `engine/src/` |
-| Editor (C++20) | 223 tracked `.cpp` under `editor/src/`, 109 panels |
-| Public API | 300 headers under `engine/include/jce/`, 24 umbrellas, 3910 `JCE_API` symbols |
-| Shaders | 146 `.sc` under `engine/shaders/` |
+| Version | `0.14.0` (authoritative: `CMakeLists.txt`) |
+| Engine (C99) | 495 tracked `.c` under `engine/src/` |
+| Editor (C++20) | 236 tracked `.cpp` under `editor/src/`, 110 panels |
+| Public API | 316 headers under `engine/include/jce/`, 24 umbrellas, 4007 `JCE_API` symbols |
+| Shaders | 164 `.sc` under `engine/shaders/` |
 | Scripting | 6 binding trees under `scripting/` (c, cpp, csharp, java, js, python) over one flat C ABI, plus Lua built in |
 | Editor languages | 15 locales under `editor/resources/assets/i18n/` |
-| Build matrix | 49 CMake presets, 13 Conan profiles |
+| Build matrix | 49 CMake presets, 15 Conan profiles |
 | Gates | `tools/lint/run_all.py` + `tools/audit/run_architecture_audit.py` -- both must exit 0 with no `FAIL` line |
 | Parity ledger | 255 measured rows vs Unity / Unreal / Godot -- 28 ahead, 165 parity, 56 behind, 3 n/a (76.6% at or above) |
 
@@ -273,7 +294,7 @@ The image loader is a single JCE service. Callers request an image by usage/form
 
 | Capability                                                                             | Authoritative owner                                        | Allowed scope / helpers                                                   | Do not use as an alternative                                                                                            |
 | -------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| Audio device, playback graph, mixing, spatialization, streaming, engine audio lifetime | **miniaudio 0.11.22**, behind `jce_audio_*`        | Specialized codec modules feed decoded PCM/streams into miniaudio         | SDL audio, OpenAL, platform audio APIs, or a second mixer in first-party code                                           |
+| Audio device, playback graph, mixing, spatialization, streaming, engine audio lifetime | **miniaudio 0.11.25**, behind `jce_audio_*`        | Specialized codec modules feed decoded PCM/streams into miniaudio         | SDL audio, OpenAL, platform audio APIs, or a second mixer in first-party code                                           |
 | Opus audio encode/decode                                                               | **Opus 1.5.2**                                       | Voice, network audio, and Opus assets/streams as defined by JCE           | Handwritten Opus wrappers at call sites or an alternate Opus decoder                                                    |
 | Ogg container parsing/writing                                                          | **libogg 1.3.5**                                     | Ogg framing for codecs such as Opus                                       | Handwritten Ogg page parsing or treating Ogg as a codec                                                                 |
 | AV1 video decode                                                                       | **dav1d 1.5.3**                                      | Video module supplies decoded frames to the renderer                      | A second AV1 software decoder in the same build                                                                         |
@@ -325,7 +346,7 @@ The following direct requirements are authoritative for the current dependency g
 | bgfx 1.146.9306-550       | Complete graphics backend abstraction and shader toolchain               |
 | HarfBuzz 12.3.0           | Text shaping                                                             |
 | FreeType 2.14.3           | Font parsing and glyph rasterization                                     |
-| miniaudio 0.11.22         | Audio device, mixing, playback, and spatial audio                        |
+| miniaudio 0.11.25         | Audio device, mixing, playback, and spatial audio                        |
 | Opus 1.5.2                | Opus audio codec                                                         |
 | libogg 1.3.5              | Ogg container framing                                                    |
 | dav1d 1.5.3               | AV1 video decoding                                                       |
@@ -383,6 +404,28 @@ The following direct requirements are authoritative for the current dependency g
 
 # Build Guide (Windows)
 
+### Experimental Windows XP OS/Core toolchain probe (A1)
+
+The Modern JCE Windows SDK/Editor remains Windows 7+ with the MSVC ABI.
+The **independent** `xp-probe` builds only a C99 JCE platform entropy adapter
+and a C++20 thread smoke consumer using the verified LLVM-MinGW-XP MSVCRT
+toolchain. No Conan dependencies, full runtime, shader tools, Editor or
+installed SDK are built in this experiment.
+
+```bat
+py scripts\jce.py xp-probe --arch x64
+```
+
+Default toolchain root is the sibling directory
+`llvm-mingw-xp-22.1.7-msvcrt-x86_64`, overridable with
+`--toolchain-root`. The result and static PE audit receipt are written to
+`build/compat/windows-x64-xp-llvm-msvcrt/`. The same CLI accepts
+`--arch x86` if an x86-targeting distribution is installed. **A successful
+local build/static PE audit is not proof of XP VM execution**; run the exact
+SHA-256 executable on the target XP guest and report the exit code.
+
+
+
 All commands are PowerShell from the repo root. Prerequisites: **VS 2022** (Desktop C++), **CMake 3.20+**, **Conan 2.x**, **Java 8+ JDK**. Ninja is recommended.
 
 ## A. SDK consumer game
@@ -435,6 +478,7 @@ Conan/compiler commands or use another project's frozen assets as defaults.
 ```powershell
 ./scripts/build-android.bat [ndk_path] [sdk_path] [arch] [--clean]
 ./scripts/windows/build-editor.bat --arch arm64 [--dist] [--clean]   # Windows ARM64
+./scripts/windows/build-editor.bat --xp [--arch x86]                # XP+ GUI Editor (x64 default)
 ./scripts/build-web.bat [emsdk_path] [--clean] [--dist]
 ```
 

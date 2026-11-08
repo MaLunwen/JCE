@@ -2,6 +2,7 @@
 #include "jce_editor_operation_metrics.h"
 #include "jce_editor_state_internal.h"
 #include "ui/jce_editor_panels.h"
+#include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/resource/jce_scene_serial.h>
@@ -9,7 +10,15 @@
 #include <cstdio>
 #include <cstring>
 
-static bool observe(void) { return getenv("JCE_EDITOR_OPERATION_METRICS") != nullptr; }
+/* The existing state init/shutdown reset this first-use launch snapshot. */
+static bool observe(void)
+{
+    if (!s.operation_metrics.selector_initialized) {
+        s.operation_metrics.enabled = getenv("JCE_EDITOR_OPERATION_METRICS") != nullptr;
+        s.operation_metrics.selector_initialized = true;
+    }
+    return s.operation_metrics.enabled;
+}
 
 void jce_editor_inspector_metric_request(uint32_t focused)
 {
@@ -135,14 +144,26 @@ void jce_editor_operation_tick(void)
             unsigned frame = 0; int consumed = 0;
             if (sscanf(cursor, "%u%n", &frame, &consumed) != 1 || consumed <= 0) break;
             if (frame == s.operation_metrics.tick) {
+                JceScene *scene = jce_state_get_scene();
                 char path[4096];
                 int length = snprintf(path, sizeof(path), "%s/scene-%u.json", directory, s.operation_metrics.tick);
                 size_t bytes = 0;
-                char *json = jce_scene_serial_save(jce_state_get_scene(), &bytes);
+                char *json = jce_scene_serial_save(scene, &bytes);
                 bool ok = json && length > 0 && (size_t)length < sizeof(path) &&
                           jce_fs_host_write_all(path, json, bytes);
                 jce_scene_serial_free(json);
-                LOG_INFO("editor_operations", "scene-content-observation: frame=%u ok=%d bytes=%zu", s.operation_metrics.tick, ok ? 1 : 0, bytes);
+                if (ok) {
+                    const JceEnvironmentState *environment = scene ? jce_scene_environment(scene) : nullptr;
+                    if (environment)
+                        jce_log_write(JCE_LOG_LEVEL_INFO, "editor_operations", __FILE__, __LINE__,
+                            "scene-content-observation: frame=%u ok=1 bytes=%zu environment=available "
+                            "world_time_seconds=%.17g weather_seed=%u", s.operation_metrics.tick, bytes,
+                            environment->world_time_seconds, (unsigned)environment->weather_seed);
+                    else
+                        jce_log_write(JCE_LOG_LEVEL_INFO, "editor_operations", __FILE__, __LINE__,
+                            "scene-content-observation: frame=%u ok=1 bytes=%zu environment=unavailable "
+                            "world_time_seconds=unavailable weather_seed=unavailable", s.operation_metrics.tick, bytes);
+                }
                 if (!ok) LOG_ERROR("editor_operations", "scene observation serialization/write failed");
             }
             cursor += consumed;

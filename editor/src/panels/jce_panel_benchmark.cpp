@@ -26,6 +26,8 @@
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_config.h"          /* jce_editor_dotjce_path */
 #include "scene/jce_editor_scene_render.h"   /* jce_editor_scene_get_camera */
+#include "jce_benchmark_observation.h"
+#include "jce_profiler_observation.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
@@ -35,7 +37,9 @@
 #include <string>
 
 extern "C" {
+#include <jce/application/jce_engine.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/os/core/jce_perf_phase.h>
@@ -100,7 +104,20 @@ int   s_warmup   = FT_WARMUP;     /* frames still to discard after a reset */
 uint32_t s_ft_last_spawned = 0;   /* auto-reset the window on a fresh workload */
 bool  s_isolated = false;         /* "Isolated scene" toggle */
 
-void ft_reset()  { s_ft_count = 0; s_ft_head = 0; s_warmup = FT_WARMUP; }
+struct BenchmarkObservationState {
+    JceBenchmarkCadence cadence;
+    JceBenchmarkBaseline baseline;
+    JceBenchmarkProfile baseline_profile;
+    bool baseline_loaded=false;
+    int baseline_kind=-1, workload_kind=-1;
+    uint32_t baseline_count=0;
+    char baseline_root[512]{};
+} s_observation;
+void ft_reset()
+{
+    s_ft_count = 0; s_ft_head = 0; s_warmup = FT_WARMUP;
+    jce_benchmark_reset(&s_observation.cadence);
+}
 void ft_push(float ms)
 {
     if (ms <= 0.0f) return;
@@ -110,110 +127,73 @@ void ft_push(float ms)
     if (s_ft_count < FT_CAP) ++s_ft_count;
 }
 
-/* ── Baseline persistence (regression detection across builds) ───────────────
- * Plain text, one workload per line:
- *   "<kind> <count> <avg_fps> <low1_fps> <p99_ms>".  Keyed by kind+count so a
- * rebuilt binary can be compared against a baseline captured on a prior commit.
- * Baselines are scene+machine specific, so the file is PROJECT-scoped
- * (<root>/.jce/benchmark_baseline.txt, explicit root — the editor never
- * chdirs); the legacy per-user ~/.jce path remains the fallback when no
- * project is open, and is copied forward once per project. */
-struct Baseline { double avg_fps, low1_fps, p99_ms; bool found; };
-
+/* v1 is a separate namespace: legacy max(CPU,GPU) baselines are never
+ * imported or overwritten. This is a limited observed backend/cadence profile,
+ * not certification of machine, scene, camera or presentation equivalence. */
+using Baseline = JceBenchmarkBaseline;
+constexpr uint64_t BASELINE_MAX_BYTES = 64 * 1024;
 void baseline_path(char *out, size_t cap)
 {
-    if (!s_current_project_root[0]) {   /* no project: legacy per-user file */
-        if (!jce_editor_dotjce_path("benchmark_baseline.txt", out, cap))
-            out[0] = '\0';
-        return;
-    }
-    std::snprintf(out, cap, "%s/.jce/benchmark_baseline.txt",
-                  s_current_project_root);
-
-    /* One-time forward-migration per root: seed the project baseline from
-     * the legacy global file.  The global file is kept as the no-project
-     * fallback and as a seed for other not-yet-migrated projects. */
-    static char s_migrated_root[512] = {0};
-    if (std::strcmp(s_migrated_root, s_current_project_root) == 0) return;
-    std::snprintf(s_migrated_root, sizeof(s_migrated_root), "%s",
-                  s_current_project_root);
-    if (jce_fs_host_exists_file(out)) return;   /* project copy wins */
-    char legacy[1024];
-    if (jce_editor_dotjce_path("benchmark_baseline.txt", legacy,
-                               sizeof(legacy)) &&
-        jce_fs_host_exists_file(legacy)) {
-        char dir[1024];
-        std::snprintf(dir, sizeof(dir), "%s/.jce", s_current_project_root);
-        jce_fs_host_create_directory(dir);
-        jce_fs_host_copy_file(legacy, out);
+    constexpr const char *name="benchmark_ui_cadence_v1.txt";
+    if (!s_current_project_root[0]) {
+        if (!jce_editor_dotjce_path(name,out,cap)) out[0]='\0';
+    } else {
+        const int n=std::snprintf(out,cap,"%s/.jce/%s",s_current_project_root,name);
+        if (n<0 || static_cast<size_t>(n)>=cap) out[0]='\0';
     }
 }
-
-void baseline_save(int kind, int count, double avg_fps, double low1_fps, double p99_ms)
+bool baseline_read(const char *path, std::string &body)
 {
-    char path[1024]; baseline_path(path, sizeof path);
-    if (!path[0]) return;
-    /* Project .jce/ dir may not exist yet (fresh project). */
-    if (s_current_project_root[0]) {
-        char dir[1024];
-        std::snprintf(dir, sizeof(dir), "%s/.jce", s_current_project_root);
-        jce_fs_host_create_directory(dir);
-    }
-    /* read existing, drop the matching key, append the new line */
-    char lines[64][160]; int n = 0;
-    uint64_t raw_size = 0;
-    char *raw = (char *)jce_fs_host_read_all(path, &raw_size);
-    if (raw) {
-        std::istringstream input(std::string(raw, raw + raw_size));
-        jce_fs_buffer_free(raw);
-        int k, c;
-        std::string line;
-        while (n < 64 && std::getline(input, line)) {
-            if (sscanf(line.c_str(), "%d %d", &k, &c) == 2 &&
-                k == kind && c == count) {
-                continue;
-            }
-            std::snprintf(lines[n++], sizeof lines[0], "%s\n", line.c_str());
+    uint64_t read=0,total=0;
+    char *raw=static_cast<char *>(jce_fs_host_read_capped(path,BASELINE_MAX_BYTES,&read,&total));
+    if (!raw) return false;
+    const bool complete=read==total;
+    if (complete) body.assign(raw,static_cast<size_t>(read));
+    jce_fs_buffer_free(raw);
+    return complete;
+}
+bool baseline_save(int kind, int count, const JceBenchmarkProfile &profile,
+                   double avg, double low, double p99)
+{
+    char current[256];
+    if (!jce_benchmark_format_baseline(current,sizeof(current),s_observation.cadence,
+                                     kind,count,profile,avg,low,p99)) return false;
+    char path[1024]; baseline_path(path,sizeof(path));
+    if (!path[0]) return false;
+    std::string body;
+    if (jce_fs_host_exists_file(path) && !baseline_read(path,body)) return false;
+    std::istringstream input(body); std::string output,line;
+    while (std::getline(input,line)) {
+        const auto entry=jce_benchmark_parse_baseline(line.c_str());
+        if (!jce_benchmark_baseline_matches(entry,kind,count,profile)) {
+            output+=line; output+='\n';
         }
     }
-    std::string output;
-    for (int i = 0; i < n; ++i) output += lines[i];
-    char current[160];
-    int current_len = std::snprintf(current, sizeof current,
-                                    "%d %d %.3f %.3f %.4f\n",
-                                    kind, count, avg_fps, low1_fps, p99_ms);
-    if (current_len > 0) {
-        size_t written = (size_t)current_len;
-        if (written >= sizeof current) written = sizeof current - 1;
-        output.append(current, written);
-    }
-    jce_fs_host_write_all(path, output.data(), output.size());
+    output+=current;
+    if (output.size()>BASELINE_MAX_BYTES) return false;
+    return jce_fs_host_write_all_atomic(path,output.data(),output.size());
 }
-
-Baseline baseline_load(int kind, int count)
+Baseline baseline_load(int kind, int count, const JceBenchmarkProfile &profile)
 {
-    Baseline b = {0,0,0,false};
-    char path[1024]; baseline_path(path, sizeof path);
-    if (!path[0]) return b;
-    uint64_t raw_size = 0;
-    char *raw = (char *)jce_fs_host_read_all(path, &raw_size);
-    if (raw) {
-        std::istringstream input(std::string(raw, raw + raw_size));
-        jce_fs_buffer_free(raw);
-        int k, c; double a, l, p;
-        std::string line;
-        while (std::getline(input, line)) {
-            if (sscanf(line.c_str(), "%d %d %lf %lf %lf",
-                       &k, &c, &a, &l, &p) == 5 &&
-                k == kind && c == count) {
-                b.avg_fps = a; b.low1_fps = l; b.p99_ms = p; b.found = true; break;
-            }
-        }
+    char path[1024]; baseline_path(path,sizeof(path));
+    std::string body;
+    if (!path[0] || !jce_fs_host_exists_file(path) || !baseline_read(path,body)) return {};
+    std::istringstream input(body); std::string line;
+    while (std::getline(input,line)) {
+        const auto entry=jce_benchmark_parse_baseline(line.c_str());
+        if (jce_benchmark_baseline_matches(entry,kind,count,profile)) return entry;
     }
-    return b;
+    return {};
 }
-
-Baseline s_baseline = {0,0,0,false};   /* cached for the active workload */
+const char *gpu_reason_key(const JceGpuTimingObservation &gpu)
+{
+    switch (gpu.unavailable_reason) {
+    case JCE_GPU_TIMING_BACKEND_UNAVAILABLE: return "benchmark.gpuBackendUnavailable";
+    case JCE_GPU_TIMING_FREQUENCY_UNAVAILABLE: return "benchmark.gpuFrequencyUnavailable";
+    case JCE_GPU_TIMING_INTERVAL_UNAVAILABLE: return "benchmark.gpuIntervalUnavailable";
+    default: return "benchmark.gpuContextUnavailable";
+    }
+}
 
 struct FtStats { double avg_ms, min_ms, max_ms, p99_ms, low1_fps, avg_fps; int n; };
 
@@ -321,10 +301,11 @@ extern "C" void jce_editor_panel_benchmark_content(void)
 
     const uint32_t spawned = jce_state_benchmark_spawned();
     const int      spawned_kind = jce_state_benchmark_kind();
-    if (spawned != s_ft_last_spawned) {            /* fresh workload */
+    if (spawned != s_ft_last_spawned || spawned_kind != s_observation.workload_kind) {            /* fresh workload */
         ft_reset();
         s_ft_last_spawned = spawned;
-        s_baseline = baseline_load(spawned_kind, (int)spawned);
+        s_observation.workload_kind = spawned_kind;
+        s_observation.baseline_loaded = false;
     }
     if (spawned) {
         ImGui::SameLine();
@@ -337,17 +318,48 @@ extern "C" void jce_editor_panel_benchmark_content(void)
     ImGui::Separator();
     ImGui::SeparatorText(jce_editor_i18n("benchmark.liveStats"));
 
-    JceGpuStats st;
-    if (jce_renderer_get_gpu_stats(&st) && st.valid) {
-        const double frame_ms = st.cpu_frame_ms > st.gpu_ms ? st.cpu_frame_ms : st.gpu_ms;
-        const double fps = frame_ms > 0.0 ? 1000.0 / frame_ms : 0.0;
-        ft_push((float)frame_ms);
-        stat_row("benchmark.fps",      "%.0f",    fps);
-        stat_row("benchmark.cpuFrame", "%.2f ms", st.cpu_frame_ms);
-        stat_row("benchmark.gpuFrame", "%.2f ms", st.gpu_ms);
-        stat_row("benchmark.draws",    "%.0f",    (double)st.num_draw);
-    } else {
-        ImGui::TextDisabled("%s", jce_editor_i18n("benchmark.noGpuStats"));
+    const JceRenderer *renderer=jce_editor_get_renderer();
+    JceBenchmarkProfile profile;
+    profile.backend=renderer?static_cast<int>(jce_renderer_get_backend(renderer)):0;
+    profile.tier=static_cast<int>(jce_renderer_get_tier());
+    profile.target_fps=jce_engine_get_target_fps();
+    profile.play=static_cast<int>(jce_state_get_play_state());
+    profile.vsync=renderer && jce_renderer_get_vsync(renderer); profile.workload_isolated=s_isolated;
+    const bool blocked=ImGui::GetIO().AppFocusLost || profile.play==JCE_PLAY_PAUSED ||
+        ImGui::IsPopupOpen(nullptr,ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    JceGpuTimingObservation gpu{};
+    const auto cadence = jce_benchmark_poll(&s_observation.cadence, ImGui::GetFrameCount(), blocked, profile, &gpu);
+    if (cadence.accepted) ft_push(static_cast<float>(cadence.ms));
+    if (cadence.accepted) stat_row("benchmark.fps","%.1f Hz",1000.0/cadence.ms);
+    else ImGui::TextDisabled("%s: %s",jce_editor_i18n("benchmark.fps"),
+                             jce_editor_i18n("profiler.value.unavailable"));
+    const JceFrameStats empty_stats{};
+    const auto *backend_stats=jce_gfx_stats_capture();
+    const auto timing=jce_profiler_observe(backend_stats?backend_stats:&empty_stats,&gpu);
+    if (timing.cpu_available) stat_row("benchmark.cpuFrame","%.2f ms",timing.cpu_interval_ms);
+    else ImGui::TextDisabled("%s: %s",jce_editor_i18n("benchmark.cpuFrame"),
+                             jce_editor_i18n("profiler.value.unavailable"));
+    if (timing.gpu_available) stat_row("benchmark.gpuFrame","%.2f ms",timing.gpu_ms);
+    else ImGui::TextDisabled("%s: %s (%s)",jce_editor_i18n("benchmark.gpuFrame"),
+        jce_editor_i18n("profiler.value.unavailable"),jce_editor_i18n(gpu_reason_key(gpu)));
+    JceGpuStats st{};
+    if (jce_renderer_get_gpu_stats(&st) && st.valid)
+        stat_row("benchmark.draws","%.0f",static_cast<double>(st.num_draw));
+    ImGui::TextWrapped("%s",jce_editor_i18n("benchmark.observationHelp"));
+    ImGui::Text("%s: %s | %llu / %llu / %llu",jce_editor_i18n("benchmark.coverage"),
+        jce_editor_i18n(s_observation.cadence.complete ? "benchmark.coverageComplete" : "benchmark.coverageIncomplete"),
+        static_cast<unsigned long long>(s_observation.cadence.interruptions),
+        static_cast<unsigned long long>(s_observation.cadence.missed_ui),
+        static_cast<unsigned long long>(s_observation.cadence.missed_host));
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s",jce_editor_i18n("benchmark.coverageHelp"));
+    if (ImGui::SmallButton(jce_editor_i18n("benchmark.reset"))) ft_reset();
+    if (!s_observation.baseline_loaded || s_observation.baseline_kind!=spawned_kind || s_observation.baseline_count!=spawned ||
+        !jce_benchmark_same_profile(s_observation.baseline_profile,profile) ||
+        std::strcmp(s_observation.baseline_root,s_current_project_root)!=0) {
+        s_observation.baseline=baseline_load(spawned_kind,static_cast<int>(spawned),profile);
+        s_observation.baseline_profile=profile; s_observation.baseline_kind=spawned_kind; s_observation.baseline_count=spawned;
+        std::snprintf(s_observation.baseline_root,sizeof(s_observation.baseline_root),"%s",s_current_project_root);
+        s_observation.baseline_loaded=true;
     }
 
     /* Frame-time distribution (industry-standard: average hides stutter). */
@@ -359,10 +371,8 @@ extern "C" void jce_editor_panel_benchmark_content(void)
         ImGui::Spacing();
         ImGui::Text("%s  (%d %s)", jce_editor_i18n("benchmark.frameStats"),
                     ft.n, jce_editor_i18n("benchmark.samples"));
-        ImGui::SameLine();
-        if (ImGui::SmallButton(jce_editor_i18n("benchmark.reset"))) ft_reset();
-        stat_row("benchmark.avg",      "%.0f FPS", ft.avg_fps);
-        stat_row("benchmark.onePctLow","%.0f FPS", ft.low1_fps);
+        stat_row("benchmark.avg",      "%.1f Hz", ft.avg_fps);
+        stat_row("benchmark.onePctLow","%.1f Hz", ft.low1_fps);
         stat_row("benchmark.p99",      "%.2f ms",  ft.p99_ms);
         ImGui::TextUnformatted(jce_editor_i18n("benchmark.minmax"));
         ImGui::SameLine(190.0f);
@@ -371,23 +381,29 @@ extern "C" void jce_editor_panel_benchmark_content(void)
         /* Baseline + regression: save the current distribution, compare to a
          * baseline captured (possibly on a previous build) for this workload. */
         if (spawned) {
+            ImGui::BeginDisabled(!s_observation.cadence.complete);
             if (ImGui::SmallButton(jce_editor_i18n("benchmark.saveBaseline"))) {
-                baseline_save(spawned_kind, (int)spawned, ft.avg_fps, ft.low1_fps, ft.p99_ms);
-                s_baseline = baseline_load(spawned_kind, (int)spawned);
+                if (baseline_save(spawned_kind,static_cast<int>(spawned),profile,ft.avg_fps,ft.low1_fps,ft.p99_ms))
+                    s_observation.baseline=baseline_load(spawned_kind,static_cast<int>(spawned),profile);
             }
+            ImGui::EndDisabled();
             ImGui::SameLine();
-            if (s_baseline.found) {
-                const double dfps = s_baseline.avg_fps > 0 ? (ft.avg_fps - s_baseline.avg_fps) / s_baseline.avg_fps * 100.0 : 0.0;
-                const double dp99 = s_baseline.p99_ms  > 0 ? (ft.p99_ms  - s_baseline.p99_ms)  / s_baseline.p99_ms  * 100.0 : 0.0;
+            if (!s_observation.cadence.complete) {
+                ImGui::TextDisabled("%s",jce_editor_i18n("benchmark.coverageIncomplete"));
+            } else if (s_observation.baseline.found) {
+                const double dfps = s_observation.baseline.avg_fps > 0 ? (ft.avg_fps - s_observation.baseline.avg_fps) / s_observation.baseline.avg_fps * 100.0 : 0.0;
+                const double dp99 = s_observation.baseline.p99_ms  > 0 ? (ft.p99_ms  - s_observation.baseline.p99_ms)  / s_observation.baseline.p99_ms  * 100.0 : 0.0;
                 const ImVec4 col = (dfps >= -2.0) ? ImVec4(0.5f, 0.9f, 0.5f, 1.0f)   /* within noise / better */
                                                   : ImVec4(1.0f, 0.5f, 0.4f, 1.0f);  /* regressed */
-                ImGui::TextColored(col, "%s: %+.0f%% FPS, %+.0f%% p99",
+                ImGui::TextColored(col, "%s: %+.0f%% Hz, %+.0f%% p99",
                                    jce_editor_i18n("benchmark.vsBaseline"), dfps, dp99);
             } else {
                 ImGui::TextDisabled("%s", jce_editor_i18n("benchmark.noBaseline"));
             }
         }
     }
+
+    ImGui::TextWrapped("%s",jce_editor_i18n("benchmark.baselineScope"));
 
     /* Render-queue: how many submits the N objects collapsed to (instancing). */
     JceSceneRenderer *sr = jce_editor_get_scene_renderer();

@@ -458,12 +458,6 @@ function(jce_scripting_register_sdk_install)
 	set(JCE_SDK_SCRIPT_HAVE_CSHARP "${_have_csharp}")
 	set(JCE_SDK_SCRIPT_PYTHON_VERSION "${_python_version}")
 
-	configure_file(
-		"${_JCE_SCRIPTING_CMAKE_DIR}/JCEScripting.cmake.in"
-		"${CMAKE_CURRENT_BINARY_DIR}/JCEScripting.cmake"
-		@ONLY)
-	install(FILES "${CMAKE_CURRENT_BINARY_DIR}/JCEScripting.cmake"
-		DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE")
 
 	# jce_script_enable() and the shim it configures.  Installed UNCONFIGURED,
 	# beside JCEScripting.cmake which includes it by ${CMAKE_CURRENT_LIST_DIR}:
@@ -492,12 +486,15 @@ function(jce_scripting_register_sdk_install)
 	#  binary that LINKS the backend and REGISTERS nothing, which is the     #
 	#  quietest failure this whole layer can produce.                        #
 	# ---------------------------------------------------------------- #
+	set(JCE_SDK_SCRIPT_CATALOG_LANGUAGES "")
+	set(JCE_SDK_SCRIPT_COMPILED_LANGUAGES "")
 	file(GLOB _jce_rosters "${_scripting_root}/*/jce_backend.cmake")
 	foreach(_r IN LISTS _jce_rosters)
 		get_filename_component(_rdir "${_r}" DIRECTORY)
 		get_filename_component(_rname "${_rdir}" NAME)
 		set(JCE_BACKEND_LANGUAGE "")
 		set(JCE_BACKEND_REGISTER_FRAGMENT "")
+		set(JCE_BACKEND_VM_TARGET "")
 		include("${_r}")
 		if(NOT JCE_BACKEND_LANGUAGE OR NOT JCE_BACKEND_REGISTER_FRAGMENT)
 			message(FATAL_ERROR
@@ -505,6 +502,15 @@ function(jce_scripting_register_sdk_install)
 				"JCE_BACKEND_LANGUAGE and JCE_BACKEND_REGISTER_FRAGMENT). "
 				"Installing it would ship a language the consumer can name "
 				"and cannot register.")
+		endif()
+		if(NOT JCE_BACKEND_LANGUAGE MATCHES "^[a-z][a-z0-9_]*$" OR
+		   NOT JCE_BACKEND_VM_TARGET MATCHES "^[A-Za-z_][A-Za-z0-9_]*$" OR
+		   JCE_BACKEND_LANGUAGE IN_LIST JCE_SDK_SCRIPT_CATALOG_LANGUAGES)
+			message(FATAL_ERROR "JCE SDK: malformed or duplicate scripting roster: ${_r}")
+		endif()
+		list(APPEND JCE_SDK_SCRIPT_CATALOG_LANGUAGES "${JCE_BACKEND_LANGUAGE}")
+		if(TARGET ${JCE_BACKEND_VM_TARGET})
+			list(APPEND JCE_SDK_SCRIPT_COMPILED_LANGUAGES "${JCE_BACKEND_LANGUAGE}")
 		endif()
 		if(NOT EXISTS "${_rdir}/${JCE_BACKEND_REGISTER_FRAGMENT}")
 			message(FATAL_ERROR
@@ -542,6 +548,16 @@ function(jce_scripting_register_sdk_install)
 			DESTINATION
 				"${CMAKE_INSTALL_LIBDIR}/cmake/JCE/backends/${JCE_BACKEND_LANGUAGE}")
 	endforeach()
+	# Same actual roster/TARGET graph as installation; missing payloads must
+	# not later be interpreted as intentionally uncompiled backends.
+	list(SORT JCE_SDK_SCRIPT_CATALOG_LANGUAGES)
+	list(SORT JCE_SDK_SCRIPT_COMPILED_LANGUAGES)
+	configure_file(
+		"${_JCE_SCRIPTING_CMAKE_DIR}/JCEScripting.cmake.in"
+		"${CMAKE_CURRENT_BINARY_DIR}/JCEScripting.cmake"
+		@ONLY)
+	install(FILES "${CMAKE_CURRENT_BINARY_DIR}/JCEScripting.cmake"
+		DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/JCE")
 	list(LENGTH _jce_rosters _jce_roster_n)
 	message(STATUS
 		"JCE SDK: ${_jce_roster_n} scripting roster(s) will be installed "

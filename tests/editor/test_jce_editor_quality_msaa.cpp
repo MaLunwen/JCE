@@ -23,6 +23,8 @@
 #include "core/jce_project_settings.h"
 
 #include <string>
+#include <filesystem>
+#include <chrono>
 
 TEST_CASE("a quality level's Anti Aliasing reaches the effective settings")
 {
@@ -98,5 +100,52 @@ TEST_CASE("a quality level's Anti Aliasing reaches the effective settings")
         CHECK(jce_editor_quality_msaa(lvl->anti_aliasing,
                                       ps.graphics.default_msaa)
               == ps.graphics.default_msaa);
+    }
+}
+
+/* Consume the actual JSON loader and effective composition. These are CPU
+ * path/parameter controls; they do not certify grass drawing. */
+TEST_CASE("authored custom asset roots reach viewport and package settings")
+{
+    namespace fs = std::filesystem;
+    const fs::path repo = fs::path(__FILE__).parent_path().parent_path().parent_path();
+    const fs::path base = repo / "build/tests/editor-feature-ui40/custom-root-settings" /
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    fs::create_directories(base / "resources/assets");
+    fs::create_directories(base / "authored");
+    fs::create_directories(base / "cooked-custom");
+    JceRenderSettings poison = jce_render_settings_default();
+    poison.grass_enabled = 0;
+    REQUIRE(jce_render_settings_save_json(
+        (base / "resources/assets/render_settings.json").generic_string().c_str(), &poison));
+    JceProjectSettings ps;
+    jce_project_settings_defaults(&ps);
+    jce_project_settings_apply(&ps);
+    JceRenderSettings authored = jce_render_settings_default();
+    authored.grass_enabled = 1;
+    std::string used;
+    JceRenderSettings result = jce_render_settings_default();
+
+    SUBCASE("custom source wins over conflicting conventional source") {
+        const std::string wanted = (base / "authored/render_settings.json").generic_string();
+        REQUIRE(jce_render_settings_save_json(wanted.c_str(), &authored));
+        REQUIRE(jce_editor_effective_render_settings(false, base.generic_string().c_str(),
+            &result, &used, "authored", "cooked-custom"));
+        CHECK(result.grass_enabled == 1);
+        CHECK(used == wanted);
+    }
+    SUBCASE("missing custom source falls back to custom cooked") {
+        const std::string wanted = (base / "cooked-custom/render_settings.json").generic_string();
+        REQUIRE(jce_render_settings_save_json(wanted.c_str(), &authored));
+        REQUIRE(jce_editor_effective_render_settings(false, base.generic_string().c_str(),
+            &result, &used, "authored", "cooked-custom"));
+        CHECK(result.grass_enabled == 1);
+        CHECK(used == wanted);
+    }
+    SUBCASE("missing custom roots do not load the conventional poison file") {
+        REQUIRE(jce_editor_effective_render_settings(false, base.generic_string().c_str(),
+            &result, &used, "authored", "cooked-custom"));
+        CHECK(result.grass_enabled == jce_render_settings_default().grass_enabled);
+        CHECK(used.empty());
     }
 }

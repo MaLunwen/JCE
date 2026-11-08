@@ -231,7 +231,7 @@ void draw_menu_bar(void)
             s_show_save_as = true;
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.new")))
-            s_show_new_project = true;
+            jce_editor_layout_request_new_project();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.open")))
             request_gated_action(PGA_OPEN_PROJECT);
         ImGui::Separator();
@@ -359,9 +359,14 @@ void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Del / Backspace"))
             jce_panel_delete_selection();
         ImGui::Separator();
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.preferences"), "Ctrl+,")) {
-            bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_USER_PREFERENCES);
-            if (vis) *vis = true;
+        {
+            char shortcut[64];
+            jce_hotkey_chord_label(jce_hotkey_get(JCE_HK_EDIT_PREFERENCES),
+                                   shortcut, sizeof(shortcut));
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.preferences"), shortcut)) {
+                bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_USER_PREFERENCES);
+                if (vis) *vis = true;
+            }
         }
         /* Project Settings moved to File menu (Ctrl+Shift+P) to match
          * Unity / Unreal convention; do not duplicate here. */

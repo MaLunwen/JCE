@@ -10,7 +10,7 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_views.h>
-#include <jce/renderer/jce_volumetric_fog.h>
+#include "renderer/jce_volumetric_fog_internal.h"
 
 #include "os/core/jce_memory.h"
 #include "renderer/jce_fullscreen_pass.h"
@@ -26,14 +26,36 @@
 
 typedef struct { float pos[2]; float uv[2]; } VfQuadV;
 
+typedef struct JceFogScreenShafts {
+    JceFsTarget target;
+    bgfx_program_handle_t radial;
+    bgfx_program_handle_t composite;
+    bgfx_uniform_handle_t sampler;
+    bgfx_uniform_handle_t source;
+    bgfx_uniform_handle_t tint;
+    float radiance[4];
+} JceFogScreenShafts;
+
 struct JceVolumetricFog {
+    JceFogScreenShafts *screen_shafts;
+    bool screen_shafts_attempted;
+    bool screen_shafts_rendered;
     JceVolumetricFogParams params;
+    float noise[4];
+    float lobes[4];
+    float volume[4];
 
     bgfx_program_handle_t  prog;
 
     bgfx_uniform_handle_t  u_p0;
     bgfx_uniform_handle_t  u_p1;
     bgfx_uniform_handle_t  u_color;
+    bgfx_uniform_handle_t  u_noise;
+    bgfx_uniform_handle_t  u_lobes;
+    bgfx_uniform_handle_t  u_volume;
+    bgfx_uniform_handle_t  u_cloud_map;
+    bgfx_uniform_handle_t  u_cloud_ray;
+    bgfx_uniform_handle_t  s_cloud_shadow;
     bgfx_uniform_handle_t  u_sun;        /* dir.xyz + Henyey-Greenstein g */
     bgfx_uniform_handle_t  u_sun_color;  /* rgb + cascade count           */
     bgfx_uniform_handle_t  u_csm_vp;     /* mat4[4]                       */
@@ -82,6 +104,7 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
     const int want_w = desc->width  > 0 ? desc->width  : 1280;
     const int want_h = desc->height > 0 ? desc->height : 720;
     f->params = jce_volumetric_fog_default_params();
+    jce_volumetric_fog_set_look(f, NULL, NULL);
     jce_fs_target_init(&f->rt);
     jce_fs_quad_init(&f->quad);
 
@@ -101,6 +124,12 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
     f->u_p0    = bgfx_create_uniform("u_volfog_p0",    BGFX_UNIFORM_TYPE_VEC4, 1);
     f->u_p1    = bgfx_create_uniform("u_volfog_p1",    BGFX_UNIFORM_TYPE_VEC4, 1);
     f->u_color = bgfx_create_uniform("u_volfog_color", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_noise = bgfx_create_uniform("u_volfog_noise", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_lobes = bgfx_create_uniform("u_volfog_lobes", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_volume = bgfx_create_uniform("u_volfog_volume", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_cloud_map = bgfx_create_uniform("u_volfog_cloud_map", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->u_cloud_ray = bgfx_create_uniform("u_volfog_cloud_ray", BGFX_UNIFORM_TYPE_VEC4, 1);
+    f->s_cloud_shadow = bgfx_create_uniform("s_volfog_cloud_shadow", BGFX_UNIFORM_TYPE_SAMPLER, 1);
     f->u_sun        = bgfx_create_uniform("u_volfog_sun",        BGFX_UNIFORM_TYPE_VEC4, 1);
     f->u_sun_color  = bgfx_create_uniform("u_volfog_sun_color",  BGFX_UNIFORM_TYPE_VEC4, 1);
     f->u_csm_vp     = bgfx_create_uniform("u_volfog_csm_vp",     BGFX_UNIFORM_TYPE_MAT4, 4);
@@ -140,14 +169,33 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
     return f;
 }
 
+static void vfog_screen_shafts_destroy(JceFogScreenShafts *s)
+{
+    if (!s) return;
+    if (BGFX_HANDLE_IS_VALID(s->radial)) bgfx_destroy_program(s->radial);
+    if (BGFX_HANDLE_IS_VALID(s->composite)) bgfx_destroy_program(s->composite);
+    if (BGFX_HANDLE_IS_VALID(s->sampler)) bgfx_destroy_uniform(s->sampler);
+    if (BGFX_HANDLE_IS_VALID(s->source)) bgfx_destroy_uniform(s->source);
+    if (BGFX_HANDLE_IS_VALID(s->tint)) bgfx_destroy_uniform(s->tint);
+    jce_fs_target_destroy(&s->target);
+    JCE_FREE(s);
+}
+
 void jce_volumetric_fog_destroy(JceVolumetricFog *f)
 {
     if (!f) return;
+    vfog_screen_shafts_destroy(f->screen_shafts);
     if (f->prog.idx           != UINT16_MAX) bgfx_destroy_program(f->prog);
     if (f->prog_composite.idx != UINT16_MAX) bgfx_destroy_program(f->prog_composite);
     if (f->u_p0.idx           != UINT16_MAX) bgfx_destroy_uniform(f->u_p0);
     if (f->u_p1.idx           != UINT16_MAX) bgfx_destroy_uniform(f->u_p1);
     if (f->u_color.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_color);
+    if (f->u_noise.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_noise);
+    if (f->u_lobes.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_lobes);
+    if (BGFX_HANDLE_IS_VALID(f->u_volume)) bgfx_destroy_uniform(f->u_volume);
+    if (BGFX_HANDLE_IS_VALID(f->u_cloud_map)) bgfx_destroy_uniform(f->u_cloud_map);
+    if (BGFX_HANDLE_IS_VALID(f->u_cloud_ray)) bgfx_destroy_uniform(f->u_cloud_ray);
+    if (BGFX_HANDLE_IS_VALID(f->s_cloud_shadow)) bgfx_destroy_uniform(f->s_cloud_shadow);
     if (f->u_sun.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_sun);
     if (f->u_sun_color.idx  != UINT16_MAX) bgfx_destroy_uniform(f->u_sun_color);
     if (f->u_csm_vp.idx     != UINT16_MAX) bgfx_destroy_uniform(f->u_csm_vp);
@@ -176,8 +224,8 @@ void jce_volumetric_fog_set_params(JceVolumetricFog *f, const JceVolumetricFogPa
     if (q.scattering     <  0.0f) q.scattering     = 0.0f;
     if (q.height_falloff <  0.0f) q.height_falloff = 0.0f;
     if (q.max_distance   <= 0.0f) q.max_distance   = 1.0f;
-    if (q.step_count     <  1.0f) q.step_count     = 1.0f;
-    if (q.step_count     > 256.f) q.step_count     = 256.0f;
+    q.step_count = isfinite(q.step_count)
+        ? floorf(fminf(fmaxf(q.step_count, 1.0f), 64.0f) + 0.5f) : 32.0f;
     if (q.near_plane     <= 0.0f) q.near_plane     = 0.01f;
     if (q.far_plane      <= q.near_plane) q.far_plane = q.near_plane + 1.0f;
     if (q.color_r        <  0.0f) q.color_r        = 0.0f;
@@ -186,17 +234,64 @@ void jce_volumetric_fog_set_params(JceVolumetricFog *f, const JceVolumetricFogPa
     f->params = q;
 }
 
+static float volfog_look_value(float value, float fallback, float lo, float hi)
+{
+    return isfinite(value) ? fminf(fmaxf(value, lo), hi) : fallback;
+}
+
+void jce_volumetric_fog_set_look(JceVolumetricFog *f,
+    const JceVolumetricFogLook *look, const double wind_offset_xz_m[2])
+{
+    if (!f) return;
+
+    memset(f->noise, 0, sizeof f->noise);
+    memset(f->lobes, 0, sizeof f->lobes);
+    memset(f->volume, 0, sizeof f->volume);
+    if (!look) return;
+
+    f->volume[3] = volfog_look_value(look->volume_radius_m, 0.0f, 0.0f, 100000.0f);
+    for (int axis = 0; axis < 3; ++axis)
+        f->volume[axis] = volfog_look_value(look->volume_center[axis], 0.0f, -100000.0f, 100000.0f);
+
+    f->lobes[0] = volfog_look_value(look->forward_strength, 1.0f, 0.0f, 4.0f);
+    f->lobes[1] = volfog_look_value(look->backward_strength, 0.0f, 0.0f, 4.0f);
+    f->lobes[2] = (f->lobes[0] != 1.0f || f->lobes[1] > 0.0f) ? 1.0f : 0.0f;
+    f->noise[0] = volfog_look_value(look->noise_strength, 0.0f, 0.0f, 1.0f);
+    if (f->noise[0] == 0.0f) return;
+
+    const float cell_m = volfog_look_value(look->noise_cell_m, 24.0f, 1.0f, 256.0f);
+    f->noise[1] = 1.0f / cell_m;
+    /* Match the shader lattice's 64-cell period, in its own units. */
+    if (wind_offset_xz_m) {
+        for (int axis = 0; axis < 2; ++axis)
+            if (isfinite(wind_offset_xz_m[axis]))
+                f->noise[2 + axis] = (float)fmod(wind_offset_xz_m[axis] / cell_m, 64.0);
+    }
+}
+
 void jce_volumetric_fog_render(JceVolumetricFog *f,
                                uint16_t depth_tex_handle,
                                const jce_mat4 *view, const jce_mat4 *proj,
                                const JceVolumetricFogSun *sun,
                                uint16_t first_view_id)
 {
-    if (!f || f->prog.idx == UINT16_MAX || !view || !proj) return;
-    if (depth_tex_handle == UINT16_MAX) return;
+    jce_volumetric_fog_render_with_cloud(f, depth_tex_handle, view, proj, sun,
+                                         NULL, first_view_id);
+}
+
+void jce_volumetric_fog_render_with_cloud(JceVolumetricFog *f,
+    uint16_t depth_tex_handle, const jce_mat4 *view, const jce_mat4 *proj,
+    const JceVolumetricFogSun *sun, const JceVolumetricFogCloudShadow *cloud,
+    uint16_t first_view_id)
+{
+    if (!f) return;
+    f->screen_shafts_rendered = false;
+    if (f->prog.idx == UINT16_MAX || !view || !proj || depth_tex_handle == UINT16_MAX)
+        return;
     JCE_PROFILE_ZONE_N("Renderer::VolumetricFog::render");
 
     uint16_t v = first_view_id;
+    bgfx_set_view_name(v, "Scene/VolumetricFog", INT32_MAX);
     bgfx_set_view_frame_buffer(v, f->rt.fb);
     bgfx_set_view_rect(v, 0, 0, (uint16_t)f->rt.w, (uint16_t)f->rt.h);
     bgfx_set_view_clear(v, BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);
@@ -214,6 +309,36 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
     bgfx_set_uniform(f->u_p0,    p0,  1);
     bgfx_set_uniform(f->u_p1,    p1,  1);
     bgfx_set_uniform(f->u_color, col, 1);
+    if (BGFX_HANDLE_IS_VALID(f->u_noise)) bgfx_set_uniform(f->u_noise, f->noise, 1);
+    if (BGFX_HANDLE_IS_VALID(f->u_lobes)) bgfx_set_uniform(f->u_lobes, f->lobes, 1);
+    if (BGFX_HANDLE_IS_VALID(f->u_volume)) bgfx_set_uniform(f->u_volume, f->volume, 1);
+
+    const bool have_cloud_bindings = BGFX_HANDLE_IS_VALID(f->u_cloud_map) &&
+        BGFX_HANDLE_IS_VALID(f->u_cloud_ray) && BGFX_HANDLE_IS_VALID(f->s_cloud_shadow);
+    const bool cloud_on = have_cloud_bindings && sun && sun->enabled &&
+        sun->cascade_count > 0u && cloud &&
+        cloud->texture != UINT16_MAX && isfinite(cloud->extent_m) && cloud->extent_m > 0.0f &&
+        isfinite(cloud->center_xz[0]) && isfinite(cloud->center_xz[1]) &&
+        isfinite(cloud->base_y_m) && isfinite(cloud->sun_slope_xz[0]) &&
+        isfinite(cloud->sun_slope_xz[1]);
+    if (have_cloud_bindings) {
+        float map[4] = {0};
+        float ray[4] = {0};
+        bgfx_texture_handle_t tex = { depth_tex_handle };
+        if (cloud_on) {
+            tex.idx = cloud->texture;
+            map[0] = cloud->extent_m;
+            map[1] = cloud->center_xz[0];
+            map[2] = cloud->center_xz[1];
+            map[3] = cloud->base_y_m;
+            ray[0] = cloud->sun_slope_xz[0];
+            ray[1] = cloud->sun_slope_xz[1];
+        }
+        bgfx_set_uniform(f->u_cloud_map, map, 1);
+        bgfx_set_uniform(f->u_cloud_ray, ray, 1);
+        bgfx_set_texture(6, f->s_cloud_shadow, tex,
+                         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    }
 
     /* Sun + cascades.  Bound UNCONDITIONALLY, including the disabled case:
      * bgfx retains uniform values between submits, so a frame that skipped the
@@ -304,6 +429,139 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
     JCE_PROFILE_ZONE_END;
 }
 
+static bgfx_program_handle_t vfog_screen_program(const JcePakArchive *pak,
+    const char *suffix, const char *fragment)
+{
+    const bgfx_shader_handle_t vs = jce_shader_load_from_pak(pak, "vs_volfog", suffix, LOG_TAG);
+    const bgfx_shader_handle_t fs = jce_shader_load_from_pak(pak, fragment, suffix, LOG_TAG);
+    if (BGFX_HANDLE_IS_VALID(vs) && BGFX_HANDLE_IS_VALID(fs))
+        return bgfx_create_program(vs, fs, true);
+    if (BGFX_HANDLE_IS_VALID(vs)) bgfx_destroy_shader(vs);
+    if (BGFX_HANDLE_IS_VALID(fs)) bgfx_destroy_shader(fs);
+    return (bgfx_program_handle_t){UINT16_MAX};
+}
+
+static JceFogScreenShafts *vfog_screen_shafts_get(JceVolumetricFog *f,
+    const JcePakArchive *pak)
+{
+    if (f->screen_shafts_attempted) return f->screen_shafts;
+    f->screen_shafts_attempted = true;
+    const char *suffix = jce_shader_backend_suffix();
+    if (!suffix) return NULL;
+    JceFogScreenShafts *s = JCE_CALLOC(1, sizeof *s);
+    if (!s) return NULL;
+
+    jce_fs_target_init(&s->target);
+    s->radial = vfog_screen_program(pak, suffix, "fs_volfog_screen_shafts");
+    s->composite = vfog_screen_program(pak, suffix, "fs_volfog_screen_shafts_composite");
+    s->sampler = bgfx_create_uniform("s_screenShafts", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    s->source = bgfx_create_uniform("u_screenShaftSource", BGFX_UNIFORM_TYPE_VEC4, 1);
+    s->tint = bgfx_create_uniform("u_screenShaftTint", BGFX_UNIFORM_TYPE_VEC4, 1);
+    if (!BGFX_HANDLE_IS_VALID(s->radial) || !BGFX_HANDLE_IS_VALID(s->composite) ||
+        !BGFX_HANDLE_IS_VALID(s->sampler) || !BGFX_HANDLE_IS_VALID(s->source) ||
+        !BGFX_HANDLE_IS_VALID(s->tint)) {
+        vfog_screen_shafts_destroy(s);
+        return NULL;
+    }
+    f->screen_shafts = s;
+    return s;
+}
+
+static bool vfog_screen_shafts_target(JceFsTarget *target, int w, int h)
+{
+    if (BGFX_HANDLE_IS_VALID(target->fb) && target->w == w && target->h == h) return true;
+    const uint64_t flags = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+    const bgfx_frame_buffer_handle_t fb = bgfx_create_frame_buffer((uint16_t)w, (uint16_t)h,
+        BGFX_TEXTURE_FORMAT_RGBA8, BGFX_TEXTURE_RT | flags);
+    if (!BGFX_HANDLE_IS_VALID(fb)) return false;
+    const bgfx_texture_handle_t tex = bgfx_get_texture(fb, 0);
+    if (!BGFX_HANDLE_IS_VALID(tex)) {
+        bgfx_destroy_frame_buffer(fb);
+        return false;
+    }
+    jce_fs_target_destroy(target);
+    *target = (JceFsTarget){fb, tex, w, h, BGFX_TEXTURE_FORMAT_RGBA8, flags};
+    return true;
+}
+
+void jce_volumetric_fog_render_screen_shafts(JceVolumetricFog *f,
+    const JcePakArchive *pak, uint16_t depth_tex_handle,
+    const jce_mat4 *view, const jce_mat4 *proj,
+    jce_vec3 sun_direction, jce_vec3 sun_radiance, float strength,
+    const JceVolumetricFogCloudShadow *cloud, uint16_t view_id)
+{
+    if (!f || !f->composite_ok || !BGFX_HANDLE_IS_VALID(f->rt.fb) ||
+        depth_tex_handle == UINT16_MAX || !view || !proj ||
+        !(strength > 0.0f) || !(sun_direction.y > 0.0f) ||
+        !isfinite(sun_radiance.x) || !isfinite(sun_radiance.y) || !isfinite(sun_radiance.z) ||
+        !(fmaxf(fmaxf(sun_radiance.x, sun_radiance.y), sun_radiance.z) > 0.0f))
+        return;
+
+    const jce_mat4 vp = jce_m4_multiply(proj, view);
+    const jce_vec4 clip = jce_m4_mul_v4(&vp,
+        (jce_vec4){sun_direction.x, sun_direction.y, sun_direction.z, 0.0f});
+    if (!(clip.w > 1e-4f) || !isfinite(clip.w) || !isfinite(clip.x) || !isfinite(clip.y))
+        return;
+    const float x = clip.x / clip.w, y = clip.y / clip.w;
+    const float margin = fmaxf(fabsf(x), fabsf(y));
+    if (!(margin < 1.36f)) return;
+    const float edge = fmaxf(margin - 1.0f, 0.0f) / 0.36f;
+    const float fade = 1.0f - edge * edge * (3.0f - 2.0f * edge);
+
+    const jce_vec4 n = jce_m4_mul_v4(proj, (jce_vec4){0, 0, -f->params.near_plane, 1});
+    const jce_vec4 z = jce_m4_mul_v4(proj, (jce_vec4){0, 0, -f->params.far_plane, 1});
+    if (n.w == 0.0f || z.w == 0.0f) return;
+    const float near_ndc = n.z / n.w, far_ndc = z.z / z.w;
+    if (!isfinite(near_ndc) || !isfinite(far_ndc) || near_ndc == far_ndc) return;
+    const float far_depth = near_ndc > far_ndc ? 0.0f : 1.0f;
+
+    JceFogScreenShafts *s = vfog_screen_shafts_get(f, pak);
+    if (!s || !vfog_screen_shafts_target(&s->target, (f->rt.w + 3) / 4, (f->rt.h + 3) / 4))
+        return;
+    if (s->target.tex.idx == depth_tex_handle ||
+        (cloud && cloud->extent_m > 0.0f && s->target.tex.idx == cloud->texture)) return;
+
+    const float source[4] = {x, y, far_depth, (float)f->rt.w / f->rt.h};
+    const float gain = fminf(strength, 4.0f) * fade;
+    s->radiance[0] = fminf(fmaxf(sun_radiance.x, 0.0f), 8.0f) * gain;
+    s->radiance[1] = fminf(fmaxf(sun_radiance.y, 0.0f), 8.0f) * gain;
+    s->radiance[2] = fminf(fmaxf(sun_radiance.z, 0.0f), 8.0f) * gain;
+    s->radiance[3] = 0.0f;
+
+    float map[4] = {0}, ray[4] = {0};
+    bgfx_texture_handle_t cloud_tex = {depth_tex_handle};
+    if (cloud && cloud->texture != UINT16_MAX && cloud->extent_m > 0.0f) {
+        cloud_tex.idx = cloud->texture;
+        map[0] = cloud->extent_m;
+        map[1] = cloud->center_xz[0];
+        map[2] = cloud->center_xz[1];
+        map[3] = cloud->base_y_m;
+        ray[0] = cloud->sun_slope_xz[0];
+        ray[1] = cloud->sun_slope_xz[1];
+    }
+    if (!BGFX_HANDLE_IS_VALID(f->s_depth) || !BGFX_HANDLE_IS_VALID(f->s_cloud_shadow) ||
+        !BGFX_HANDLE_IS_VALID(f->u_cloud_map) || !BGFX_HANDLE_IS_VALID(f->u_cloud_ray))
+        return;
+
+    bgfx_set_view_name(view_id, "Scene/ScreenSunShafts", INT32_MAX);
+    bgfx_set_view_frame_buffer(view_id, s->target.fb);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)s->target.w, (uint16_t)s->target.h);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx_set_view_transform(view_id, JCE_M4_PTR(*view), JCE_M4_PTR(*proj));
+
+    bgfx_set_uniform(s->source, source, 1);
+    bgfx_set_uniform(f->u_cloud_map, map, 1);
+    bgfx_set_uniform(f->u_cloud_ray, ray, 1);
+    const uint32_t clamp_uv = BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP;
+    bgfx_set_texture(0, f->s_depth, (bgfx_texture_handle_t){depth_tex_handle},
+                     clamp_uv | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT);
+    bgfx_set_texture(1, f->s_cloud_shadow, cloud_tex, clamp_uv);
+    jce_fs_quad_bind(&f->quad);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB, 0);
+    bgfx_submit(view_id, s->radial, 0, BGFX_DISCARD_ALL);
+    f->screen_shafts_rendered = true;
+}
+
 uint16_t jce_volumetric_fog_get_result_texture(const JceVolumetricFog *f)
 {
     if (!f || f->rt.fb.idx == UINT16_MAX) return UINT16_MAX;
@@ -323,6 +581,7 @@ void jce_volumetric_fog_composite(JceVolumetricFog *f,
      * pass a view-id strictly greater than the fog-render view-id used
      * in jce_volumetric_fog_render(); otherwise composite would sample
      * stale data from the previous frame's fog RT. */
+    bgfx_set_view_name(view_id, "Scene/FogComposite", INT32_MAX);
     bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
     bgfx_set_view_frame_buffer(view_id, dst);
     bgfx_set_view_rect(view_id, 0, 0, (uint16_t)f->rt.w, (uint16_t)f->rt.h);
@@ -342,6 +601,14 @@ void jce_volumetric_fog_composite(JceVolumetricFog *f,
                    | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE,
                                            BGFX_STATE_BLEND_SRC_ALPHA);
     bgfx_set_state(state, 0);
-    bgfx_submit(view_id, f->prog_composite, 0, BGFX_DISCARD_ALL);
+    bgfx_program_handle_t program = f->prog_composite;
+    JceFogScreenShafts *shaft = f->screen_shafts;
+    if (f->screen_shafts_rendered && shaft && shaft->target.fb.idx != dst_fb_idx) {
+        bgfx_set_texture(1, shaft->sampler, shaft->target.tex,
+                         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+        bgfx_set_uniform(shaft->tint, shaft->radiance, 1);
+        program = shaft->composite;
+    }
+    bgfx_submit(view_id, program, 0, BGFX_DISCARD_ALL);
     JCE_PROFILE_ZONE_END;
 }

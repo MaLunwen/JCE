@@ -40,11 +40,16 @@ bool jce_editor_project_is_engine_workspace(void);
  * then refresh the in-memory cache so subsequent jce_editor_project_get()
  * calls observe the new value.  `field` accepts the same names as
  * jce_project_set_field().  Returns false if no project is open or the
- * save fails. */
+ * save fails. On failure the cached object and fields are unchanged. On
+ * success only the edited field is replaced; the object and other borrowed
+ * fields remain valid until project activation/close or their own edit.
+ * Changed known source metadata or unavailable verification refuses the edit
+ * with a reload diagnostic. This preflight is not a concurrent-writer lock. */
 bool jce_editor_project_update_field(const char *field, const char *value);
 
 /* Replace the project's bundles[] array wholesale.  Persists to
- * jce_project.json and reloads the cache.  Pass NULL/0 to clear. */
+ * jce_project.json before replacing only the cached array. A failed save
+ * preserves the old array and cache identity. Pass NULL/0 to clear. */
 bool jce_editor_project_set_bundles(const char *const *paths, int count);
 
 #ifdef __cplusplus

@@ -70,7 +70,12 @@ capabilities:
     # decode path that skips the service, which is the whole failure mode.
     include_whitelist:
       - engine/src/renderer/
-    link_whitelist: [jce_platform, jce_renderer, jce_resource, jce_cook]
+    link_whitelist: [jce_platform, jce_renderer, jce_resource, jce_cook, jce_pak]
+    notes: jce_pak compiles the existing PAK loader TU and its public
+      jce_image_decode_pak adapter, which links the single jce_image service.
+      This is an offline host link closure, without renderer/device startup
+      or a new image decoder at the tool call site. Header ownership stays
+      confined to engine/src/renderer/.
     forbidden_alternatives: [direct IMG_Load at call sites, second general-purpose loader]
 
   - capability: image-decode-hdr
@@ -172,6 +177,9 @@ capabilities:
     include_whitelist:
       - engine/src/os/core/jce_json.c                              # the facade itself
       - engine/src/middleware/scene/jce_scene_components_internal.h
+      # Existing checked recursive Duplicate/Add/Replace node surgery, split
+      # from the serializer TU; the public JSON facade has no checked merge.
+      - engine/src/middleware/scene/jce_scene_json_patch_internal.h
       - engine/src/middleware/scene/jce_scene_tags_layers.c
       - engine/src/middleware/ai_dispatch/jce_aid_json.c
       - engine/src/resource/jce_bundle_contract_internal.c
@@ -180,7 +188,11 @@ capabilities:
       - engine/src/resource/jce_bundle_loader.c
       - engine/src/resource/jce_bundle_pack.c
       - engine/src/resource/jce_bundle_pack_cook.c            # split out of the line above
-    link_whitelist: [jce_core, jce_scene, jce_resource, jce_ai_dispatch]
+    link_whitelist: [jce_core, jce_scene, jce_resource, jce_ai_dispatch, jce_pak]
+    notes: jce_pak compiles the sanctioned jce_bundle_loader.c owner for
+      --selected-archive typed manifest validation through the public Bundle
+      loader. The existing loader consumes cJSON; the tool does not include
+      cJSON or parse the manifest itself. No consumer header bypass is added.
     forbidden_alternatives: [handwritten JSON parser/writer, nlohmann/rapidjson, cJSON_* at consumer call sites]
 
   - capability: gltf-parse
@@ -257,7 +269,7 @@ capabilities:
 
   - capability: audio-device-mixer
     owner: miniaudio
-    version: "0.11.22"
+    version: "0.11.25"
     facade: jce_audio_*
     include_whitelist: [engine/src/middleware/audio/, engine/src/resource/, tools/]
     link_whitelist: [jce_audio, jce_resource, jce_cook]

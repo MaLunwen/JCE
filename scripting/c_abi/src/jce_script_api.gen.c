@@ -1223,3 +1223,14 @@ JCE_SCRIPT_API bool jce_script_api_stat_flush(JceScriptApi *api)
     return api->host.stat_flush(api->host.user);
 }
 
+/* jce_script_api_get_viewport_size -> host.viewport_size (void_out_array) */
+JCE_SCRIPT_API void jce_script_api_get_viewport_size(JceScriptApi *api,
+                                                     float out_wh[2])
+{
+    if (!api || !api->host.viewport_size) {
+        if (out_wh) memset(out_wh, 0, 2 * sizeof out_wh[0]);
+        return;
+    }
+    api->host.viewport_size(api->host.user, out_wh);
+}
+

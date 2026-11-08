@@ -33,6 +33,7 @@ extern "C" {
 #include "jce_video_timestamp.h"
 #include "jce_video_perf.h"
 #include "jce_video_late_policy.h"
+#include "jce_video_lifecycle_trace.h"
 #include "jce_av1_packet.h"
 #include "os/core/jce_memory.h"
 
@@ -57,200 +58,20 @@ static const int s_yuv_avx2_init = (jce_yuv_set_avx2(SDL_HasAVX2()), 0);
 #define VIDEO_PACKET_MAX_BYTES (16u * 1024u * 1024u)
 #define JCE_VIDEO_AUDIO_PCM_MAX_BYTES (100u * 1024u * 1024u) /* 100 MB */
 
-typedef struct {
-    JceMp4Parser        *parser;        /* stays open for sample access */
-    JceH264Decoder      *h264;          /* OpenH264 H.264 decoder */
-    JceH265Decoder      *h265;          /* AOSP libhevc H.265/HEVC decoder */
-    JceAv1Decoder       *av1;           /* dav1d AV1 decoder (royalty-free) */
-    JceMp4VideoTrackInfo vtrack;        /* cached video track info */
-    uint32_t             sample_idx;    /* next sample to decode */
-    bool                 ended;
-    uint32_t             width;
-    uint32_t             height;
-    uint8_t             *packet; /* bounded encoded sample staging */
-    size_t               packet_capacity;
+#include "jce_video_slot_internal.h"
 
-    /* AV1 / IVF: dav1d decoder owns these (must outlive decoder). */
-    bool                 ivf;
-    uint32_t             av1_fps_num;   /* IVF timebase numerator */
-    uint32_t             av1_fps_den;   /* IVF timebase denominator */
-    uint32_t             av1_frame_idx; /* index of next decoded AV1 frame */
-
-    /* WebM / Matroska: container demuxer + VP8 or AV1 video decoder.
-     * (AV1-in-WebM uses slot->decoder.av1 with packet-driven mode.)
-     * Audio is not currently routed through the worker (silent track). */
-    JceWebmParser       *webm;
-    JceVp8Decoder       *vp8;
-    JceVp9Decoder       *vp9;
-
-    uint64_t             webm_duration_ns;
-    uint32_t             webm_frame_idx;
-    int                  webm_video_codec; /* JceWebmVideoCodec */
-    int                  webm_audio_codec; /* JceWebmAudioCodec */
-    uint32_t             webm_audio_channels;
-    uint32_t             webm_audio_samplerate;
-
-    /* Pre-built keyframe index for O(log n) seek. */
-    uint32_t            *keyframe_indices;  /* sorted array of keyframe sample indices */
-    uint32_t             keyframe_count;
-    uint32_t             last_seek_kf_idx;  /* last keyframe used for inexact seek (skip dup) */
-} JceVideoDecoder;
-
-typedef struct {
-    bool     used;
-
-    int      width;
-    int      height;
-    double   framerate;
-    double   duration;
-
-    bool     has_audio;
-    int      samplerate;
-    int      audio_channels;
-    uint32_t audio_sample_count;
-    JceVideoAudioStatus audio_status;
-    char     audio_status_text[128];
-
-    bool     metadata_only;
-    char     video_codec[5];
-    char     audio_codec[5];
-
-    bool     loop;
-    bool     ended;
-    double   time;
-
-    uint8_t *rgba;
-    int      rgba_w;
-    int      rgba_h;
-    double   frame_time;
-    uint64_t frame_counter;
-    bool     decode_ts_base_set;
-    double   decode_ts_base_sec;
-    bool     post_seek;          /* suppress monotonicity in normalize_frame_time */
-
-    /* Legacy PCM query fields. Streaming paths expose format/count only;
-     * no full-clip PCM allocation is retained. */
-    int16_t *audio_pcm;
-    uint32_t audio_pcm_frames;
-    uint32_t audio_pcm_channels;
-    uint32_t audio_pcm_samplerate;
-
-    /* Streaming audio source. Lazily created on first pull or, for the
-     * WebM/Opus path, upfront at load time. Owned. */
-    JceAudioStream *audio_stream;
-
-    /* Opt-in AV1 receive/input/send stage timing. */
-    uint64_t av1_trace_receive, av1_trace_read, av1_trace_send;
-
-    JceReadSource *source; /* shared immutable memory or host-file input */
-    JceVideoDecoder decoder;
-
-    /* ── Async decode pipeline (Stage 1) ──────────────────────────
-     * A dedicated worker thread drives the decoder end-to-end,
-     * pushing RGBA frames into the queue. jce_video_advance pops
-     * frames based on audio/wall clock, copies into display_rgba.
-     *
-     * slot->rgba (above) is the DECODER scratch — worker-only.
-     * slot->display_rgba is what UI uploads to GPU. */
-    bool          queue_active;
-    bool          queue_yuv_mode;        /* AV1/VP8: queue stores YUV planes (Stage 2) */
-    bool          worker_running;
-    bool          quit_request;
-    bool          seek_request;
-    double        seek_target_sec;
-    bool          seek_exact;
-    bool          worker_eof;
-    JceMutex     *qmtx;
-    JceCondVar   *q_not_full;
-    JceCondVar   *q_not_empty;
-    /* Frame queue (ring buffer; capacity defined by JCE_VIDEO_Q_CAP). */
-    void         *qslots;              /* VideoQueueEntry[JCE_VIDEO_Q_CAP] */
-    int           q_head;
-    int           q_tail;
-    int           q_count;
-    uint64_t      seek_serial;
-
-    /* Worker scratch: YUV planes from the most recent decode call.
-     * Valid only between decoder_emit_frame_yuv420 and the next decode.
-     * Pointers reference decoder-owned memory (dav1d / libvpx). */
-    const uint8_t *pending_yuv_y;
-    const uint8_t *pending_yuv_u;
-    const uint8_t *pending_yuv_v;
-    ptrdiff_t      pending_yuv_y_stride;
-    ptrdiff_t      pending_yuv_uv_stride;
-    uint32_t       pending_yuv_w;
-    uint32_t       pending_yuv_h;
-    bool           pending_yuv_valid;
-    JceYuvColor    pending_yuv_color;
-
-    uint8_t *display_rgba;
-    int      display_rgba_w;
-    int      display_rgba_h;
-    size_t   display_rgba_capacity;
-    double   display_frame_time;
-    uint64_t display_frame_counter;
-    bool     seek_display_pending;
-    double   seek_display_target;
-
-    /* Stage 2 zero-copy pop: pop swaps YUV plane pointers between the
-     * queue entry and these display-side buffers. The expensive
-     * YUV → RGBA conversion runs OUTSIDE the queue lock so the worker
-     * can keep decoding. Buffers cycle entry ↔ display each pop. */
-    uint8_t *display_y; size_t display_y_capacity;
-    uint8_t *display_u; size_t display_u_capacity;
-    uint8_t *display_v; size_t display_v_capacity;
-    int      display_y_stride;
-    int      display_uv_stride;
-    int      display_yuv_w;
-    int      display_yuv_h;
-    bool     display_yuv_pending;
-    JceYuvPreview preview; /* UI fallback for frames queued before configuration */
-    JceVideoFrameProcessor frame_processor; /* worker-owned */
-    JceVideoFrameProcessor display_processor; /* owner-only, borrows display RGBA */
-    uint32_t worker_preview_limit; /* protected by qmtx */
-    JceVideoPresentationTarget presentation; /* protected by qmtx */
-    bool preview_supported; /* fixed before worker start; safe during seek */
-    JceVideoSeekTrace seek_trace; /* worker-owned, opt-in diagnostic only */
-
-    void *worker_thread;               /* JceThread* */
-
-    /* ── Perf probes (S1) ─────────────────────────────────────────
-     * EMA-smoothed per-frame timings in microseconds. Updated by
-     * worker thread (decode/convert/push) and UI thread (pop).
-     * Read race-free via jce_video_get_perf_stats — we accept stale
-     * reads since this is debug-only. */
-    double   perf_decode_us_ema;
-    double   perf_convert_us_ema;     /* UI-side for queued YUV */
-    double   perf_push_us_ema;
-    double   perf_pop_us_ema;
-    double   perf_decode_us_last;
-    double   perf_convert_us_last;
-    double   perf_push_us_last;
-    double   perf_pop_us_last;
-    uint64_t perf_frames_decoded;
-    uint64_t perf_frames_displayed;
-    uint64_t perf_frames_dropped;     /* late frames skipped during pop */
-    uint64_t perf_perf_freq;          /* jce_time_perf_freq() cache */
-} VideoSlot;
-
-#define JCE_VIDEO_Q_CAP 8
-
-struct VideoQueueEntry {
-    /* RGBA path (H264/H265 / legacy). */
-    uint8_t *rgba;
-    size_t   rgba_capacity;
-    /* YUV path (AV1 / VP8, Stage 2 — saves ~100MB at 4K vs RGBA). */
-    uint8_t *y;        size_t y_capacity;
-    uint8_t *u;        size_t u_capacity;
-    uint8_t *v;        size_t v_capacity;
-    int      y_stride;       /* tight: == w   */
-    int      uv_stride;      /* tight: == w/2 */
-    bool     is_yuv;         /* true: use y/u/v; false: use rgba */
-    JceYuvColor color;       /* travels with the same frame and seek serial */
-    int      w;
-    int      h;
-    double   pts_sec;
-    uint64_t serial;
+class JceVideoLifecycleScope {
+    JceTraceScope scope_;
+    JceTraceTaskState state_;
+public:
+    explicit JceVideoLifecycleScope(const char *name, uint64_t parent = 0,
+        JceTraceTaskState state = JCE_TRACE_TASK_SUCCEEDED)
+        : scope_(jce_trace_scope_begin_parent(name, parent)), state_(state) {}
+    ~JceVideoLifecycleScope() { jce_trace_scope_end(scope_, state_); }
+    uint64_t id() const { return scope_.id; }
+    void state(JceTraceTaskState state) { state_ = state; }
+    JceVideoLifecycleScope(const JceVideoLifecycleScope &) = delete;
+    JceVideoLifecycleScope &operator=(const JceVideoLifecycleScope &) = delete;
 };
 
 static VideoSlot s_slots[JCE_MAX_VIDEOS];
@@ -840,7 +661,7 @@ static const uint8_t *decoder_mp4_packet(VideoSlot *slot,
     return slot->decoder.packet;
 }
 
-static bool av1_decoder_open(VideoSlot *slot, JceReadSource *source)
+static bool av1_decoder_open_impl(VideoSlot *slot, JceReadSource *source)
 {
     if (!slot || !source) return false;
     JceAv1FrameInfo info = {0};
@@ -869,6 +690,14 @@ static bool av1_decoder_open(VideoSlot *slot, JceReadSource *source)
     slot->frame_time = jce_video_timestamp_normalize(slot->frame_counter, slot->frame_time, slot->framerate,
         slot->post_seek, &slot->decode_ts_base_set, &slot->decode_ts_base_sec, 0.0, true);
     return true;
+}
+
+static bool av1_decoder_open(VideoSlot *slot, JceReadSource *source)
+{
+    JceVideoLifecycleScope scope("video_decoder_open");
+    const bool result = av1_decoder_open_impl(slot, source);
+    if (!result) scope.state(JCE_TRACE_TASK_FAILED);
+    return result;
 }
 
 static double av1_frame_interval(const VideoSlot *slot)
@@ -1205,7 +1034,7 @@ static bool mp4_av1_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
  *  coarse seek work end-to-end.
  * ====================================================================== */
 
-static bool webm_decoder_open(VideoSlot *slot, JceReadSource *source)
+static bool webm_decoder_open_impl(VideoSlot *slot, JceReadSource *source)
 {
     if (!slot || !source) return false;
     JceWebmInfo info{};
@@ -1253,6 +1082,14 @@ static bool webm_decoder_open(VideoSlot *slot, JceReadSource *source)
     slot->decoder.webm_audio_samplerate = info.audio_samplerate;
     slot->decoder.ended             = false;
     return true;
+}
+
+static bool webm_decoder_open(VideoSlot *slot, JceReadSource *source)
+{
+    JceVideoLifecycleScope scope("video_decoder_open");
+    const bool result = webm_decoder_open_impl(slot, source);
+    if (!result) scope.state(JCE_TRACE_TASK_FAILED);
+    return result;
 }
 
 static bool webm_decoder_read_next(VideoSlot *slot)
@@ -1544,7 +1381,7 @@ static double decoder_legacy_timestamp(const VideoSlot *slot)
         ? (double)timestamp / slot->decoder.vtrack.timescale : 0.0;
 }
 
-static bool decoder_open(VideoSlot *slot, JceReadSource *source,
+static bool decoder_open_impl(VideoSlot *slot, JceReadSource *source,
                          JceMp4Parser *parser)
 {
     if (!slot || !parser) return false;
@@ -1752,7 +1589,16 @@ static bool decoder_open(VideoSlot *slot, JceReadSource *source,
     return true;
 }
 
-static bool decoder_read_next(VideoSlot *slot)
+static bool decoder_open(VideoSlot *slot, JceReadSource *source,
+                         JceMp4Parser *parser)
+{
+    JceVideoLifecycleScope scope("video_decoder_open");
+    const bool result = decoder_open_impl(slot, source, parser);
+    if (!result) scope.state(JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
+static bool decoder_read_next_impl(VideoSlot *slot)
 {
     if (!slot) return false;
     if (slot->decoder.webm) return webm_decoder_read_next(slot);
@@ -1866,6 +1712,15 @@ static bool decoder_read_next(VideoSlot *slot)
 
 /* Check whether a video sample is a keyframe (IDR / random-access point)
  * by inspecting NAL unit types in the bitstream data. */
+static bool decoder_read_next(VideoSlot *slot)
+{
+    JceVideoLifecycleScope scope("video_decode");
+    const bool picture = decoder_read_next_impl(slot);
+    jce_video_lifecycle_counter(scope.id(), picture ? "video_decode_picture"
+        : slot && slot->decoder.ended ? "video_decode_eof" : "video_decode_pending", 1);
+    return picture;
+}
+
 static bool is_sample_keyframe(const VideoSlot *slot, uint32_t sample_index)
 {
     bool sync = false;
@@ -1873,7 +1728,7 @@ static bool is_sample_keyframe(const VideoSlot *slot, uint32_t sample_index)
         && sync;
 }
 
-static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
+static bool decoder_seek_impl(VideoSlot *slot, double time_sec, bool exact)
 {
     if (!slot) return false;
     if (slot->decoder.webm) return webm_decoder_seek(slot, time_sec, exact);
@@ -2015,6 +1870,14 @@ static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     return true;
 }
 
+static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
+{
+    JceVideoLifecycleScope scope("video_seek_decode");
+    const bool result = decoder_seek_impl(slot, time_sec, exact);
+    if (!result) scope.state(JCE_TRACE_TASK_FAILED);
+    return result;
+}
+
 static void decoder_close(VideoSlot *slot)
 {
     if (!slot) return;
@@ -2065,6 +1928,8 @@ static VideoQueueEntry *qe_at(const VideoSlot *slot, int idx)
 static void queue_clear_locked(VideoSlot *slot)
 {
     /* Caller holds qmtx. Buffers stay allocated for reuse. */
+    if (slot->q_count) jce_video_lifecycle_counter(slot->trace_owner,
+        "video_queue_clear_drop", slot->q_count);
     slot->q_head = 0;
     slot->q_tail = 0;
     slot->q_count = 0;
@@ -2118,6 +1983,16 @@ static void queue_destroy(VideoSlot *slot)
  * Routes to RGBA or YUV-planes payload based on slot->queue_yuv_mode.
  * Must be called only from the worker thread (touches decoder and
  * queue). Returns false on push failure (alloc OOM); true otherwise. */
+static void worker_trace_committed_locked(VideoSlot *slot, uint64_t serial)
+{
+    jce_video_lifecycle_counter(slot->trace_owner, "video_queue_push", slot->q_count);
+    JceVideoLifecycleSeek *request = &slot->trace_active_seek;
+    if (request->id && request->serial == serial && serial == slot->seek_serial
+        && !slot->seek_request && !slot->quit_request
+        && (!slot->seek_exact || slot->frame_time + 0.0005 >= slot->seek_target_sec))
+        jce_video_lifecycle_seek_finish(request, "video_seek_queue_ready", JCE_TRACE_TASK_SUCCEEDED);
+}
+
 static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
 {
     bool prepared = false;
@@ -2132,8 +2007,10 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
             (int)slot->pending_yuv_y_stride, (int)slot->pending_yuv_uv_stride,
             (int)slot->pending_yuv_w, (int)slot->pending_yuv_h, slot->pending_yuv_color
         };
-        if (!jce_video_frame_prepare(&slot->frame_processor, &input, limit))
+        if (!jce_video_frame_prepare(&slot->frame_processor, &input, limit)) {
+            jce_video_lifecycle_counter(slot->trace_owner, "video_queue_prepare_failed", 1);
             return false;
+        }
         slot->pending_yuv_valid = false;
         prepared = true;
         jce_mutex_lock(slot->qmtx);
@@ -2159,10 +2036,11 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
             if (head->pts_sec + 2.0 < slot->frame_time) {
                 slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
                 slot->q_count--;
+                jce_video_lifecycle_counter(slot->trace_owner, "video_queue_drop", 1);
                 slot->perf_frames_dropped++;
                 break;
             }
-            jce_cond_wait(slot->q_not_full, slot->qmtx);
+            jce_video_lifecycle_cond_wait(slot->q_not_full, slot->qmtx, "video_queue_wait");
         }
         if (slot->quit_request || slot->seek_request) {
             jce_mutex_unlock(slot->qmtx);
@@ -2176,19 +2054,19 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
         if (e->y_capacity < y_need) {
             JCE_FREE(e->y);
             e->y = (uint8_t *)JCE_MALLOC(y_need);
-            if (!e->y) { e->y_capacity = 0; jce_mutex_unlock(slot->qmtx); return false; }
+            if (!e->y) { e->y_capacity = 0; jce_video_lifecycle_counter(slot->trace_owner, "video_queue_oom", 1); jce_mutex_unlock(slot->qmtx); return false; }
             e->y_capacity = y_need;
         }
         if (e->u_capacity < uv_need) {
             JCE_FREE(e->u);
             e->u = (uint8_t *)JCE_MALLOC(uv_need);
-            if (!e->u) { e->u_capacity = 0; jce_mutex_unlock(slot->qmtx); return false; }
+            if (!e->u) { e->u_capacity = 0; jce_video_lifecycle_counter(slot->trace_owner, "video_queue_oom", 1); jce_mutex_unlock(slot->qmtx); return false; }
             e->u_capacity = uv_need;
         }
         if (e->v_capacity < uv_need) {
             JCE_FREE(e->v);
             e->v = (uint8_t *)JCE_MALLOC(uv_need);
-            if (!e->v) { e->v_capacity = 0; jce_mutex_unlock(slot->qmtx); return false; }
+            if (!e->v) { e->v_capacity = 0; jce_video_lifecycle_counter(slot->trace_owner, "video_queue_oom", 1); jce_mutex_unlock(slot->qmtx); return false; }
             e->v_capacity = uv_need;
         }
         /* Copy planes tight (drop dav1d/libvpx padding strides). */
@@ -2212,6 +2090,7 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
 
         slot->q_tail = (slot->q_tail + 1) % JCE_VIDEO_Q_CAP;
         slot->q_count++;
+        worker_trace_committed_locked(slot, serial);
         jce_cond_signal(slot->q_not_empty);
         jce_mutex_unlock(slot->qmtx);
         slot->pending_yuv_valid = false;
@@ -2235,10 +2114,11 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
         if (head->pts_sec + 2.0 < slot->frame_time) {
             slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
             slot->q_count--;
+            jce_video_lifecycle_counter(slot->trace_owner, "video_queue_drop", 1);
             slot->perf_frames_dropped++;
             break;
         }
-        jce_cond_wait(slot->q_not_full, slot->qmtx);
+        jce_video_lifecycle_cond_wait(slot->q_not_full, slot->qmtx, "video_queue_wait");
     }
     if (slot->quit_request || slot->seek_request) {
         jce_mutex_unlock(slot->qmtx);
@@ -2255,6 +2135,7 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
         *capacity = old_capacity;
     } else {
         if (!jce_yuv_buffer_reserve(&e->rgba, &e->rgba_capacity, need)) {
+            jce_video_lifecycle_counter(slot->trace_owner, "video_queue_oom", 1);
             jce_mutex_unlock(slot->qmtx);
             return false;
         }
@@ -2268,9 +2149,25 @@ static bool worker_push_current_frame(VideoSlot *slot, uint64_t serial)
 
     slot->q_tail = (slot->q_tail + 1) % JCE_VIDEO_Q_CAP;
     slot->q_count++;
+    worker_trace_committed_locked(slot, serial);
     jce_cond_signal(slot->q_not_empty);
     jce_mutex_unlock(slot->qmtx);
     return true;
+}
+
+static void worker_lifecycle_seek_finish(VideoSlot *slot, const char *event,
+                                          JceTraceTaskState state)
+{
+    if (!slot->trace_active_seek.id) return;
+    jce_mutex_lock(slot->qmtx);
+    const bool current = slot->trace_active_seek.serial == slot->seek_serial
+        && !slot->seek_request && !slot->quit_request;
+    if (!current) {
+        event = slot->quit_request ? "video_seek_cancelled" : "video_seek_superseded";
+        state = JCE_TRACE_TASK_CANCELLED;
+    }
+    jce_video_lifecycle_seek_finish(&slot->trace_active_seek, event, state);
+    jce_mutex_unlock(slot->qmtx);
 }
 
 static void worker_seek_trace_finish(VideoSlot *slot, const char *event)
@@ -2319,12 +2216,14 @@ static void worker_main(VideoSlot *slot)
     while (true) {
         /* Honor quit / seek commands FIRST. */
         bool do_seek = false;
+        JceVideoLifecycleSeek trace_request = {};
         double seek_t = 0.0;
         bool   seek_exact = false;
         jce_mutex_lock(slot->qmtx);
         if (slot->quit_request) {
             jce_mutex_unlock(slot->qmtx);
             worker_seek_trace_finish(slot, "cancel");
+            jce_video_lifecycle_seek_finish(&slot->trace_active_seek, "video_seek_cancelled", JCE_TRACE_TASK_CANCELLED);
             return;
         }
         if (slot->seek_request) {
@@ -2335,11 +2234,16 @@ static void worker_main(VideoSlot *slot)
             queue_clear_locked(slot);
             slot->worker_eof = false;
             my_serial = slot->seek_serial;
+            trace_request = slot->trace_pending_seek;
+            slot->trace_pending_seek = {};
             jce_cond_broadcast(slot->q_not_full);   /* wake any pusher waiting */
         }
         jce_mutex_unlock(slot->qmtx);
 
         if (do_seek) {
+            jce_video_lifecycle_seek_finish(&slot->trace_active_seek, "video_seek_superseded", JCE_TRACE_TASK_CANCELLED);
+            slot->trace_active_seek = trace_request;
+            jce_video_lifecycle_seek_pickup(&slot->trace_active_seek);
             worker_seek_trace_finish(slot, "cancel");
             if (slot->seek_trace.enabled)
                 jce_video_seek_trace_begin(&slot->seek_trace, my_serial, seek_t, jce_time_ticks_ms());
@@ -2351,7 +2255,10 @@ static void worker_main(VideoSlot *slot)
              * is skipped (and audio can wait forever for a visible frame). */
             slot->pending_yuv_valid = false;
             const bool seek_ok = decoder_seek(slot, seek_t, seek_exact);
-            if (!seek_ok) worker_seek_trace_finish(slot, "failed");
+            if (!seek_ok) {
+                worker_seek_trace_finish(slot, "failed");
+                worker_lifecycle_seek_finish(slot, "video_seek_failed", JCE_TRACE_TASK_FAILED);
+            }
             if (seek_ok && (!seek_exact || slot->frame_time + 0.0005 >= seek_t)
                 && (slot->pending_yuv_valid || (slot->rgba && slot->frame_counter > 1))) {
                 if (worker_push_current_frame(slot, my_serial))
@@ -2365,10 +2272,11 @@ static void worker_main(VideoSlot *slot)
 
         /* If we've hit EOF without loop, idle until quit/seek. */
         if (slot->decoder.ended) {
+            worker_lifecycle_seek_finish(slot, "video_seek_eof", JCE_TRACE_TASK_FAILED);
             jce_mutex_lock(slot->qmtx);
             slot->worker_eof = true;
             while (!slot->quit_request && !slot->seek_request) {
-                jce_cond_wait(slot->q_not_full, slot->qmtx);
+                jce_video_lifecycle_cond_wait(slot->q_not_full, slot->qmtx, "video_eof_wait");
             }
             jce_mutex_unlock(slot->qmtx);
             consec_fail = 0;
@@ -2396,6 +2304,7 @@ static void worker_main(VideoSlot *slot)
         if (!ok) {
             if (slot->decoder.ended) {
                 worker_seek_trace_finish(slot, "failed");
+                worker_lifecycle_seek_finish(slot, "video_seek_eof", JCE_TRACE_TASK_FAILED);
                 /* Mark EOF; wait for quit/seek. */
                 jce_mutex_lock(slot->qmtx);
                 slot->worker_eof = true;
@@ -2422,6 +2331,7 @@ static void worker_main(VideoSlot *slot)
             slot->pending_yuv_valid = false;
             jce_mutex_lock(slot->qmtx);
             ++slot->perf_frames_dropped;
+            jce_video_lifecycle_counter(slot->trace_owner, "video_queue_preroll_drop", 1);
             jce_mutex_unlock(slot->qmtx);
             continue;
         }
@@ -2433,7 +2343,7 @@ static void worker_main(VideoSlot *slot)
         if (obsolete) jce_video_presentation_trace(&slot->presentation,
             slot->seek_trace.enabled, slot->frame_time, LOG_TAG, __FILE__, __LINE__);
         jce_mutex_unlock(slot->qmtx);
-        if (obsolete) { slot->pending_yuv_valid = false; continue; }
+        if (obsolete) { jce_video_lifecycle_counter(slot->trace_owner, "video_queue_obsolete_drop", 1); slot->pending_yuv_valid = false; continue; }
 
         const uint64_t t_push0 = perf_now();
         const bool push_ok = worker_push_current_frame(slot, my_serial);
@@ -2455,13 +2365,18 @@ static void worker_main(VideoSlot *slot)
 
 static void worker_thread_entry(void *arg)
 {
-    worker_main((VideoSlot *)arg);
+    VideoSlot *slot = (VideoSlot *)arg;
+    JceVideoLifecycleScope scope("video_worker", slot->trace_owner);
+    worker_main(slot);
 }
 
 static bool worker_start(VideoSlot *slot)
 {
     if (slot->queue_active) return true;
-    if (!queue_init(slot)) return false;
+    if (!queue_init(slot)) {
+        jce_video_lifecycle_counter(slot->trace_owner, "video_worker_queue_failed", 1);
+        return false;
+    }
     /* S4: YUV queue mode enabled.  The queue now stores raw YUV420 planes
      * (~12 MB/frame at 4K vs ~33 MB RGBA), and YUV→RGBA conversion (S3 AVX2,
      * now ~5 ms @ 4K) runs OUTSIDE the queue lock in ui_pop_for_target so the
@@ -2476,6 +2391,7 @@ static bool worker_start(VideoSlot *slot)
     slot->worker_thread = jce_thread_create(worker_thread_entry, slot,
                                             "jce_video_worker");
     if (!slot->worker_thread) {
+        jce_video_lifecycle_counter(slot->trace_owner, "video_worker_start_failed", 1);
         slot->queue_active = false;
         slot->preview_supported = false;
         slot->worker_running = false;
@@ -2490,10 +2406,12 @@ static void worker_stop(VideoSlot *slot)
     if (!slot->queue_active) return;
     jce_mutex_lock(slot->qmtx);
     slot->quit_request = true;
+    jce_video_lifecycle_seek_finish(&slot->trace_pending_seek, "video_seek_cancelled", JCE_TRACE_TASK_CANCELLED);
     jce_cond_broadcast(slot->q_not_full);
     jce_cond_broadcast(slot->q_not_empty);
     jce_mutex_unlock(slot->qmtx);
     if (slot->worker_thread) {
+        JceVideoLifecycleScope join("video_worker_join", slot->trace_owner);
         jce_thread_join((JceThread *)slot->worker_thread);
         slot->worker_thread = NULL;
     }
@@ -2511,6 +2429,8 @@ static void worker_request_seek(VideoSlot *slot, double target_sec, bool exact)
     slot->seek_target_sec = target_sec;
     slot->seek_exact = exact;
     slot->seek_serial++;
+    jce_video_lifecycle_seek_finish(&slot->trace_pending_seek, "video_seek_superseded", JCE_TRACE_TASK_CANCELLED);
+    slot->trace_pending_seek = jce_video_lifecycle_seek_submit(slot->trace_owner, slot->seek_serial);
     queue_clear_locked(slot);
     slot->worker_eof = false;
     jce_cond_broadcast(slot->q_not_full);
@@ -2551,6 +2471,7 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec, bool active)
         if (e->serial == cur_serial) break;
         slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
         slot->q_count--;
+        jce_video_lifecycle_counter(slot->trace_owner, "video_queue_old_serial_drop", 1);
     }
 
     /* Drop drastically stale frames (post-seek keyframe walk artifacts). */
@@ -2559,6 +2480,7 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec, bool active)
         if (e->pts_sec >= target_sec - 2.0) break;
         slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
         slot->q_count--;
+        jce_video_lifecycle_counter(slot->trace_owner, "video_queue_drop", 1);
         ++drops_this_call;
     }
 
@@ -2578,6 +2500,7 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec, bool active)
         while (slot->q_count > 0 && qe_at(slot, slot->q_head)->pts_sec + seek_slack < slot->seek_display_target) {
             slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
             slot->q_count--;
+            jce_video_lifecycle_counter(slot->trace_owner, "video_queue_drop", 1);
             ++drops_this_call;
         }
         if (drops_this_call) {
@@ -2603,6 +2526,7 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec, bool active)
         display_e = e;
         slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
         slot->q_count--;
+        jce_video_lifecycle_counter(slot->trace_owner, "video_queue_pop", 1);
     }
 
     /* Only use look-ahead when no due picture exists. Selecting every
@@ -2614,6 +2538,7 @@ static bool ui_pop_for_target(VideoSlot *slot, double target_sec, bool active)
             display_e = e;
             slot->q_head = (slot->q_head + 1) % JCE_VIDEO_Q_CAP;
             slot->q_count--;
+            jce_video_lifecycle_counter(slot->trace_owner, "video_queue_pop", 1);
         }
     }
 
@@ -2703,6 +2628,7 @@ extern "C" {
 
 JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
 {
+    JceVideoLifecycleScope open("video_open", 0, JCE_TRACE_TASK_FAILED);
     JceMp4Parser *parser;
     uint8_t data[32];
     const size_t size = jce_read_source_read_at(source,0u,data,sizeof(data));
@@ -2718,12 +2644,16 @@ JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
     if (jce_av1_is_ivf(data, size)) {
         VideoSlot *slot = &s_slots[idx];
         memset(slot, 0, sizeof(*slot));
+        slot->trace_owner = open.id();
         slot->source = jce_read_source_acquire(source);
 
         if (!av1_decoder_open(slot,source)) {
             LOG_ERROR(LOG_TAG, "AV1/IVF open failed for '%s'",
                       hint_path ? hint_path : "<memory>");
-            jce_read_source_close(slot->source);
+            {
+                JceVideoLifecycleScope source("video_source_close", slot->trace_owner);
+                jce_read_source_close(slot->source);
+            }
             memset(slot,0,sizeof(*slot));
             return JCE_VIDEO_INVALID;
         }
@@ -2756,6 +2686,8 @@ JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
             "parsed '%s' codec=av01 (IVF) %dx%d fps=%.3f decode=active",
             hint_path ? hint_path : "<memory>",
             slot->width, slot->height, slot->framerate);
+        open.state(JCE_TRACE_TASK_SUCCEEDED);
+        jce_video_lifecycle_counter(slot->trace_owner, slot->metadata_only ? "video_open_metadata" : "video_open_decoder", 1);
         return (JceVideo)(idx + 1);
     }
 
@@ -2763,12 +2695,16 @@ JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
     if (jce_webm_is_webm(data, size)) {
         VideoSlot *slot = &s_slots[idx];
         memset(slot, 0, sizeof(*slot));
+        slot->trace_owner = open.id();
 
         slot->source = jce_read_source_acquire(source);
         if (!webm_decoder_open(slot,source)) {
             LOG_ERROR(LOG_TAG, "WebM open failed for '%s'",
                       hint_path ? hint_path : "<memory>");
-            jce_read_source_close(slot->source);
+            {
+                JceVideoLifecycleScope source("video_source_close", slot->trace_owner);
+                jce_read_source_close(slot->source);
+            }
             memset(slot, 0, sizeof(*slot));
             return JCE_VIDEO_INVALID;
         }
@@ -2844,6 +2780,8 @@ JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
             hint_path ? hint_path : "<memory>",
             slot->video_codec, slot->width, slot->height, slot->duration,
             slot->has_audio ? slot->audio_codec : "none");
+        open.state(JCE_TRACE_TASK_SUCCEEDED);
+        jce_video_lifecycle_counter(slot->trace_owner, slot->metadata_only ? "video_open_metadata" : "video_open_decoder", 1);
         return (JceVideo)(idx + 1);
     }
 
@@ -2858,6 +2796,7 @@ JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
 
     VideoSlot *slot = &s_slots[idx];
     memset(slot, 0, sizeof(*slot));
+    slot->trace_owner = open.id();
     slot->source = jce_read_source_acquire(source);
 
     slot->width      = (int)mp4.width;
@@ -3028,6 +2967,8 @@ JceVideo jce_video_load_source(JceReadSource *source, const char *hint_path)
         slot->audio_channels,
         slot->metadata_only ? "metadata-only" : "active");
 
+    open.state(JCE_TRACE_TASK_SUCCEEDED);
+    jce_video_lifecycle_counter(slot->trace_owner, slot->metadata_only ? "video_open_metadata" : "video_open_decoder", 1);
     return (JceVideo)(idx + 1);
 }
 
@@ -3052,6 +2993,7 @@ void jce_video_unload(JceVideo v)
 {
     VideoSlot *slot = slot_from_handle(v);
     if (!slot) return;
+    JceVideoLifecycleScope close("video_close", slot->trace_owner);
 
     /* Stop the decode worker FIRST — it owns the decoder/parser. */
     worker_stop(slot);
@@ -3060,11 +3002,15 @@ void jce_video_unload(JceVideo v)
      * retains. Its worker thread reads from
      * those, so the order matters. */
     if (slot->audio_stream) {
+        JceVideoLifecycleScope audio("video_audio_close", slot->trace_owner);
         jce_audio_stream_destroy(slot->audio_stream);
         slot->audio_stream = NULL;
     }
 
-    decoder_close(slot);
+    {
+        JceVideoLifecycleScope decoder("video_decoder_close", slot->trace_owner);
+        decoder_close(slot);
+    }
 
     if (slot->audio_pcm) { JCE_FREE(slot->audio_pcm); slot->audio_pcm = NULL; }
 
@@ -3074,7 +3020,10 @@ void jce_video_unload(JceVideo v)
     jce_video_frame_destroy(&slot->frame_processor);
     jce_video_frame_destroy(&slot->display_processor);
     JCE_FREE(slot->decoder.packet);
-    jce_read_source_close(slot->source);
+    {
+        JceVideoLifecycleScope source("video_source_close", slot->trace_owner);
+        jce_read_source_close(slot->source);
+    }
     if (slot->display_y) { JCE_FREE(slot->display_y); slot->display_y = NULL; slot->display_y_capacity = 0; }
     if (slot->display_u) { JCE_FREE(slot->display_u); slot->display_u = NULL; slot->display_u_capacity = 0; }
     if (slot->display_v) { JCE_FREE(slot->display_v); slot->display_v = NULL; slot->display_v_capacity = 0; }

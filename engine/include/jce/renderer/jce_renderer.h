@@ -153,7 +153,18 @@ JCE_API bool jce_renderer_request_screenshot(const char *path);
  * fbo_idx == UINT16_MAX falls back to the backbuffer path. */
 JCE_API bool jce_renderer_request_screenshot_fbo(uint16_t fbo_idx, const char *path);
 
+/* Requests require an active windowed renderer with screenshot capability;
+ * headless/fallback and destroyed renderers reject without GPU submission.
+ * Main-thread file-capture requests share one bounded slot, including texture
+ * readback. Pending covers GPU delivery, encoding and actual file writing.
+ * Poll is non-consuming: -1 idle, 0 pending, 1 successfully wrote, 2 failed.
+ * Terminal results remain until the next accepted request. Shutdown fails an
+ * unfinished request; successful or failed completed results remain readable.
+ * Read the result before a different file consumer submits; this API does not
+ * provide per-consumer tickets. Success is the encoder/file API result, not
+ * durable storage, GPU idle or presentation. Output paths are limited to 511 bytes. */
 JCE_API bool jce_renderer_screenshot_pending(void);
+JCE_API int jce_renderer_screenshot_poll(void);
 
 /* Take the automated capture (JCE_CAPTURE_FRAME) instead of the renderer.
  * Return true if the shot was taken or submitted; false falls back to the
@@ -235,29 +246,40 @@ JCE_API bool jce_renderer_request_fbo_capture(uint16_t fbo_idx,
                                               JceFboCaptureFn sink, void *ud);
 JCE_API bool jce_renderer_fbo_capture_pending(void);
 
-/* Headless offscreen capture: blit `src_tex_idx` (an LDR/RGBA8 texture, e.g. the
- * editor scene-view's postfx output) into a read-back staging texture on
- * `blit_view`, read it back to CPU, and write a PNG to `path`.  Unlike
- * jce_renderer_request_screenshot (which only completes on a foreground present),
- * this is a pure GPU->CPU copy that finishes during normal frame processing, so
- * it works with NO window focus (headless).  Poll _poll() each frame until != 0.
- * One capture in flight; returns false if busy or args are invalid.
+/* Legacy offscreen PNG capture for an RGBA16F source texture ONLY. It blits
+ * into matching RGBA16F staging on `blit_view`, reads half-float pixels, then
+ * converts tonemapped 0..1 values to RGBA8 PNG. The active GPU backend must
+ * support BLIT/READBACK and that source format; Noop/fallback is unavailable.
+ * Arbitrary typed formats use the existing jce_render_readback_submit API.
+ * This GPU->CPU path needs no foreground presentation; an unfocused/hidden
+ * real GPU window works, unlike the backbuffer screenshot path. Poll _poll()
+ * each frame until != 0. One file capture in flight; false means busy/invalid.
  * `yflip`: 1 when the SOURCE's readback rows are bottom-up — same contract as
  * _submit_sink: pass 1 for the engine postfx RT, `bgfx caps originBottomLeft`
  * for plain FBO passes (top-down on D3D/VK/Metal, bottom-up only on GL). */
 JCE_API bool jce_renderer_readback_capture_submit(uint16_t src_tex_idx, uint16_t blit_view,
                                                   uint16_t w, uint16_t h, const char *path,
                                                   int yflip);
-/* -1 = idle, 0 = pending (call again next frame), 1 = wrote PNG, 2 = write failed. */
+/* -1 = idle, 0 = pending (call again next frame), 1 = wrote PNG, 2 = write failed.
+ * This legacy poll consumes terminal 1/2 once; later polls return -1.
+ * The screenshot_poll() latest-result query above is non-consuming. */
 JCE_API int  jce_renderer_readback_capture_poll(void);
 
 /* PNG encoding for path-mode captures runs on a writer thread, because doing
  * it inline cost ~100 ms per screenshot and tripped the fixed clock's spiral
- * guard.  _poll() therefore returns once the pixels have been handed over,
- * not once the file exists.
- *   _flush()    - block until every queued capture has been written.  Call
+ * guard. jce_renderer_readback_capture_poll() remains pending until actual
+ * encoding and file writing finish.
+ *   jce_renderer_readback_capture_flush() blocks until queued CPU writes finish.
+ *                 Call
  *                 before a process exits or before reading the files back.
- *   _shutdown() - flush, then stop and join the writer thread. */
+ *   jce_renderer_readback_capture_shutdown() cancels undelivered file requests,
+ *                 drains already-owned pixel
+ *                 callbacks and CPU writes, then join the writer. Renderer
+ *                 teardown retains GPU-borrowed CPU storage until bgfx stops.
+ *                 Use at renderer teardown, not as readback pause/restart.
+ *                 A newly created windowed backend reopens file admission.
+ * The flush function drains CPU jobs already queued; it does not wait for GPU
+ * readbacks not yet delivered. */
 /* Which GPU to ask for on a machine that has more than one.  Accepts "auto"
  * (driver default), "integrated"/"intel", "discrete"/"nvidia"/"amd", or a raw
  * PCI vendor id like "0x10DE".  MUST be set before the renderer is created --
@@ -427,28 +449,41 @@ typedef struct JceGpuViewStat {
     double   cpu_ms;
 } JceGpuViewStat;
 
-/* Flat, backend-agnostic snapshot of the last submitted frame.  All
-   timings are pre-resolved to milliseconds; memory counters are bytes.
-   This is the public surface that replaces direct bgfx_get_stats()
-   access in consumer code. */
+/* Backend-agnostic copy of the latest available backend statistics.
+ * Timing results can be latched; resource, size and timing fields may have
+ * different freshness. This is not an exact engine-frame snapshot or proof
+ * of GPU completion. Timings are milliseconds; memory counters are bytes.
+ * Consumers query this surface instead of accessing backend stats directly. */
 typedef struct JceGpuStats {
-    bool     valid;             /* false when the backend has no stats  */
+    bool     valid;             /* Stats exist; not timer availability. */
 
-    /* Timing (milliseconds). */
+    /* Timing conversions in milliseconds. A nonpositive backend timer
+     * frequency converts to 0; a valid zero does not establish timer support
+     * or absence of waiting. Raw frequencies and timing sample frame IDs
+     * are not exposed.
+     * cpu_frame_ms is the backend interval between frame-advance calls.
+     * cpu_submit_ms measures render-thread CPU issuing graphics commands.
+     * gpu_ms is latched backend GPU timing without an engine-frame join.
+     * wait_submit_ms measures render-thread waiting for the next submit;
+     * wait_render_ms measures API-thread waiting for the render backend.
+     * These waits belong to different threads; do not add them as API-thread
+     * subphases or treat them as exact subphases of the current engine frame. */
     double   cpu_frame_ms;
     double   cpu_submit_ms;
     double   gpu_ms;
     double   wait_submit_ms;
     double   wait_render_ms;
 
-    /* Per-frame counts. */
+    /* Backend-reported submitted counts. */
     uint32_t num_draw;
     uint32_t num_compute;
     uint32_t num_blit;
 
-    /* Backbuffer + latency. */
+    /* Backend-reported backbuffer size and latency counter. */
     uint16_t backbuffer_width;
     uint16_t backbuffer_height;
+    /* Implementation-dependent raw counter; not milliseconds or a measure
+     * of the current GPU queue depth. */
     uint32_t max_gpu_latency;
 
     /* Resource counts. */
@@ -470,10 +505,51 @@ typedef struct JceGpuStats {
     JceGpuViewStat views[JCE_GPU_MAX_VIEW_STATS];
 } JceGpuStats;
 
-/* Fill `out` with the most recent frame's GPU statistics.  Returns true
-   and sets out->valid when the backend reports stats, false otherwise
-   (out is still zero-initialized so callers can render placeholders). */
+/* Copy available backend statistics into `out`. This call does not advance
+ * a frame; successive reads can return the same latched timing values.
+ * Returns true and sets out->valid when statistics exist; this does not
+ * certify timer support, timer frequency or GPU completion. Returns false
+ * when statistics are unavailable (a non-NULL out is zero-initialized).
+ * See JceGpuStats for timing and freshness limits. */
 JCE_API bool jce_renderer_get_gpu_stats(JceGpuStats *out);
+
+/* Versioned, bounded observation of the latest backend GPU interval. This is
+ * read on the renderer API-owner thread; it does not advance or wait for a
+ * frame. Host/context identity is observed at read time, while gpu_source_frame
+ * names bgfx's possibly older sample: these are not an exact frame join, fence,
+ * completed resource-retirement or presentation observation. */
+typedef enum JceGpuTimingUnavailableReason {
+    JCE_GPU_TIMING_AVAILABLE = 0,
+    JCE_GPU_TIMING_CONTEXT_UNAVAILABLE,
+    JCE_GPU_TIMING_BACKEND_UNAVAILABLE,
+    JCE_GPU_TIMING_FREQUENCY_UNAVAILABLE,
+    JCE_GPU_TIMING_INTERVAL_UNAVAILABLE
+} JceGpuTimingUnavailableReason;
+
+typedef struct JceGpuTimingObservation {
+    uint32_t struct_size;       /* Bytes written by this version. */
+    uint32_t version;           /* Currently 1. */
+    JceGpuTimingUnavailableReason unavailable_reason;
+    bool context_available;
+    bool backend_available;
+    bool timer_available;
+    uint32_t read_host_frame_index; /* CPU-side bgfx frame owner at read time. */
+    uint32_t gpu_source_frame;  /* Raw bgfx timer sample identity; may repeat. */
+    uint64_t context_generation; /* Existing renderer device lifetime. */
+    int64_t timer_frequency;
+    int64_t raw_begin;
+    int64_t raw_end;
+    double duration_ms;         /* Meaningful only when timer_available. */
+} JceGpuTimingObservation;
+
+/* Returns true when the version-1 observation was copied, including an
+ * explicit unavailable reason. NULL or out_size < sizeof(*out) returns false
+ * without any writes/backend query. Only sizeof(*out) bytes are written; extra
+ * caller storage is untouched. Missing frequency and nonforward/negative ticks
+ * stay unavailable, never a claimed zero-ms GPU cost. Existing JceGpuStats and
+ * its getter retain their original layout and behavior. */
+JCE_API bool jce_renderer_get_gpu_timing_observation(
+    JceGpuTimingObservation *out, size_t out_size);
 
 /* Cumulative payload admitted by first-party static mesh and texture APIs.
  * Texture updates count submitted commands (bgfx provides no success result).
@@ -495,8 +571,9 @@ JCE_API bool jce_renderer_get_submitted_payload_stats(
     const JceRenderer *r, JceSubmittedPayloadStats *out);
 
 
-/* Monotonic bgfx frame index returned by the most recent bgfx_frame().
- * Used by asynchronous GPU readbacks to know when their data is ready. */
+/* Backend frame index returned by the most recent bgfx_frame(), used for
+ * scheduling asynchronous readbacks. This is not the GPU timing query's
+ * source frame identity and does not join JceGpuStats to an engine frame. */
 JCE_API uint32_t jce_renderer_get_frame_index(const JceRenderer *r);
 
 JCE_EXTERN_C_END

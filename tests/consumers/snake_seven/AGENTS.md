@@ -206,3 +206,21 @@ JCE_WINDOW_HIDDEN=1 JCE_MULTI_INSTANCE=1 JCE_FRAME_DT_FIXED=0.016666 JCE_INPUT_R
 
 **有些缺陷只有截图能发现**：菜单那张曾经在正中间有一个孤零零的绿方块
 （蛇头没和身体一起停到场外），而没有任何一行 trace 承载「菜单长什么样」。
+
+## 2026 producer closure
+
+原七语种 authored scene 保留所有 Script：Lua/JS/Python/Java/C/C++/C#，
+manifest 的 required_languages 与实际触达一致。C/C++ class-ref 描述文件是
+可打包的真实类地址；native/ 中的实现与 manifest factory 不变。CMake 通过
+NATIVE_FACTORIES 声明 snake_c_module/snake_cpp_module，main 只调用生成的
+注册 shim(NULL) 一次并检查失败；不再重复发布静态模块。缺 required compiled
+backend、C#桥接程序集或 dotnet 编译器时明确拒绝，不以缺 HUD/碰撞规则继续。
+SNAKE_SINGLE_FILE 保留兼容开关，但它的语言列表不能略过 authored 必需 VM；
+现有 portable Lua Bundle 仍是独立变体，不能把它的成功称作七 VM 自包含。
+
+Editor DLL 的 LIBRARY/RUNTIME 输出在各 configuration 都指向 native/build。
+C#的唯一输出/manifest 地址为 csharp/build/SnakeScripts.dll；唯一活跃源码是
+resources/scripts/Hud.cs，原 csharp/Hud.cs 字节保留但 inactive，见 SOURCE_MAP.json。
+后续只编辑活跃 canonical resource source；公开 packer 仍负责依赖/内容去重。
+当前 SDK 的 roster 文件、实际 compiled backend、VM运行输入与最终单文件
+交付资格分开验收。脚本声明齐全和 fail-closed 不能当作完整 source 已运行。

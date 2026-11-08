@@ -10,6 +10,7 @@ uniform vec4 u_baseColorFactor;
 uniform vec4 u_pbrParams;       // x=metallic, y=roughness, z=aoStrength, w=alphaCutoff
 uniform vec4 u_ssaoParams;      // x=SSAO active, yz=1/AO target size, w=contact shadows
 uniform vec4 u_weatherSurface;  // x=wetness y=snow zw=reserved
+uniform vec4 u_terrainSnowLook; // brightness, warmth, low relief tint, micro-normal strength
 #include "wetness.sh"
 #include "area_light.sh"
 uniform vec4 u_emissiveFactor;  // xyz=emissive, w=alphaMode (0=opaque, 1=mask, 2=blend)
@@ -140,9 +141,10 @@ SAMPLER2D(s_layer1,   14);
 SAMPLER2D(s_layer2,   15);
 
 // u_terrainParams.x = layer tile scale (UV multiplier for per-layer albedo)
-// u_terrainParams.y = splat enabled (1 = sample splat, 0 = layer0 only)
+// u_terrainParams.y = 0/1 base/splat, -1/-2 base/splat with optional snow look
+// u_terrainParams.z = stamp count, or -(16 * cover count + stamp count)
 // u_terrainParams.w = height-aware blend strength (0 = legacy splat blend)
-uniform vec4 u_terrainParams;
+#include "terrain_snow_height.sh"
 
 // Per-tile splat UV remap (large-world #4): for a streamed/tiled terrain the
 // splat map is a PER-TILE texture, so the global terrain UV (v_texcoord0, 0..1
@@ -151,6 +153,55 @@ uniform vec4 u_terrainParams;
 // xy = tile UV origin, zw = tile UV scale.  Monolithic terrains set {0,0,1,1}
 // so the remap is identity (byte-identical sampling).
 uniform vec4 u_terrainTileUV;
+
+/* Stable world-space basin potential. A second frequency breaks up the
+ * low-frequency shapes without allocating another terrain sampler. */
+float terrain_puddle_hash(vec2 cell)
+{
+    vec3 p = fract(vec3(cell.x, cell.y, cell.x) * 0.1031);
+    p += vec3_splat(dot(p, p.yzx + vec3_splat(33.33)));
+    return fract((p.x + p.y) * p.z);
+}
+
+float terrain_puddle_noise(vec2 world_xz)
+{
+    vec2 cell = floor(world_xz);
+    vec2 f = fract(world_xz);
+    f = f * f * (vec2_splat(3.0) - 2.0 * f);
+    float lower = mix(terrain_puddle_hash(cell),
+                      terrain_puddle_hash(cell + vec2(1.0, 0.0)), f.x);
+    float upper = mix(terrain_puddle_hash(cell + vec2(0.0, 1.0)),
+                      terrain_puddle_hash(cell + vec2(1.0, 1.0)), f.x);
+    return mix(lower, upper, f.y);
+}
+
+// Analytic XZ gradient of a cubic value-noise height sample. The four
+// corners are shared by both partials; the derivative vanishes at cell seams.
+vec2 terrain_snow_grain_gradient(vec2 p)
+{
+    vec2 cell = floor(p);
+    vec2 t = fract(p);
+    vec2 s = t * t * (vec2_splat(3.0) - 2.0 * t);
+    vec2 ds = 6.0 * t * (vec2_splat(1.0) - t);
+    float a = terrain_puddle_hash(cell);
+    float b = terrain_puddle_hash(cell + vec2(1.0, 0.0));
+    float c = terrain_puddle_hash(cell + vec2(0.0, 1.0));
+    float d = terrain_puddle_hash(cell + vec2(1.0, 1.0));
+    return ds * vec2(mix(b - a, d - c, s.y), mix(c - a, d - b, s.x));
+}
+
+float terrain_puddle_mask(vec2 world_xz, float slope_up, float wet,
+                          float exposure, float snow)
+{
+    float flatness = smoothstep(0.94, 0.995, slope_up);
+    float water = wet * flatness * mix(0.72, 1.0, exposure);
+    if (exposure <= 0.0 || water <= 0.18) return 0.0;
+    float basin = mix(terrain_puddle_noise(world_xz * 0.44),
+                      terrain_puddle_noise(world_xz * 1.40 + vec2(19.3, -7.1)), 0.25);
+    float threshold = mix(0.18, 1.02, basin);
+    return smoothstep(threshold, threshold + 0.12, water) * exposure
+         * (1.0 - smoothstep(0.12, 0.60, snow));
+}
 
 // Convert NDC depth to [0,1] range for shadow comparison.
 // OpenGL (GLSL): NDC z is in [-1,1], needs remap.
@@ -282,7 +333,8 @@ void main()
     vec3 a3L = clamp(a3, vec3_splat(0.0), vec3_splat(1.0));
 
     vec4 splat = vec4(1.0, 0.0, 0.0, 0.0);
-    if (u_terrainParams.y > 0.5) {
+    bool useSnowLook = u_terrainParams.y == -1.0 || u_terrainParams.y == -2.0;
+    if (u_terrainParams.y > 0.5 || u_terrainParams.y == -2.0) {
         vec2 splatUV = (v_texcoord0 - u_terrainTileUV.xy) * u_terrainTileUV.zw;
         splat = texture2D(s_splatMap, splatUV);
         // Re-normalize (guard against unweighted authoring or all-zero pixels).
@@ -332,10 +384,7 @@ void main()
     // 2=textured/unlit, 3=wireframe+textured).
     float viewMode = u_normalScale.z;
 
-    /* Shadow/depth debug views (8/9/10) are checked BEFORE the unlit-albedo
-     * branch below, which catches everything above mode 1.  Terrain is most of
-     * the ground, so a depth or cascade view that showed albedo here would be
-     * blank exactly where the question is asked. */
+    /* Depth and shadow views report the results of this terrain draw. */
     if (viewMode > 7.5)
     {
         vec3 dbg;
@@ -346,7 +395,7 @@ void main()
         return;
     }
 
-    if (viewMode > 1.5)
+    if (viewMode > 1.5 && viewMode < 3.5)
     {
         // Output albedo without lighting (gamma-correct for display).
         vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(u_iblParams.z));
@@ -433,19 +482,92 @@ void main()
     float roughness = clamp(dot(roughnessLayers, splat), 0.04, 1.0);
     float materialAo = clamp(dot(aoLayers, splat), 0.0, 1.0);
 
-    /* Rain. Ground is the surface people read wetness off first, and it was
-     * the surface that had none: the environment has integrated
-     * global_wetness since it was written and no lit shader ever asked. */
     float wet = u_weatherSurface.x * wetness_exposure(N);
-    roughness = clamp(wetness_roughness(roughness, wet), 0.04, 1.0);
-    albedo    = wetness_albedo(albedo, wet);
-
-    /* Lying snow, AFTER the wet response: a surface gets wet first and then
-     * snow settles on top of it, and the snow is what you see. Doing it the
-     * other way round darkens the snow with the rain that fell before it. */
     float snow = snow_coverage(N, u_weatherSurface.y);
-    albedo     = snow_albedo(albedo, snow);
+    float stamp_count, cover_count;
+    terrain_snow_counts(stamp_count, cover_count);
+    float precipitation_exposure = 1.0;
+    if ((snow > 0.0 || wet > 0.0) && cover_count > 0.0) {
+        vec3 base_world = vec3(v_worldpos.x, v_localpos.y, v_worldpos.z);
+        precipitation_exposure = terrain_snow_exposure(base_world, cover_count);
+        snow *= precipitation_exposure;
+    }
+
+    /* Shelter attenuates the ground's wet response as well as its puddles.
+     * Mix lying snow afterward so earlier rain does not darken its surface. */
+    float exposed_wet = wet * precipitation_exposure;
+    roughness = clamp(wetness_roughness(roughness, exposed_wet), 0.04, 1.0);
+    albedo    = wetness_albedo(albedo, exposed_wet);
+    if (useSnowLook && snow > 0.0 &&
+        (u_terrainSnowLook.x != 0.0 || u_terrainSnowLook.y != 0.0 || u_terrainSnowLook.z > 0.0)) {
+        vec3 snowWhite = vec3_splat(0.90 + u_terrainSnowLook.x) +
+            u_terrainSnowLook.y * vec3(0.055, 0.012, -0.065);
+        if (u_terrainSnowLook.z > 0.0) {
+            // Virtual snow relief, with actual R5 snow geometry reinforcing depressions.
+            float relief = terrain_puddle_noise(v_worldpos.xz * 0.62);
+            relief += clamp(v_worldpos.y - v_localpos.y, -u_terrainSnowGeometry.z, u_terrainSnowGeometry.w) * 1.8;
+            float basin = (1.0 - smoothstep(0.20, 0.58, relief)) * u_terrainSnowLook.z;
+            snowWhite *= mix(vec3_splat(1.0), vec3(0.66, 0.79, 0.90), basin);
+        }
+        albedo = mix(albedo, clamp(snowWhite, vec3_splat(0.0), vec3_splat(0.98)), snow);
+    } else {
+        albedo = snow_albedo(albedo, snow);
+    }
     roughness  = clamp(snow_roughness(roughness, snow), 0.04, 1.0);
+    // Accumulated snow covers the underlying sand normal. The shared signed
+    // snow field and the independently controlled snow grain remain afterward.
+    if (snow > 0.0)
+        N = normalize(mix(N, baseNormal, 0.85 * snow));
+    if (snow > 0.0 && stamp_count > 0.0) {
+        // Resolved geometry uses the same quantized coverage as both vertex
+        // paths. Smaller stamps retain the existing material-detail path.
+        float track_snow = snow;
+        if (u_terrainSnowGeometry.x > 0.0)
+            track_snow = u_terrainSnowGeometry.x * precipitation_exposure *
+                smoothstep(0.35, 0.85, clamp(baseNormal.y, 0.0, 1.0));
+        vec3 track = terrain_snow_limit(
+            terrain_snow_track(v_worldpos.xz, stamp_count, 0.0), track_snow);
+        float compact = clamp(-track.x * 8.0, 0.0, 1.0);
+        if (compact > 0.0) {
+            albedo *= mix(vec3_splat(1.0), vec3(0.73, 0.82, 0.92), compact);
+            roughness *= 1.0 - 0.22 * compact;
+            // Only the already-existing signed depression reduces ambient light.
+            materialAo *= 1.0 - 0.18 * compact;
+        }
+        vec2 gradient = track.yz;
+        float slope = length(gradient);
+        if (slope > 0.0) {
+            gradient *= min(1.0, 0.85 / slope);
+            N = normalize(N - vec3(gradient.x, 0.0, gradient.y) * max(N.y, 0.0));
+        }
+    }
+
+    if (useSnowLook && u_terrainSnowLook.w > 0.0) {
+        // Use quad derivatives in uniform control flow and fade subpixel grain.
+        vec2 grain = v_worldpos.xz * 4.0;
+        vec2 footprint = fwidth(grain);
+        float grainWeight = 1.0 - smoothstep(0.28, 0.85, max(footprint.x, footprint.y));
+        if (snow > 0.0 && grainWeight > 0.0) {
+            vec2 slope = terrain_snow_grain_gradient(grain) *
+                (0.12 * u_terrainSnowLook.w * snow * grainWeight);
+            N = normalize(N - vec3(slope.x, 0.0, slope.y) * max(N.y, 0.0));
+        }
+    }
+
+    float puddle = 0.0;
+    if (wet > 0.0) {
+        puddle = terrain_puddle_mask(v_worldpos.xz, baseNormal.y, wet,
+                                    precipitation_exposure, snow);
+        if (puddle > 0.0) {
+            albedo *= mix(vec3_splat(1.0), vec3(0.71, 0.82, 0.88), puddle);
+            roughness = mix(roughness, 0.075, puddle);
+            metallic *= 1.0 - puddle;
+            float flatten = 0.72 * puddle;
+            N = normalize(vec3(N.x * (1.0 - flatten),
+                               mix(max(N.y, 0.0), 1.0, flatten),
+                               N.z * (1.0 - flatten)));
+        }
+    }
 
     // Low-cost specular AA from normal derivatives (Toksvig-like).
     vec3 dndx = dFdx(N);
@@ -475,12 +597,25 @@ void main()
         ao *= mix(1.0, clamp(ssao, 0.0, 1.0), aoStrength);
     }
 
+    if (viewMode > 3.5 && viewMode < 7.5)
+    {
+        vec3 dbg;
+        if      (viewMode < 4.5) dbg = N * 0.5 + vec3_splat(0.5);
+        else if (viewMode < 5.5) dbg = vec3_splat(roughness);
+        else if (viewMode < 6.5) dbg = vec3_splat(metallic);
+        else                     dbg = vec3_splat(ao);
+        gl_FragColor = vec4(dbg, 1.0);
+        return;
+    }
+
     // --- View direction ---
     vec3 V = normalize(u_cameraPos.xyz - v_worldpos);
 
     // --- F0: reflectance at normal incidence ---
     vec3 F0 = vec3_splat(0.04);
     F0 = mix(F0, albedo, metallic);
+    if (puddle > 0.0)
+        F0 = mix(F0, vec3_splat(0.020), puddle);
 
     // --- Lighting accumulation ---
     vec3 Lo = vec3_splat(0.0);

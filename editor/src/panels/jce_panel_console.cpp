@@ -11,6 +11,7 @@
 
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_cpu_scope.h"
 #include "core/jce_editor_assert_bridge.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
@@ -35,6 +36,33 @@
 
 /* ── Console UI state (filter / scroll / selection) ───────────────── */
 
+/* Derived CPU geometry is owned by the existing Console UI. Both source rings
+ * remain authoritative. Exact text snapshots detect same-slot ring overwrite;
+ * the native 1024 + 512 ring bounds also bound this cache. */
+struct ConsoleRowLayout {
+    std::string text, timestamp;
+    JceConsoleLevel level;
+    int duplicates;
+    float width, height;
+};
+
+struct ConsoleLayoutFont {
+    ImGuiContext *context = nullptr;
+    ImFont *font = nullptr;
+    ImFontAtlas *atlas = nullptr;
+    ImGuiID font_id = 0;
+    int next_font_id = 0, next_texture_id = 0;
+    float size = 0.0f, dpi = 0.0f;
+    ImVec2 spacing;
+    bool operator==(const ConsoleLayoutFont &other) const
+    {
+        return context == other.context && font == other.font && atlas == other.atlas &&
+            font_id == other.font_id && next_font_id == other.next_font_id &&
+            next_texture_id == other.next_texture_id && size == other.size &&
+            dpi == other.dpi && spacing.x == other.spacing.x && spacing.y == other.spacing.y;
+    }
+};
+
 struct ConsoleUiState {
     bool          auto_scroll    = true;
     bool          show_info      = true;
@@ -56,6 +84,10 @@ struct ConsoleUiState {
     JceConsoleSession *session = nullptr;
     std::set<int> selected;   /* entry indices */
     int           anchor      = -1;
+    std::vector<JceConsoleEntry> rows;
+    std::vector<int> visible_idx, collapse_count;
+    std::vector<ConsoleRowLayout> layout;
+    ConsoleLayoutFont layout_font;
 };
 
 static ConsoleUiState s_ui;
@@ -235,6 +267,9 @@ static void console_clear_all(void)
     }
     s_engine.view_head  = 0;
     s_engine.view_count = 0;
+    /* A context-menu Clear may run inside the row loop. Keep that frame's
+     * borrowed row snapshot and geometry alive; the next draw rebuilds them. */
+    s_ui.layout_font = ConsoleLayoutFont{};
 }
 
 /* Build the merged display list.  Both inputs are already in timestamp order,
@@ -272,6 +307,59 @@ static void console_build_rows(std::vector<JceConsoleEntry> &rows)
                        });
 }
 
+
+/* TextEx measures short text before its internal clipping. Retain full content
+ * extent and all native interactions; skip only invisible text submission. */
+static const char *console_level_prefix(JceConsoleLevel level)
+{
+    switch (level) {
+    case JCE_CONSOLE_WARNING: return "[WARN]  ";
+    case JCE_CONSOLE_ERROR: return "[ERROR] ";
+    case JCE_CONSOLE_DEBUG: return "[DEBUG] ";
+    default: return "[INFO]  ";
+    }
+}
+
+static void console_prepare_layout(const std::vector<JceConsoleEntry> &rows,
+                                   const std::vector<int> &visible_idx,
+                                   const std::vector<int> &collapse_count)
+{
+    ImFont *font = ImGui::GetFont();
+    ImFontAtlas *atlas = font->OwnerAtlas;
+    const ConsoleLayoutFont key{ImGui::GetCurrentContext(), font, atlas, font->FontId,
+        atlas->FontNextUniqueID, atlas->TexNextUniqueID, ImGui::GetFontSize(),
+        ImGui::GetWindowViewport()->DpiScale, ImGui::GetStyle().ItemSpacing};
+    bool reused = key == s_ui.layout_font && s_ui.layout.size() == visible_idx.size();
+    for (size_t i = 0; reused && i < visible_idx.size(); ++i) {
+        const JceConsoleEntry &entry = rows[(size_t)visible_idx[i]];
+        const ConsoleRowLayout &cached = s_ui.layout[i];
+        reused = cached.level == entry.level && cached.duplicates == collapse_count[i] &&
+            cached.text == entry.text && cached.timestamp == entry.timestamp;
+    }
+    if (reused) return;
+
+    s_ui.layout.resize(visible_idx.size());
+    for (size_t i = 0; i < visible_idx.size(); ++i) {
+        const JceConsoleEntry &entry = rows[(size_t)visible_idx[i]];
+        ConsoleRowLayout &cached = s_ui.layout[i];
+        cached.text = entry.text;
+        cached.timestamp = entry.timestamp;
+        cached.level = entry.level;
+        cached.duplicates = collapse_count[i];
+        const ImVec2 text_size = ImGui::CalcTextSize(entry.text);
+        float width = ImGui::CalcTextSize(entry.timestamp).x + key.spacing.x +
+            ImGui::CalcTextSize(console_level_prefix(entry.level)).x + key.spacing.x + text_size.x;
+        if (cached.duplicates > 1) {
+            char badge[32];
+            snprintf(badge, sizeof(badge), "(x%d)", cached.duplicates);
+            width += key.spacing.x + ImGui::CalcTextSize(badge).x;
+        }
+        cached.width = width;
+        cached.height = std::max(ImGui::GetTextLineHeight(), text_size.y);
+    }
+    s_ui.layout_font = key;
+}
+
 /* The editor's own commands, REGISTERED rather than if-chained.
  *
  * They used to be a chain of strncmp() in this function, which had three
@@ -288,6 +376,7 @@ static void console_build_rows(std::vector<JceConsoleEntry> &rows)
 static void ed_cmd_clear(int argc, const char **argv, void *user)
 {
     (void)argc; (void)argv; (void)user;
+    if (!s_ui.initialized) return;
     console_clear_all();
     s_ui.selected.clear();
     s_ui.anchor = -1;
@@ -296,6 +385,7 @@ static void ed_cmd_clear(int argc, const char **argv, void *user)
 static void ed_cmd_echo(int argc, const char **argv, void *user)
 {
     (void)user;
+    if (!s_ui.initialized) return;
     char line[512];
     line[0] = '\0';
     for (int i = 1; i < argc; ++i) {
@@ -305,13 +395,13 @@ static void ed_cmd_echo(int argc, const char **argv, void *user)
     jce_editor_console_log("%s", line);
 }
 
-static void ed_cmd_play (int, const char **, void *) { jce_state_play();  }
-static void ed_cmd_stop (int, const char **, void *) { jce_state_stop();  }
-static void ed_cmd_pause(int, const char **, void *) { jce_state_pause(); }
+static void ed_cmd_play (int, const char **, void *) { if (s_ui.initialized) jce_state_play(); }
+static void ed_cmd_stop (int, const char **, void *) { if (s_ui.initialized) jce_state_stop(); }
+static void ed_cmd_pause(int, const char **, void *) { if (s_ui.initialized) jce_state_pause(); }
 
 static void execute_console_command(const char *cmd)
 {
-    if (!cmd || !*cmd) return;
+    if (!s_ui.initialized || !cmd || !*cmd) return;
     jce_editor_console_log("> %s", cmd);
     /* One dispatcher.  cvars echo on a bare name and set on "name value";
      * commands -- the engine's help/list and the five registered above --
@@ -386,7 +476,7 @@ static int cmdline_callback(ImGuiInputTextCallbackData *data)
 static void console_sink(const char *text, void *user)
 {
     (void)user;
-    jce_editor_console_log("%s", text ? text : "");
+    if (s_ui.initialized) jce_editor_console_log("%s", text ? text : "");
 }
 
 static void ensure_init(void)
@@ -418,13 +508,54 @@ static void ensure_init(void)
                              "pause Play");
 
     /* Subscribe to the engine log.  The mutex must exist before the sink can
-     * fire, and the sink is never removed — the log backend thread is joined
-     * by jce_log_shutdown() long before these statics go away. */
+     * fire. Panel shutdown removes it through the logger's synchronous
+     * sink barrier before releasing this hand-off mutex. */
     if (!s_engine.mtx) {
         s_engine.mtx = jce_mutex_create();
         if (s_engine.mtx)
             jce_log_set_sink(console_log_sink, nullptr);
     }
+}
+
+/* Logging is an Editor lifecycle service; opening the dock is only its view. */
+void jce_editor_panel_console_init(void)
+{
+    ensure_init();
+}
+
+void jce_editor_panel_console_poll(void)
+{
+    /* A late/extra host poll must not resurrect an already retired owner. */
+    if (s_ui.initialized) console_engine_drain();
+}
+
+void jce_editor_panel_console_shutdown(void)
+{
+    const bool cache_owned = s_ui.rows.capacity() || s_ui.visible_idx.capacity() ||
+        s_ui.collapse_count.capacity() || s_ui.layout.capacity();
+    if (!s_ui.initialized && !s_ui.session && !s_engine.mtx && !cache_owned) return;
+    JceEditorCpuScope close_scope("editor.console.shutdown");
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.sink.attached", s_engine.mtx ? 1 : 0);
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.session.owned", s_ui.session ? 1 : 0);
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.mutex.owned", s_engine.mtx ? 1 : 0);
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.cache.owned", cache_owned ? 1 : 0);
+    /* Command registry has no unregister operation. Its callbacks use no owned
+     * userdata and stay in this executable; disarm them before releasing UI. */
+    s_ui.initialized = false;
+    if (s_engine.mtx) jce_log_set_sink(nullptr, nullptr);
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.sink.attached", 0);
+    jce_console_set_output(nullptr, nullptr);
+    JceConsoleSession *session = s_ui.session;
+    s_ui.session = nullptr;
+    if (session) jce_console_session_destroy(session);
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.session.owned", 0);
+    JceMutex *mutex = s_engine.mtx;
+    s_engine.mtx = nullptr;
+    if (mutex) jce_mutex_destroy(mutex);
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.mutex.owned", 0);
+    s_engine = {};
+    s_ui = ConsoleUiState{};
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "editor.console.cache.owned", 0);
 }
 
 static void copy_selection_to_clipboard(const std::vector<JceConsoleEntry> &rows)
@@ -549,7 +680,7 @@ static bool console_try_parse_path_line(const char *text,
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
-void jce_editor_panel_console_content(void)
+void jce_editor_panel_console_content_admitted(bool presentation_admitted)
 {
     ensure_init();
 
@@ -564,6 +695,9 @@ void jce_editor_panel_console_content(void)
         s_ui.anchor = -1;
     }
     s_ui.last_play = ps_now;
+
+    /* Covered docks retain lifecycle transitions, but present no UI content. */
+    if (!presentation_admitted) return;
 
     /* Toolbar: Clear + filter checkboxes + auto-scroll + clear-on-play + collapse */
     if (ImGui::SmallButton(jce_editor_i18n("console.clear")))
@@ -640,18 +774,20 @@ void jce_editor_panel_console_content(void)
     const float cmd_h = ImGui::GetFrameHeightWithSpacing();
 
     /* Log output */
-    ImGui::BeginChild("ConsoleScroll", ImVec2(0, -cmd_h), ImGuiChildFlags_None,
-                       ImGuiWindowFlags_HorizontalScrollbar);
+    if (ImGui::BeginChild("ConsoleScroll", ImVec2(0, -cmd_h), ImGuiChildFlags_None,
+                       ImGuiWindowFlags_HorizontalScrollbar)) {
 
     /* Editor events and mirrored engine log, interleaved by timestamp. */
-    std::vector<JceConsoleEntry> rows;
+    auto &rows = s_ui.rows;
     console_build_rows(rows);
     int count = (int)rows.size();
 
     /* Pre-compute per-entry visibility + collapse counts.
      * collapse merges consecutive entries with identical (level,text). */
-    std::vector<int> visible_idx;
-    std::vector<int> collapse_count;
+    auto &visible_idx = s_ui.visible_idx;
+    auto &collapse_count = s_ui.collapse_count;
+    visible_idx.clear();
+    collapse_count.clear();
     visible_idx.reserve(count);
     collapse_count.reserve(count);
 
@@ -681,6 +817,7 @@ void jce_editor_panel_console_content(void)
         }
     }
 
+    console_prepare_layout(rows, visible_idx, collapse_count);
     for (size_t vi = 0; vi < visible_idx.size(); ++vi) {
         int idx = visible_idx[vi];
         int dup = collapse_count[vi];
@@ -772,6 +909,9 @@ void jce_editor_panel_console_content(void)
 
         ImGui::SameLine(0, 0);
         ImGui::SetCursorScreenPos(row_start);
+        const ConsoleRowLayout &bounds = s_ui.layout[vi];
+        if (ImGui::IsRectVisible(row_start,
+                ImVec2(row_start.x + bounds.width, row_start.y + bounds.height))) {
         ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
         ImGui::TextUnformatted(entry.timestamp);
         ImGui::PopStyleColor();
@@ -786,6 +926,12 @@ void jce_editor_panel_console_content(void)
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
             ImGui::Text("(x%d)", dup);
             ImGui::PopStyleColor();
+        }
+
+        } else {
+            /* Use the same live ItemSize path as TextEx: it owns per-row pixel
+             * truncation, full multiline height and horizontal content width. */
+            ImGui::Dummy(ImVec2(bounds.width, bounds.height));
         }
 
         ImGui::PopID();
@@ -818,7 +964,7 @@ void jce_editor_panel_console_content(void)
 
     if (s_ui.auto_scroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
         ImGui::SetScrollHereY(1.0f);
-
+    }
     ImGui::EndChild();
 
     /* Command-line input at the bottom, backed by the session. */
@@ -844,6 +990,11 @@ void jce_editor_panel_console_content(void)
         s_ui.cmd_buf[0] = '\0';
         ImGui::SetKeyboardFocusHere(-1);
     }
+}
+
+void jce_editor_panel_console_content(void)
+{
+    jce_editor_panel_console_content_admitted(true);
 }
 
 /* ── Standalone wrapper ───────────────────────────────────────────── */

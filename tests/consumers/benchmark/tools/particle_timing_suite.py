@@ -4,16 +4,17 @@ import argparse
 import json
 import re
 from pathlib import Path
-from particle_suite import particle_asset, scene, alive_records, validate, validate_alive_controls
+from particle_suite import particle_asset, scene, alive_records, validate, validate_alive_controls, component_population, validate_burst_records
 from gbuffer_asset_suite import image, sha256_file, write
 from tools.benchmark_suite import source_identity, read_frames, frame_summary
 from tools.jce_determinism import assert_backend, MARKER
-from tools.perf_bench import run
+from particle_process import particle_backend, run_particle_process, validate_particle_execution
+from tools.perf_bench import read_execution_log
 
 
 
 def validate_process(metrics, backend):
-    """perf_bench.run stores OS completion in its nested process member."""
+    """The guarded consumer runner preserves strict nested OS completion."""
     process = metrics.get("process")
     if not isinstance(process, dict) or type(process.get("returncode")) is not int \
             or process["returncode"] != 0 or process.get("timed_out") is not False:
@@ -31,8 +32,7 @@ def timing_records(log, emitters, cpu, count):
     if "] ERROR -" in log or "CPU particle upload unavailable" in log:
         raise ValueError("runtime error")
     actual = alive_records(log, emitters, cpu)
-    if actual["total_alive"] != count:
-        raise ValueError("population mismatch")
+    validate_burst_records(actual, emitters, count, True, cpu)
     disabled = re.findall(r"benchmark-particle-stats-disabled: frame=(\d+) requested=(\d+) completed=(\d+)", log)
     if len(disabled) != 1:
         raise ValueError("diagnostic cutoff absent or duplicate")
@@ -66,12 +66,19 @@ def correctness(path, exe_hash, backend, route, count, size, emitters):
         if json.loads(Path(case["files"]["scene.json"]["path"]).read_text(encoding="utf-8")) != scene(
                 asset_path, emitters, route != "cpu"):
             raise ValueError("correctness scene mismatch")
-        log = Path(case["files"]["engine.log"]["path"]).read_text(encoding="utf-8")
-        assert_backend(case["process"].get("stdout", "")+"\n"+log, backend)
         validate_process(case["process"], backend)
-        if "] ERROR -" in log or "CPU particle upload unavailable" in log:
-            raise ValueError("correctness process failed")
-        counts[label] = alive_records(log, emitters, route == "cpu")["total_alive"]
+        captured = dict(case["process"]["process"])
+        for stream in ("stdout", "stderr"):
+            if stream in case["process"]:
+                captured[stream] = case["process"][stream]
+        log_path = Path(case["files"]["engine.log"]["path"])
+        validate_particle_execution(captured, log_path,
+            Path(case["files"]["frames.csv"]["path"]), 200, backend)
+        log = read_execution_log(log_path, captured)
+        component_population(log, emitters, route == "cpu")
+        actual = alive_records(log, emitters, route == "cpu")
+        validate_burst_records(actual, emitters, count, label != "zero", route == "cpu")
+        counts[label] = actual["total_alive"]
         pixels[label] = image(Path(case["files"]["target.png"]["path"]))
     validate(pixels)
     validate_alive_controls(counts, "burst", count)
@@ -116,11 +123,12 @@ def main():
                 "JCE_GPU_PARTICLES_FORCE": "0" if args.path == "cpu" else "1",
                 "JCE_BENCH_ASSET_STILL": "1", "JCE_BENCH_PLAY_FRAME": "1",
                 "JCE_BENCH_PARTICLE_STATS": "1", "JCE_BENCH_PARTICLE_STATS_UNTIL_FRAME": "64"}
-            process = run(env, directory / "engine.log", frames=721, exe=args.exe,
+            process = run_particle_process(env, directory / "engine.log", frames=721, exe=args.exe,
                           samples_path=directory / "frames.csv", sample_interval=.02)
             validate_process(process, args.backend)
             log = (directory / "engine.log").read_text(encoding="utf-8")
-            assert_backend(process.get("stdout", "")+"\n"+log, args.backend)
+            particle_backend(log, args.backend)
+            component_population(log, args.emitters, args.path == "cpu")
             witness = timing_records(log, args.emitters, args.path == "cpu", args.count)
             if sha256_file(args.exe) != binary_hash:
                 raise ValueError("executable changed")

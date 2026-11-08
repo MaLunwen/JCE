@@ -1,0 +1,57 @@
+# Actual payload writer, real retained ring/SDL restart, and checked clock ports.
+if(EMSCRIPTEN)
+    jce_test_suite_skipped("trace-capture-clock" "requires native SDL lifetime restart")
+    return()
+endif()
+set(_capture_clock_owner "${CMAKE_SOURCE_DIR}/engine/src/os/core/jce_trace_capture.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_capture_clock_owner}")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/trace-capture-clock")
+function(_jce_capture_clock_replace_once source_name wire replacement)
+    string(FIND "${${source_name}}" "${wire}" _first)
+    string(FIND "${${source_name}}" "${wire}" _last REVERSE)
+    if(_first LESS 0 OR NOT _first EQUAL _last)
+        message(FATAL_ERROR "capture clock control requires one exact owner wire")
+    endif()
+    string(REPLACE "${wire}" "${replacement}" _replaced "${${source_name}}")
+    set(${source_name} "${_replaced}" PARENT_SCOPE)
+endfunction()
+foreach(_capture_clock_variant IN ITEMS current old_ticks missing_failure_latch)
+    set(_capture_clock_name test_jce_trace_capture_clock)
+    set(_capture_clock_selected "${_capture_clock_owner}")
+    set(_capture_clock_kind integration)
+    set(_capture_clock_selector JCE_TEST_TRACE_CAPTURE_CLOCK_ONLY)
+    if(NOT _capture_clock_variant STREQUAL "current")
+        string(APPEND _capture_clock_name "_${_capture_clock_variant}")
+        set(_capture_clock_kind contract)
+        file(READ "${_capture_clock_owner}" _capture_clock_source)
+        if(_capture_clock_variant STREQUAL "old_ticks")
+            set(_capture_clock_selector JCE_TEST_TRACE_CAPTURE_CLOCK_AXIS_ONLY)
+            foreach(_capture_clock_edge IN ITEMS started finished)
+                _jce_capture_clock_replace_once(_capture_clock_source
+                    "jce_trace_clock_now_internal(&${_capture_clock_edge})"
+                    "(${_capture_clock_edge} = jce_time_ticks_ns(), true)")
+            endforeach()
+        else()
+            set(_capture_clock_selector JCE_TEST_TRACE_CAPTURE_CLOCK_FAILURE_ONLY)
+            _jce_capture_clock_replace_once(_capture_clock_source
+                "if (!jce_trace_clock_now_internal(&finished) || finished < started) {\n        capture->write_ok = false;"
+                "if (!jce_trace_clock_now_internal(&finished) || finished < started) {\n        /* Omitted failure latch allows a later replay. */")
+        endif()
+        set(_capture_clock_selected "${CMAKE_CURRENT_BINARY_DIR}/trace-capture-clock/${_capture_clock_variant}.c")
+        jce_test_write_if_changed("${_capture_clock_selected}" "${_capture_clock_source}")
+    endif()
+    jce_add_unit_test(${_capture_clock_name} KIND ${_capture_clock_kind}
+        SOURCES test_jce_trace_capture.c LINK jce_core sdl::sdl
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/os/core")
+    target_compile_definitions(${_capture_clock_name} PRIVATE
+        JCE_TEST_TRACE_CAPTURE_OWNER="${_capture_clock_selected}"
+        JCE_TEST_TRACE_CAPTURE_FILE_PREFIX="${_capture_clock_name}"
+        ${_capture_clock_selector}=1)
+    if(_capture_clock_kind STREQUAL "contract")
+        set_tests_properties(${_capture_clock_name} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+foreach(_capture_clock_key IN ITEMS owner variant name selected kind selector source edge)
+    unset(_capture_clock_${_capture_clock_key})
+endforeach()
+unset(_capture_clock_key)

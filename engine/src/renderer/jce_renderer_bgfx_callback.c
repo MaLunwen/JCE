@@ -23,23 +23,52 @@
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_render_readback.h>
 #include <jce/renderer/jce_shaders.h>
 #include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices (frame reset) */
 #include <jce/renderer/jce_ies_profile.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_views.h>
 #include "os/core/jce_memory.h"
+#include "os/core/jce_atomic_storage.h"
 #include "os/platform/jce_window_internal.h"
 #include "jce_renderer_caps_internal.h"
+#include "jce_renderer_frame_serial_internal.h"
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>   /* IMG_SavePNG for backbuffer screenshots */
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "jce_renderer_bgfx_callback.h"
+#include "jce_renderer_bgfx_profiler_internal.h"
+#include "os/core/jce_trace_scope_internal.h"
+#include <limits.h>
 
 #define LOG_TAG "jce_renderer"
+
+#if defined(JCE_BGFX_DEBUG_ANNOTATION_COMPILED) && (JCE_BGFX_DEBUG_ANNOTATION_COMPILED == 1)
+#define JCE_RCB_ANNOTATION_COMPILED 1
+#elif defined(JCE_BGFX_DEBUG_ANNOTATION_COMPILED) && (JCE_BGFX_DEBUG_ANNOTATION_COMPILED == 0)
+#define JCE_RCB_ANNOTATION_COMPILED 0
+#else
+#define JCE_RCB_ANNOTATION_COMPILED (-1)
+#endif
+#if defined(JCE_BGFX_DEBUG_ANNOTATION_REQUEST) && (JCE_BGFX_DEBUG_ANNOTATION_REQUEST == 1)
+#define JCE_RCB_ANNOTATION_REQUEST 1
+#elif defined(JCE_BGFX_DEBUG_ANNOTATION_REQUEST) && (JCE_BGFX_DEBUG_ANNOTATION_REQUEST == 0)
+#define JCE_RCB_ANNOTATION_REQUEST 0
+#else
+#define JCE_RCB_ANNOTATION_REQUEST (-1)
+#endif
+#if defined(JCE_BGFX_DEBUG_ANNOTATION_OPTION) && (JCE_BGFX_DEBUG_ANNOTATION_OPTION == 1)
+#define JCE_RCB_ANNOTATION_OPTION 1
+#elif defined(JCE_BGFX_DEBUG_ANNOTATION_OPTION) && (JCE_BGFX_DEBUG_ANNOTATION_OPTION == 0)
+#define JCE_RCB_ANNOTATION_OPTION 0
+#else
+#define JCE_RCB_ANNOTATION_OPTION (-1)
+#endif
 
 /* What this module holds ON BEHALF OF A HOST, in one struct rather than
  * loose names -- the shape the global-state detector has been teaching since
@@ -52,10 +81,81 @@
  * see the handler for why it is a polled flag rather than a lifecycle emit.
  * capture_fn is installed and called on the main thread only. */
 static struct {
-    volatile unsigned char device_lost;
+    JceAtomicI32          device_lost;
+    JceAtomicI32          profiler_begins;
+    bool                  profiler_attempt_open; /* owner-thread boundary only */
     JceAutoCaptureFn       capture_fn;
     void                  *capture_ud;
-} g_rcb_host = { 0u, NULL, NULL };
+} g_rcb_host = { .device_lost = { { 0 } }, .profiler_begins = { { 0 } } };
+
+JceBgfxCpuProfilerWitness jce_rcb_cpu_profiler_witness(void)
+{
+    JceBgfxCpuProfilerWitness witness;
+#if defined(JCE_BGFX_CPU_PROFILER_COMPILED) && (JCE_BGFX_CPU_PROFILER_COMPILED == 1)
+    witness.compiled = 1;
+#elif defined(JCE_BGFX_CPU_PROFILER_COMPILED) && (JCE_BGFX_CPU_PROFILER_COMPILED == 0)
+    witness.compiled = 0;
+#else
+    witness.compiled = -1;
+#endif
+    witness.bridge_supported = JCE_BGFX_CPU_TLS_AVAILABLE != 0;
+    witness.begin_observed = (uint32_t)jce_atomic_i32_load(&g_rcb_host.profiler_begins);
+    witness.begin_count_saturated = witness.begin_observed == INT32_MAX;
+    return witness;
+}
+
+static void jce_bgfx_cpu_profiler_observe_begin(void)
+{
+    int32_t before = jce_atomic_i32_load(&g_rcb_host.profiler_begins);
+    while (before < INT32_MAX) {
+        if (jce_atomic_i32_compare_exchange_internal(&g_rcb_host.profiler_begins,
+                                                      before, before + 1))
+            return;
+        before = jce_atomic_i32_load(&g_rcb_host.profiler_begins);
+    }
+}
+
+static void jce_bgfx_cpu_profiler_publish(const char *phase, const char *scope_name,
+                                          JceTraceTaskState outcome)
+{
+    const JceBgfxCpuProfilerWitness witness = jce_rcb_cpu_profiler_witness();
+    LOG_INFO(LOG_TAG, "bgfx CPU profiler: phase=%s compiled=%d bridge_supported=%u "
+             "begin_observed=%u begin_count_saturated=%u annotation_request=%d "
+             "annotation_option=%d annotation_compiled=%d", phase, (int)witness.compiled,
+             (unsigned)witness.bridge_supported, (unsigned)witness.begin_observed,
+             (unsigned)witness.begin_count_saturated, JCE_RCB_ANNOTATION_REQUEST,
+             JCE_RCB_ANNOTATION_OPTION, JCE_RCB_ANNOTATION_COMPILED);
+    if (jce_trace_enabled()) {
+        JceTraceScope scope = jce_trace_scope_begin(scope_name);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.cpu.compiled", witness.compiled);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.gpu.annotation.request", JCE_RCB_ANNOTATION_REQUEST);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.gpu.annotation.option", JCE_RCB_ANNOTATION_OPTION);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.gpu.annotation.compiled", JCE_RCB_ANNOTATION_COMPILED);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.cpu.bridge_supported", witness.bridge_supported);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.cpu.begin_observed", witness.begin_observed);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "bgfx.cpu.begin_saturated", witness.begin_count_saturated);
+        jce_trace_scope_end(scope, outcome);
+    }
+}
+
+void jce_rcb_cpu_profiler_attempt_end(JceBgfxCpuProfilerAttemptResult result)
+{
+    const char *phase, *scope_name;
+    if (!g_rcb_host.profiler_attempt_open) return;
+    switch (result) {
+    case JCE_BGFX_CPU_ATTEMPT_INIT_FAILED:
+        phase = "init_failed"; scope_name = "bgfx.cpu.capability.init_failed"; break;
+    case JCE_BGFX_CPU_ATTEMPT_API_REFUSED:
+        phase = "api_refused"; scope_name = "bgfx.cpu.capability.api_refused"; break;
+    case JCE_BGFX_CPU_ATTEMPT_ALLOCATION_FAILED:
+        phase = "allocation_failed"; scope_name = "bgfx.cpu.capability.allocation_failed"; break;
+    default:
+        /* Preserve an omitted terminal before reset without claiming a join. */
+        phase = "superseded_unfinalized"; scope_name = "bgfx.cpu.capability.superseded_unfinalized"; break;
+    }
+    jce_bgfx_cpu_profiler_publish(phase, scope_name, JCE_TRACE_TASK_FAILED);
+    g_rcb_host.profiler_attempt_open = false;
+}
 
 static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePath, uint16_t _line,
                            bgfx_fatal_t _code, const char *_str)
@@ -90,13 +190,11 @@ static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePa
      * is a pre-existing decision of this engine, and it is exactly what makes
      * a deferred delivery reach anybody.
      *
-     * A PLAIN STORE, deliberately: one producer writes 1, one consumer
-     * read-and-clears.  No read-modify-write, so nothing can be lost by
-     * interleaving; and the condition is LEVEL-TRIGGERED -- bgfx re-issues
-     * the fatal while the device is gone -- so a store racing a clear costs
-     * one frame's delivery rather than the event. */
+     * Atomic read-and-clear preserves a notification arriving after the
+     * consumer exchange. A volatile load followed by a store can lose that
+     * notification and is a data race in C; no repeat from bgfx is assumed. */
     if (_code == BGFX_FATAL_DEVICE_LOST)
-        g_rcb_host.device_lost = 1;
+        jce_atomic_i32_store(&g_rcb_host.device_lost, 1);
     /* JCE_BGFX_TRAP=1: break on the FIRST fatal so the crash handler prints
      * the fully symbolized stack of the offender (debug-bgfx bug hunts). */
     {
@@ -137,11 +235,13 @@ static void jce_bgfx_trace_vargs(bgfx_callback_interface_t *_this, const char *_
     int n = vsnprintf(buf, sizeof(buf), _format, _argList);
     if (n < 0)
         return;
-    if ((size_t)n >= sizeof(buf))
+    const bool truncated = (size_t)n >= sizeof(buf);
+    const int required = n;
+    if (truncated)
         n = (int)sizeof(buf) - 1;
     /* Strip trailing newline that bgfx tends to append. */
     while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
-    if (n == 0)
+    if (n == 0 && !truncated)
         return;
 
     if (api_version_line)
@@ -153,35 +253,46 @@ static void jce_bgfx_trace_vargs(bgfx_callback_interface_t *_this, const char *_
     /* Keep only the basename for compactness. */
     const char *slash = strrchr(file, '/');
     const char *back  = strrchr(file, '\\');
-    if (back && back > slash) slash = back;
+    if (back && (!slash || back > slash)) slash = back;
     if (slash) file = slash + 1;
 
-    LOG_INFO("bgfx", "%s:%u %s", file, (unsigned)_line, buf);
+    /* Explicit debug mirroring survives DIST's ordinary INFO erasure. The
+     * prefix also survives any subsequent canonical logger truncation. */
+    if (truncated)
+        jce_log_write(JCE_LOG_LEVEL_INFO, "bgfx", __FILE__, __LINE__,
+            "[bgfx_trace_truncated required_bytes=%d] %s:%u %s",
+            required, file, (unsigned)_line, buf);
+    else
+        jce_log_write(JCE_LOG_LEVEL_INFO, "bgfx", __FILE__, __LINE__,
+            "%s:%u %s", file, (unsigned)_line, buf);
 }
 
 static void jce_bgfx_profiler_begin(bgfx_callback_interface_t *_this, const char *_name,
                                     uint32_t _abgr, const char *_filePath, uint16_t _line)
 {
     (void)_this;
-    (void)_name;
     (void)_abgr;
     (void)_filePath;
     (void)_line;
+    jce_bgfx_cpu_profiler_observe_begin();
+    jce_bgfx_cpu_trace_begin(_name);
 }
 
 static void jce_bgfx_profiler_begin_literal(bgfx_callback_interface_t *_this, const char *_name,
                                             uint32_t _abgr, const char *_filePath, uint16_t _line)
 {
     (void)_this;
-    (void)_name;
     (void)_abgr;
     (void)_filePath;
     (void)_line;
+    jce_bgfx_cpu_profiler_observe_begin();
+    jce_bgfx_cpu_trace_begin(_name);
 }
 
 static void jce_bgfx_profiler_end(bgfx_callback_interface_t *_this)
 {
     (void)_this;
+    jce_bgfx_cpu_trace_end();
 }
 
 static uint32_t jce_bgfx_cache_read_size(bgfx_callback_interface_t *_this, uint64_t _id)
@@ -210,9 +321,111 @@ static void jce_bgfx_cache_write(bgfx_callback_interface_t *_this, uint64_t _id,
     (void)_size;
 }
 
-/* Set while a bgfx_request_screen_shot() is in flight; cleared by the
-   screen_shot callback once the file is written (or fails). */
-static bool s_screenshot_pending = false;
+/* One bounded file request, shared by screenshot and texture readback.
+ * API admission/poll/shutdown are main-thread operations; callback and writer
+ * completion cross threads. The short lock protects only these scalar/path
+ * copies, never graphics, allocation, encoding, IO or worker waits. */
+#define SCREENSHOT_PATH_MAX 512
+#define SCREENSHOT_REQUEST_PREFIX "\x03__jce_file__"
+static struct {
+    SDL_SpinLock lock;
+    uint64_t serial, identity, readback_identity;
+    uint16_t screenshot_framebuffer;
+    int result;                  /* -1 idle, 0 pending, 1 wrote, 2 failed */
+    unsigned callbacks;         /* callbacks already owning pixels */
+    bool closing, readback, writing, backend_active, trace_admitted;
+    char path[SCREENSHOT_PATH_MAX];
+    char request[64];            /* identity-bearing bgfx pseudo-path */
+} s_file = { .result = -1 };
+
+/* Private ring-counter ledger, not task lifetimes: both names use the file
+ * identity as event.id, parent zero. Admit value is backbuffer=0/readback=1;
+ * terminal value is JCE_TRACE_TASK_SUCCEEDED/FAILED/CANCELLED. Only accepted
+ * requests traced at admission emit a terminal. A complete pair requires one
+ * continuously enabled capture, with the core quiescence/loss rules. */
+static bool rb_png_prepare(void);
+static bool rb_png_primitives_ready(void);
+
+static uint64_t screenshot_admit(const char *path, bool readback,
+                                  uint16_t framebuffer)
+{
+    uint64_t id = 0;
+
+    if (!path || !path[0] || strlen(path) >= SCREENSHOT_PATH_MAX ||
+        (unsigned char)path[0] < 32)
+        return 0;
+    /* Prepare on the requesting main thread, before a callback can arrive.
+     * Failed primitives reject before GPU work; a host without a writer
+     * thread retains the existing inline backbuffer fallback. */
+    SDL_LockSpinlock(&s_file.lock);
+    bool available = s_file.backend_active && s_file.result != 0;
+    SDL_UnlockSpinlock(&s_file.lock);
+    if (!available)
+        return 0;
+    bool writer_ready = rb_png_prepare();
+    if (!writer_ready && (readback || !rb_png_primitives_ready()))
+        return 0;
+    bool trace_admitted = jce_trace_enabled();
+    SDL_LockSpinlock(&s_file.lock);
+    if (s_file.backend_active && !s_file.closing && s_file.result != 0 &&
+        s_file.serial != UINT64_MAX) {
+        id = ++s_file.serial;
+        s_file.identity = id;
+        s_file.result = 0;
+        s_file.readback = readback;
+        s_file.screenshot_framebuffer = framebuffer;
+        s_file.writing = false;
+        s_file.trace_admitted = trace_admitted;
+        jce_strlcpy(s_file.path, path, sizeof(s_file.path));
+        snprintf(s_file.request, sizeof(s_file.request),
+                 SCREENSHOT_REQUEST_PREFIX "%llu", (unsigned long long)id);
+    }
+    SDL_UnlockSpinlock(&s_file.lock);
+    /* This returns before the caller can submit GPU work or complete an
+     * early readback failure, so the admit precedes its terminal. */
+    if (id && trace_admitted)
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_RENDER,
+            "renderer.screenshot.admit", readback ? 1 : 0, id, 0);
+    return id;
+}
+
+static void screenshot_complete(uint64_t id, bool success)
+{
+    bool trace_admitted = false;
+    SDL_LockSpinlock(&s_file.lock);
+    if (id && s_file.identity == id && s_file.result == 0) {
+        s_file.result = success ? 1 : 2;
+        trace_admitted = s_file.trace_admitted;
+        s_file.trace_admitted = false;
+    }
+    SDL_UnlockSpinlock(&s_file.lock);
+    if (trace_admitted)
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_RENDER,
+            "renderer.screenshot.terminal",
+            success ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED, id, 0);
+}
+
+static uint64_t screenshot_callback_begin(const char *request, char *path,
+                                           uint16_t *framebuffer, bool *trace_pixels)
+{
+    uint64_t id = 0;
+
+    SDL_LockSpinlock(&s_file.lock);
+    if (request && !s_file.closing && s_file.result == 0 &&
+        !s_file.readback && !s_file.writing &&
+        strcmp(request, s_file.request) == 0) {
+        id = s_file.identity;
+        s_file.writing = true;
+        ++s_file.callbacks;
+        *framebuffer = s_file.screenshot_framebuffer;
+        *trace_pixels = s_file.trace_admitted;
+        memcpy(path, s_file.path, sizeof(s_file.path));
+    }
+    SDL_UnlockSpinlock(&s_file.lock);
+    return id;
+}
+
+static void screenshot_callback_end(void);
 
 /* Continuous capture (video recording). BGFX_RESET_CAPTURE does not deliver
    capture callbacks in this bgfx configuration, so recording instead drives
@@ -254,7 +467,7 @@ static bool s_fbo_capture_pending = false;
 static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
                               uint32_t pitch, uint32_t size, int format,
                               int yflip, int drop_alpha, const char *what,
-                              const char *path);
+                              const char *path, uint64_t file_identity);
 
 static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
                                  uint32_t _width, uint32_t _height, uint32_t _pitch,
@@ -383,7 +596,29 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
         return;
     }
 
-    (void)_size;
+    char output_path[SCREENSHOT_PATH_MAX];
+    uint16_t framebuffer = UINT16_MAX;
+    bool trace_pixels = false;
+    uint64_t file_identity = screenshot_callback_begin(_filePath, output_path,
+                                                        &framebuffer, &trace_pixels);
+    if (!file_identity)
+        return; /* late/duplicate callbacks cannot finish another request */
+    _filePath = output_path;
+    if (!_data || !_width || !_height || _width > UINT16_MAX ||
+        _height > UINT16_MAX || _pitch > INT_MAX ||
+        (uint64_t)_pitch < (uint64_t)_width * 4u ||
+        (uint64_t)(_height - 1u) * _pitch + (uint64_t)_width * 4u > _size) {
+        LOG_ERROR(LOG_TAG, "screenshot readback invalid: %s", _filePath);
+        screenshot_complete(file_identity, false);
+        screenshot_callback_end();
+        return;
+    }
+
+    /* The provider delivered a validated CPU pixel layout. Encoding and
+     * file outcome are separate, as are queue fences and presentation. */
+    if (trace_pixels)
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_RENDER,
+            "renderer.screenshot.cpu_pixels", framebuffer, file_identity, 0);
 
     /* DIAG (root-cause hunt for "F12/F9 black"): sample a 32x32 grid of the raw
        capture and log its average luminance.  avg_lum ~0 => the backbuffer itself
@@ -432,8 +667,7 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
        Anything that cannot be handed over (queue full, allocation failed, or a
        .bmp, which the writer does not encode) still runs inline. A screenshot
        is never dropped to save a frame. */
-    const uint64_t t_freq  = SDL_GetPerformanceFrequency();
-    const uint64_t t_enter = SDL_GetPerformanceCounter();
+    const uint64_t t_enter = jce_time_perf_counter();
     uint64_t t_conv = t_enter;
     bool async = false;
 
@@ -445,7 +679,7 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
                                       (int)(src_is_rgba ? SDL_PIXELFORMAT_RGBA32
                                                         : SDL_PIXELFORMAT_BGRA32),
                                       _yflip ? 1 : 0, 1, "screenshot",
-                                      _filePath);
+                                      _filePath, file_identity);
     }
     /* JCE_SHOT_DUAL=1 also writes the inline version to "<path>.inline.png".
      *
@@ -479,15 +713,15 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
                 }
             }
         }
-        const uint64_t t_end = SDL_GetPerformanceCounter();
+        const uint64_t t_end = jce_time_perf_counter();
         LOG_INFO(LOG_TAG, "screenshot queued in %.2f ms (%ux%u) — encode and "
                  "write run on the PNG writer thread",
-                 (double)(t_end - t_enter) * 1000.0 /
-                 (double)(t_freq ? t_freq : 1), _width, _height);
-        s_screenshot_pending = false;
+                 jce_time_perf_to_ms(t_enter, t_end), _width, _height);
+        screenshot_callback_end();
         return;
     }
 
+    JceTraceScope write_scope = jce_trace_scope_begin("renderer.screenshot_write");
     bool ok = false;
     if (_data && _filePath && _width && _height) {
         /* Wrap the raw pixels in their native channel order (BGRA8 on D3D/VK,
@@ -502,14 +736,15 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
             SDL_Surface *rgb = SDL_ConvertSurface(src, SDL_PIXELFORMAT_RGB24);
             SDL_DestroySurface(src);
             if (rgb) {
-                if (_yflip)
-                    SDL_FlipSurface(rgb, SDL_FLIP_VERTICAL);
-                t_conv = SDL_GetPerformanceCounter();
+                bool flipped = !_yflip || SDL_FlipSurface(rgb, SDL_FLIP_VERTICAL);
+                t_conv = jce_time_perf_counter();
                 const char *ext = strrchr(_filePath, '.');
-                if (ext && SDL_strcasecmp(ext, ".bmp") == 0)
-                    ok = SDL_SaveBMP(rgb, _filePath);
-                else
-                    ok = IMG_SavePNG(rgb, _filePath);
+                if (flipped) {
+                    if (ext && SDL_strcasecmp(ext, ".bmp") == 0)
+                        ok = SDL_SaveBMP(rgb, _filePath);
+                    else
+                        ok = IMG_SavePNG(rgb, _filePath);
+                }
                 SDL_DestroySurface(rgb);
             }
         }
@@ -517,13 +752,12 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
 
     {   /* Inline fallback took the frame with it — say so, with the split, so
            a regression back onto this path is visible rather than merely slow. */
-        const uint64_t t_end = SDL_GetPerformanceCounter();
-        const double ms = 1000.0 / (double)(t_freq ? t_freq : 1);
+        const uint64_t t_end = jce_time_perf_counter();
         LOG_WARN(LOG_TAG, "screenshot written INLINE: convert %.2f ms + "
                  "encode/write %.2f ms = %.2f ms blocking the frame (%ux%u)",
-                 (double)(t_conv - t_enter) * ms,
-                 (double)(t_end - t_conv) * ms,
-                 (double)(t_end - t_enter) * ms, _width, _height);
+                 jce_time_perf_to_ms(t_enter, t_conv),
+                 jce_time_perf_to_ms(t_conv, t_end),
+                 jce_time_perf_to_ms(t_enter, t_end), _width, _height);
     }
 
     if (ok)
@@ -532,7 +766,10 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
         LOG_ERROR(LOG_TAG, "screenshot failed: %s (%s)",
                   _filePath ? _filePath : "(null)", SDL_GetError());
 
-    s_screenshot_pending = false;
+    screenshot_complete(file_identity, ok);
+    jce_trace_scope_end(write_scope, ok ? JCE_TRACE_TASK_SUCCEEDED
+                                       : JCE_TRACE_TASK_FAILED);
+    screenshot_callback_end();
 }
 
 /* Request an async capture of the current frame's backbuffer to `path`.
@@ -541,30 +778,22 @@ static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_
    default).  Returns false if a capture is already pending or `path` is bad. */
 bool jce_renderer_request_screenshot(const char *path)
 {
-    if (!path || !path[0])
-        return false;
-    if (s_screenshot_pending)
-        return false;
-    bgfx_frame_buffer_handle_t backbuffer = { UINT16_MAX }; /* invalid == backbuffer */
-    s_screenshot_pending = true;
-    bgfx_request_screen_shot(backbuffer, path);
-    return true;
+    return jce_renderer_request_screenshot_fbo(UINT16_MAX, path);
 }
 
 bool jce_renderer_request_screenshot_fbo(uint16_t fbo_idx, const char *path)
 {
-    if (!path || !path[0])
-        return false;
-    if (fbo_idx == UINT16_MAX)          /* caller wants the backbuffer */
-        return jce_renderer_request_screenshot(path);
-    if (s_screenshot_pending)
-        return false;
-    s_screenshot_pending = true;
+    char request[64];
     bgfx_frame_buffer_handle_t fbh = { fbo_idx };
-    /* A REAL path (not a capture sentinel) => the screen_shot callback writes the
-       file, exactly as for the backbuffer path — but reading an offscreen FBO
-       sidesteps the flip-model "black backbuffer after Present" problem. */
-    bgfx_request_screen_shot(fbh, path);
+
+    if (!screenshot_admit(path, false, fbo_idx))
+        return false;
+    SDL_LockSpinlock(&s_file.lock);
+    memcpy(request, s_file.request, sizeof(request));
+    SDL_UnlockSpinlock(&s_file.lock);
+    /* The callback resolves the identity to the bounded real output path.
+     * This also distinguishes late callbacks for repeated identical paths. */
+    bgfx_request_screen_shot(fbh, request);
     return true;
 }
 
@@ -588,18 +817,22 @@ bool jce_rcb_host_took_capture(const char *path)
 
 bool jce_renderer_take_device_lost(void)
 {
-    /* READ-AND-CLEAR, so one device-loss is delivered once.  If bgfx is
-     * still failing, the next fatal sets it again -- which is what makes a
-     * missed frame cost a frame and not the event. */
-    if (!g_rcb_host.device_lost)
-        return false;
-    g_rcb_host.device_lost = 0u;
-    return true;
+    return jce_atomic_i32_exchange(&g_rcb_host.device_lost, 0) != 0;
+}
+
+int jce_renderer_screenshot_poll(void)
+{
+    int result;
+
+    SDL_LockSpinlock(&s_file.lock);
+    result = s_file.result;
+    SDL_UnlockSpinlock(&s_file.lock);
+    return result;
 }
 
 bool jce_renderer_screenshot_pending(void)
 {
-    return s_screenshot_pending;
+    return jce_renderer_screenshot_poll() == 0;
 }
 
 bool jce_renderer_request_fbo_capture(uint16_t fbo_idx,
@@ -637,7 +870,7 @@ bool jce_renderer_request_fbo_capture(uint16_t fbo_idx,
    and are released once everything is idle again. */
 #define RB_SLOTS 3
 typedef struct {
-    int                    state;       /* 0 idle, 1 awaiting readback */
+    int                    state;       /* 0 idle, 1 GPU pending, 2 retiring */
     int                    mode;        /* 0 = write PNG (path), 1 = feed capture sink */
     int                    yflip;       /* rows bottom-up? SOURCE-specific: the
                                          * postfx RT reads back bottom-up on
@@ -650,23 +883,30 @@ typedef struct {
     uint32_t               ready_frame;
     uint16_t               w, h;
     uint64_t               seq;         /* FIFO delivery order */
+    uint64_t               file_identity;
     char                   path[512];
 } RbSlot;
 
-static RbSlot   s_rb_slots[RB_SLOTS];
-static uint64_t s_rb_seq_submit  = 1;   /* next sequence to hand out   */
-static uint64_t s_rb_seq_deliver = 1;   /* next sequence poll delivers */
+/* One legacy capture queue for the active renderer backend.  The API-thread
+ * submit/poll owner and the after-backend-stop reset own the same state. */
+typedef struct {
+    RbSlot slots[RB_SLOTS];
+    uint64_t seq_submit;   /* next sequence to hand out */
+    uint64_t seq_deliver;  /* next sequence poll delivers */
+    uint8_t *half_lut;
+    bool format_unavailable_warned;
+} RbQueue;
+
+static RbQueue s_rb = { .seq_submit = 1, .seq_deliver = 1 };
 
 /* Half-float -> byte LUT for the tonemapped 0..1 capture sources: one table
    lookup per channel instead of bit-twiddling + float math + clamp per
    pixel.  The per-pixel conversion ran on the MAIN thread (poll) and cost
    tens of ms per 2560x1494 frame — the single biggest "recording slows the
    editor" contributor.  64 KB, built on first use. */
-static uint8_t *s_rb_half_lut = NULL;
-
 static const uint8_t *rb_lut(void)
 {
-    if (!s_rb_half_lut) {
+    if (!s_rb.half_lut) {
         uint8_t *lut = (uint8_t *)JCE_MALLOC(65536);
         if (!lut) return NULL;
         for (uint32_t hbits = 0; hbits < 65536u; ++hbits) {
@@ -674,9 +914,9 @@ static const uint8_t *rb_lut(void)
             f = (f < 0.0f) ? 0.0f : (f > 1.0f ? 1.0f : f);
             lut[hbits] = (uint8_t)(f * 255.0f + 0.5f);
         }
-        s_rb_half_lut = lut;
+        s_rb.half_lut = lut;
     }
-    return s_rb_half_lut;
+    return s_rb.half_lut;
 }
 
 static void rb_slot_release(RbSlot *s)
@@ -704,11 +944,24 @@ static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
         return false;
     if (mode == 0 && (!path || !path[0]))
         return false;
+    /* A promised frame is not proof a backend performed an unsupported blit.
+     * Reuse the canonical same-format admission before allocating or admitting
+     * a file request. In this provider every uint32 ready serial can be valid. */
+    if (!jce_render_readback_format_supported(JCE_RENDER_FORMAT_RGBA16F)) {
+        if (!s_rb.format_unavailable_warned) {
+            s_rb.format_unavailable_warned=true;
+            LOG_WARN(LOG_TAG,"readback capture unavailable: RGBA16F blit/read-back capability missing");
+        }
+        return false;
+    }
 
     RbSlot *slot = NULL;
     for (int i = 0; i < RB_SLOTS; ++i)
-        if (s_rb_slots[i].state == 0) { slot = &s_rb_slots[i]; break; }
+        if (s_rb.slots[i].state == 0) { slot = &s_rb.slots[i]; break; }
     if (!slot)
+        return false;
+    uint64_t file_identity = mode == 0 ? screenshot_admit(path, true, UINT16_MAX) : 0;
+    if (mode == 0 && !file_identity)
         return false;
 
     /* (Re)create the staging texture + CPU buffer only when the size changed;
@@ -723,17 +976,21 @@ static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
             BGFX_TEXTURE_FORMAT_RGBA16F,
             BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
             BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
-        if (!BGFX_HANDLE_IS_VALID(slot->staging))
+        if (!BGFX_HANDLE_IS_VALID(slot->staging)) {
+            screenshot_complete(file_identity, false);
             return false;
+        }
         slot->pixels = (uint8_t *)JCE_MALLOC((size_t)w * h * 8u); /* RGBA16F */
         if (!slot->pixels) {
             bgfx_destroy_texture(slot->staging);
             slot->staging.idx = UINT16_MAX;
+            screenshot_complete(file_identity, false);
             return false;
         }
         slot->staging_w = w;
         slot->staging_h = h;
     }
+
 
     bgfx_texture_handle_t src = { src_tex_idx };
     /* blit_view must sort AFTER the source's render pass so the blit reads this
@@ -745,7 +1002,13 @@ static bool rb_submit(uint16_t src_tex_idx, uint16_t blit_view,
     if (mode == 0) snprintf(slot->path, sizeof slot->path, "%s", path);
     slot->ready_frame = bgfx_read_texture(slot->staging, slot->pixels, 0, 0);
     slot->w = w; slot->h = h;
-    slot->seq = s_rb_seq_submit++;
+    slot->seq = s_rb.seq_submit++;
+    slot->file_identity = file_identity;
+    if (mode == 0) {
+        SDL_LockSpinlock(&s_file.lock);
+        s_file.readback_identity = file_identity;
+        SDL_UnlockSpinlock(&s_file.lock);
+    }
     slot->state = 1;
     return true;
 }
@@ -800,6 +1063,7 @@ typedef struct {
     int      drop_alpha; /* convert to RGB24 first (backbuffer alpha is junk) */
     const char *what;    /* log label; a literal, never freed */
     char     path[512];
+    uint64_t file_identity;
 } RbPngJob;
 
 static RbPngJob   s_png_queue[RB_PNG_QUEUE];
@@ -814,37 +1078,44 @@ static int        s_png_busy;      /* jobs handed out but not yet finished */
 /* Encode + write on the serial writer service. Takes ownership of rgba8. */
 static void rb_png_write(RbPngJob *job)
 {
-    SDL_Surface *surf = SDL_CreateSurfaceFrom((int)job->w, (int)job->h,
+    bool ok = false;
+    JceTraceScope scope = jce_trace_scope_begin("renderer.screenshot_write");
+    SDL_Surface *surface = SDL_CreateSurfaceFrom((int)job->w, (int)job->h,
         (SDL_PixelFormat)job->format, job->pixels, (int)job->pitch);
-    if (surf) {
-        SDL_Surface *out = surf;
-        /* The backbuffer's alpha channel is undefined, so that path asks for
-         * RGB24 and the readback path does not. Doing the conversion HERE
-         * rather than at the submitter is the point of the exercise: it used
-         * to cost 5-8 ms on the frame. */
-        if (job->drop_alpha) {
-            out = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGB24);
-            SDL_DestroySurface(surf);
-            surf = NULL;
-        }
-        if (out) {
-            /* Flip only when the SUBMITTER declared bottom-up rows (postfx RT,
-             * or plain FBO on GL). Plain FBOs read back top-down on D3D/VK/
-             * Metal — an unconditional flip inverted those PNGs. */
-            if (job->yflip)
-                SDL_FlipSurface(out, SDL_FLIP_VERTICAL);
-            if (IMG_SavePNG(out, job->path))
-                LOG_SUCCESS(LOG_TAG, "%s saved: %s (%ux%u)",
-                            job->what, job->path, job->w, job->h);
-            else
-                LOG_ERROR(LOG_TAG, "%s PNG write failed: %s (%s)",
-                          job->what, job->path, SDL_GetError());
-            SDL_DestroySurface(out);
-        }
-        if (surf) SDL_DestroySurface(surf);
+
+    if (surface && job->drop_alpha) {
+        SDL_Surface *rgb = SDL_ConvertSurface(surface, SDL_PIXELFORMAT_RGB24);
+        SDL_DestroySurface(surface);
+        surface = rgb;
     }
+    if (surface) {
+        if (!job->yflip || SDL_FlipSurface(surface, SDL_FLIP_VERTICAL))
+            ok = IMG_SavePNG(surface, job->path);
+        SDL_DestroySurface(surface); /* exactly one owner, including RGBA */
+    }
+    if (ok)
+        LOG_SUCCESS(LOG_TAG, "%s saved: %s (%ux%u)",
+                    job->what, job->path, job->w, job->h);
+    else
+        LOG_ERROR(LOG_TAG, "%s PNG write failed: %s (%s)",
+                  job->what, job->path, SDL_GetError());
     JCE_FREE(job->pixels);
     job->pixels = NULL;
+    screenshot_complete(job->file_identity, ok);
+    jce_trace_scope_end(scope, ok ? JCE_TRACE_TASK_SUCCEEDED
+                                : JCE_TRACE_TASK_FAILED);
+}
+
+static void screenshot_callback_end(void)
+{
+    /* The writer primitives exist before the GPU request is accepted. Keep
+     * the same lock order as shutdown: writer mutex, then tiny state lock. */
+    jce_mutex_lock(s_png_mu);
+    SDL_LockSpinlock(&s_file.lock);
+    --s_file.callbacks;
+    SDL_UnlockSpinlock(&s_file.lock);
+    jce_cond_broadcast(s_png_drained);
+    jce_mutex_unlock(s_png_mu);
 }
 
 static void rb_png_worker(void *unused)
@@ -891,12 +1162,20 @@ static bool rb_png_prepare(void)
             return false;
         }
     }
+    SDL_LockSpinlock(&s_file.lock);
+    s_file.closing = false; /* reopen only from main-thread file admission */
+    SDL_UnlockSpinlock(&s_file.lock);
     if (!s_png_thread) {
         s_png_thread = jce_thread_create(rb_png_worker, NULL, "jce-png-write");
         if (!s_png_thread)
             return false;
     }
     return true;
+}
+
+static bool rb_png_primitives_ready(void)
+{
+    return s_png_mu != NULL;
 }
 
 static bool rb_png_has_capacity(void)
@@ -929,11 +1208,11 @@ static bool rb_png_enqueue(RbPngJob *job)
 static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
                               uint32_t pitch, uint32_t size, int format,
                               int yflip, int drop_alpha, const char *what,
-                              const char *path)
+                              const char *path, uint64_t file_identity)
 {
     if (!data || !path || !w || !h || !size) return false;
     if (w > 0xFFFFu || h > 0xFFFFu)          return false;
-    if (!rb_png_prepare())                   return false;
+    if (!s_png_thread)                      return false;
 
     uint8_t *copy = (uint8_t *)JCE_MALLOC((size_t)size);
     if (!copy) return false;
@@ -948,6 +1227,7 @@ static bool rb_png_submit_raw(const void *data, uint32_t w, uint32_t h,
     job.yflip      = yflip;
     job.drop_alpha = drop_alpha;
     job.what       = what;
+    job.file_identity = file_identity;
     jce_strlcpy(job.path, path, sizeof job.path);
     if (!rb_png_enqueue(&job)) {
         JCE_FREE(copy);
@@ -967,21 +1247,100 @@ void jce_renderer_readback_capture_flush(void)
 
 void jce_renderer_readback_capture_shutdown(void)
 {
-    if (!s_png_mu) return;
-    jce_renderer_readback_capture_flush();
-    jce_mutex_lock(s_png_mu);
-    s_png_quit = true;
-    jce_cond_broadcast(s_png_cv);
-    jce_mutex_unlock(s_png_mu);
-    if (s_png_thread) {
-        jce_thread_join(s_png_thread);
-        s_png_thread = NULL;
+    unsigned callbacks;
+    uint64_t cancelled_trace_identity = 0;
+
+    SDL_LockSpinlock(&s_file.lock);
+    s_file.closing = true;
+    s_file.backend_active = false;
+    SDL_UnlockSpinlock(&s_file.lock);
+    if (s_png_mu) {
+        jce_mutex_lock(s_png_mu);
+        for (;;) {
+            SDL_LockSpinlock(&s_file.lock);
+            callbacks = s_file.callbacks;
+            SDL_UnlockSpinlock(&s_file.lock);
+            if (!callbacks)
+                break;
+            jce_cond_wait(s_png_drained, s_png_mu);
+        }
+        jce_mutex_unlock(s_png_mu);
+        /* Wait only for callbacks already owning pixels and queued CPU work.
+         * Never wait for a bgfx callback not yet delivered: bgfx_shutdown
+         * runs later, so waiting for that callback here would deadlock. */
+        jce_renderer_readback_capture_flush();
+        jce_mutex_lock(s_png_mu);
+        s_png_quit = true;
+        jce_cond_broadcast(s_png_cv);
+        jce_mutex_unlock(s_png_mu);
+        if (s_png_thread) {
+            jce_thread_join(s_png_thread);
+            s_png_thread = NULL;
+        }
+        jce_cond_destroy(s_png_drained);
+        jce_cond_destroy(s_png_cv);
+        jce_mutex_destroy(s_png_mu);
+        s_png_drained = NULL;
+        s_png_cv = NULL;
+        s_png_mu = NULL;
+        s_png_quit = false;
+        s_png_head = s_png_tail = s_png_count = s_png_busy = 0;
     }
-    jce_cond_destroy(s_png_drained); s_png_drained = NULL;
-    jce_cond_destroy(s_png_cv);      s_png_cv      = NULL;
-    jce_mutex_destroy(s_png_mu);     s_png_mu      = NULL;
-    s_png_quit = false;
-    s_png_head = s_png_tail = s_png_count = s_png_busy = 0;
+    SDL_LockSpinlock(&s_file.lock);
+    if (s_file.result == 0) {
+        s_file.result = 2;
+        if (s_file.trace_admitted)
+            cancelled_trace_identity = s_file.identity;
+        s_file.trace_admitted = false;
+    }
+    s_file.readback_identity = 0;
+    SDL_UnlockSpinlock(&s_file.lock);
+    if (cancelled_trace_identity)
+        jce_trace_counter_ring_internal(JCE_TRACE_CATEGORY_RENDER,
+            "renderer.screenshot.terminal", JCE_TRACE_TASK_CANCELLED,
+            cancelled_trace_identity, 0);
+    for (int i = 0; i < RB_SLOTS; ++i) {
+        RbSlot *slot = &s_rb.slots[i];
+        if (slot->state == 1) {
+            /* bgfx still borrows pixels. Retire the GPU handle in command
+             * order, but retain CPU storage until the backend has joined. */
+            if (slot->staging_w && BGFX_HANDLE_IS_VALID(slot->staging))
+                bgfx_destroy_texture(slot->staging);
+            slot->staging.idx = UINT16_MAX;
+            slot->staging_w = slot->staging_h = 0;
+            slot->state = 2;
+        } else if (slot->state == 0) {
+            rb_slot_release(slot);
+        }
+    }
+    s_rb.seq_deliver = s_rb.seq_submit;
+}
+
+/* Called only after bgfx_shutdown has joined the backend. No GPU API calls:
+ * all pending readbacks have now finished or been cancelled by their owner. */
+void jce_rcb_after_backend_shutdown(void)
+{
+    if (g_rcb_host.profiler_attempt_open) {
+        jce_bgfx_cpu_profiler_publish("after_backend_shutdown",
+            "bgfx.cpu.capability.after_backend_shutdown", JCE_TRACE_TASK_SUCCEEDED);
+        g_rcb_host.profiler_attempt_open = false;
+    }
+    jce_atomic_i32_store(&g_rcb_host.device_lost, 0);
+    SDL_LockSpinlock(&s_file.lock);
+    s_file.backend_active = false;
+    s_file.closing = true;
+    s_file.readback_identity = 0;
+    SDL_UnlockSpinlock(&s_file.lock);
+    for (int i = 0; i < RB_SLOTS; ++i) {
+        RbSlot *slot = &s_rb.slots[i];
+        JCE_FREE(slot->pixels);
+        memset(slot, 0, sizeof(*slot));
+        slot->staging.idx = UINT16_MAX;
+    }
+    JCE_FREE(s_rb.half_lut);
+    s_rb.half_lut = NULL;
+    s_rb.seq_submit = s_rb.seq_deliver = 1;
+    s_rb.format_unavailable_warned=false;
 }
 
 /* Deliver one ready slot, strictly FIFO.  Returns the poll result code. */
@@ -1023,6 +1382,7 @@ static int rb_deliver(RbSlot *slot)
      */
     if (!rb_png_prepare()) {
         LOG_ERROR(LOG_TAG, "readback capture PNG service unavailable");
+        screenshot_complete(slot->file_identity, false);
         slot->state = 0;
         return 2;
     }
@@ -1042,12 +1402,15 @@ static int rb_deliver(RbSlot *slot)
         job.yflip      = slot->yflip;
         job.drop_alpha = 0;
         job.what       = "readback capture";
+        job.file_identity = slot->file_identity;
         jce_strlcpy(job.path, slot->path, sizeof job.path);
         if (!rb_png_enqueue(&job)) {
             JCE_FREE(rgba8);
             return 0;
         }
-        result = 1;
+        result = 1; /* queued; the outer poll still awaits real file completion */
+    } else {
+        screenshot_complete(slot->file_identity, false);
     }
     slot->state = 0;
     return result;
@@ -1064,20 +1427,20 @@ int jce_renderer_readback_capture_poll(void)
     for (;;) {
         RbSlot *next = NULL;
         for (int i = 0; i < RB_SLOTS; ++i) {
-            if (s_rb_slots[i].state == 1) {
+            if (s_rb.slots[i].state == 1) {
                 any_in_flight = 1;
-                if (s_rb_slots[i].seq == s_rb_seq_deliver)
-                    next = &s_rb_slots[i];
+                if (s_rb.slots[i].seq == s_rb.seq_deliver)
+                    next = &s_rb.slots[i];
             }
         }
         if (!next)
             break;
-        if (jce_rcb_host_frame_index() < next->ready_frame)
+        if (!jce_renderer_frame_ready(jce_rcb_host_frame_index(),next->ready_frame))
             return 0;   /* oldest capture still on the GPU */
         last_result = rb_deliver(next);
         if (next->state == 1)
             return 0;   /* writer backpressure: preserve FIFO and retry */
-        s_rb_seq_deliver++;
+        s_rb.seq_deliver++;
         any_in_flight = 0;   /* recount on the next loop iteration */
     }
 
@@ -1086,9 +1449,18 @@ int jce_renderer_readback_capture_poll(void)
        across 3 slots — worth keeping only while recording). */
     if (!any_in_flight && !s_capture_active) {
         for (int i = 0; i < RB_SLOTS; ++i)
-            if (s_rb_slots[i].state == 0 && s_rb_slots[i].staging_w)
-                rb_slot_release(&s_rb_slots[i]);
+            if (s_rb.slots[i].state == 0 && s_rb.slots[i].staging_w)
+                rb_slot_release(&s_rb.slots[i]);
     }
+    SDL_LockSpinlock(&s_file.lock);
+    if (s_file.readback_identity) {
+        int result = s_file.identity == s_file.readback_identity ? s_file.result : 2;
+        if (result != 0)
+            s_file.readback_identity = 0;
+        SDL_UnlockSpinlock(&s_file.lock);
+        return result;
+    }
+    SDL_UnlockSpinlock(&s_file.lock);
     return last_result != -1 ? last_result : (any_in_flight ? 0 : -1);
 }
 
@@ -1151,15 +1523,31 @@ static bgfx_callback_interface_t s_bgfx_callback = {
 
 /* -- Boundary (see jce_renderer_bgfx_callback.h) -------------------- */
 
+void jce_rcb_backend_started(void)
+{
+    SDL_LockSpinlock(&s_file.lock);
+    s_file.backend_active = true;
+    s_file.closing = false;
+    SDL_UnlockSpinlock(&s_file.lock);
+}
+
 bgfx_callback_interface_t *jce_rcb_callback_interface(void)
 {
+    /* Attempts are serialized by renderer admission. Preserve any omitted
+     * terminal explicitly; it is not evidence of a successful backend join. */
+    jce_rcb_cpu_profiler_attempt_end(JCE_BGFX_CPU_ATTEMPT_SUPERSEDED_UNFINALIZED);
+    jce_atomic_i32_store(&g_rcb_host.device_lost, 0);
+    jce_atomic_i32_store(&g_rcb_host.profiler_begins, 0);
+    g_rcb_host.profiler_attempt_open = true;
+    jce_bgfx_cpu_profiler_publish("init_attempt", "bgfx.cpu.capability.init_attempt",
+                                  JCE_TRACE_TASK_SUCCEEDED);
     return &s_bgfx_callback;
 }
 
 bool jce_rcb_capture_wants_shot(void)
 {
     return s_capture_active && !s_capture_imgui_mode &&
-           !s_capture_shot_pending && !s_screenshot_pending;
+           !s_capture_shot_pending && !jce_renderer_screenshot_pending();
 }
 
 void jce_rcb_capture_mark_shot_pending(void)

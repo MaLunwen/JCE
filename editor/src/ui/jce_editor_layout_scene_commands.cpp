@@ -6,6 +6,7 @@
 
 #include "core/jce_editor_state.h"
 #include "ui/jce_editor_layout.h"
+#include "ui/jce_editor_layout_internal.h"
 
 extern "C" bool jce_editor_layout_run_new_scene_command(void)
 {
@@ -14,4 +15,9 @@ extern "C" bool jce_editor_layout_run_new_scene_command(void)
 
     jce_editor_layout_request_focus_scene_view();
     return true;
+}
+
+extern "C" void jce_editor_layout_request_new_project(void)
+{
+    request_gated_action(PGA_NEW_PROJECT);
 }

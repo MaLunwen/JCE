@@ -94,6 +94,11 @@ typedef enum {
 /* Lifecycle. */
 void  jce_editor_panels_init(void);
 void  jce_editor_panels_shutdown(void);
+/* CPU-only log subscription and pending-ring drain, independent of dock visibility. */
+void  jce_editor_panel_console_init(void);
+void  jce_editor_panel_console_poll(void);
+void  jce_editor_panel_console_shutdown(void);
+void jce_editor_panel_bundle_browser_shutdown(void);
 
 /* Visibility toggle (returns pointer for ImGui::MenuItem binding). */
 bool *jce_editor_panel_visible_ptr(JceEditorPanel panel);
@@ -122,6 +127,8 @@ void  jce_editor_panel_game_view(void);
  * (Ctrl+S / Ctrl+A / …) never mis-fire while the user is playing in the Game
  * View.  Play-consistent: broader than the strict mouse-captured check. */
 bool  jce_editor_game_view_is_input_active(void);
+/* Release Game View mouse/keyboard ownership on Stop, Esc and focus loss. */
+void  jce_editor_game_view_release_play_input(void);
 void  jce_editor_panel_timeline(void);
 void  jce_editor_panel_assets(void);
 void  jce_editor_panel_file_viewer(void);
@@ -182,6 +189,8 @@ void  jce_editor_panel_animation_rigging(void);
 void  jce_editor_panel_render_pipeline_content(void);
 void  jce_editor_panel_render_pipeline_tick(void);
 void  jce_editor_panel_test_runner(void);
+void  jce_editor_panel_test_runner_tick(void);
+void  jce_editor_panel_test_runner_shutdown(void);
 void  jce_editor_panel_build_profiles(void);
 void  jce_editor_panel_toolbar(void);
 /* Inline variant: draw the toolbar's contents at the current cursor
@@ -196,7 +205,10 @@ void  jce_editor_panel_status_bar(void);
 void  jce_editor_panel_hierarchy_content(void);
 void  jce_editor_panel_inspector_content(void);
 void  jce_editor_panel_console_content(void);
-void  jce_editor_panel_scene_view_content(void);
+/* False retains log drain and Clear-on-Play without presenting covered content. */
+void  jce_editor_panel_console_content_admitted(bool presentation_admitted);
+/* False keeps pending CPU results/input cleanup without drawing a covered view. */
+void  jce_editor_panel_scene_view_content(bool viewport_admitted);
 void  jce_editor_panel_game_view_content(void);
 
 /* Game viewport maximised over the editor work area.

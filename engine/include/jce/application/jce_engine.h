@@ -25,6 +25,60 @@ typedef enum JceAppResult {
     JCE_APP_FAILURE  = 2    /* Quit with error */
 } JceAppResult;
 
+/* Optional same-interval host observations. CPU facts do not certify GPU
+ * execution, presentation or successful pixels. Each availability bit is
+ * independent; a retained allocation is not proof of fresh rendering. */
+typedef enum JceFrameViewportCpuOutcome {
+    JCE_FRAME_VIEWPORT_CPU_UNKNOWN = 0,
+    JCE_FRAME_VIEWPORT_CPU_SKIPPED = 1,
+    JCE_FRAME_VIEWPORT_CPU_FAILED = 2,
+    JCE_FRAME_VIEWPORT_CPU_COMPLETED = 3
+} JceFrameViewportCpuOutcome;
+
+typedef enum JceFrameViewportObservationFlags {
+    JCE_FRAME_VIEWPORT_REQUESTED_SIZE_VALID = 1u << 0,
+    JCE_FRAME_VIEWPORT_ALLOCATED_SIZE_VALID = 1u << 1,
+    JCE_FRAME_VIEWPORT_PREPARE_SUCCEEDED = 1u << 2,
+    JCE_FRAME_VIEWPORT_DISPLAY_SIZE_VALID = 1u << 3,
+    JCE_FRAME_VIEWPORT_TEXTURE_VALID = 1u << 4,
+    JCE_FRAME_VIEWPORT_IMAGE_COUNT_VALID = 1u << 5,
+    JCE_FRAME_VIEWPORT_QUEUE_COUNT_VALID = 1u << 6,
+    JCE_FRAME_VIEWPORT_SUBMIT_COUNTS_VALID = 1u << 7
+} JceFrameViewportObservationFlags;
+
+typedef struct JceFrameViewportObservation {
+    uint32_t struct_size;
+    uint32_t source_id;
+    uint32_t flags;
+    uint32_t cpu_outcome;
+    uint32_t refusal_reason;
+    uint32_t requested_width, requested_height;
+    uint32_t allocated_width, allocated_height;
+    uint32_t display_width, display_height;
+    uint32_t texture_index;
+    uint32_t image_count;
+    uint32_t queued_commands;
+    uint32_t main_submits;
+    uint32_t recording_submits;
+} JceFrameViewportObservation;
+
+/* Enabled only for explicit frame-context modes 2 and 3, while the current Engine's
+ * main-thread app.draw callback is active. Off/v1 performs no collection.
+ * Reports are copied immediately, at most once per interval, with 0..4 unique
+ * nonzero caller-assigned source IDs. NULL/count0 is an explicit empty report;
+ * no report remains unknown. No caller pointers survive this call.
+ * A nonempty report requires a 4-byte aligned stride of 64..4096 bytes.
+ * An empty report accepts zero or a valid stride. Each struct_size must be
+ * 4-byte aligned, at least the known prefix and no larger than stride. Extra
+ * trailing fields are ignored. Input addresses require uint32_t alignment.
+ * Unavailable fields must be zero. Valid sizes must be nonzero pairs; a valid
+ * texture index is 0..65534, and observed counts may be zero. Unknown flags,
+ * outcomes, malformed input or duplicate reporting fail without changing a
+ * previously accepted observation. A new interval clears the observation. */
+JCE_API bool JCE_CALL jce_engine_frame_observation_enabled(void);
+JCE_API bool JCE_CALL jce_engine_report_frame_observations(
+    const JceFrameViewportObservation *observations, uint32_t count, size_t stride);
+
 typedef struct JceEngine       JceEngine;
 typedef struct JceAppDesc      JceAppDesc;
 typedef struct JceInputActions JceInputActions;
@@ -32,7 +86,10 @@ struct JceConfig;
 struct JceRenderer;
 
 /* Register the application descriptor (IApp callbacks).
-   Must be called before jce_engine_create().
+   Must be called on the host thread before engine creation. Descriptor and
+   other pre-boot configuration setters refuse changes while any engine owner
+   exists, including construction and deferred teardown. This preserves the
+   original exit callback/user data until that owner's final release.
    If not called, engine falls back to direct jce_app_* calls.
 
    ── Why there are two of these ──────────────────────────────────────
@@ -84,8 +141,25 @@ JCE_API void JCE_CALL jce_engine_set_pak_path(const char *path);
    Requires jce_config.h for JceRendererBackend enum. */
 JCE_API void JCE_CALL jce_engine_set_renderer_override(int backend);
 
-/* Create the engine: init logger, load config, open PAK, create
-   window/renderer/audio/input, async-load assets, create app. */
+/* Create the engine with explicit cleanup ownership, on the host thread.
+   owner must be a valid empty slot; an occupied slot is rejected unchanged.
+   CONTINUE means fully initialized and ready. FAILURE can still leave *owner
+   non-NULL when cleanup must be retried; retain it and call try_destroy until
+   completion. A failed/closing owner admits no new event, update or draw work.
+   Only one engine session may exist in a process, including pending cleanup.
+   The slot is published before app.init, so callbacks can request its closure;
+   closure during init forces failed creation even if init returns true. */
+JCE_API JceAppResult JCE_CALL jce_engine_create_owned(int argc, char *argv[],
+                                                     JceEngine **owner);
+
+/* Legacy creation ABI: returns NULL on failure. If failed startup cannot yet
+   release its owner, the engine retains one process-local pending owner.
+   destroy(NULL) or a later legacy create retries it. That create invocation
+   drains only and returns NULL even if cleanup completes; it never starts the
+   retained application's descriptor again implicitly. Complete that retry before reapplying pre-boot
+   settings for a replacement application; pending ownership rejects setters.
+   Prefer create_owned to observe completion directly.
+   Initializes logger/config/PAK, window/renderer/audio/input/assets and app. */
 JCE_API JceEngine     *jce_engine_create(int argc, char *argv[]);
 
 /* Route a platform event to input + app.
@@ -93,10 +167,29 @@ JCE_API JceEngine     *jce_engine_create(int argc, char *argv[]);
    The event pointer is backend-specific (SDL_Event* internally). */
 JCE_API JceAppResult JCE_CALL jce_engine_event(JceEngine *e, const void *event);
 
-/* Run one frame: begin_frame, app_update, end_frame, input_update. */
+/* Run one frame: begin_frame, app_update, end_frame, input_update.
+   Recursive entry during a frame or event callback returns CONTINUE. */
 JCE_API JceAppResult JCE_CALL jce_engine_iterate(JceEngine *e);
 
-/* Shut down everything in reverse order. */
+/* Shut down owned services on the host thread. A NULL slot is rejected; an
+   already empty slot succeeds. An address other than the current owner is
+   rejected before dereference. The caller must discard all aliases after
+   completion; raw pointers cannot distinguish a later reused address.
+   Returns true and clears *owner only when teardown has finished. False leaves
+   the slot unchanged for retry; constructing and active callbacks keep their
+   borrowed services until the enclosing call returns. Closing blocks further
+   application work. Native joins may have platform-specific latency; this is
+   an ownership result, not a portable wall-clock deadline or GPU fence. */
+JCE_API bool JCE_CALL jce_engine_try_destroy(JceEngine **owner);
+
+/* Legacy shutdown ABI, using the same cleanup owner as try_destroy.
+   NULL retries the pending owner from a failed legacy create, if any.
+   During a frame or event callback, requests quit and retains the engine and
+   its services until the outer event/iterate call returns. The host must call
+   destroy again after that return, normally on a terminal application result.
+   Shutdown also retains ownership if the shared async executor cannot stop
+   inside an active callback; retry after the outer owner-thread pump returns.
+   Terminal finalization and teardown reject recursive destruction. */
 JCE_API void JCE_CALL jce_engine_destroy(JceEngine *e);
 
 /* ---- FixedUpdate cadence (P3-B.2) ------------------------------ */
@@ -138,6 +231,16 @@ JCE_API double JCE_CALL jce_engine_get_fixed_hz(void);
  * wait itself happens on the loop thread. */
 JCE_API void JCE_CALL jce_engine_set_target_fps(int fps);
 JCE_API int  JCE_CALL jce_engine_get_target_fps(void);
+
+/* Effective background CPU permission for the single host, default false.
+ * Main-thread only, callable before boot. The stock/Editor host policy publishes
+ * authored run-in-background intent subject to its manual/OS pause, and restores
+ * the prior value conditionally when that host closes. The getter observes this
+ * published permission, not an author's original project setting. It permits
+ * update-only ticks while minimized/non-drawable, never overrides OS PAUSE, and
+ * does not enable rendering or alter foreground auxiliary-hook frequency. */
+JCE_API void JCE_CALL jce_engine_set_run_in_background(bool enabled);
+JCE_API bool JCE_CALL jce_engine_get_run_in_background(void);
 
 /* ---- Optional scene-asset bundle catalog ----------------------- */
 
@@ -181,6 +284,14 @@ JCE_API void JCE_CALL jce_engine_apply_graphics_config(
  * window close button, including the WILL_QUIT lifecycle event).  Safe to
  * call from anywhere on the main thread; used by the default_main runtime
  * presets (hold ESC 2s) and available to any app/driver code. */
+/* Request terminal SUCCESS or FAILURE on the main thread, through the same
+ * frame/KPI finalization, WILL_QUIT and host teardown path. FAILURE is sticky:
+ * later successful/legacy quit requests cannot downgrade it. CONTINUE and
+ * other invalid values are ignored. Requests before create are retained;
+ * only fully completed engine destruction clears this session's request.
+ * Deferred/reentrant destruction and early creation failures do not clear it.
+ * Compatible additive API; legacy request_quit requests SUCCESS. */
+JCE_API void JCE_CALL jce_engine_request_quit_with_result(JceAppResult result);
 JCE_API void JCE_CALL jce_engine_request_quit(void);
 JCE_API bool JCE_CALL jce_engine_quit_requested(void);
 

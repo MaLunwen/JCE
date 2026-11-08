@@ -27,6 +27,8 @@
 #include <jce/application/jce_main.h>
 #include <jce/application/jce_project.h>
 #include <jce/application/jce_runtime_stats_host.h>
+#include <jce/application/jce_runtime_host_policy.inc.h>
+#include <jce/application/jce_default_frame_observation.inc.h>
 #include <jce/application/jce_lifecycle.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_console.h>   /* r.taa cvar: the TAA driver below */
@@ -41,6 +43,8 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>              /* .jce/project-settings.json reader */
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_env.h>
+#include <jce/os/core/jce_trace.h>
 #include <jce/os/platform/jce_host_paths.h>    /* per-user saves directory */
 #include <jce/os/core/jce_math.h>
 #include <jce/os/platform/jce_input.h>
@@ -75,6 +79,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>   /* screenshot/recording preset file names */
+
+/* Stock consumers opt into a closed, verified Bundle asset view. The hook
+ * must query the actual inspected typed graph, not a filename/extension test.
+ * Ordinary generated applications retain their developer override behavior. */
+#ifndef JCE_DEFAULT_MAIN_PACKAGED_ONLY
+#  define JCE_DEFAULT_MAIN_PACKAGED_ONLY 0
+#endif
+#if JCE_DEFAULT_MAIN_PACKAGED_ONLY && !defined(JCE_DEFAULT_MAIN_PACKAGED_SCENE_ALLOWED)
+#  error "Packaged-only default main requires typed Bundle scene admission"
+#endif
 
 #ifndef JCE_PROJECT_EMBEDDED_BUNDLE_COUNT
 #  define JCE_PROJECT_EMBEDDED_BUNDLE_COUNT 0
@@ -115,6 +129,7 @@ static bool              s_camera_draw_skybox = true;
 static bool              s_camera_keep_color = false;
 static bool              s_camera_keep_depth = false;
 static JceSceneRenderer *s_scene_renderer = NULL;
+static bool s_cache_was_transitioning, s_cache_reset_pending;
 /* The developer console, created only under --dev.  NULL otherwise, which
  * is what makes every call site a single null test. */
 static JceConsoleShell   *s_console_shell = NULL;
@@ -224,7 +239,11 @@ static JceBundleFile   **s_bundle_files   = NULL;
 static int               s_bundle_count   = 0;
 static JcePakArchive    *s_engine_pak     = NULL;
 static const JceServices*s_svc            = NULL;
-static JceRuntimeStatsHost s_runtime_host = {0};
+static struct {
+    JceRuntimeStatsHost stats;
+    JceRuntimeHostPolicy policy;
+} s_default_host = {0};
+#define s_runtime_host (s_default_host.stats)
 #define s_runtime (s_runtime_host.runtime) /* Legacy template-private consumer alias. */
 static float             s_last_dt        = 0.016f;
 static bool              s_jump_edge      = false;
@@ -401,6 +420,7 @@ static void jce_default_unmount_project_bundles(void)
     if (s_bundle_fs) { jce_fs_destroy(s_bundle_fs); s_bundle_fs = NULL; }
 }
 
+#if !JCE_DEFAULT_MAIN_PACKAGED_ONLY
 static JceProject *jce_default_load_project_manifest(void)
 {
     char base[1024] = {0};
@@ -412,12 +432,17 @@ static JceProject *jce_default_load_project_manifest(void)
         project = jce_project_load(".");
     return project;
 }
+#endif
 
 static bool jce_default_mount_runtime_assets(const JceProject *proj)
 {
     bool has_pak = false;
     bool has_loose = false;
+#if !JCE_DEFAULT_MAIN_PACKAGED_ONLY
     char base[1024] = {0};
+#else
+    (void)proj;
+#endif
 
     s_runtime_fs = jce_fs_create();
     if (!s_runtime_fs) {
@@ -431,7 +456,10 @@ static bool jce_default_mount_runtime_assets(const JceProject *proj)
             LOG_ERROR("app", "%s", "embedded PAK could not be mounted");
     }
 
-    if (jce_fs_host_get_base_path(base, sizeof(base))) {
+    /* A packaged stock application must not discover an adjacent project. */
+#if !JCE_DEFAULT_MAIN_PACKAGED_ONLY
+    if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
         const char *cooked = (proj && proj->cooked_assets &&
                               proj->cooked_assets[0])
                              ? proj->cooked_assets : "resources/_cooked";
@@ -446,6 +474,8 @@ static bool jce_default_mount_runtime_assets(const JceProject *proj)
         }
     }
 
+#endif
+
     if (!has_pak && !has_loose) {
         LOG_ERROR("app", "%s", "no runtime asset source is available");
         jce_fs_destroy(s_runtime_fs);
@@ -458,7 +488,11 @@ static bool jce_default_mount_runtime_assets(const JceProject *proj)
      * a copied single-executable app could load the startup scene explicitly
      * from its PAK yet later CPU-side assets silently fell back to the host
      * filesystem and disappeared outside the build directory. */
+#if JCE_DEFAULT_MAIN_PACKAGED_ONLY
+    jce_fs_set_active_policy(s_runtime_fs, JCE_FS_ACTIVE_ISOLATED);
+#else
     jce_fs_set_active(s_runtime_fs);
+#endif
 
     LOG_INFO("app", "runtime assets mounted: pak=%s loose=%s",
              has_pak ? "yes" : "no", has_loose ? "yes" : "no");
@@ -517,7 +551,14 @@ static bool jce_default_load_startup_scene(
             }
         }
     }
+#if JCE_DEFAULT_MAIN_PACKAGED_ONLY
+    if (!scene_path || !JCE_DEFAULT_MAIN_PACKAGED_SCENE_ALLOWED(scene_path)) {
+        LOG_ERROR("app", "%s", "startup scene is outside the verified stock Bundle");
+        return false;
+    }
+#else
     if (!scene_path) return true; /* Intentional empty-project boot. */
+#endif
 
     if (!s_runtime_fs) {
         LOG_ERROR("app", "%s", "startup scene requested without runtime assets");
@@ -534,7 +575,19 @@ static bool jce_default_load_startup_scene(
         return false;
     }
     snprintf(s_boot_scene_path, sizeof(s_boot_scene_path), "%s", scene_path);
-    LOG_INFO("app", "startup scene loaded (runtime assets): %s", scene_path);
+    /* Explicit diagnostics observe actual admission, not packaged intent. */
+#if !defined(JCE_LOG_NONE)
+    const char *perf_log = getenv("JCE_PERF_LOG");
+    const char *frame_log = getenv("JCE_KPI_FRAME_LOG");
+    if (jce_env_flag_enabled(perf_log) ||
+        (frame_log && frame_log[0]) || jce_trace_enabled()) {
+        jce_log_write(JCE_LOG_LEVEL_INFO, "app", __FILE__, __LINE__,
+                      "startup scene loaded (runtime assets): %s", scene_path);
+    } else
+#endif
+    {
+        LOG_INFO("app", "startup scene loaded (runtime assets): %s", scene_path);
+    }
     return true;
 }
 
@@ -661,6 +714,7 @@ static void jce_default_init_world_streaming(const JceProject *proj)
 static bool s_default_resolve_path(const char *in, char *out, int outsz, void *ud)
 {
     (void)ud;
+    if (JCE_DEFAULT_MAIN_PACKAGED_ONLY) return false;
     if (!in || !in[0] || !out || outsz <= 0) return false;
     /* Already absolute (drive letter, UNC, or POSIX root) → use as-is. */
     if (in[0] == '/' || in[0] == '\\' ||
@@ -741,18 +795,13 @@ static struct JceDefaultProjectPost {
     int   particle_step_ms;/* 0 = no cap */
 } s_ps_post;
 
-/* Is TAA asked for this frame?  Reads the same r.taa cvar the scene renderer
- * registers and the render-pipeline asset drives (rp.enable_taa), which is the
- * one the editor's viewports read too -- so both hosts answer this question
- * from the same place.
- *
- * Looked up every call rather than cached: the cvar is registered when the
- * scene renderer is created, and a cached NULL from before that would pin TAA
- * off for the life of the process. */
+/* Resolve before deciding direct-to-backbuffer versus a PostFX bridge.
+ * A project can change pipeline policy after scene-renderer creation; waiting
+ * until taa_begin_frame/render would choose the wrong route for that frame. */
 static bool s_default_main_taa_requested(void)
 {
-    const JceCvar *cv = jce_cvar_find("r.taa");
-    return cv ? jce_cvar_get_bool(cv) : false;
+    return jce_scene_renderer_taa_requested(s_scene_renderer) &&
+           jce_postfx_taa_supported();
 }
 
 static char *dm_pak_read_config(const char *pak_key, size_t *out_len);
@@ -764,9 +813,10 @@ static void s_default_apply_project_settings(JceRuntimeDesc *rd)
     const char *rel = ".jce/project-settings.json";
     char path[1200] = {0};
     char base[1024] = {0};
-    if (jce_fs_host_exists_file(rel)) {
+    if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY && jce_fs_host_exists_file(rel)) {
         snprintf(path, sizeof(path), "%s", rel);
-    } else if (jce_fs_host_get_base_path(base, sizeof(base))) {
+    } else if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
         int n = snprintf(path, sizeof(path), "%s%s", base, rel);
         if (n <= 0 || n >= (int)sizeof(path) || !jce_fs_host_exists_file(path))
             path[0] = '\0';
@@ -909,11 +959,15 @@ static const char *s_default_navmesh_path(void)
      * the shipped layout.  The runtime keeps the pointer, hence the static. */
     int n = snprintf(s_navmesh_bin, sizeof(s_navmesh_bin), "%s.navmesh.bin", np);
     if (n > 0 && n < (int)sizeof(s_navmesh_bin) &&
-        jce_fs_host_exists_file(s_navmesh_bin))
+        (JCE_DEFAULT_MAIN_PACKAGED_ONLY
+            ? jce_fs_probe_read(s_navmesh_bin) == JCE_FS_PRESENCE_PRESENT
+            : jce_fs_host_exists_file(s_navmesh_bin)))
         return s_navmesh_bin;
+    if (JCE_DEFAULT_MAIN_PACKAGED_ONLY) return NULL;
 
     char base[1024] = {0};
-    if (jce_fs_host_get_base_path(base, sizeof(base))) {
+    if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
         n = snprintf(s_navmesh_bin, sizeof(s_navmesh_bin), "%s%s.navmesh.bin",
                      base, np);
         if (n > 0 && n < (int)sizeof(s_navmesh_bin) &&
@@ -1061,6 +1115,52 @@ static char *dm_pak_read_config(const char *pak_key, size_t *out_len)
     return buf;
 }
 
+/* Load legacy quality before the canonical pipeline and player overrides.
+ * Other legacy services apply later, after their owners have been created. */
+static void s_default_load_render_settings(void)
+{
+    bool rs_loaded = false;
+    s_render_settings_loaded = false;
+    char base[1024] = {0};
+    if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
+        const char *cooked = (s_project && s_project->cooked_assets &&
+                              s_project->cooked_assets[0])
+                             ? s_project->cooked_assets : "resources/_cooked";
+        char rpath[1024];
+        int n = snprintf(rpath, sizeof(rpath), "%s%s/render_settings.json",
+                         base, cooked);
+        if (n > 0 && n < (int)sizeof(rpath) &&
+            jce_render_settings_load_json(rpath, &s_render_settings)) {
+            LOG_INFO("app", "render settings loaded: %s", rpath);
+            rs_loaded = true;
+        }
+    }
+    if (!rs_loaded) {
+        size_t clen = 0;
+        char *cbuf = dm_pak_read_config("render_settings.json", &clen);
+        if (cbuf) {
+            if (jce_render_settings_load_json_mem(cbuf, clen, &s_render_settings)) {
+                LOG_INFO("app", "%s", "render settings loaded: pak:render_settings.json");
+                rs_loaded = true;
+            }
+            free(cbuf);
+        }
+    }
+    if (rs_loaded) {
+        s_render_settings_loaded = true;
+        /* Preserve the legacy swapchain sample snapping, including 16.
+         * This is fallback intent; an explicit .rp.json field and graphics
+         * user config resolve afterwards, before the single live sync. */
+        int ms = s_render_settings.msaa;
+        JceRenderPipelineDesc pipeline;
+        jce_render_pipeline_get_requested(&pipeline);
+        pipeline.msaa_samples = ms >= 16 ? 16 : ms >= 8 ? 8 :
+                                ms >= 4 ? 4 : ms >= 2 ? 2 : 1;
+        jce_render_pipeline_apply(&pipeline);
+    }
+}
+
 static bool app_init(const JceServices *svc, void *ud)
 {
     (void)ud;
@@ -1117,15 +1217,39 @@ static bool app_init(const JceServices *svc, void *ud)
                      jce_bundle_file_id(s_bundle_files[0]));
     }
 
+#if !JCE_DEFAULT_MAIN_PACKAGED_ONLY
+    s_project = jce_default_load_project_manifest();
+#endif
+
     /* Settings S2: the engine-init boot ran BEFORE any game PAK was mounted,
      * so a packaged single-exe game always fell back to the tier preset and
      * silently lost its authored render-pipeline asset.  Re-resolve now that
      * bundles are overlaid: host file (CWD, exe dir) first, then the packed
-     * key.  Strict no-op when nothing resolves. */
+     * key. Legacy quality supplies only an MSAA fallback; explicit canonical
+     * fields and then the player's graphics section take priority. */
+    s_default_load_render_settings();
+#if JCE_DEFAULT_MAIN_PACKAGED_ONLY
+    /* Engine init may have observed a developer CWD pipeline before the
+     * Bundle existed. Reset that content layer, then resolve only this PAK.
+     * Player graphics preferences are reapplied by the existing call below. */
+    {
+        JceRenderPipelineDesc pipeline;
+        jce_render_pipeline_preset_for_current_tier(&pipeline);
+        if (s_render_settings_loaded) {
+            JceRenderPipelineDesc fallback;
+            jce_render_pipeline_get_requested(&fallback);
+            pipeline.msaa_samples = fallback.msaa_samples;
+        }
+        jce_render_pipeline_apply(&pipeline);
+        jce_render_pipeline_apply_boot_mounted(s_engine_pak, NULL,
+            "settings/render_pipeline.rp.json");
+    }
+#else
     jce_render_pipeline_apply_boot_mounted(
         (const struct JcePakArchive *)s_engine_pak,
         "Settings/RenderPipeline.rp.json",
         "settings/render_pipeline.rp.json");
+#endif
 
     /* Settings S7 follow-up: re-layer the player's saved in-game graphics
      * choices (jce.ini [graphics]) — the re-resolve above may have replaced
@@ -1134,8 +1258,15 @@ static bool app_init(const JceServices *svc, void *ud)
      * the config carries no [graphics] section. */
     if (svc)
         jce_engine_apply_graphics_config(svc->config, svc->renderer);
-
-    s_project = jce_default_load_project_manifest();
+    /* The no-graphics API call is a strict no-op. Always synchronize boot's
+     * final effective policy here, including numeric QA forces. The renderer
+     * setter deduplicates a matching user-config request without a reset. */
+    if (svc && svc->renderer) {
+        JceRenderPipelineDesc effective;
+        jce_render_pipeline_get(&effective);
+        jce_renderer_set_msaa(svc->renderer, (int)effective.msaa_samples);
+    }
+    /* Render-pipeline startup resolution is complete. */
     JceRuntimeBootManifest runtime_boot = {0};
     const bool boot_entry_present = s_engine_pak &&
         jce_pak_find(s_engine_pak, JCE_RUNTIME_BOOT_MANIFEST_PATH);
@@ -1145,7 +1276,17 @@ static bool app_init(const JceServices *svc, void *ud)
         LOG_ERROR("app", "%s", "runtime boot manifest is invalid");
         return false;
     }
-    if (!s_project && !boot_loaded) {
+    bool bundle_boot_allowed = false;
+#if JCE_DEFAULT_MAIN_PACKAGED_ONLY
+    /* The stock reader admitted the complete Lua/JS Bundle before app_init.
+     * A failed mount or missing/non-scene startup never becomes an empty boot. */
+    if (s_bundle_count == 1) {
+        const char *bundle_scene = jce_bundle_file_scene_path(s_bundle_files[0]);
+        bundle_boot_allowed = bundle_scene &&
+            JCE_DEFAULT_MAIN_PACKAGED_SCENE_ALLOWED(bundle_scene);
+    }
+#endif
+    if (!s_project && !boot_loaded && !bundle_boot_allowed) {
         LOG_ERROR("app", "%s",
                   "jce_project.json and packed runtime boot manifest are both missing");
         return false;
@@ -1168,12 +1309,16 @@ static bool app_init(const JceServices *svc, void *ud)
         return false;
     }
 
+    if (JCE_DEFAULT_MAIN_PACKAGED_ONLY)
+        jce_scene_particles_set_asset_root(NULL);
+
     /* Anchor component-relative *.particles.json reads under the staged
      * cooked tree (same class of fix as s_default_resolve_path below: those
      * reads are otherwise CWD-relative and fail when CWD != cooked root). */
     {
         char base[1024] = {0};
-        if (jce_fs_host_get_base_path(base, sizeof(base))) {
+        if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
             const char *cooked = (s_project && s_project->cooked_assets &&
                                   s_project->cooked_assets[0])
                                  ? s_project->cooked_assets : "resources/_cooked";
@@ -1385,7 +1530,8 @@ static bool app_init(const JceServices *svc, void *ud)
     {
         bool matrix_loaded = false;
         char base[1024] = {0};
-        if (jce_fs_host_get_base_path(base, sizeof(base))) {
+        if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
             const char *cooked = (s_project && s_project->cooked_assets &&
                                   s_project->cooked_assets[0])
                                  ? s_project->cooked_assets : "resources/_cooked";
@@ -1410,43 +1556,12 @@ static bool app_init(const JceServices *svc, void *ud)
         }
     }
 
-    /* Project-wide quality settings (Top 5): load the build-exported
-     * render_settings.json from the cooked tree.  lod_bias applies globally
+    /* Project-wide quality settings (Top 5): apply the legacy settings loaded
+     * before the canonical pipeline. lod_bias applies globally
      * now; the shadow tier folds into the scene render config each frame via
      * s_default_scene_cfg().  Missing file ⇒ engine defaults. */
     {
-        /* Loose cooked tree first (dev hot-tweak), then the embedded PAK, so a
-         * single self-contained exe still applies the authored shadow tier /
-         * MSAA / vsync / LOD bias / grass toggle instead of engine defaults. */
-        bool rs_loaded = false;
-        char base[1024] = {0};
-        if (jce_fs_host_get_base_path(base, sizeof(base))) {
-            const char *cooked = (s_project && s_project->cooked_assets &&
-                                  s_project->cooked_assets[0])
-                                 ? s_project->cooked_assets : "resources/_cooked";
-            char rpath[1024];
-            int n = snprintf(rpath, sizeof(rpath), "%s%s/render_settings.json",
-                             base, cooked);
-            if (n > 0 && n < (int)sizeof(rpath) &&
-                jce_render_settings_load_json(rpath, &s_render_settings)) {
-                LOG_INFO("app", "render settings loaded: %s", rpath);
-                rs_loaded = true;
-            }
-        }
-        if (!rs_loaded) {
-            size_t clen = 0;
-            char *cbuf = dm_pak_read_config("render_settings.json", &clen);
-            if (cbuf) {
-                if (jce_render_settings_load_json_mem(cbuf, clen, &s_render_settings)) {
-                    LOG_INFO("app", "%s",
-                             "render settings loaded: pak:render_settings.json");
-                    rs_loaded = true;
-                }
-                free(cbuf);
-            }
-        }
-        if (rs_loaded) {
-            s_render_settings_loaded = true;
+        if (s_render_settings_loaded) {
             /* lod_bias is a MESH-LOD distance multiplier (see jce_lod.h).
              * It used to be cast to int8 and handed to
              * jce_texture_set_global_mip_bias, which is a top-mip DROP
@@ -1454,13 +1569,11 @@ static bool app_init(const JceServices *svc, void *ud)
              * game one mip level of texture detail that the editor kept,
              * and 2.0 cost two.  Wrong quantity, wrong units, wrong sign. */
             jce_lod_set_global_bias(s_render_settings.lod_bias);
-            /* Window-period graphics: vsync + MSAA are swapchain reset flags,
-             * applied here via a GPU reset (the renderer is already created).
-             * HDR is handled by the pipeline's internal HDR offscreen target +
-             * tonemap, not a backbuffer flag. */
+            /* Vsync remains a legacy swapchain request. MSAA was already
+             * composed with canonical/player policy before scene-renderer creation.
+             * HDR stays in the pipeline's offscreen target and tonemap. */
             if (svc && svc->renderer) {
                 jce_renderer_set_vsync(svc->renderer, s_render_settings.vsync != 0);
-                jce_renderer_set_msaa(svc->renderer, s_render_settings.msaa);
             }
             /* Grass rendering project gate (Stage 1b.6). */
             if (s_scene_renderer)
@@ -1487,7 +1600,7 @@ static bool app_init(const JceServices *svc, void *ud)
             jce_particles_set_soft_fade_distance(
                 s_render_settings.soft_particles
                     ? JCE_PARTICLES_SOFT_FADE_DEFAULT : 0.0f);
-            LOG_INFO("app", "render settings applied (vsync=%d msaa=%d "
+            LOG_INFO("app", "render settings applied (vsync=%d msaa_fallback=%d "
                      "texq=%d aniso=%d fps_cap=%d softparticles=%d)",
                      s_render_settings.vsync, s_render_settings.msaa,
                      s_render_settings.texture_quality,
@@ -1536,7 +1649,8 @@ static bool app_init(const JceServices *svc, void *ud)
         static char s_loc_dir[1024];
         {
             char base[1024] = {0};
-            if (jce_fs_host_get_base_path(base, sizeof(base))) {
+            if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
                 const char *cooked =
                     (s_project && s_project->cooked_assets &&
                      s_project->cooked_assets[0])
@@ -1559,24 +1673,32 @@ static bool app_init(const JceServices *svc, void *ud)
         {
             const char *rel = "Settings/audio_mixer.json";
             char base[1024] = {0};
-            if (jce_fs_host_exists_file(rel)) {
+            if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY && jce_fs_host_exists_file(rel)) {
                 snprintf(s_mixer_cfg_path, sizeof(s_mixer_cfg_path), "%s", rel);
                 rd.mixer_config_path = s_mixer_cfg_path;
-            } else if (jce_fs_host_get_base_path(base, sizeof(base))) {
+            } else if (!JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+        jce_fs_host_get_base_path(base, sizeof(base))) {
                 int n = snprintf(s_mixer_cfg_path, sizeof(s_mixer_cfg_path),
                                  "%s%s", base, rel);
                 if (n > 0 && n < (int)sizeof(s_mixer_cfg_path) &&
                     jce_fs_host_exists_file(s_mixer_cfg_path))
                     rd.mixer_config_path = s_mixer_cfg_path;
             }
+            if (JCE_DEFAULT_MAIN_PACKAGED_ONLY &&
+                jce_fs_probe_read("settings/audio_mixer.json") == JCE_FS_PRESENCE_PRESENT)
+                rd.mixer_config_path = "settings/audio_mixer.json";
             if (rd.mixer_config_path)
                 LOG_INFO("app", "audio mixer config: %s", rd.mixer_config_path);
         }
         const bool stats_configured = jce_runtime_stats_host_attach_env(&s_runtime_host);
         if (!stats_configured)
             LOG_WARN("app", "%s", "runtime stats configuration unavailable");
-        s_runtime_host.runtime = jce_runtime_create_with_platform_services(
-            &rd, stats_configured ? s_runtime_host.stats : NULL);
+        uint32_t viewport_w = 0, viewport_h = 0;
+        if (svc->window) jce_window_get_size(svc->window, &viewport_w, &viewport_h);
+        const JceRuntimeCreateOptions create_options = {(float)viewport_w, (float)viewport_h};
+        s_runtime_host.runtime = jce_runtime_create_with_options(
+            &rd, stats_configured ? s_runtime_host.stats : NULL,
+            &create_options, sizeof create_options);
         if (s_runtime_host.runtime)
             jce_runtime_set_platform_services(s_runtime_host.runtime, stats_configured ? s_runtime_host.stats : NULL);
         else {
@@ -1655,6 +1777,12 @@ static bool app_init(const JceServices *svc, void *ud)
                  s_cursor_captured ? "captured (FPS-look)" : "free (orbit/UI)",
                  has_character ? "has" : "has no");
     }
+    if (!jce_runtime_host_policy_begin(&s_default_host.policy,
+            s_runtime_host.runtime, boot_loaded ? runtime_boot.run_in_background : true,
+            svc && svc->window, 30, 15)) {
+        LOG_ERROR("app", "%s", "player lifecycle registration failed");
+        return false;
+    }
     return true;
 }
 /* Editor-authored action map drives movement when the action exists;
@@ -1672,9 +1800,29 @@ static bool dm_act_down(const JceInput *in, const JceInputActions *acts,
     return jce_input_key_down(in, fallback_key);
 }
 
+/* CPU notes invalidation; only an admitted draw consumes GPU cache retirement. */
+static void default_player_cache_transition(bool transitioning)
+{
+    if (s_cache_was_transitioning && !transitioning) s_cache_reset_pending = true;
+    s_cache_was_transitioning = transitioning;
+}
+static void default_player_cache_prepare(void)
+{
+    if (s_cache_reset_pending && s_scene_renderer) {
+        s_cache_reset_pending = false;
+        jce_scene_renderer_reset_entity_caches(s_scene_renderer);
+    }
+}
+
+/* Narrow adapter retained as an actual stock-entry consumption seam. */
+static bool default_player_policy_update(float *dt)
+{
+    return jce_runtime_host_policy_step(&s_default_host.policy, false, dt);
+}
 static void app_update(float dt, void *ud)
 {
     (void)ud;
+    if (!default_player_policy_update(&dt)) { s_last_dt = 0.0f; return; }
     s_last_dt = dt;
     if (s_kpi_game_shots_active)
         jce_screenshot_schedule_tick(
@@ -1762,7 +1910,7 @@ static void app_update(float dt, void *ud)
         jce_fs_host_create_directory(dir);
         snprintf(path, sizeof path, "%s/shot_%lld.png",
                  dir, (long long)time(NULL));
-        if (jce_renderer_request_screenshot(path))
+        if (!s_kpi_game_shots.in_flight && jce_renderer_request_screenshot(path))
             LOG_INFO("app", "screenshot -> %s", path);
     }
 
@@ -1833,6 +1981,8 @@ static void app_update(float dt, void *ud)
          * consume this through scene scripts, while FPS projects can ignore it
          * and keep using the default camera path below. */
         jce_input_mouse_delta(in, &ri.pointer_dx, &ri.pointer_dy);
+        if (!jce_window_point_to_pixels(s_svc->window, ri.pointer_dx, ri.pointer_dy,
+                                        &ri.pointer_dx, &ri.pointer_dy)) ri.pointer_dx = ri.pointer_dy = 0;
         ri.pointer_wheel = jce_input_mouse_wheel(in);
         for (int button = 1; button <= 5; ++button) {
             if (jce_input_mouse_button(in, button))
@@ -1848,6 +1998,10 @@ static void app_update(float dt, void *ud)
             uint32_t pointer_w = 0, pointer_h = 0;
             jce_input_mouse_pos(in, &pointer_x, &pointer_y);
             if (s_svc->window) jce_window_get_size(s_svc->window, &pointer_w, &pointer_h);
+            (void)jce_runtime_set_viewport_size(s_runtime_host.runtime,
+                (float)pointer_w, (float)pointer_h);
+            if (!jce_window_point_to_pixels(s_svc->window, pointer_x, pointer_y,
+                                            &pointer_x, &pointer_y)) pointer_w = pointer_h = 0;
             /* Focus loss is not a user release. Recorded input owns its
              * focus boundary; live hosts invalidate their logical viewport. */
             if (!getenv("JCE_INPUT_REPLAY") && !jce_lifecycle_is_focused())
@@ -1886,11 +2040,8 @@ static void app_update(float dt, void *ud)
          * entity-keyed renderer cache slot (foliage/grass/water/canopies)
          * goes stale.  Drop them once per completed transition — content
          * rebuilds lazily on the next draw. */
-        static bool s_was_transitioning = false;
-        bool transitioning = jce_runtime_is_transitioning(s_runtime_host.runtime);
-        if (s_was_transitioning && !transitioning && s_scene_renderer)
-            jce_scene_renderer_reset_entity_caches(s_scene_renderer);
-        s_was_transitioning = transitioning;
+        default_player_cache_transition(
+            jce_runtime_is_transitioning(s_runtime_host.runtime));
     }
 
     /* Drive chunk streaming from the live camera position (cooperative
@@ -2167,8 +2318,28 @@ static void jce_default_main_render_camera_overlays(
 static void app_draw(const JceServices *svc, void *ud)
 {
     (void)ud;
-    if (!svc || !svc->renderer || !s_scene_renderer || !s_scene || !s_camera)
+    JceFrameViewportObservation frame_observation;
+    const bool frame_observation_on = default_frame_observation_begin(&frame_observation);
+    const char *frame_capture = getenv("JCE_KPI_FRAME_LOG");
+    bool frame_capture_forces_draw = frame_capture && frame_capture[0];
+    if (frame_capture_forces_draw) {
+        const char *viewport_policy = getenv("JCE_KPI_FRAME_LOG_VIEWPORT");
+        /* Only exact natural removes FrameLog's own capture override.
+         * Default/invalid selectors retain compatibility; shots stay explicit. */
+        frame_capture_forces_draw = !viewport_policy || strcmp(viewport_policy, "natural") != 0;
+    }
+    if (!jce_runtime_host_policy_draw(&s_default_host.policy,
+            s_kpi_game_shots_active || frame_capture_forces_draw)) {
+        default_frame_observation_refuse(&frame_observation, frame_observation_on,
+                                        JCE_DEFAULT_OBSERVATION_HOST_POLICY);
         return;
+    }
+    if (!svc || !svc->renderer || !s_scene_renderer || !s_scene || !s_camera) {
+        default_frame_observation_refuse(&frame_observation, frame_observation_on,
+                                        JCE_DEFAULT_OBSERVATION_MISSING_OWNERS);
+        return;
+    }
+    default_player_cache_prepare();
 
 #if defined(JCE_APP_AUTHORED_CAMERA_ONLY) && JCE_APP_AUTHORED_CAMERA_ONLY
     /* Scene scripts animate the authored camera. Resolve it after update,
@@ -2272,6 +2443,7 @@ static void app_draw(const JceServices *svc, void *ud)
              * budgets and why the UI stays native moved there with them. */
             uint32_t rw = sw, rh = sh;
             jce_render_pipeline_scene_extent(sw, sh, &rw, &rh);
+            default_frame_observation_request(&frame_observation, frame_observation_on, rw, rh);
             float aspect = (float)sw / (float)sh;
             jce_mat4 view = jce_camera_view(s_camera);
             jce_mat4 proj = jce_camera_proj(s_camera, aspect,
@@ -2305,6 +2477,7 @@ static void app_draw(const JceServices *svc, void *ud)
                                              s_camera_keep_color,
                                              s_camera_keep_depth,
                                              "RuntimeScene")) {
+                default_frame_observation_prepared(&frame_observation, frame_observation_on, s_post_target);
                 JceSceneRenderConfig pcfg = s_default_scene_cfg();
                 uint16_t base = jce_offscreen_target_get_view_id(s_post_target);
                 /* Postfx path renders into the offscreen target — bind the
@@ -2342,11 +2515,11 @@ static void app_draw(const JceServices *svc, void *ud)
                 /* This main DOES composite (a few lines below), so the
                  * analytic aerial fog must stand down or the frame gets both. */
                 pcfg.composites_volumetric_fog = true;
+                pcfg.scene_depth_tex_handle =
+                    jce_offscreen_target_get_depth_texture(s_post_target);
                 pcfg.fog_enabled =
                     jce_scene_fog_params_from_scene(s_scene, &pcfg.fog);
                 if (pcfg.fog_enabled) {
-                    pcfg.scene_depth_tex_handle =
-                        jce_offscreen_target_get_depth_texture(s_post_target);
                     pcfg.fog_rt_width  = (int)rw;
                     pcfg.fog_rt_height = (int)rh;
                 }
@@ -2363,6 +2536,7 @@ static void app_draw(const JceServices *svc, void *ud)
                 jce_default_main_render_camera_overlays(base, &pcfg);
                 jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                           base, s_last_dt, &pcfg);
+                default_frame_observation_cpu_returned(&frame_observation, frame_observation_on);
                 jce_default_main_physics_debug(base, svc);
 
                 /* Composite the fog into the scene RT.  view_base+16 matches
@@ -2459,6 +2633,7 @@ static void app_draw(const JceServices *svc, void *ud)
         }
     }
     if (!present_done) {
+        default_frame_observation_request(&frame_observation, frame_observation_on, sw, sh);
         /* DIRECT TO BACKBUFFER: a "keep" clear mode cannot be honoured here
          * and is not silently dropped.  The backbuffer is a rotating
          * swapchain, so "what was already in it" is a buffer from two or three
@@ -2519,6 +2694,7 @@ static void app_draw(const JceServices *svc, void *ud)
         jce_default_main_render_camera_overlays(JCE_VIEW_RUNTIME_GAME, &cfg);
         jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                                   JCE_VIEW_RUNTIME_GAME, s_last_dt, &cfg);
+        default_frame_observation_cpu_returned(&frame_observation, frame_observation_on);
         jce_default_main_physics_debug(JCE_VIEW_RUNTIME_GAME, svc);
     }
 
@@ -2551,8 +2727,11 @@ static void app_draw(const JceServices *svc, void *ud)
              * Game View has always tested the panel rect; this is that test. */
             if ((!s_cursor_captured || s_preset_alt_active) && svc->input) {
                 float mx = 0.0f, my = 0.0f;
+                uint32_t point_w = 0, point_h = 0;
+                jce_window_get_point_size(svc->window, &point_w, &point_h);
                 ptr.valid = jce_input_primary_pointer(svc->input,
-                    (float)sw, (float)sh, &mx, &my, &ptr.down);
+                    (float)point_w, (float)point_h, &mx, &my, &ptr.down) &&
+                    jce_window_point_to_pixels(svc->window, mx, my, &mx, &my);
                 ptr.x = mx;
                 ptr.y = my;
                 if (ptr.valid) ptr_arg = &ptr;
@@ -2679,9 +2858,16 @@ static void app_draw(const JceServices *svc, void *ud)
      * observed through the renderer's one-in-flight screenshot contract, so
      * ordered schedules cannot overwrite or reorder files. */
     if (s_kpi_game_shots_active) {
-        if (s_kpi_game_shots.in_flight && !jce_screenshot_pending()) {
-            jce_screenshot_schedule_mark_complete(&s_kpi_game_shots, true);
-            LOG_INFO("app", "%s", "deterministic game capture completed");
+        if (s_kpi_game_shots.in_flight) {
+            int result = jce_screenshot_poll();
+            if (result != 0) {
+                bool success = result == 1;
+                jce_screenshot_schedule_mark_complete(&s_kpi_game_shots, success);
+                if (success)
+                    LOG_INFO("app", "%s", "deterministic game capture completed");
+                else
+                    LOG_ERROR("app", "%s", "deterministic game capture write failed");
+            }
         }
         {
             const JceScreenshotScheduleEntry *due =
@@ -2703,11 +2889,13 @@ static void app_draw(const JceServices *svc, void *ud)
             }
         }
     }
+    default_frame_observation_publish(&frame_observation, frame_observation_on);
 }
 
 static void app_exit(void *ud)
 {
     (void)ud;
+    jce_runtime_host_policy_end(&s_default_host.policy);
     s_kpi_game_shots_active = false;
     memset(&s_kpi_game_shots, 0, sizeof(s_kpi_game_shots));
     /* Finalize a still-running F9 recording so the container is playable. */
@@ -2731,6 +2919,7 @@ static void app_exit(void *ud)
     /* Offscreen postfx target borrows the renderer — destroy before it. */
     if (s_post_target)    { jce_offscreen_target_destroy(s_post_target);  s_post_target    = NULL; }
     if (s_scene_renderer) { jce_scene_renderer_destroy(s_scene_renderer); s_scene_renderer = NULL; }
+    s_cache_was_transitioning = s_cache_reset_pending = false;
     /* Destroy cached meshes (owned here) before tearing the rest down, then
      * free the growable cache + its hash index. */
     for (uint32_t i = 0; i < s_mesh_cache_count; ++i) {

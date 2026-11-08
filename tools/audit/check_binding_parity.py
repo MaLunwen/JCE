@@ -14,7 +14,7 @@ Sources scanned:
   * Lua    — luaL_Reg tables / lua_register / lua_pushcfunction sites in
              engine/src/middleware/script/** and application/jce_rt_script.c
   * JNI    — JNIEXPORT functions / Java_* symbols in
-             engine/src/os/platform/jce_jni_bridge.c (+ engine/java if present)
+             engine/src/application/jce_jni_bridge.c (+ engine/java if present)
 
 CORE_PARITY lists the representative APIs the plan wants proven equivalent
 across C / Lua / Java.  A missing binding is a finding; the checker prints a
@@ -42,7 +42,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_ROOT = REPO_ROOT / "engine" / "include" / "jce"
 SCRIPT_DIR = REPO_ROOT / "engine" / "src" / "middleware" / "script"
 RT_SCRIPT = REPO_ROOT / "engine" / "src" / "application" / "jce_rt_script.c"
-JNI_BRIDGE = REPO_ROOT / "engine" / "src" / "os" / "platform" / "jce_jni_bridge.c"
+JNI_BRIDGE = REPO_ROOT / "engine" / "src" / "application" / "jce_jni_bridge.c"
 JAVA_ROOT = REPO_ROOT / "engine" / "java"
 
 # Representative cross-language APIs the plan wants proven at parity.

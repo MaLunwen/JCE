@@ -36,10 +36,7 @@ static void *default_alloc(size_t size, void *ctx)
 static void *default_realloc(void *ptr, size_t new_size, void *ctx)
 {
     (void)ctx;
-    jce__alloc_account_free(ptr);            /* drop old accounting (NULL ⇒ no-op) */
-    void *p = mi_realloc(ptr, new_size);
-    jce__alloc_account_alloc(p, new_size);   /* add new accounting (NULL ⇒ no-op)  */
-    return p;
+    return jce__realloc_tracked(ptr, new_size);
 }
 
 static void default_free(void *ptr, void *ctx)
@@ -165,6 +162,13 @@ bool jce_mem_stats(JceMemStats *out)
                     &cur_rss, &peak_rss,
                     &cur_commit, &peak_commit,
                     &page_faults);
+
+#if JCE_PLATFORM_WEB
+    /* Emscripten's mimalloc primitive leaves allocator commit estimates as
+     * RSS/commit defaults. They are not OS process memory observations. */
+    cur_rss = peak_rss = 0;
+    cur_commit = peak_commit = 0;
+#endif
 
     out->current_rss    = cur_rss;
     out->peak_rss       = peak_rss;

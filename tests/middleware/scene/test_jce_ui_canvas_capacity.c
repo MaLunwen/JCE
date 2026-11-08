@@ -78,7 +78,12 @@ static void test_last_button_state_survives_growth_and_deletion(void)
     JceEntity entities[ELEMENTS];
     for (unsigned i = 0; i < ELEMENTS; ++i) entities[i] = make_element(scene, root, i, true);
     render(canvas, scene, NULL);
-    JceUIPointer pointer = {1200, 66, true, true}; /* Center of element 999. */
+    /* The NULL layout sample had no pointer/button observation. Establish a
+     * real up sample before the down edge; held entry is not a fresh press. */
+    JceUIPointer pointer = {1200, 66, false, true}; /* Center of element 999. */
+    render(canvas, scene, &pointer);
+    TEST_ASSERT_EQUAL_UINT64(0, jce_ui_canvas_last_clicked(canvas));
+    pointer.down = true;
     render(canvas, scene, &pointer);
     /* Remove many hashed records while the final button keeps its press. */
     for (unsigned i = 0; i < ELEMENTS / 2u; ++i) jce_scene_destroy_entity(scene, entities[i]);

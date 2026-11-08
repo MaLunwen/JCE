@@ -285,16 +285,11 @@ bool flush_to_disk(const char *root)
     return ok;
 }
 
-/* Follow the open project: flush the outgoing root, load the incoming.
- * Called lazily from every accessor and from flush_tick. */
-void ensure_root(void)
+/* One table, one outgoing publication: refusal retains its root and values. */
+bool select_root(const char *root)
 {
-    const char *root = current_root();
-    if (strcmp(root, s_root) == 0 && s_loaded) return;
-    if (s_loaded && s_dirty && s_root[0]) {
-        flush_to_disk(s_root);
-        s_dirty = false;
-    }
+    if (strcmp(root, s_root) == 0 && s_loaded) return true;
+    if (s_loaded && !jce_editor_pstate_flush_now()) return false;
     strncpy(s_root, root, sizeof(s_root) - 1);
     s_root[sizeof(s_root) - 1] = '\0';
     s_loaded = true;
@@ -302,7 +297,10 @@ void ensure_root(void)
     s_dirty = false;
     if (s_root[0]) load_from_disk(s_root);
     else table_clear();
+    return true;
 }
+
+bool ensure_root(void) { return select_root(current_root()); }
 
 void mark_dirty(void) { s_dirty = true; s_quiet = 0.0f; }
 
@@ -317,23 +315,29 @@ const char *jce_editor_current_project_root(void)
     return s_current_project_root;
 }
 
-void jce_editor_current_project_root_set(const char *root)
+bool jce_editor_current_project_root_set(const char *root)
 {
-    /* Same truncation as the snprintf this replaced in dialog_project.cpp;
-     * NULL / "" both mean "no project open".  The store itself follows
-     * lazily via ensure_root() — do not flush from here, the caller
-     * (set_current_project_root) snapshots the outgoing project first. */
-    snprintf(s_current_project_root, sizeof(s_current_project_root),
-             "%s", root ? root : "");
+    /* Copy first: root may alias this owner's published fixed-size string. */
+    char next[sizeof(s_current_project_root)];
+    if (root && strlen(root) >= sizeof(next)) {
+        LOG_ERROR(LOG_TAG, "project switch refused: root exceeds state capacity");
+        return false;
+    }
+    snprintf(next, sizeof(next), "%s", root ? root : "");
+    if (!select_root(next)) {
+        LOG_ERROR(LOG_TAG, "project switch refused: outgoing state remains pending for %s", s_root);
+        return false;
+    }
+    memcpy(s_current_project_root, next, strlen(next) + 1);
+    return true;
 }
 
-bool jce_editor_pstate_active(void) { ensure_root(); return s_root[0] != '\0'; }
+bool jce_editor_pstate_active(void) { return ensure_root() && s_root[0] != '\0'; }
 
 static bool pstate_get(const char *scene_in, const char *key,
                        const Entry **out)
 {
-    ensure_root();
-    if (!s_root[0] || !key_valid(key)) return false;
+    if (!ensure_root() || !s_root[0] || !key_valid(key)) return false;
     char scene[PSTATE_SCENE_MAX];
     normalize_scene(scene_in, scene, sizeof(scene));
     int idx = entry_find(scene, key);
@@ -344,8 +348,7 @@ static bool pstate_get(const char *scene_in, const char *key,
 
 static void pstate_set_num(const char *scene_in, const char *key, double v)
 {
-    ensure_root();
-    if (!s_root[0] || !key_valid(key)) return;   /* inert without a project */
+    if (!ensure_root() || !s_root[0] || !key_valid(key)) return;
     char scene[PSTATE_SCENE_MAX];
     normalize_scene(scene_in, scene, sizeof(scene));
     Entry *e = entry_upsert(scene, key);
@@ -360,8 +363,7 @@ static void pstate_set_num(const char *scene_in, const char *key, double v)
 static void pstate_set_string(const char *scene_in, const char *key,
                               const char *v)
 {
-    ensure_root();
-    if (!s_root[0] || !key_valid(key)) return;
+    if (!ensure_root() || !s_root[0] || !key_valid(key)) return;
     if (!v) v = "";
     char scene[PSTATE_SCENE_MAX];
     normalize_scene(scene_in, scene, sizeof(scene));
@@ -418,21 +420,19 @@ void jce_editor_pstate_scene_set_str(const char *scene, const char *key,
 
 void jce_editor_pstate_flush_tick(float dt_sec)
 {
-    ensure_root();   /* also handles project switches */
-    if (!s_dirty || !s_root[0]) return;
+    if (!ensure_root() || !s_dirty || !s_root[0]) return;
     s_quiet += (dt_sec > 0.0f ? dt_sec : 0.0f);
     if (s_quiet < 0.5f) return;
-    s_dirty = false;
     s_quiet = 0.0f;
-    flush_to_disk(s_root);
+    s_dirty = !flush_to_disk(s_root);
 }
 
-void jce_editor_pstate_flush_now(void)
+bool jce_editor_pstate_flush_now(void)
 {
-    if (!s_dirty || !s_root[0]) return;
-    s_dirty = false;
+    if (!s_dirty || !s_root[0]) return true;
     s_quiet = 0.0f;
-    flush_to_disk(s_root);
+    s_dirty = !flush_to_disk(s_root);
+    return !s_dirty;
 }
 
 } /* extern "C" */

@@ -19,6 +19,7 @@
 #include <stdlib.h>                  /* getenv — JCE_VEL_INST kill-switch */
 #include "os/core/jce_memory.h"      /* JCE_CALLOC/JCE_FREE — grown prev-xform table */
 #include "renderer/jce_render_encoder.h"
+#include "os/core/jce_trace_scope_internal.h"
 
 /* ── Velocity pre-pass GPU-instancing ───────────────────────────────────
  * The TAA velocity/G-buffer pre-pass instances skinned + glTF-model meshes but
@@ -33,10 +34,51 @@
  * that actually moved this frame (prev != cur) keeps the per-object inline
  * path.  fs_gbuffer_vel is reused unchanged.  Dedicated queue → no state shared
  * with the color/shadow queues.  Kill-switch: JCE_VEL_INST=0. */
-static JceRenderQueue       *s_vel_rq          = NULL;
-static bgfx_program_handle_t s_vel_inst_prog   = { UINT16_MAX };
-static int                   s_vel_inst_tried  = 0;
 static int                   s_vel_inst_disable = -1;
+
+bool sr_velocity_inst_prepare(JceSceneRenderer *sr)
+{
+    if (!sr) return false;
+    if (!sr->gbuffer_vel_inst_prog_tried) {
+        sr->gbuffer_vel_inst_prog_tried = true;
+        JceTraceScope scope = jce_trace_scope_begin("sr.velocity_inst.prepare");
+        JceShaderHandle program = shader_load_program_named(sr->pak,
+            "gbuffer_vel_inst", "gbuffer_vel");
+        if (jce_shader_valid(program)) {
+            JceRenderQueue *queue = jce_rq_create(1024);
+            if (queue) {
+                sr->prog_gbuffer_vel_inst.idx = program.idx;
+                sr->velocity_instance_queue = queue;
+            } else {
+                jce_shader_program_destroy(program);
+                LOG_WARN(LOG_TAG, "velocity instance queue allocation failed; program retired, per-entity fallback");
+            }
+        } else {
+            LOG_WARN(LOG_TAG, "gbuffer_vel_inst not in PAK (velocity prepass stays per-entity)");
+        }
+        jce_trace_scope_end(scope, sr->velocity_instance_queue
+            ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    }
+    return BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel_inst) && sr->velocity_instance_queue;
+}
+
+void sr_velocity_inst_release(JceSceneRenderer *sr)
+{
+    if (!sr) return;
+    if (sr->velocity_instance_queue || BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel_inst)) {
+        JceTraceScope scope = jce_trace_scope_begin("sr.velocity_inst.release");
+        if (sr->velocity_instance_queue) {
+            jce_rq_destroy(sr->velocity_instance_queue);
+            sr->velocity_instance_queue = NULL;
+        }
+        if (BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel_inst)) {
+            jce_shader_program_destroy((JceShaderHandle){sr->prog_gbuffer_vel_inst.idx});
+            sr->prog_gbuffer_vel_inst.idx = UINT16_MAX;
+        }
+        jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
+    }
+    sr->gbuffer_vel_inst_prog_tried = false;
+}
 
 /* material_key carries quantised roughness; restore it to u_gbuffer_mat before
  * each batch (fs_gbuffer_vel writes roughness into the SSR normal G-buffer). */
@@ -55,164 +97,8 @@ static void sr_vel_inst_bind(uint32_t material_key, void *user)
     jce_enc_set_uniform(sr->u_gbuffer_albedo, alb, 1);
 }
 
-/* ── TAA per-object previous-world-matrix table ─────────────────────────
- * Look up an entity's previous-frame world matrix before drawing it into the
- * velocity G-buffer; update it after.  A simple linear-probe table keyed by
- * entity id, pruned each frame (untouched => evicted).  Only touched while TAA
- * wants velocity, so it is inert when TAA is off. */
-/* Grow the open-addressing table to hold >=need live entries at <0.7 load,
- * rehashing existing entries.  Keeps per-entity find/store O(1) amortized: the
- * old FIXED 512-slot table degraded to O(N*512) once the scene exceeded 512
- * entities (every probe scanned all 512 slots, never finding an open one) —
- * measured ~7ms/frame of the velocity pre-pass at 10k entities. */
-static void sr_prev_xform_grow(JceSceneRenderer *sr, uint32_t need)
-{
-    uint32_t newcap = sr->prev_xform_cap ? sr->prev_xform_cap : SR_PREV_XFORM_MAX;
-    while ((uint64_t)need * 10u >= (uint64_t)newcap * 7u) newcap *= 2u;
-    if (sr->prev_xform && newcap <= sr->prev_xform_cap) return;
-    SrPrevXform *nw = (SrPrevXform *)JCE_CALLOC(newcap, sizeof(SrPrevXform));
-    if (!nw) return;  /* OOM: keep the smaller table — slower but correct */
-    SrPrevXform *old = sr->prev_xform;
-    uint32_t oldcap = sr->prev_xform_cap;
-    for (uint32_t i = 0; i < oldcap; i++) {
-        if (!old[i].used) continue;
-        uint32_t h = (old[i].entity * 2654435761u) % newcap;
-        for (uint32_t j = 0; j < newcap; j++) {
-            uint32_t s = (h + j) % newcap;
-            if (!nw[s].used) { nw[s] = old[i]; break; }
-        }
-    }
-    if (old) JCE_FREE(old);
-    sr->prev_xform = nw;
-    sr->prev_xform_cap = newcap;
-}
-
-static jce_mat4 *sr_prev_xform_find(JceSceneRenderer *sr, uint32_t entity)
-{
-    if (!sr->prev_xform) return NULL;
-    uint32_t cap = sr->prev_xform_cap;
-    uint32_t h = (entity * 2654435761u) % cap;
-    for (uint32_t i = 0; i < cap; i++) {
-        uint32_t s = (h + i) % cap;
-        SrPrevXform *e = &sr->prev_xform[s];
-        if (e->used && e->entity == entity) return &e->prev_world;
-        if (!e->used) return NULL; /* open slot ends the probe chain */
-    }
-    return NULL;
-}
-
-/* Store/refresh an entity's world matrix for next frame and mark it touched. */
-static void sr_prev_xform_store(JceSceneRenderer *sr, uint32_t entity,
-                                const jce_mat4 *world)
-{
-    if (!sr->prev_xform ||
-        (uint64_t)(sr->prev_xform_count + 1u) * 10u >= (uint64_t)sr->prev_xform_cap * 7u)
-        sr_prev_xform_grow(sr, sr->prev_xform_count + 1u);
-    if (!sr->prev_xform) return;  /* OOM */
-    uint32_t cap = sr->prev_xform_cap;
-    uint32_t h = (entity * 2654435761u) % cap;
-    for (uint32_t i = 0; i < cap; i++) {
-        uint32_t s = (h + i) % cap;
-        SrPrevXform *e = &sr->prev_xform[s];
-        if (e->used && e->entity == entity) {
-            e->prev_world = *world;
-            e->touched = true;
-            return;
-        }
-        if (!e->used) {
-            e->used = true; e->entity = entity; e->prev_world = *world;
-            e->touched = true;
-            sr->prev_xform_count++;
-            return;
-        }
-    }
-    /* Unreachable: grow keeps load < 0.7 so an open slot always exists. */
-}
-
-/* Prune entries not touched this frame (dead/culled entities) so the table
-   does not fill up over a long session. */
-static void sr_prev_xform_prune(JceSceneRenderer *sr)
-{
-    if (!sr->prev_xform) return;
-    for (uint32_t i = 0; i < sr->prev_xform_cap; i++) {
-        SrPrevXform *e = &sr->prev_xform[i];
-        if (e->used && !e->touched) {
-            e->used = false; e->entity = 0;
-            if (sr->prev_xform_count) sr->prev_xform_count--;
-        }
-        e->touched = false;
-    }
-}
-
-/* (Re)create the camera pre-pass targets at the viewport size:
- *   color0 = world-normal+roughness G-buffer (RGBA8, for SSR)
- *   color1 = TAA per-object motion vectors (RGBA16F, RG = NDC delta) — ONLY when
- *            want_velocity (TAA on); omitted otherwise so SSAO/SSR-only frames
- *            keep the legacy 2-attachment layout (byte-identical).
- *   depth  = the shared camera depth (SSAO + SSR both sample it).
- * Viewport-sized (not square) unlike sr_create_shadow_targets.  Recreated when
- * the size OR the velocity-attachment presence changes. */
-void sr_ensure_ssao_target(JceSceneRenderer *sr, uint16_t w, uint16_t h,
-                                  bool want_velocity)
-{
-    if (!sr || w == 0 || h == 0) return;
-    if (sr->ssao_valid && sr->ssao_w == w && sr->ssao_h == h &&
-        sr->ssao_has_velocity == want_velocity &&
-        BGFX_HANDLE_IS_VALID(sr->ssao_depth_fbo))
-        return;
-    sr->depth_history.valid = false;
-    if (BGFX_HANDLE_IS_VALID(sr->ssao_depth_fbo)) {
-        bgfx_destroy_frame_buffer(sr->ssao_depth_fbo);
-        sr->ssao_depth_fbo.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->ssao_depth_tex)) {
-        bgfx_destroy_texture(sr->ssao_depth_tex);
-        sr->ssao_depth_tex.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->ssao_normal_tex)) {
-        bgfx_destroy_texture(sr->ssao_normal_tex);
-        sr->ssao_normal_tex.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->ssao_velocity_tex)) {
-        bgfx_destroy_texture(sr->ssao_velocity_tex);
-        sr->ssao_velocity_tex.idx = UINT16_MAX;
-    }
-    if (BGFX_HANDLE_IS_VALID(sr->ssao_albedo_tex)) {
-        bgfx_destroy_texture(sr->ssao_albedo_tex);
-        sr->ssao_albedo_tex.idx = UINT16_MAX;
-    }
-    const uint64_t rt_flags = BGFX_TEXTURE_RT
-        | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-        | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT;
-    sr->ssao_normal_tex = bgfx_create_texture_2d(w, h, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA8, rt_flags, NULL, 0);
-    sr->ssao_depth_tex = bgfx_create_texture_2d(w, h, false, 1,
-        sr->shadow_depth_fmt, rt_flags, NULL, 0);
-    sr->ssao_albedo_tex = bgfx_create_texture_2d(w, h, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA8, rt_flags, NULL, 0);
-    if (want_velocity)
-        sr->ssao_velocity_tex = bgfx_create_texture_2d(w, h, false, 1,
-            BGFX_TEXTURE_FORMAT_RGBA16F, rt_flags, NULL, 0);
-
-    bgfx_attachment_t at[4];
-    memset(at, 0, sizeof(at));
-    int n = 0;
-    bgfx_attachment_init(&at[n++], sr->ssao_normal_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-    /* ALBEDO AT 1, ALWAYS.  Not gated on SSGI: a conditional attachment moves
-     * velocity from 2 to 1, and the fragment shaders write fixed FragData
-     * indices -- so on the frames SSGI were off, albedo would land in the
-     * velocity target and TAA would ghost for a reason nothing in TAA could
-     * explain.  See the field's comment in jce_sr_internal.h. */
-    bgfx_attachment_init(&at[n++], sr->ssao_albedo_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-    if (want_velocity)
-        bgfx_attachment_init(&at[n++], sr->ssao_velocity_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-    bgfx_attachment_init(&at[n++], sr->ssao_depth_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-    sr->ssao_depth_fbo = bgfx_create_frame_buffer_from_attachment((uint8_t)n, at, false);
-    sr->ssao_w = w; sr->ssao_h = h;
-    sr->ssao_has_velocity = want_velocity;
-    sr->ssao_valid = BGFX_HANDLE_IS_VALID(sr->ssao_depth_fbo);
-}
-
+/* World snapshots are owned by jce_sr_velocity_world.c. Retained prepass hits
+ * below do not traverse or copy that table. */
 /* Camera-space depth pre-pass for SSAO: renders ALL opaque geometry depth-only
  * into ssao_depth_fbo at view (view_id_base+1), using the camera view/proj.
  * Reuses the depth-only shadow submit helpers (same CULL_CW as the main pass =
@@ -346,11 +232,11 @@ static bool sr_try_submit_skinned_velocity(JceSceneRenderer *sr, JceScene *scene
     /* prev world = same world matrix as current (skinned entities animate via
        the bone palette, and the world TRS is captured for non-skinned dynamics;
        the per-bone delta carries the limb motion). */
-    const jce_mat4 *prev_model = sr_prev_xform_find(sr, (uint32_t)e);
+    const jce_mat4 *prev_model = sr_prev_xform_find(sr, e);
     jce_model_draw_velocity(mc->model, sr->renderer, view_id, ctx,
                             &model, pal, pal_n,
                             prev_model, prev_pal, prev_n);
-    sr_prev_xform_store(sr, (uint32_t)e, &model);
+    sr_prev_xform_store(sr, e, &model);
     return true;
 }
 
@@ -358,7 +244,7 @@ static bool sr_try_submit_skinned_velocity(JceSceneRenderer *sr, JceScene *scene
  * character that is NOT animating this frame has no bone motion — it is static,
  * so its per-object velocity is camera-only, exactly what the static instanced
  * velocity path computes (vs_gbuffer_vel_inst; prev world == cur world ==
- * i_data0..3).  Push each skinned primitive into the SAME s_vel_rq batch the
+ * i_data0..3). Push each skinned primitive into this renderer's velocity batch the
  * static primitives use: one instanced MRT draw replaces thousands of per-char
  * skinned velocity submits (the crowd prepass wall).  A char whose WORLD moved
  * this frame falls through to the per-char path so its object motion vector
@@ -402,7 +288,7 @@ static bool sr_try_push_bindpose_velocity(JceSceneRenderer *sr, JceScene *scene,
                        : jce_scene_get_world_matrix(scene, e);
 
     /* Tracked AND moved this frame → per-char (real object motion vector). */
-    const jce_mat4 *prev = sr_prev_xform_find(sr, (uint32_t)e);
+    const jce_mat4 *prev = sr_prev_xform_find(sr, e);
     if (prev && memcmp(prev->raw[0], model.raw[0], sizeof(float) * 16) != 0)
         return false;
 
@@ -446,7 +332,7 @@ static bool sr_try_push_bindpose_velocity(JceSceneRenderer *sr, JceScene *scene,
         c.material_key   = (uint32_t)(rough * 1000.0f);
         jce_rq_push(vel_rq, &c);
     }
-    sr_prev_xform_store(sr, (uint32_t)e, &model);
+    sr_prev_xform_store(sr, e, &model);
     return true;
 }
 
@@ -504,7 +390,7 @@ static bool sr_try_push_crowd_velocity(JceSceneRenderer *sr, JceScene *scene,
                        : jce_scene_get_world_matrix(scene, e);
 
     /* World moved this frame → per-char (real object motion vector). */
-    const jce_mat4 *prev = sr_prev_xform_find(sr, (uint32_t)e);
+    const jce_mat4 *prev = sr_prev_xform_find(sr, e);
     if (prev && memcmp(prev->raw[0], model.raw[0], sizeof(float) * 16) != 0)
         return false;
 
@@ -538,7 +424,7 @@ static bool sr_try_push_crowd_velocity(JceSceneRenderer *sr, JceScene *scene,
     g->worlds[g->count] = model;
     g->bases[g->count]  = ai->crowd_palette_base;
     g->count++;
-    sr_prev_xform_store(sr, (uint32_t)e, &model);
+    sr_prev_xform_store(sr, e, &model);
     return true;
 }
 
@@ -602,7 +488,7 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
      * (1 mat4 / instance) is exact — pushing each drawable primitive collapses the
      * per-model solo submit that made the prepass draw count scale O(N).  Moved /
      * non-instanceable models keep the per-object solo path below (byte-identical). */
-    const jce_mat4 *prev_model = sr_prev_xform_find(sr, (uint32_t)e);
+    const jce_mat4 *prev_model = sr_prev_xform_find(sr, e);
     jce_mat4 node_lt;
     bool moved = (prev_model != NULL) &&
                  memcmp(prev_model->raw[0], model.raw[0], sizeof(float) * 16) != 0;
@@ -625,7 +511,7 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
             c.material_key   = (uint32_t)(rough * 1000.0f);
             jce_rq_push(vel_rq, &c);
         }
-        sr_prev_xform_store(sr, (uint32_t)e, &model);
+        sr_prev_xform_store(sr, e, &model);
         return true;
     }
 
@@ -634,8 +520,69 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
     jce_enc_set_uniform(sr->u_gbuffer_albedo, alb2, 1);
     jce_model_draw_velocity(mc->model, sr->renderer, view_id, ctx,
                             &model, NULL, 0, prev_model, NULL, 0);
-    sr_prev_xform_store(sr, (uint32_t)e, &model);
+    sr_prev_xform_store(sr, e, &model);
     return true;
+}
+
+/* CPU-only queue storage; normal reuse does not emit lifecycle events. */
+bool sr_depth_prepass_queue_prepare(JceSceneRenderer *sr)
+{
+    if (!sr) return false;
+    if (!sr->depth_prepass_queue) {
+        JceTraceScope scope = jce_trace_scope_begin("sr.depth_queue.prepare");
+        sr->depth_prepass_queue = jce_rq_create(1024);
+        jce_trace_scope_end(scope, sr->depth_prepass_queue
+            ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    }
+    if (!sr->depth_prepass_queue) return false;
+    jce_rq_set_material_binder(sr->depth_prepass_queue, NULL, NULL);
+    jce_rq_clear(sr->depth_prepass_queue);
+    return true;
+}
+
+void sr_depth_prepass_queue_release(JceSceneRenderer *sr)
+{
+    if (!sr || !sr->depth_prepass_queue) return;
+    JceTraceScope scope = jce_trace_scope_begin("sr.depth_queue.release");
+    jce_rq_destroy(sr->depth_prepass_queue);
+    sr->depth_prepass_queue = NULL;
+    jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
+}
+
+static void sr_ensure_normal_gbuffer_program(JceSceneRenderer *sr, bool want_normals)
+{
+    /* Lazy-load the SSR normal G-buffer program (vs_gbuffer + fs_gbuffer).
+     * When absent, fall back to depth-only (SSR then has matte normals). */
+    if (want_normals && !sr->gbuffer_prog_tried) {
+        sr->gbuffer_prog_tried = true;
+        const JceRendererApiInfo api = jce_renderer_get_api_info();
+        if (!jce_graphics_api_is_compatibility_gl_es(api.build_tier, api.backend)) {
+            JceShaderHandle gh = shader_load_program(sr->pak, "gbuffer");
+            sr->prog_gbuffer.idx = gh.idx;
+            if (gh.idx == UINT16_MAX)
+                LOG_WARN(LOG_TAG, "gbuffer shader not in PAK (SSR loses real normals)");
+        } else {
+            LOG_WARN(LOG_TAG, "normal G-buffer unsupported by compatibility GL/ES shader profile; using depth-only fallback");
+        }
+    }
+}
+
+static void sr_ensure_velocity_gbuffer_programs(JceSceneRenderer *sr, bool want_velocity)
+{
+    if (!want_velocity || sr->gbuffer_vel_prog_tried) return;
+    sr->gbuffer_vel_prog_tried = true;
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    if (!jce_graphics_api_is_compatibility_gl_es(api.build_tier, api.backend)) {
+        JceShaderHandle static_program = shader_load_program(sr->pak, "gbuffer_vel");
+        JceShaderHandle skinned_program = shader_load_program(sr->pak, "gbuffer_vel_skinned");
+        sr->prog_gbuffer_vel.idx = static_program.idx;
+        sr->prog_gbuffer_vel_skinned.idx = skinned_program.idx;
+        if (static_program.idx == UINT16_MAX)
+            LOG_WARN(LOG_TAG, "gbuffer_vel shader not in PAK (TAA per-object motion off)");
+    } else {
+        LOG_WARN(LOG_TAG,
+            "velocity G-buffer unsupported by compatibility GL/ES shader profile; TAA per-object motion off");
+    }
 }
 
 void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
@@ -656,15 +603,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
      * exactly the frames where nothing moved. */
     sr->depth_prepass_frame = true;
 
-    /* Lazy-load the SSR normal G-buffer program (vs_gbuffer + fs_gbuffer).
-     * When absent, fall back to depth-only (SSR then has matte normals). */
-    if (!sr->gbuffer_prog_tried) {
-        sr->gbuffer_prog_tried = true;
-        JceShaderHandle gh = shader_load_program(sr->pak, "gbuffer");
-        sr->prog_gbuffer.idx = gh.idx;
-        if (gh.idx == UINT16_MAX)
-            LOG_WARN(LOG_TAG, "gbuffer shader not in PAK (SSR loses real normals)");
-    }
+    sr_ensure_normal_gbuffer_program(sr, want_normals);
     const bool have_gbuffer = BGFX_HANDLE_IS_VALID(sr->prog_gbuffer);
 
     /* Instanced depth batch for the SSAO-only path: fs_ssao samples ONLY the
@@ -678,34 +617,20 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
         const char *pb = getenv("JCE_PREPASS_BATCH");
         s_pre_batch_env = (pb && pb[0] == '0') ? 0 : 1;
     }
-    static JceRenderQueue *s_pre_rq = NULL;
     JceShaderHandle pre_inst_sh = jce_renderer_get_program_shadow_inst(sr->renderer);
     /* The batched path writes DEPTH ONLY: it submits through the shadow
      * instancing program, which has no normal output.  So it is available
      * exactly when nobody asked for normals. */
     bool pre_batch = s_pre_batch_env && !want_normals &&
                      pre_inst_sh.idx != UINT16_MAX;
-    if (pre_batch && !s_pre_rq) s_pre_rq = jce_rq_create(1024);
-    if (pre_batch && s_pre_rq) {
-        jce_rq_set_material_binder(s_pre_rq, NULL, NULL);
-        jce_rq_clear(s_pre_rq);
-    } else {
-        pre_batch = false;
-    }
+    if (pre_batch && !sr_depth_prepass_queue_prepare(sr))
+        pre_batch = false;  /* same allocation-failure per-entity fallback */
 
     /* TAA velocity mode: lazy-load the MRT velocity programs (normal+velocity).
      * write_velocity is true only when the FBO was created WITH the velocity
      * attachment AND the programs are present. */
     const bool want_vel = sr->ssao_has_velocity && sr->taa_want_velocity;
-    if (want_vel && !sr->gbuffer_vel_prog_tried) {
-        sr->gbuffer_vel_prog_tried = true;
-        JceShaderHandle s  = shader_load_program(sr->pak, "gbuffer_vel");
-        JceShaderHandle sk = shader_load_program(sr->pak, "gbuffer_vel_skinned");
-        sr->prog_gbuffer_vel.idx         = s.idx;
-        sr->prog_gbuffer_vel_skinned.idx = sk.idx;
-        if (s.idx == UINT16_MAX)
-            LOG_WARN(LOG_TAG, "gbuffer_vel shader not in PAK (TAA per-object motion off)");
-    }
+    sr_ensure_velocity_gbuffer_programs(sr, want_vel);
     const bool write_velocity = want_vel &&
                                 BGFX_HANDLE_IS_VALID(sr->prog_gbuffer_vel);
     sr->velocity_valid_frame = write_velocity;
@@ -724,9 +649,10 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     /* ── Static-frame prepass cache (UE-style retained depth) ──────────
      * The pass output is a pure function of (collect list, transforms,
      * camera VP, target size); on a static frame all are unchanged, so the
-     * FBO already holds byte-identical depth/normals — and SSAO consumes it
-     * 1-frame-late anyway.  Velocity frames always render (per-frame motion
-     * vectors).  JCE_PREPASS_CACHE=0 disables. */
+     * FBO already holds byte-identical depth/normals. The view remap orders a
+     * changed depth producer before color consumers. Velocity output additionally
+     * requires the matching current/prior history below. JCE_PREPASS_CACHE=0
+     * disables retention. */
     static int s_pre_cache_env = -1;
     if (s_pre_cache_env < 0) {
         const char *pc = getenv("JCE_PREPASS_CACHE");
@@ -736,44 +662,63 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     const uint64_t pre_xf = jce_scene_get_xform_counter(scene);
     struct SrPrepassCacheSlot *pcslot =
         &sr->pre_cache[(size_t)(view_id_base & 3u)];
-    if (s_pre_cache_env && sr->depth_history_reused &&
-        pcslot->valid && pcslot->view_base == view_id_base &&
+    /* Capture the prior producer before invalidating/reusing this bounded slot.
+     * Another view can hash to it; its equal numeric counter is not history. */
+    const bool pre_cache_identity = pcslot->valid && pcslot->view_base == view_id_base &&
+        pcslot->target_generation == sr->ssao_target_generation &&
         pcslot->scene == (const void *)scene &&
-        pcslot->list_gen == pre_lg && pcslot->xform == pre_xf &&
+        pcslot->list_gen == pre_lg &&
         pcslot->w == sr->ssao_w && pcslot->h == sr->ssao_h &&
         memcmp(&pcslot->vp, &pre_vp, sizeof(jce_mat4)) == 0 &&
         pcslot->had_velocity == write_velocity &&
-        pcslot->had_normals == want_normals &&
+        pcslot->had_normals == want_normals;
+    if (s_pre_cache_env && sr->depth_history_reused &&
+        pre_cache_identity && pcslot->xform == pre_xf &&
         /* Velocity frames additionally need the SAME prev VP: static frames
          * have prev==cur (zero motion, unchanged output); the first frame
-         * after the camera stops still renders (prev differs). */
+         * after the camera stops still renders (prev differs). Likewise the
+         * first pass after object transforms stop must replace their retained
+         * nonzero velocity. Two completed passes at the same transform counter
+         * establish that zero-motion result without another entity traversal. */
         (!write_velocity ||
-         memcmp(pcslot->prev_vp, sr->frame_prev_vp,
-                sizeof pcslot->prev_vp) == 0)) {
+         (pcslot->previous_xform_valid && pcslot->previous_xform == pre_xf &&
+          memcmp(pcslot->prev_vp, sr->frame_prev_vp,
+                 sizeof pcslot->prev_vp) == 0))) {
         return;   /* no touch/submit: the FBO keeps depth+velocity */
     }
     pcslot->valid = false;   /* re-latched after a full render below */
+
+    if (write_velocity) sr_prev_xform_begin(sr, scene);
 
     bgfx_set_view_rect(v, 0, 0, sr->ssao_w, sr->ssao_h);
     bgfx_set_view_frame_buffer(v, sr->ssao_depth_fbo);
     if (write_velocity) {
         /* MRT clear: ONE bgfx_set_view_clear color cannot give the velocity
          * attachment the exact neutral 0.5 it needs, so use palette clears.
-         *   slot 0 (normal) = 0x8080ffff (up normal, roughness 1)
-         *   slot 1 (velocity) = (0.5, 0.5, 0, 1) => decoded motion = 0 */
+         * Target/shader color slots stay fixed: normal 0, albedo 1, velocity 2.
+         * Palette 1 uses exact float 0.5: RGBA8's 128/255 is not zero motion
+         * when the velocity attachment stores it at RGBA16F precision. */
         float vel_clear[4] = { 0.5f, 0.5f, 0.0f, 1.0f };
         bgfx_set_palette_color_rgba8(0, 0x8080ffffu);
         bgfx_set_palette_color(1, vel_clear);
+        bgfx_set_palette_color_rgba8(2, 0x000000ffu);
         bgfx_set_view_clear_mrt(v, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL,
                                 1.0f, 0,
-                                0,    /* attachment 0 -> palette 0 */
-                                1,    /* attachment 1 -> palette 1 */
+                                0,    /* attachment 0 -> palette 0 (normal) */
+                                2,    /* attachment 1 -> palette 2 (albedo) */
+                                1,    /* attachment 2 -> palette 1 (velocity) */
                                 UINT8_MAX, UINT8_MAX, UINT8_MAX,
-                                UINT8_MAX, UINT8_MAX, UINT8_MAX);
+                                UINT8_MAX, UINT8_MAX);
     } else {
         /* Clear normal G-buffer to up-ish normal + roughness=1 (matte => no SSR)
          * for pixels not covered by a G-buffer submit; clear depth to far. */
-        bgfx_set_view_clear(v, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL, 0x8080ffff, 1.0f, 0);
+        uint16_t clear = BGFX_CLEAR_DEPTH | BGFX_CLEAR_STENCIL;
+        /* Test actual allocated planes: a provider-refused depth-only FBO may have
+         * used the legacy MRT fallback while retaining the preferred request. */
+        if (BGFX_HANDLE_IS_VALID(sr->ssao_normal_tex) ||
+            BGFX_HANDLE_IS_VALID(sr->ssao_albedo_tex))
+            clear |= BGFX_CLEAR_COLOR;
+        bgfx_set_view_clear(v, clear, 0x8080ffff, 1.0f, 0);
     }
     bgfx_set_view_transform(v, view.raw[0], proj.raw[0]);
     bgfx_touch(v);
@@ -815,20 +760,9 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
     }
     bool vel_inst_ready = false;
     if (write_velocity && !s_vel_inst_disable) {
-        if (!s_vel_inst_tried) {
-            s_vel_inst_tried = 1;
-            /* vs_gbuffer_vel_inst + fs_gbuffer_vel (fragment reused, like pbr_inst). */
-            JceShaderHandle h = shader_load_program_named(sr->pak,
-                                                          "gbuffer_vel_inst", "gbuffer_vel");
-            s_vel_inst_prog.idx = h.idx;
-            if (h.idx == UINT16_MAX)
-                LOG_WARN(LOG_TAG, "gbuffer_vel_inst not in PAK (velocity prepass stays per-entity)");
-            else
-                s_vel_rq = jce_rq_create(1024);
-        }
-        if (BGFX_HANDLE_IS_VALID(s_vel_inst_prog) && s_vel_rq) {
-            jce_rq_set_material_binder(s_vel_rq, sr_vel_inst_bind, sr);
-            jce_rq_clear(s_vel_rq);
+        if (sr_velocity_inst_prepare(sr)) {
+            jce_rq_set_material_binder(sr->velocity_instance_queue, sr_vel_inst_bind, sr);
+            jce_rq_clear(sr->velocity_instance_queue);
             vel_inst_ready = true;
         }
     }
@@ -864,15 +798,15 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                  * static instanced velocity queue (camera-only motion — exact
                  * for a char that didn't move) instead of a per-char submit. */
                 if (vel_inst_ready &&
-                    sr_try_push_bindpose_velocity(sr, scene, e, i, v, s_vel_rq,
-                                                  (uint16_t)s_vel_inst_prog.idx))
+                    sr_try_push_bindpose_velocity(sr, scene, e, i, v, sr->velocity_instance_queue,
+                                                  (uint16_t)sr->prog_gbuffer_vel_inst.idx))
                     continue;
                 /* Animated crowd: batch a palette-packed animating char for one
                  * dual-skinned instanced MRT draw (true per-limb motion). */
                 if (sr_try_push_crowd_velocity(sr, scene, e, i)) continue;
                 if (sr_try_submit_skinned_velocity(sr, scene, e, v, &vctx)) continue;
                 if (sr_try_submit_model_velocity(sr, scene, e, i, v, &vctx,
-                        s_vel_rq, vel_inst_ready, (uint16_t)s_vel_inst_prog.idx)) continue;
+                        sr->velocity_instance_queue, vel_inst_ready, (uint16_t)sr->prog_gbuffer_vel_inst.idx)) continue;
                 if (sr_try_submit_terrain_shadow(sr, scene, e, v, NULL))          continue;
             }
             /* rank-2: frustum-cull off-screen primitives out of the velocity
@@ -888,7 +822,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                 !sr_aabb_in_frustum_fast(sr->prepass_cull_planes,
                                     sr->prepass_cull_absn,
                                     sr->ecull[i].wmin, sr->ecull[i].wmax)) {
-                sr_prev_xform_store(sr, (uint32_t)e, &sr->ecull_world[i]);
+                sr_prev_xform_store(sr, e, &sr->ecull_world[i]);
                 continue;
             }
             jce_mat4 model;
@@ -901,7 +835,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
             float rough = 0.8f;
             if (mr) rough = mr->roughness;
             float gmat[4] = { rough, 0.0f, 0.0f, 0.0f };
-            const jce_mat4 *prev_model = sr_prev_xform_find(sr, (uint32_t)e);
+            const jce_mat4 *prev_model = sr_prev_xform_find(sr, e);
             /* Instance unless the object is tracked AND actually moved this frame.
              * - tracked + unchanged  → static → camera-only motion = inline result.
              * - untracked (NULL prev) → inline ALSO uses cur as prev (camera-only),
@@ -913,14 +847,14 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                 JceDrawCmd c;
                 memset(&c, 0, sizeof c);
                 c.view_id        = v;
-                c.program        = (uint16_t)s_vel_inst_prog.idx;
+                c.program        = (uint16_t)sr->prog_gbuffer_vel_inst.idx;
                 c.program_single = UINT16_MAX;   /* n=1 → inst prog + 1 instance */
                 c.mesh_vbh       = jce_mesh_get_vbh(mesh);
                 c.mesh_ibh       = jce_mesh_get_ibh(mesh);
                 c.index_count    = jce_mesh_index_count(mesh);
                 c.transform      = model;
                 c.material_key   = (uint32_t)(rough * 1000.0f);
-                jce_rq_push(s_vel_rq, &c);
+                jce_rq_push(sr->velocity_instance_queue, &c);
             } else {
                 jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
                 const float alb[4] = { mr ? mr->base_color[0] : 1.0f,
@@ -929,7 +863,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
                 jce_enc_set_uniform(sr->u_gbuffer_albedo, alb, 1);
                 sr_submit_mesh_velocity(sr, &vctx, v, &model, prev_model, mesh);
             }
-            sr_prev_xform_store(sr, (uint32_t)e, &model);
+            sr_prev_xform_store(sr, e, &model);
             continue;
         }
 
@@ -996,7 +930,7 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
             cmd.material_key   = 1u;
             cmd.state          = BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
                                | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA;
-            jce_rq_push(s_pre_rq, &cmd);
+            jce_rq_push(sr->depth_prepass_queue, &cmd);
             continue;
         }
         jce_enc_set_transform(model.raw[0], 1);
@@ -1026,30 +960,30 @@ void sr_draw_depth_prepass(JceSceneRenderer *sr, JceScene *scene,
      * sets its own per-submit uniforms from vctx).  Cleared inside; no-op when
      * the feature is off / nothing accumulated. */
     /* Flush the instanced depth batch: one sorted instanced draw per mesh. */
-    if (pre_batch && jce_rq_count(s_pre_rq) > 0) {
-        jce_rq_sort(s_pre_rq, JCE_SORT_FOR_INSTANCING);
-        jce_rq_flush(s_pre_rq, sr->renderer);
+    if (pre_batch && jce_rq_count(sr->depth_prepass_queue) > 0) {
+        jce_rq_sort(sr->depth_prepass_queue, JCE_SORT_FOR_INSTANCING);
+        jce_rq_flush(sr->depth_prepass_queue, sr->renderer);
     }
     jce_perf_phase_add("prepass_loop",
                        jce_time_perf_to_ms(_t0_ppl, jce_time_perf_counter()));
     if (write_velocity && sr->crowd_vel_group_count > 0)
         sr_crowd_velocity_flush(sr, v, &vctx);
 
-    if (vel_inst_ready && jce_rq_count(s_vel_rq) > 0) {
+    if (vel_inst_ready && jce_rq_count(sr->velocity_instance_queue) > 0) {
         jce_enc_set_uniform(sr->u_curViewProj,  vctx.cur_view_proj.raw[0],  1);
         jce_enc_set_uniform(sr->u_prevViewProj, vctx.prev_view_proj.raw[0], 1);
-        jce_rq_sort(s_vel_rq, JCE_SORT_FOR_INSTANCING);
-        jce_rq_flush(s_vel_rq, sr->renderer);
+        jce_rq_sort(sr->velocity_instance_queue, JCE_SORT_FOR_INSTANCING);
+        jce_rq_flush(sr->velocity_instance_queue, sr->renderer);
     }
-
-    if (write_velocity)
-        sr_prev_xform_prune(sr);
 
     if (s_pre_cache_env) {
         pcslot->valid     = true;
         pcslot->view_base = view_id_base;
+        pcslot->target_generation = sr->ssao_target_generation;
         pcslot->scene     = (const void *)scene;
         pcslot->list_gen  = pre_lg;
+        pcslot->previous_xform_valid = pre_cache_identity;
+        if (pre_cache_identity) pcslot->previous_xform = pcslot->xform;
         pcslot->xform     = pre_xf;
         pcslot->w         = sr->ssao_w;
         pcslot->h         = sr->ssao_h;
@@ -1459,6 +1393,14 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
                         (vv && vv[0] && vv[0] != '0') ||
                         (kv && kv[0] && kv[0] != '0')) ? 1 : 0;
     }
+    /* Optional timing state must be initialized before the steady-path goto;
+     * the full path starts its clock at grid maintenance, as before. */
+    static int s_cull_kpi = -1;
+    if (s_cull_kpi < 0) {
+        const char *kv = getenv("JCE_CULL_KPI");
+        s_cull_kpi = (kv && kv[0] && kv[0] != '0') ? 1 : 0;
+    }
+    uint64_t kpi_t0 = 0;
     bool *ref_vis = NULL;   /* declared BEFORE the fast-path goto (verify buf) */
     const uint64_t xf_now = jce_scene_get_xform_counter(scene);
     const bool same_frame_shape =
@@ -1658,12 +1600,7 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
     /* Optional broad-phase KPI (JCE_CULL_KPI=1): time ONLY the grid
      * maintenance + frustum query (the part this change targets) and log it
      * every 120 calls with the churn counts.  Off by default. */
-    static int s_cull_kpi = -1;
-    if (s_cull_kpi < 0) {
-        const char *kv = getenv("JCE_CULL_KPI");
-        s_cull_kpi = (kv && kv[0] && kv[0] != '0') ? 1 : 0;
-    }
-    const uint64_t kpi_t0 = s_cull_kpi ? jce_time_perf_counter() : 0;
+    if (s_cull_kpi) kpi_t0 = jce_time_perf_counter();
 
     /* A/B + safety hatch: JCE_DISABLE_PERSIST_CULL=1 reverts to the legacy
      * reset+reinsert-ALL-every-frame path (still benefits from extent sizing +
@@ -1859,6 +1796,7 @@ uint32_t sr_compute_visible(JceSceneRenderer *sr,
     sr->cull_frame_valid   = true;
 
 cull_query:
+    if (s_cull_kpi && kpi_t0 == 0) kpi_t0 = jce_time_perf_counter();
     /* Coarse attribution for this tail, behind JCE_DBG_CULLPROF=1.
      *
      * Deliberately ONCE PER FRAME, not per entity. The per-entity rdtsc probes

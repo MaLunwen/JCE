@@ -103,6 +103,12 @@ JCE_API void jce_ui_canvas_set_default_font(const char *font_path);
  * exists.  Changing it invalidates the cached fonts. */
 JCE_API void jce_ui_canvas_set_font_fallbacks(const char *paths_semicolon);
 
+/* Notify the canvas resource owner after imported/replaced content or mount
+ * changes within the same filesystem identity. Call on the canvas owner
+ * thread before the next render. Positive and negative font/sprite caches
+ * rebuild lazily on their next lookup. External writes are not polled here. */
+JCE_API void jce_ui_canvas_invalidate_resources(void);
+
 /* Render every Screen-Space-Overlay Canvas in `scene` into bgfx `view_id`.
  *
  * This function fully configures `view_id`: it binds the given framebuffer,

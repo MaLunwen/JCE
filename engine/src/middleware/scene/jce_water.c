@@ -186,7 +186,11 @@ bool JCE_CALL jce_water_ring_mesh_size(int rings, int segments,
     if (out_verts)   *out_verts   = 0u;
     if (out_indices) *out_indices = 0u;
     if (rings < 1 || segments < 3) return false;
-    if (rings > 64 || segments > 512) return false;
+    /* Bound storage and preserve 16-bit addressable topology. The modern
+     * near-field renderer requests 96 rings, while old meshes retain their
+     * exact counts and winding. */
+    if (rings > 128 || segments > 512) return false;
+    if ((uint32_t)rings * (uint32_t)segments > 65534u) return false;
 
     /* One centre vertex, then `segments` per ring. */
     const uint32_t verts = 1u + (uint32_t)rings * (uint32_t)segments;

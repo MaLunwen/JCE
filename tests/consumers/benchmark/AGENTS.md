@@ -86,6 +86,14 @@ composes post output back into the plain bridge before Canvas, reusing the
 editor's public composition API and the bridge's readback row convention.
 It is not an assertion about native-resolution backbuffer overlay parity.
 
+`src/metrics.c` observes actual supported window flags through the public SDK,
+with availability distinct from a valid zero mask. Hidden, input focus,
+maximization and nonfocusable values follow those live bits. They are collected
+after GPU stats within the same observation call, not at a matched GPU frame.
+These flags do not establish OS foreground ownership, physical visibility or
+presentation completion. The window-flags self-test covers zero, high unsigned
+bits, changed observed state and a missing window.
+
 `src/metrics.c` exports complete JSONL through SDK filesystem APIs. Tagged
 allocation totals cover opt-in instrumentation, not the whole heap. Separate
 mimalloc process snapshots and OS sampling must retain their measurement scope.
@@ -196,8 +204,17 @@ percentiles before creating separate character/culling charts. Every trial's
 maximum and long-frame count remain visible; failed or incomplete input is
 refused. Scenario policy remains here instead of entering generic tools/.
 
-Build with `python scripts/jce.py app tests/consumers/benchmark --arch x64 --variant release`.
+Build with `python scripts/jce.py app tests/consumers/benchmark --sdk <dist-sdk> --arch x64 --variant dist`.
 GPU probes use `JCE_WINDOW_HIDDEN=1`; do not take desktop focus during tests.
+
+The build variant must match the selected installed SDK. In particular, a
+DIST SDK uses `--sdk <dist-sdk> --variant dist`; a
+release request cannot consume that SDK. `jce_project.json` declares
+`postfx/empty.scene.json` relative to `source_assets` for public startup-Scene
+graph admission and embedded packaging. This existing camera/light fixture
+has no scripts or external assets. The custom benchmark host still requires
+an explicit `JCE_SCENE` diagnostic input; this manifest declaration does not
+certify default-host boot consumption or standalone no-input gameplay.
 
 `tools/media_color_fixtures.py` generates first-party procedural color inputs
 with an explicit external reference executable. `media_pixel_suite.py` retains
@@ -355,3 +372,106 @@ before seven runs of 600 measured frames; no pixel/readback observer runs in
 that timing interval. `stream_route_metrics.py` reports sampled process RSS
 and OS read counters separately from tracked model budget; cold physical disk
 throughput and renderer upload bytes remain unavailable without sensors.
+
+Particle evidence is explicitly opt-in through the existing observation/statistics
+flags. Its finite public logger calls and actual public backend-name observation
+survive DIST; ordinary DIST logging remains quiet. `tools/particle_process.py`
+shares OS sampling, fresh execution-log merging and KPI parsing with maintained
+tools, without requiring the stock host's unavailable aggregate perf record.
+All three particle runners require a clean completed process, observed backend,
+complete consecutive frame CSV and unchanged typed-count/pixel controls. These
+observer-on results are correctness diagnostics, not throughput certification.
+
+## Qualified public GPU timer readout
+
+`metrics.c` remains the sole opt-in `JCE_BENCH_COUNTERS` JSONL collector. Its
+window functions and flags include the public `api_platform.h` directly, rather
+than relying on application umbrellas to transitively expose platform symbols.
+The independent `gpu_timing` object consumes `JceGpuTimingObservation`; it is the only
+qualified GPU interval. The preserved `gpu` numeric fields are explicitly
+unqualified legacy stats, not a second timing authority. Signed frequency and
+raw ticks, and unsigned context generation, are decimal strings without double
+precision loss. An unavailable timer writes null duration with its explicit
+reason. Backend sample frame and read-time host/context identity remain latched
+and unjoined; repeated samples are retained, not credited as fresh GPU work.
+The default host links the same collector through a private thin draw entry.
+After successful initialization it writes frame zero, then samples the raw draw
+callback count at the existing 5-second cadence and finally before stock host
+exit. Its unavailable simulation clock is null. A value services packet borrows
+only live engine members and is cleared before host teardown. Normal runs with
+no counters path query no extra GPU observation.
+`src/test_metrics_gpu_timing.c` contains the complete actual collector with typed
+public getter/introspection/write ports and the real SDK JSON facade. Three
+excluded-from-product targets cover eight CPU groups, an ordinary omitted
+public-getter-wire failure and the old zero-frame replacement control. They use
+the installed SDK's sanctioned JCE::Core native-test target with their own main;
+product targets retain JCE::JCE and its application-registration linkage. These
+CPU controls do not boot assets, create a device or certify GPU timings.
+The existing custom Player resource validator retains its strict update clock
+and event protocol; default draw diagnostics are not submitted to that validator
+as custom Player measurements. Actual readout must retain executable/SDK/source
+hashes and original JSONL plus actual backend identity, separate from throughput.
+
+Only a frame-zero explicit `initialized` or `default-initialized` event replaces
+the JSONL file. A successful initialization followed by zero draw callbacks still
+appends its exit record, preserving both lifetime endpoints. Public JSON child
+attachment is void-returning: local object allocation failures are cleaned up,
+but this transport does not certify complete successful encoding under all OOM.
+
+`src/probe_capture_witness.c` is an opt-in 16px real-GPU capture diagnostic,
+called from the existing AppDesc draw and yielding its full viewport on capture
+turns (including terminal/cancel turns). The Engine remains the only frame
+submitter; public trace cursors observe actual ASYNC bake identity and CPU
+readback retirement against an isolated zero baseline. Its runner validates
+fresh specular/irradiance KTX face/mip payloads and axis radiance. The pinned
+bimg zero-type uncompressed header is explicitly a KTX1 compatibility defect;
+accepting that exact convention is never standard-container conformance.
+Cancel-exit qualifies after-stop release only with the actual positive stop
+counter inside renderer destruction; ready collection is separately reported.
+No physical Editor UI, throughput, VRAM/GPU-idle, forced RGBA8-source fallback
+or post-capture bake-handle/cancel reachability is certified. Offline validator
+controls launch no application and remain separate from real GPU receipts.
+
+## Static Water/opaque depth oracle
+
+`tools/check_depth_order_pixels.py` is opt-in: without `--execute` it only writes
+fresh scene inputs and identities. It reuses `run_visual_witness(host="player")`
+and the unchanged public-SDK `main.c` scene/render/readback lifecycle. There is
+no alternate renderer, native target, Engine API or application input injection.
+Fifteen serial child runs cover B/BW/BF/BWF, each with A/A and reversed entity
+creation order, plus empty/Water-only/foreground-only mask controls. The fixture
+contains built-in unit cubes and a zero-wave Gerstner plane; no imported asset,
+authoring generator or third-party byte is copied. TAA, SSAO, SSR and motion blur
+use the existing actual `JCE_BENCH_ASSET_STILL` control. Scene settings disable
+fog, IBL, bloom, FXAA, auto exposure and depth of field. Tonemapping is retained
+through the existing common capture bridge, so raw linear blend values are not
+incorrectly compared with gamma-encoded PNG values.
+
+`tools/depth_order_oracle.py` projects the authored orthographic camera and unit
+cube/plane geometry independently of Engine matrices or reference screenshots.
+Each nonempty, eroded ROI requires projected support and actual single-object
+pixels. Foreground pixels must match BF in BWF; free-water pixels must match BW
+in BWF and differ from both B and Water-only. This checks depth rejection and
+remaining background contribution without assuming old wrong images are goldens.
+No alignment, colour correction, empty-mask exemption or automatic pixel-budget
+relaxation is permitted. A/A and all four entity-order controls use the same
+fixed pixel budget. Original inputs, all PNGs, logs and source/executable hashes
+remain in the fresh output, including failures. Captures are 1280x720, single
+shot at frame 60 with 180 ordinary host frames; these are correctness diagnostics,
+not throughput, physical presentation, full lifecycle, Grass/cutout, dynamic
+camera or Elemental Serenity stylized-water qualification. Actual old-stage GPU
+controls must fail these same ordinary image assertions after running; the
+adjacent synthetic CPU tests only establish validator sensitivity.
+Repeated `--case` arguments may select a quick capture subset (for example B,
+BW, BF, BWF). Such a run retains its images but ends as
+`CAPTURE_SUBSET_NOT_QUALIFIED`; single-object support, A/A and entity permutation
+may not be dropped from the complete oracle or described as passed.
+
+The actual one-time Play marker and the explicitly requested asset-STILL marker
+call public `jce_log_write(INFO)` directly so DIST keeps these test-host admission
+records. Their original messages, one-time/opt-in call sites and runtime logger
+filters are unchanged. This is not an Engine logging-default or compile-policy
+change. A legacy DIST host whose LOG_INFO macros erased these records fails
+entry admission even when a PNG exists; that failure is not a depth-pixel negative
+control. Keep each rebuilt host's consumer before/after source manifest, installed
+SDK product identity, actual build command/log and resulting EXE hash together.

@@ -25,18 +25,25 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
-import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_git_spec = importlib.util.spec_from_file_location(
+    "singleton_git_files", REPO_ROOT / "tools/lint/lint_git_files.py")
+_lgf = importlib.util.module_from_spec(_git_spec)
+_git_spec.loader.exec_module(_lgf)
+
 SCAN_PREFIXES = ("engine/src/", "editor/src/")
 SRC_EXT = (".c", ".cc", ".cpp", ".cxx")
 SKIP_FRAGMENTS = ("/third_party/", "/generated/")
 VENDOR_PREFIXES = ("stb_", "miniaudio", "dr_", "cJSON", "cgltf", "tinyexr")
+CPP_EXT = (".cc", ".cpp", ".cxx")
+USING_ALIAS_RE = re.compile(r"^using\s+[A-Za-z_]\w*\s*=")
 
 # A file-scope (column-0) declaration of a mutable variable.  We deliberately
 # require column 0 so function-local statics (always indented in this tree)
@@ -88,17 +95,20 @@ INTEREST = re.compile(
 )
 
 
-def tracked_files() -> list[str]:
-    out = subprocess.run(
-        ["git", "ls-files", "-z", "--", *SCAN_PREFIXES],
-        cwd=REPO_ROOT, capture_output=True, text=True, encoding="utf-8",
-    )
-    if out.returncode != 0:
-        print("error: git ls-files failed:\n" + out.stderr, file=sys.stderr)
-        sys.exit(2)
+class SourceInventoryError(RuntimeError):
+    """The working source inventory could not be consumed completely."""
+
+
+def working_tree_files() -> list[str]:
+    # The shared inventory includes new nonignored owners and subtracts only
+    # Git-declared deletions. A failed command cannot lower the state count.
+    try:
+        candidates = _lgf.working_tree(strict=True)
+    except _lgf.GitInventoryError as error:
+        raise SourceInventoryError(str(error)) from error
     files = []
-    for rp in out.stdout.split("\0"):
-        if not rp or not rp.endswith(SRC_EXT):
+    for rp in sorted(candidates):
+        if not rp.startswith(SCAN_PREFIXES) or not rp.endswith(SRC_EXT):
             continue
         if any(f in ("/" + rp) for f in SKIP_FRAGMENTS):
             continue
@@ -168,15 +178,16 @@ def module_of(rp: str) -> str:
 
 def scan() -> list[dict]:
     found: list[dict] = []
-    for rp in tracked_files():
+    for rp in working_tree_files():
         try:
             text = (REPO_ROOT / rp).read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
+        except OSError as error:
+            raise SourceInventoryError(f"cannot read source {rp}: {error}") from error
         lines = text.splitlines()
         # C++ anonymous-namespace bodies have internal linkage: a variable
         # declared there is file-local, exactly like `static`.
-        anon = anon_ns_line_set(text) if rp.endswith((".cc", ".cpp", ".cxx")) else set()
+        is_cpp = rp.endswith(CPP_EXT)
+        anon = anon_ns_line_set(text) if is_cpp else set()
         pending_aggregate = None   # (line, quals, kw, tag)
         for i, line in enumerate(lines, start=1):
             if pending_aggregate is not None:
@@ -208,6 +219,8 @@ def scan() -> list[dict]:
             if not line or line[0].isspace() or line[0] in "#/}{":
                 continue
             code = line.split("//", 1)[0]
+            if is_cpp and USING_ALIAS_RE.match(code):
+                continue  # A type alias owns no mutable storage.
             if "static" not in code and not code.startswith(("g_", "gs_")):
                 # non-static file-scope definitions are rarer; still catch g_*.
                 pass
@@ -248,7 +261,11 @@ def main() -> int:
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
 
-    found = scan()
+    try:
+        found = scan()
+    except SourceInventoryError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     total = len(found)
 
     if args.write_baseline:

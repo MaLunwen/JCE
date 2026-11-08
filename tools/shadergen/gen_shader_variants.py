@@ -22,6 +22,7 @@ import argparse
 import io
 import itertools
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -155,6 +156,16 @@ def emit_public_header(m: dict) -> str:
     return chr(10).join(L) + chr(10)
 
 
+def fragment_for(m: dict, variant: dict, key: int) -> str:
+    """Resolve one table cell through the same family/axis declaration."""
+    family = next(f for f in m["fs_families"] if f["name"] == variant["fs_family"])
+    applicable = {a["bit"] for a in axes_for(family["name"], m["axes"])}
+    kept = tuple(sorted((a for a in m["axes"]
+                         if (key >> a["bit"]) & 1 and a["bit"] in applicable),
+                        key=lambda a: a["bit"]))
+    return fs_name(family["name"], kept)[3:]
+
+
 def emit_table(m: dict) -> str:
     axes = m["axes"]
     fams = {f["name"]: f for f in m["fs_families"]}
@@ -193,19 +204,117 @@ def emit_table(m: dict) -> str:
     L.append("static const char *const jce_shader_fs_for"
              "[JCE_SHADER_VARIANT_COUNT][JCE_SHADER_KEY_COUNT] = {")
     for vv in vvs:
-        fam = fams[vv["fs_family"]]
-        applicable = {a["bit"] for a in axes_for(fam["name"], axes)}
         row = []
         for key in range(1 << nbits):
-            kept = tuple(sorted(
-                (a for a in axes if (key >> a["bit"]) & 1
-                 and a["bit"] in applicable),
-                key=lambda a: a["bit"]))
-            # the loader prefixes fs_ itself, so the table carries the base
-            row.append(f'"{fs_name(fam["name"], kept)[3:]}"')
+            row.append(f'"{fragment_for(m, vv, key)}"')
         L.append(f"    /* {vv['name']} */ {{ " + ", ".join(row) + " },")
     L.append("};")
     return "\n".join(L) + "\n"
+
+
+def stock_profiles(m: dict) -> dict:
+    """Derive runtime acquisitions and cook stages from one maintained source.
+
+    The full profile deliberately keeps the existing unrestricted cooker. Its
+    stock table is not an inventory of every subsystem's optional shaders.
+    """
+    identifier = re.compile(r"[a-z][a-z0-9_]*\Z")
+    programs = m["stock_programs"]
+    fields = set()
+    for program in programs:
+        if set(program) != {"member", "vertex", "fragment"} or any(
+                not isinstance(value, str) or not identifier.fullmatch(value)
+                for value in program.values()):
+            raise ValueError("invalid stock program declaration")
+        if program["member"] in fields:
+            raise ValueError("duplicate stock member")
+        fields.add(program["member"])
+    variants = m["vertex_variants"]
+    variant_ids = {v["name"]: i for i, v in enumerate(variants)}
+    axes = {axis["name"]: axis["bit"] for axis in m["axes"]}
+    keys = 1 << (max(axes.values()) + 1)
+    profiles = {}
+    for index, profile in enumerate(m["stock_profiles"]):
+        name = profile["name"]
+        if not isinstance(name, str) or not identifier.fullmatch(name) or name in profiles:
+            raise ValueError("invalid or duplicate stock profile")
+        unrestricted = profile["cook_unrestricted"]
+        if type(unrestricted) is not bool:
+            raise ValueError("cook_unrestricted must be boolean")
+        members = profile["stock_members"]
+        if members == ["*"]:
+            members = [program["member"] for program in programs]
+        if not isinstance(members, list) or len(set(members)) != len(members) or any(
+                member not in fields for member in members):
+            raise ValueError("invalid selected stock members")
+        cells = profile["pbr_cells"]
+        if cells == "*":
+            coordinates = [(v, key) for v in range(len(variants)) for key in range(keys)]
+        else:
+            if not isinstance(cells, list):
+                raise ValueError("invalid PBR profile cells")
+            coordinates = []
+            for cell in cells:
+                if set(cell) != {"variant", "keywords"} or cell["variant"] not in variant_ids:
+                    raise ValueError("unknown PBR vertex variant")
+                names = cell["keywords"]
+                if not isinstance(names, list) or len(set(names)) != len(names) or any(
+                        axis not in axes for axis in names):
+                    raise ValueError("unknown or duplicate PBR keyword")
+                coordinate = (variant_ids[cell["variant"]], sum(1 << axes[a] for a in names))
+                if coordinate in coordinates:
+                    raise ValueError("duplicate PBR profile cell")
+                coordinates.append(coordinate)
+        selected = [program.copy() for program in programs if program["member"] in members]
+        pbr = [{"variant": v, "variant_name": variants[v]["name"], "key": key,
+                "vertex": variants[v]["name"], "fragment": fragment_for(m, variants[v], key)}
+               for v, key in coordinates]
+        pairs = [(row["vertex"], row["fragment"]) for row in pbr + selected]
+        for pair in profile["additional_cook_pairs"]:
+            if set(pair) != {"vertex", "fragment"} or any(
+                    not isinstance(value, str) or not identifier.fullmatch(value)
+                    for value in pair.values()):
+                raise ValueError("invalid additional cook pair")
+            pairs.append((pair["vertex"], pair["fragment"]))
+        profiles[name] = {"id": index, "stock_pairs": selected, "pbr_cells": pbr,
+                          "cook": {"unrestricted": unrestricted,
+                                   "vertex": [] if unrestricted else sorted({"vs_" + v for v, f in pairs}),
+                                   "fragment": [] if unrestricted else sorted({"fs_" + f for v, f in pairs}),
+                                   "compute": []}}
+    if list(profiles) != ["full", "compatibility"]:
+        raise ValueError("stock profile order must be full, compatibility")
+    return {"schema": 1, "source_authority": "contracts/shader-keywords.json",
+            "scope": "Declared shader acquisition/cook policy, not verified device capabilities or GUI acceptance",
+            "profiles": profiles}
+
+
+def emit_stock_profiles(m: dict, catalog: dict) -> str:
+    profiles = catalog["profiles"]
+    variants = m["vertex_variants"]
+    keys = 1 << (max(a["bit"] for a in m["axes"]) + 1)
+    lines = [f"/* {BANNER} */", "#ifndef JCE_SHADER_STOCK_PROFILES_INC",
+             "#define JCE_SHADER_STOCK_PROFILES_INC", "",
+             "typedef enum JceShaderStockProfile {"]
+    for name, profile in profiles.items():
+        lines.append(f"    JCE_SHADER_STOCK_PROFILE_{name.upper()} = {profile['id']},")
+    lines += [f"    JCE_SHADER_STOCK_PROFILE_COUNT = {len(profiles)}", "} JceShaderStockProfile;", "",
+              "static const unsigned char jce_shader_stock_pbr_selected",
+              "    [JCE_SHADER_STOCK_PROFILE_COUNT][JCE_SHADER_VARIANT_COUNT][JCE_SHADER_KEY_COUNT] = {"]
+    for name, profile in profiles.items():
+        selected = {(cell["variant"], cell["key"]) for cell in profile["pbr_cells"]}
+        lines.append(f"    /* {name} */ {{")
+        for variant in range(len(variants)):
+            lines.append("        { " + ", ".join(str(int((variant, key) in selected)) for key in range(keys)) + " },")
+        lines.append("    },")
+    lines += ["};", "", "/* Member, vertex base, fragment base, selected-profile mask. */",
+              "#define JCE_SHADER_STOCK_SCALAR_PAIRS(X) " + chr(92)]
+    for i, program in enumerate(m["stock_programs"]):
+        mask = sum(1 << profile["id"] for profile in profiles.values()
+                   if any(p["member"] == program["member"] for p in profile["stock_pairs"]))
+        tail = " " + chr(92) if i + 1 < len(m["stock_programs"]) else ""
+        lines.append(f'    X({program["member"]}, "{program["vertex"]}", "{program["fragment"]}", {mask}u)' + tail)
+    lines += ["", "#endif /* JCE_SHADER_STOCK_PROFILES_INC */", ""]
+    return "\n".join(lines)
 
 
 def wanted(m: dict) -> dict[Path, str]:
@@ -216,6 +325,9 @@ def wanted(m: dict) -> dict[Path, str]:
             out[sdir / (fs_name(fam["name"], combo) + ".sc")] = emit_sc(m, fam, combo)
     out[ROOT / m["public_header_out"]] = emit_public_header(m)
     out[ROOT / m["table_out"]] = emit_table(m)
+    catalog = stock_profiles(m)
+    out[ROOT / m["stock_profile_table_out"]] = emit_stock_profiles(m, catalog)
+    out[ROOT / m["stock_profile_catalog_out"]] = json.dumps(catalog, indent=2, sort_keys=True) + "\n"
     return out
 
 

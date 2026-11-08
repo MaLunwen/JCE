@@ -191,6 +191,40 @@ static void test_hour_wraps(void)
         "the clock did not wrap through midnight");
 }
 
+/* A frozen hour must not inherit the last running clock's one-frame delta.
+ * Surface integration continues even while the celestial hour is pinned. */
+static void test_freeze_after_running_keeps_hour_and_weather(void)
+{
+    JceScene *s = make_scene(13.0f, 1, 1.0f);
+    jce_scene_environment_advance(s, 1.0f / 30.0f);
+    JceSceneRenderingSettings rs = *jce_scene_get_rendering_settings(s);
+    rs.tod_speed = 0.0f;
+    jce_scene_set_rendering_settings(s, &rs);
+    const float wet_before = jce_scene_environment(s)->global_wetness;
+    const float steps[] = {1.0f / 60.0f, 1.0f / 30.0f, 1.0f / 15.0f};
+    for (int i = 0; i < 120; ++i) {
+        jce_scene_environment_advance(s, steps[i % 3]);
+        TEST_ASSERT_FLOAT_WITHIN(3.0e-6f, 13.0f, jce_scene_environment_hour(s));
+    }
+    TEST_ASSERT_TRUE(jce_scene_environment(s)->global_wetness > wet_before + 0.001f);
+    rs.tod_speed = 0.375f;
+    jce_scene_set_rendering_settings(s, &rs);
+    jce_scene_environment_advance(s, 1.0f / 15.0f);
+    TEST_ASSERT_FLOAT_WITHIN(3.0e-6f, 13.025f, jce_scene_environment_hour(s));
+    jce_scene_destroy(s);
+}
+
+static void test_initial_frozen_hour_has_no_default_day_delta(void)
+{
+    JceScene *s = make_scene(13.0f, 0, 0.0f);
+    JceSceneRenderingSettings rs = *jce_scene_get_rendering_settings(s);
+    rs.tod_speed = 0.0f;
+    jce_scene_set_rendering_settings(s, &rs);
+    jce_scene_environment_advance(s, 1.0f / 15.0f);
+    TEST_ASSERT_FLOAT_WITHIN(3.0e-6f, 13.0f, jce_scene_environment_hour(s));
+    jce_scene_destroy(s);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -199,5 +233,7 @@ int main(void)
     RUN_TEST(test_wetness_integrates_under_rain);
     RUN_TEST(test_set_hour_jumps_the_live_clock);
     RUN_TEST(test_hour_wraps);
+    RUN_TEST(test_freeze_after_running_keeps_hour_and_weather);
+    RUN_TEST(test_initial_frozen_hour_has_no_default_day_delta);
     return UNITY_END();
 }

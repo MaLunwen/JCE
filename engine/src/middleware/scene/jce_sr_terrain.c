@@ -2,81 +2,24 @@
  * jce_sr_terrain.c  Scene-renderer terrain module (split from
  * jce_scene_renderer.c).
  *
- * Terrain per-chunk LOD cache, transformed world-surface sampling, and
- * per-chunk draw (colour + shadow).  Helpers shared across the split modules
- * are declared in jce_sr_internal.h; everything else stays file-static here.
+ * Terrain per-chunk LOD cache, surface collection, and per-chunk draw
+ * (colour + shadow). Per-terrain projection is shared with the scene
+ * through jce_terrain_surface_internal.h.
  */
 
 #include "jce_terrain_cache.h"
 #include "jce_sr_internal.h"
+#include "jce_scene_internal.h"
 #include <jce/renderer/jce_image.h>
-
-static jce_vec3 sr_surface_transform_point(const jce_mat4 *m, jce_vec3 p)
-{
-    const jce_vec4 v = jce_m4_mul_v4(m, jce_v4(p.x, p.y, p.z, 1.0f));
-    return jce_v3(v.x, v.y, v.z);
-}
-
-static jce_vec3 sr_surface_transform_vector(const jce_mat4 *m, jce_vec3 v)
-{
-    const jce_vec4 r = jce_m4_mul_v4(m, jce_v4(v.x, v.y, v.z, 0.0f));
-    return jce_v3(r.x, r.y, r.z);
-}
-
-static void sr_surface_expand_bounds(SrTerrainSurface *s, jce_vec3 p,
-                                     bool first)
-{
-    if (first) {
-        s->world_min = p;
-        s->world_max = p;
-        return;
-    }
-    if (p.x < s->world_min.x) s->world_min.x = p.x;
-    if (p.y < s->world_min.y) s->world_min.y = p.y;
-    if (p.z < s->world_min.z) s->world_min.z = p.z;
-    if (p.x > s->world_max.x) s->world_max.x = p.x;
-    if (p.y > s->world_max.y) s->world_max.y = p.y;
-    if (p.z > s->world_max.z) s->world_max.z = p.z;
-}
-
-static bool sr_surface_init(SrTerrainSurface *out, JceTerrain *terrain,
-                            const jce_mat4 *world)
-{
-    if (!out || !terrain || !world) return false;
-
-    const jce_vec3 scale = jce_m4_extract_scale(world);
-    if (scale.x <= 1e-6f || scale.y <= 1e-6f || scale.z <= 1e-6f)
-        return false;
-
-    memset(out, 0, sizeof *out);
-    out->terrain = terrain;
-    out->world = *world;
-    out->inverse = jce_m4_inverse(world);
-    out->normal_matrix = jce_m4_transpose(&out->inverse);
-    out->local_min_y = fminf(0.0f, jce_terrain_max_height(terrain));
-    out->local_max_y = fmaxf(0.0f, jce_terrain_max_height(terrain));
-
-    const float sx = jce_terrain_world_size_x(terrain);
-    const float sz = jce_terrain_world_size_z(terrain);
-    bool first = true;
-    for (int iy = 0; iy < 2; ++iy)
-        for (int iz = 0; iz < 2; ++iz)
-            for (int ix = 0; ix < 2; ++ix) {
-                const jce_vec3 local = jce_v3(ix ? sx : 0.0f,
-                    iy ? out->local_max_y : out->local_min_y,
-                    iz ? sz : 0.0f);
-                sr_surface_expand_bounds(out,
-                    sr_surface_transform_point(world, local), first);
-                first = false;
-            }
-
-    const float eps = 1e-5f;
-    out->upright = fabsf(world->col[1].x) <= eps * scale.y &&
-                   fabsf(world->col[1].z) <= eps * scale.y &&
-                   fabsf(world->col[0].y) <= eps * scale.x &&
-                   fabsf(world->col[2].y) <= eps * scale.z;
-    return true;
-}
+#include <jce/renderer/jce_shaders.h>
+#include <jce/os/core/jce_hash.h>
+#include "renderer/jce_render_encoder.h"
+#include <stdlib.h>
+#include "jce_sr_terrain_vertices.h"
+#include "jce_sr_snow_mesh_cover.h"
+#include "jce_sr_snow_limits.h"
+#include "os/core/jce_trace_scope_internal.h"
+#include <limits.h>
 
 void sr_terrain_surfaces_collect(JceSceneRenderer *sr, JceScene *scene,
                                  EntityList *list, float reference_y,
@@ -106,168 +49,12 @@ void sr_terrain_surfaces_collect(JceSceneRenderer *sr, JceScene *scene,
 
         if (out->count >= SR_TERRAIN_SURFACE_MAX) continue;
         if (slot < 0 || !sr->terrain_cache[slot].terrain) continue;
-        if (sr_surface_init(&out->surfaces[out->count],
+        if (jce_terrain_surface_init(&out->surfaces[out->count],
                             sr->terrain_cache[slot].terrain, &world))
             out->count++;
     }
     out->hash = jce_fnv1a32_append(out->hash, &out->count,
                                    sizeof out->count);
-}
-
-static bool sr_surface_local_normal(const SrTerrainSurface *s, float x,
-                                    float z, jce_vec3 *out_normal)
-{
-    const JceTerrain *terrain = s->terrain;
-    const int width = jce_terrain_width(terrain);
-    const int height = jce_terrain_height(terrain);
-    const float size_x = jce_terrain_world_size_x(terrain);
-    const float size_z = jce_terrain_world_size_z(terrain);
-    if (width < 2 || height < 2 || size_x <= 0.0f || size_z <= 0.0f)
-        return false;
-
-    const float ex = size_x / (float)(width - 1);
-    const float ez = size_z / (float)(height - 1);
-    const float xm = fmaxf(0.0f, x - ex);
-    const float xp = fminf(size_x, x + ex);
-    const float zm = fmaxf(0.0f, z - ez);
-    const float zp = fminf(size_z, z + ez);
-    const float dx_den = xp - xm;
-    const float dz_den = zp - zm;
-    if (dx_den <= 1e-8f || dz_den <= 1e-8f) return false;
-
-    const float dx = (jce_terrain_sample_height(terrain, xp, z) -
-                      jce_terrain_sample_height(terrain, xm, z)) / dx_den;
-    const float dz = (jce_terrain_sample_height(terrain, x, zp) -
-                      jce_terrain_sample_height(terrain, x, zm)) / dz_den;
-    *out_normal = jce_v3_normalize(jce_v3(-dx, 1.0f, -dz));
-    return jce_v3_len(*out_normal) > 0.0f;
-}
-
-static bool sr_surface_ray_interval(const SrTerrainSurface *s, jce_vec3 o,
-                                    jce_vec3 d, float *out_near,
-                                    float *out_far)
-{
-    const jce_vec3 mn = jce_v3(0.0f, s->local_min_y,
-                                0.0f);
-    const jce_vec3 mx = jce_v3(jce_terrain_world_size_x(s->terrain),
-                                s->local_max_y,
-                                jce_terrain_world_size_z(s->terrain));
-    float tmin = 0.0f;
-    float tmax = 1e30f;
-    const float ov[3] = { o.x, o.y, o.z };
-    const float dv[3] = { d.x, d.y, d.z };
-    const float av[3] = { mn.x, mn.y, mn.z };
-    const float bv[3] = { mx.x, mx.y, mx.z };
-    for (int axis = 0; axis < 3; ++axis) {
-        if (fabsf(dv[axis]) <= 1e-8f) {
-            if (ov[axis] < av[axis] || ov[axis] > bv[axis]) return false;
-            continue;
-        }
-        float a = (av[axis] - ov[axis]) / dv[axis];
-        float b = (bv[axis] - ov[axis]) / dv[axis];
-        if (a > b) { const float tmp = a; a = b; b = tmp; }
-        if (a > tmin) tmin = a;
-        if (b < tmax) tmax = b;
-        if (tmin > tmax) return false;
-    }
-    *out_near = tmin;
-    *out_far = tmax;
-    return tmax >= 0.0f;
-}
-
-static float sr_surface_signed_height(const SrTerrainSurface *s, jce_vec3 p)
-{
-    return p.y - jce_terrain_sample_height(s->terrain, p.x, p.z);
-}
-
-static bool sr_surface_sample_tilted(const SrTerrainSurface *s, float world_x,
-                                     float world_z, jce_vec3 *out_local)
-{
-    const float pad = fmaxf(1.0f, s->world_max.y - s->world_min.y) * 0.01f;
-    const jce_vec3 world_o = jce_v3(world_x, s->world_max.y + pad, world_z);
-    const jce_vec3 local_o = sr_surface_transform_point(&s->inverse, world_o);
-    jce_vec3 local_d = sr_surface_transform_vector(&s->inverse,
-                                                    jce_v3(0.0f, -1.0f, 0.0f));
-    local_d = jce_v3_normalize(local_d);
-    if (jce_v3_len(local_d) <= 0.0f) return false;
-
-    float t0, t1;
-    if (!sr_surface_ray_interval(s, local_o, local_d, &t0, &t1)) return false;
-    if (t0 < 0.0f) t0 = 0.0f;
-    if (t1 < t0) return false;
-
-    const float cell_x = jce_terrain_world_size_x(s->terrain) /
-                         (float)(jce_terrain_width(s->terrain) - 1);
-    const float cell_z = jce_terrain_world_size_z(s->terrain) /
-                         (float)(jce_terrain_height(s->terrain) - 1);
-    float step = 0.5f * fminf(cell_x, cell_z);
-    if (step < 0.01f) step = 0.01f;
-    int steps = (int)ceilf((t1 - t0) / step);
-    if (steps < 1) steps = 1;
-    if (steps > 4096) steps = 4096;
-
-    float prev_t = t0;
-    jce_vec3 prev_p = jce_v3_add(local_o, jce_v3_scale(local_d, prev_t));
-    float prev_f = sr_surface_signed_height(s, prev_p);
-    for (int i = 1; i <= steps; ++i) {
-        const float t = t0 + (t1 - t0) * (float)i / (float)steps;
-        const jce_vec3 p = jce_v3_add(local_o, jce_v3_scale(local_d, t));
-        const float f = sr_surface_signed_height(s, p);
-        if (prev_f >= 0.0f && f <= 0.0f) {
-            float a = prev_t;
-            float b = t;
-            for (int it = 0; it < 14; ++it) {
-                const float mid = 0.5f * (a + b);
-                const jce_vec3 mp = jce_v3_add(local_o,
-                                               jce_v3_scale(local_d, mid));
-                if (sr_surface_signed_height(s, mp) > 0.0f) a = mid;
-                else b = mid;
-            }
-            *out_local = jce_v3_add(local_o,
-                                    jce_v3_scale(local_d, 0.5f * (a + b)));
-            return true;
-        }
-        prev_t = t;
-        prev_f = f;
-    }
-    return false;
-}
-
-static bool sr_surface_sample_one(const SrTerrainSurface *s, float world_x,
-                                  float world_z, bool want_normal,
-                                  float *out_world_y, jce_vec3 *out_normal)
-{
-    const float eps = 1e-4f;
-    if (world_x < s->world_min.x - eps || world_x > s->world_max.x + eps ||
-        world_z < s->world_min.z - eps || world_z > s->world_max.z + eps)
-        return false;
-
-    jce_vec3 local;
-    if (s->upright) {
-        local = sr_surface_transform_point(&s->inverse,
-            jce_v3(world_x, 0.0f, world_z));
-        const float sx = jce_terrain_world_size_x(s->terrain);
-        const float sz = jce_terrain_world_size_z(s->terrain);
-        if (local.x < -eps || local.x > sx + eps ||
-            local.z < -eps || local.z > sz + eps)
-            return false;
-        local.x = fminf(sx, fmaxf(0.0f, local.x));
-        local.z = fminf(sz, fmaxf(0.0f, local.z));
-        local.y = jce_terrain_sample_height(s->terrain, local.x, local.z);
-    } else if (!sr_surface_sample_tilted(s, world_x, world_z, &local)) {
-        return false;
-    }
-
-    const jce_vec3 world_hit = sr_surface_transform_point(&s->world, local);
-    *out_world_y = world_hit.y;
-    if (!want_normal) return true;
-
-    jce_vec3 local_normal;
-    if (!sr_surface_local_normal(s, local.x, local.z, &local_normal))
-        return false;
-    *out_normal = jce_v3_normalize(sr_surface_transform_vector(
-        &s->normal_matrix, local_normal));
-    return jce_v3_len(*out_normal) > 0.0f;
 }
 
 bool sr_terrain_surfaces_sample(void *user, float world_x,
@@ -285,7 +72,7 @@ bool sr_terrain_surfaces_sample(void *user, float world_x,
     for (int i = 0; i < set->count; ++i) {
         float y;
         jce_vec3 normal = jce_v3(0.0f, 1.0f, 0.0f);
-        if (!sr_surface_sample_one(&set->surfaces[i], world_x, world_z,
+        if (!jce_terrain_surface_sample(&set->surfaces[i], world_x, world_z,
                                    want_normal, &y, &normal))
             continue;
         const float distance = fabsf(y - set->reference_y);
@@ -340,6 +127,21 @@ typedef struct SrTerrainMaterialEntry {
     SrTerrainMaterialJob *job;
 } SrTerrainMaterialEntry;
 
+enum {
+    SR_SNOW_STAMP_MAX = 8,
+    SR_SNOW_COVER_MAX = 8,
+    SR_SNOW_COVER_VECS = 3,
+    SR_SNOW_COUNT_RADIX = 16,
+    SR_SNOW_MARKER_SCAN_MAX = 64,
+};
+
+typedef struct {
+    float stamps[SR_SNOW_STAMP_MAX][4];
+    float covers[SR_SNOW_COVER_MAX][SR_SNOW_COVER_VECS][4];
+    uint16_t stamp_count;
+    uint16_t cover_count;
+} SrTerrainSnowMarkers;
+
 struct SrTerrainMaterialCache {
     SrTerrainMaterialEntry entries[SR_TERRAIN_MATERIAL_CACHE_MAX];
     int                     inflight;
@@ -348,6 +150,13 @@ struct SrTerrainMaterialCache {
     bgfx_uniform_handle_t   sampler;
     bgfx_uniform_handle_t   normal_scales;
     bgfx_uniform_handle_t   mask_flags;
+    bgfx_uniform_handle_t   snow_stamps;
+    bgfx_uniform_handle_t   snow_cover;
+    bgfx_uniform_handle_t   snow_geometry;
+    bgfx_uniform_handle_t   snow_look;
+    bgfx_program_handle_t   snow_depth;
+    bool                    snow_depth_attempted;
+    bool                    snow_geometry_enabled;
 };
 
 typedef struct SrTerrainMaterialBinding {
@@ -668,6 +477,16 @@ static struct SrTerrainMaterialCache *sr_terrain_material_cache_get(
     cache->sampler.idx = UINT16_MAX;
     cache->normal_scales.idx = UINT16_MAX;
     cache->mask_flags.idx = UINT16_MAX;
+    cache->snow_stamps = bgfx_create_uniform("u_terrainSnowStamps",
+        BGFX_UNIFORM_TYPE_VEC4, SR_SNOW_STAMP_MAX);
+    cache->snow_cover = bgfx_create_uniform("u_terrainSnowCover",
+        BGFX_UNIFORM_TYPE_VEC4, SR_SNOW_COVER_MAX * SR_SNOW_COVER_VECS);
+    cache->snow_geometry = bgfx_create_uniform("u_terrainSnowGeometry",
+        BGFX_UNIFORM_TYPE_VEC4, 1);
+    cache->snow_look = bgfx_create_uniform("u_terrainSnowLook", BGFX_UNIFORM_TYPE_VEC4, 1);
+    cache->snow_depth.idx = UINT16_MAX;
+    const char *snow_setting = getenv("JCE_TERRAIN_SNOW_GEOMETRY");
+    cache->snow_geometry_enabled = !snow_setting || strcmp(snow_setting, "0") != 0;
     for (int i = 0; i < SR_TERRAIN_MATERIAL_CACHE_MAX; ++i)
         cache->entries[i].texture.idx = UINT16_MAX;
 
@@ -883,6 +702,16 @@ void sr_terrain_material_cache_destroy(JceSceneRenderer *sr)
         bgfx_destroy_uniform(cache->normal_scales);
     if (BGFX_HANDLE_IS_VALID(cache->mask_flags))
         bgfx_destroy_uniform(cache->mask_flags);
+    if (BGFX_HANDLE_IS_VALID(cache->snow_stamps))
+        bgfx_destroy_uniform(cache->snow_stamps);
+    if (BGFX_HANDLE_IS_VALID(cache->snow_cover))
+        bgfx_destroy_uniform(cache->snow_cover);
+    if (BGFX_HANDLE_IS_VALID(cache->snow_geometry))
+        bgfx_destroy_uniform(cache->snow_geometry);
+    if (BGFX_HANDLE_IS_VALID(cache->snow_look))
+        bgfx_destroy_uniform(cache->snow_look);
+    if (BGFX_HANDLE_IS_VALID(cache->snow_depth))
+        bgfx_destroy_program(cache->snow_depth);
     JCE_FREE(cache);
     sr->terrain_material_cache = NULL;
 }
@@ -1017,7 +846,33 @@ static bool sr_terrain_init_chunks(JceSceneRenderer *sr, int slot)
  * around its outer ring to hide T-junction cracks against neighbouring chunks
  * drawn at a different LOD.  Returns the cached mesh, or NULL on failure.
  * No-op (returns the cached mesh) when the chunk is already built at `lod`. */
-JceMesh *sr_terrain_chunk_mesh(JceSceneRenderer *sr, int slot,
+/* JCE owns the conversion allocation; test ports only inject allocator faults. */
+static void *sr_terrain_vertex_allocate(size_t bytes, void *user)
+{
+    (void)user;
+    return JCE_MALLOC(bytes);
+}
+static void sr_terrain_vertex_release(void *ptr, void *user)
+{
+    (void)user;
+    JCE_FREE(ptr);
+}
+static const SrTerrainVertexAllocator sr_terrain_vertex_allocator = {
+    sr_terrain_vertex_allocate, sr_terrain_vertex_release, NULL
+};
+static void sr_terrain_mesh_rejected(JceSceneRenderer *sr, int slot, int cx,
+    int cz, int lod, int vertices, int indices, uint32_t reason, const char *label)
+{
+    if (!(sr->terrain_vertex_reported_reasons & reason)) {
+        sr->terrain_vertex_reported_reasons |= reason;
+        LOG_WARN(LOG_TAG, "terrain: mesh rejected owner=%p asset=%s slot=%d chunk=(%d,%d) lod=%d vertices=%d indices=%d reason=%s terrain_stride=%u mesh_stride=%u",
+            (void *)sr, sr->terrain_cache[slot].path, slot, cx, cz, lod,
+            vertices, indices, label, (unsigned)sizeof(JceTerrainVertex),
+            (unsigned)sizeof(JceMeshVertex));
+    }
+    jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "sr.terrain.mesh.rejected.reason", reason);
+}
+static JceMesh *sr_terrain_chunk_mesh_build(JceSceneRenderer *sr, int slot,
                                int cx, int cz, int lod)
 {
     JceTerrain *terr = sr->terrain_cache[slot].terrain;
@@ -1032,7 +887,12 @@ JceMesh *sr_terrain_chunk_mesh(JceSceneRenderer *sr, int slot,
 
     int core_v = 0, core_i = 0;
     jce_terrain_chunk_mesh_size(terr, cx, cz, lod, &core_v, &core_i);
-    if (core_v <= 0 || core_i <= 0) return NULL;
+    if (core_v <= 0 || core_i <= 0 || core_v > INT_MAX / 24 ||
+        core_i > INT_MAX - core_v * 24 || lod < 0 || lod > 30) {
+        sr_terrain_mesh_rejected(sr, slot, cx, cz, lod, core_v, core_i,
+            1u, "invalid-generated-capacity");
+        return NULL;
+    }
 
     /* Skirt adds at most a full ring of duplicated edge verts plus two
      * triangles per edge segment.  nx == nz == sqrt(core_v) for square
@@ -1041,16 +901,32 @@ JceMesh *sr_terrain_chunk_mesh(JceSceneRenderer *sr, int slot,
     int skirt_i_cap = 4 * core_v * 6;
     int cap_v = core_v + skirt_v_cap;
     int cap_i = core_i + skirt_i_cap;
+    if ((size_t)cap_v > SIZE_MAX / sizeof(JceTerrainVertex) ||
+        (size_t)cap_i > SIZE_MAX / sizeof(uint32_t)) {
+        sr_terrain_mesh_rejected(sr, slot, cx, cz, lod, cap_v, cap_i,
+            1u, "source-byte-capacity-overflow");
+        return NULL;
+    }
 
     JceTerrainVertex *vb = (JceTerrainVertex *)
         JCE_MALLOC(sizeof(JceTerrainVertex) * (size_t)cap_v);
     uint32_t *ib = (uint32_t *)JCE_MALLOC(sizeof(uint32_t) * (size_t)cap_i);
-    if (!vb || !ib) { if (vb) JCE_FREE(vb); if (ib) JCE_FREE(ib); return NULL; }
+    if (!vb || !ib) {
+        JCE_FREE(vb); JCE_FREE(ib);
+        sr_terrain_mesh_rejected(sr, slot, cx, cz, lod, cap_v, cap_i,
+            2u, "source-allocation-failed");
+        return NULL;
+    }
 
     int wrote_v = 0, wrote_i = 0;
     jce_terrain_chunk_build_mesh(terr, cx, cz, lod,
                                  vb, core_v, ib, core_i, &wrote_v, &wrote_i);
-    if (wrote_v <= 0 || wrote_i <= 0) { JCE_FREE(vb); JCE_FREE(ib); return NULL; }
+    if (wrote_v <= 0 || wrote_i <= 0 || wrote_v > core_v || wrote_i > core_i) {
+        JCE_FREE(vb); JCE_FREE(ib);
+        sr_terrain_mesh_rejected(sr, slot, cx, cz, lod, wrote_v, wrote_i,
+            4u, "invalid-generated-count");
+        return NULL;
+    }
 
     /* The core grid is row-major nx*nz (see jce_terrain_chunk_build_mesh).
      * Derive nx/nz from the chunk extents at this LOD to walk its border. */
@@ -1126,18 +1002,55 @@ JceMesh *sr_terrain_chunk_mesh(JceSceneRenderer *sr, int slot,
         }
     }
 
-    if (sr->terrain_cache[slot].chunk_meshes[idx]) {
-        jce_mesh_destroy(sr->terrain_cache[slot].chunk_meshes[idx]);
-        sr->terrain_cache[slot].chunk_meshes[idx] = NULL;
+    SrTerrainVertexOwner converted = {0};
+    const SrTerrainVertexResult conversion = sr_terrain_vertices_create(
+        &converted, vb, (uint32_t)wrote_v, &sr_terrain_vertex_allocator);
+    JCE_FREE(vb);
+    if (conversion != SR_TERRAIN_VERTICES_OK) {
+        JCE_FREE(ib);
+        sr_terrain_mesh_rejected(sr, slot, cx, cz, lod, wrote_v, wrote_i,
+            8u, conversion == SR_TERRAIN_VERTICES_OOM ?
+                "converted-allocation-failed" : "invalid-conversion-input");
+        return NULL;
     }
-    /* JceTerrainVertex layout matches JceMeshVertex exactly. */
-    JceMesh *m = jce_mesh_create((const JceMeshVertex *)vb, (uint32_t)wrote_v,
+    /* Mesh owner copies the input and generates tangents for the whole zero
+     * tangent stream. The public terrain vertex format stays unchanged. */
+    JceMesh *m = jce_mesh_create(converted.vertices, (uint32_t)wrote_v,
                                  ib, (uint32_t)wrote_i);
-    JCE_FREE(vb); JCE_FREE(ib);
-    if (!m) return NULL;
+    sr_terrain_vertices_destroy(&converted);
+    JCE_FREE(ib);
+    if (!m) {
+        sr_terrain_mesh_rejected(sr, slot, cx, cz, lod, wrote_v, wrote_i,
+            16u, "mesh-owner-create-failed");
+        return NULL;
+    }
+    /* Keep the previous allocation owned until the candidate is accepted.
+     * A failed request returns NULL and cannot masquerade as its old LOD. */
+    if (sr->terrain_cache[slot].chunk_meshes[idx])
+        jce_mesh_destroy(sr->terrain_cache[slot].chunk_meshes[idx]);
     sr->terrain_cache[slot].chunk_meshes[idx] = m;
     sr->terrain_cache[slot].chunk_lod[idx]    = (int8_t)lod;
     return m;
+}
+
+JceMesh *sr_terrain_chunk_mesh(JceSceneRenderer *sr, int slot,
+                               int cx, int cz, int lod)
+{
+    if (!sr || slot < 0 || slot >= 16 || cx < 0 || cz < 0 || lod < 0 || lod > 30 ||
+        cx >= sr->terrain_cache[slot].chunk_nx ||
+        cz >= sr->terrain_cache[slot].chunk_nz) return NULL;
+    const int idx = cz * sr->terrain_cache[slot].chunk_nx + cx;
+    if (idx >= sr->terrain_cache[slot].chunk_count ||
+        !sr->terrain_cache[slot].terrain ||
+        !sr->terrain_cache[slot].chunk_meshes ||
+        !sr->terrain_cache[slot].chunk_lod) return NULL;
+    if (sr->terrain_cache[slot].chunk_meshes[idx] &&
+        sr->terrain_cache[slot].chunk_lod[idx] == (int8_t)lod)
+        return sr->terrain_cache[slot].chunk_meshes[idx];
+    JceTraceScope scope = jce_trace_scope_begin("sr.terrain.chunk_mesh");
+    JceMesh *mesh = sr_terrain_chunk_mesh_build(sr, slot, cx, cz, lod);
+    jce_trace_scope_end(scope, mesh ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return mesh;
 }
 
 /* Find (or lazily load) the terrain cache slot for `path`, initialising the
@@ -1436,21 +1349,257 @@ static bgfx_texture_handle_t sr_terrain_tile_splat_tex(JceSceneRenderer *sr,
     return st;
 }
 
+/* A roof is a rectangular plane with zero transmission. A canopy is an
+ * ellipse with authored transmission. Project the same transformed plane
+ * into world XZ and retain its world Y slope for the fragment height test. */
+static bool sr_terrain_snow_cover(const jce_mat4 *world, float transmission,
+                                  float cover[SR_SNOW_COVER_VECS][4])
+{
+    const jce_vec4 center = world->col[3];
+    const jce_vec4 x = world->col[0], z = world->col[2];
+    const float determinant = x.x * z.z - z.x * x.z;
+    const float reach_x = fabsf(x.x) + fabsf(z.x);
+    const float reach_z = fabsf(x.z) + fabsf(z.z);
+    if (!(fabsf(determinant) >= 0.025f && reach_x <= 48.0f && reach_z <= 48.0f &&
+          fabsf(x.y) + fabsf(z.y) <= 48.0f)) return false;
+
+    const float inverse = 1.0f / determinant;
+    const float data[SR_SNOW_COVER_VECS][4] = {
+        {center.x, center.y, center.z, transmission},
+        {z.z * inverse, -z.x * inverse, -x.z * inverse, x.x * inverse},
+        {x.y, z.y, reach_x, reach_z},
+    };
+    memcpy(cover, data, sizeof data);
+    return true;
+}
+
+static void sr_terrain_snow_markers(JceSceneRenderer *sr, JceScene *scene,
+    JceEntity terrain_entity, JceTerrain *terrain, const jce_mat4 *model,
+    bool allow_stamps, bool allow_cover,
+    SrTerrainSnowMarkers *out)
+{
+    allow_stamps = allow_stamps && !jce_terrain_is_tiled(terrain);
+    if (!allow_stamps && !allow_cover) return;
+    JceEntity children[SR_SNOW_MARKER_SCAN_MAX];
+    const int count = jce_scene_get_children(scene, terrain_entity, children,
+                                             SR_SNOW_MARKER_SCAN_MAX);
+    JceTerrainSurface surface;
+    bool surface_ready = false;
+    for (int i = 0; i < count; ++i) {
+        const JceEntity child = children[i];
+        const char *tag = jce_scene_get_entity_tag_name(scene, child);
+        const bool stamp = allow_stamps && out->stamp_count < SR_SNOW_STAMP_MAX &&
+                           strcmp(tag, "SnowStamp") == 0;
+        const bool cover_slot = allow_cover && out->cover_count < SR_SNOW_COVER_MAX;
+        const bool roof = cover_slot && strcmp(tag, "SnowRoof") == 0;
+        const bool canopy = cover_slot && strcmp(tag, "SnowCanopy") == 0;
+        const bool mesh = cover_slot && strcmp(tag, "SnowOccluder") == 0;
+        if ((!stamp && !roof && !canopy && !mesh) || !entity_enabled(scene, child)) continue;
+        const JceTransform *marker = jce_scene_get_transform(scene, child);
+        if (!marker) continue;
+        const jce_mat4 world = jce_scene_get_world_matrix(scene, child);
+        const jce_vec4 p = world.col[3];
+        if (!(fabsf(p.x) <= 32768.0f && fabsf(p.z) <= 32768.0f) || !isfinite(p.y)) continue;
+        if (mesh) {
+            out->cover_count += sr_snow_mesh_cover(sr, scene, child, &world,
+                &out->covers[out->cover_count], SR_SNOW_COVER_MAX - out->cover_count);
+            continue;
+        }
+        if (roof || canopy) {
+            const float transmission = roof ? -1.0f : marker->scale.y;
+            if ((!canopy || (transmission >= 0.0f && transmission < 1.0f)) &&
+                sr_terrain_snow_cover(&world, transmission, out->covers[out->cover_count]))
+                ++out->cover_count;
+            continue;
+        }
+
+        if (!(marker->scale.x >= 0.20f && marker->scale.x <= 2.50f) ||
+            !sr_snow_depth_valid(marker->scale.y)) continue;
+        if (!surface_ready) {
+            surface_ready = jce_terrain_surface_init(&surface, terrain, model);
+            if (!surface_ready) { allow_stamps = false; continue; }
+        }
+        float ground;
+        if (!jce_terrain_surface_sample(&surface, p.x, p.z, false, &ground, NULL) ||
+            !(fabsf(p.y - ground) <= 0.35f)) continue;
+        float *entry = out->stamps[out->stamp_count++];
+        entry[0] = p.x;
+        entry[1] = p.z;
+        entry[2] = marker->scale.x;
+        entry[3] = marker->scale.y;
+    }
+}
+
+static uint16_t sr_terrain_chunk_snow_cover(const SrTerrainSnowMarkers *markers,
+    jce_vec3 min, jce_vec3 max, float covers[SR_SNOW_COVER_MAX][SR_SNOW_COVER_VECS][4])
+{
+    uint16_t count = 0;
+    for (uint16_t i = 0; i < markers->cover_count; ++i) {
+        const float (*cover)[4] = markers->covers[i];
+        const float *center = cover[0], *slope_and_reach = cover[2];
+        if (center[0] + slope_and_reach[2] < min.x || center[0] - slope_and_reach[2] > max.x ||
+            center[2] + slope_and_reach[3] < min.z || center[2] - slope_and_reach[3] > max.z ||
+            center[1] + fabsf(slope_and_reach[0]) + fabsf(slope_and_reach[1]) <= min.y + 0.08f)
+            continue;
+        memcpy(covers[count++], cover, sizeof covers[0]);
+    }
+    return count;
+}
+
+typedef struct {
+    float snow_amount;
+    float minimum_radius;
+} SrTerrainSnowGeometry;
+
+static float sr_terrain_geometry_snow_amount(const JceSceneRenderer *sr)
+{
+    if (!sr->env || !(sr->env->snow_amount >= 1.0f / 32.0f)) return 0.0f;
+    return floorf(fminf(sr->env->snow_amount, 1.0f) * 32.0f) / 32.0f;
+}
+
+static SrTerrainSnowGeometry sr_terrain_snow_geometry(JceSceneRenderer *sr,
+    JceTerrain *terrain, const jce_mat4 *model, const SrTerrainSnowMarkers *snow)
+{
+    const SrTerrainSnowGeometry none = {0};
+    const float amount = sr_terrain_geometry_snow_amount(sr);
+    if (amount == 0.0f || snow->stamp_count == 0) return none;
+    const int width = jce_terrain_width(terrain), height = jce_terrain_height(terrain);
+    if (width < 2 || height < 2) return none;
+    const float dx = hypotf(model->col[0].x, model->col[0].z) *
+        jce_terrain_world_size_x(terrain) / (float)(width - 1);
+    const float dz = hypotf(model->col[2].x, model->col[2].z) *
+        jce_terrain_world_size_z(terrain) / (float)(height - 1);
+    const float radius = 1.5f * fmaxf(dx, dz);
+    if (!(radius > 0.0f && radius <= 2.5f)) return none;
+    float largest = 0.0f;
+    for (uint16_t i = 0; i < snow->stamp_count; ++i)
+        largest = fmaxf(largest, snow->stamps[i][2]);
+    if (largest < radius) return none;
+
+    struct SrTerrainMaterialCache *cache = sr->terrain_material_cache;
+    if (!cache || !cache->snow_geometry_enabled ||
+        !BGFX_HANDLE_IS_VALID(cache->snow_geometry)) return none;
+    if (!cache->snow_depth_attempted) {
+        cache->snow_depth_attempted = true;
+        cache->snow_depth.idx = shader_load_program_named(sr->pak, "terrain_snow_depth", "shadow").idx;
+    }
+    if (!BGFX_HANDLE_IS_VALID(cache->snow_depth)) return none;
+    return (SrTerrainSnowGeometry){amount, radius};
+}
+
+static SrTerrainSnowGeometry sr_terrain_collect_geometry(JceSceneRenderer *sr,
+    JceScene *scene, JceEntity entity, JceTerrain *terrain, const jce_mat4 *model,
+    SrTerrainSnowMarkers *snow)
+{
+    if (!terrain || sr_terrain_geometry_snow_amount(sr) == 0.0f ||
+        !jce_shader_valid(jce_renderer_get_program_terrain(sr->renderer)))
+        return (SrTerrainSnowGeometry){0};
+    const struct SrTerrainMaterialCache *cache = sr_terrain_material_cache_get(sr);
+    if (!cache || !cache->snow_geometry_enabled) return (SrTerrainSnowGeometry){0};
+    sr_terrain_snow_markers(sr, scene, entity, terrain, model,
+        BGFX_HANDLE_IS_VALID(cache->snow_stamps), BGFX_HANDLE_IS_VALID(cache->snow_cover), snow);
+    return sr_terrain_snow_geometry(sr, terrain, model, snow);
+}
+
+static bool sr_terrain_chunk_snow_geometry(const SrTerrainSnowMarkers *snow,
+    SrTerrainSnowGeometry geometry, jce_vec3 min, jce_vec3 max)
+{
+    if (geometry.snow_amount == 0.0f) return false;
+    for (uint16_t i = 0; i < snow->stamp_count; ++i) {
+        const float *stamp = snow->stamps[i];
+        if (stamp[2] < geometry.minimum_radius) continue;
+        const float reach = stamp[2] * 1.035f;
+        if (stamp[0] + reach >= min.x && stamp[0] - reach <= max.x &&
+            stamp[1] + reach >= min.z && stamp[1] - reach <= max.z)
+            return true;
+    }
+    return false;
+}
+
+static void sr_terrain_bind_snow(JceSceneRenderer *sr, const SrTerrainSnowMarkers *snow,
+    SrTerrainSnowGeometry geometry, jce_vec3 min, jce_vec3 max, float params[4])
+{
+    const struct SrTerrainMaterialCache *cache = sr->terrain_material_cache;
+    float chunk_cover[SR_SNOW_COVER_MAX][SR_SNOW_COVER_VECS][4];
+    const uint16_t covers = sr_terrain_chunk_snow_cover(snow, min, max, chunk_cover);
+    params[2] = (float)snow->stamp_count;
+    if (covers > 0) {
+        params[2] = -(float)(covers * SR_SNOW_COUNT_RADIX + snow->stamp_count);
+        bgfx_set_uniform(cache->snow_cover, chunk_cover, (uint16_t)(covers * SR_SNOW_COVER_VECS));
+    }
+    bgfx_set_uniform(sr->u_terrain_params, params, 1);
+    if (snow->stamp_count > 0)
+        bgfx_set_uniform(cache->snow_stamps, snow->stamps, snow->stamp_count);
+    if (cache && BGFX_HANDLE_IS_VALID(cache->snow_geometry)) {
+        const float data[4] = {geometry.snow_amount, geometry.minimum_radius,
+                               SR_SNOW_DEPTH_MAX_M, SR_SNOW_RIM_MAX_M};
+        bgfx_set_uniform(cache->snow_geometry, data, 1);
+    }
+}
+
+uint64_t sr_terrain_snow_shadow_key(JceSceneRenderer *sr, JceScene *scene, const EntityList *list)
+{
+    if (sr_terrain_geometry_snow_amount(sr) == 0.0f ||
+        !jce_shader_valid(jce_renderer_get_program_terrain(sr->renderer))) return 0;
+    const struct SrTerrainMaterialCache *material = sr_terrain_material_cache_get(sr);
+    if (!material || !material->snow_geometry_enabled) return 0;
+    uint64_t key = 0;
+    JceTerrainCache *terrain_cache = jce_scene_terrain_cache(scene);
+    for (int i = 0; i < list->count; ++i) {
+        const JceEntity entity = list->entities[i];
+        JceTerrainComponent *tc = jce_scene_get_terrain(scene, entity);
+        if (!tc || !tc->visible || !tc->terrain_path[0] || !entity_enabled(scene, entity) ||
+            !jce_scene_has_transform(scene, entity) || !jce_scene_get_child_count(scene, entity))
+            continue;
+        const int slot = sr_terrain_find_or_load_slot(sr, scene, tc->terrain_path);
+        if (slot < 0 || sr->terrain_cache[slot].chunk_count <= 0) continue;
+        const jce_mat4 model = jce_scene_get_world_matrix(scene, entity);
+        SrTerrainSnowMarkers snow = {0};
+        const SrTerrainSnowGeometry geometry = sr_terrain_collect_geometry(sr, scene, entity,
+            sr->terrain_cache[slot].terrain, &model, &snow);
+        if (geometry.snow_amount == 0.0f) continue;
+        if (key == 0) key = JCE_FNV1A64_INIT;
+        key = jce_fnv1a64_append(key, &entity, sizeof entity);
+        key = jce_fnv1a64_append(key, &model, sizeof model);
+        const uint64_t asset_revision = terrain_cache
+            ? jce_terrain_cache_revision(terrain_cache, tc->terrain_path) : 0;
+        key = jce_fnv1a64_append(key, &asset_revision, sizeof asset_revision);
+        key = jce_fnv1a64_append(key, &geometry.snow_amount, sizeof geometry.snow_amount);
+        key = jce_fnv1a64_append(key, &geometry.minimum_radius, sizeof geometry.minimum_radius);
+        key = jce_fnv1a64_append(key, &snow.stamp_count, sizeof snow.stamp_count);
+        key = jce_fnv1a64_append(key, snow.stamps, snow.stamp_count * sizeof snow.stamps[0]);
+        key = jce_fnv1a64_append(key, &snow.cover_count, sizeof snow.cover_count);
+        key = jce_fnv1a64_append(key, snow.covers, snow.cover_count * sizeof snow.covers[0]);
+    }
+    return key;
+}
+
 void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
-                            EntityList *list,
+                            EntityList *list, JceEntity entity,
                             const JceCamera *camera, uint16_t view_id,
                             int slot, JceTerrainComponent *tc,
                             const jce_mat4 *model,
-                            const JcePbrMaterial *pbr,
-                            const bgfx_texture_handle_t layer_tex[4],
-                            uint32_t receiver_layer)
+                            const JcePbrMaterial *pbr, uint32_t receiver_layer,
+                            JceSceneViewModeKind mode)
 {
     if (!sr || slot < 0 || slot >= 16) return;
     JceTerrain *terr = sr->terrain_cache[slot].terrain;
     if (!terr || sr->terrain_cache[slot].chunk_count <= 0) return;
 
+    /* The ordinary PBR fallback has a different sampler ABI. It keeps the
+     * base layer, heightfield and chunk LOD without splat blending. */
+    const bool layered = jce_shader_valid(jce_renderer_get_program_terrain(sr->renderer));
+    bgfx_texture_handle_t layer_tex[4] = {
+        sr->white_tex, sr->white_tex, sr->white_tex, sr->white_tex
+    };
+    for (int layer = 0; tc && layer < (layered ? 4 : 1); ++layer) {
+        if (!tc->layer_albedo_path[layer][0]) continue;
+        JceTexture texture = sr_resolve_texture_srgb(sr, tc->layer_albedo_path[layer]);
+        if (jce_texture_valid(texture)) layer_tex[layer].idx = texture.idx;
+    }
+
     /* Lazy splat texture upload (once per terrain). */
-    if (!sr->terrain_cache[slot].splat_uploaded) {
+    if (layered && !sr->terrain_cache[slot].splat_uploaded) {
         int tw = jce_terrain_width(terr);
         int th = jce_terrain_height(terr);
         const uint32_t *splat = jce_terrain_splat(terr);
@@ -1470,7 +1619,27 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
     bgfx_texture_handle_t splat_h = sr->terrain_cache[slot].splat_tex;
     if (!BGFX_HANDLE_IS_VALID(splat_h)) splat_h = sr->white_tex;
 
-    SrTerrainMaterialBinding layer_data = sr_terrain_material_get(sr, tc);
+    SrTerrainMaterialBinding layer_data = layered
+        ? sr_terrain_material_get(sr, tc) : (SrTerrainMaterialBinding){0};
+    SrTerrainSnowMarkers snow = {0};
+    const struct SrTerrainMaterialCache *material_cache = sr->terrain_material_cache;
+    if (layered && material_cache && sr->env &&
+        (sr->env->snow_amount > 0.001f || sr->env->global_wetness > 0.001f))
+        sr_terrain_snow_markers(sr, scene, entity, terr, model,
+            sr->env->snow_amount > 0.001f &&
+                BGFX_HANDLE_IS_VALID(material_cache->snow_stamps),
+            BGFX_HANDLE_IS_VALID(material_cache->snow_cover), &snow);
+    const SrTerrainSnowGeometry snow_geometry = sr_terrain_snow_geometry(sr, terr, model, &snow);
+
+    const JceSceneRenderLook *look = jce_scene_internal_get_render_look(scene);
+    const JceSceneTerrainSnowLook snow_look = look ? look->terrain_snow : (JceSceneTerrainSnowLook){0};
+    const float snow_look_data[4] = {
+        snow_look.brightness, snow_look.warmth, snow_look.lowland_tint, snow_look.micro_normal_strength,
+    };
+    const bool snow_look_active = layered && material_cache && sr->env &&
+        sr->env->snow_amount > 0.0f && BGFX_HANDLE_IS_VALID(material_cache->snow_look) &&
+        (snow_look_data[0] != 0.0f || snow_look_data[1] != 0.0f ||
+         snow_look_data[2] > 0.0f || snow_look_data[3] > 0.0f);
     float mask_count = layer_data.mask_flags[0] + layer_data.mask_flags[1] +
                        layer_data.mask_flags[2] + layer_data.mask_flags[3];
 
@@ -1481,6 +1650,9 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         (tc && mask_count > 0.5f)
             ? sr_terrain_clampf(tc->height_blend, 0.0f, 1.0f) : 0.0f
     };
+    /* The reserved negative splat values opt this draw into the optional
+     * uniform. Other terrain callers can keep binding their existing 0/1. */
+    if (snow_look_active) tparams[1] = tparams[1] > 0.5f ? -2.0f : -1.0f;
     /* large-world #4 per-tile splat: a tiled terrain has no monolithic splat
      * map. When its tile grid aligns with the chunk grid (tile_dim==chunk_size,
      * so chunk i ↔ tile i) we bind a per-tile splat texture per chunk (in the
@@ -1543,7 +1715,10 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         jce_vec3 wmn, wmx;
         sr_transform_aabb(model, lmn, lmx, &wmn, &wmx);
 
-        if (have_planes && !sr_aabb_in_frustum(planes, wmn, wmx)) {
+        const bool displaced = sr_terrain_chunk_snow_geometry(&snow, snow_geometry, wmn, wmx);
+        jce_vec3 cull_min = wmn, cull_max = wmx;
+        if (displaced) { cull_min.y -= SR_SNOW_DEPTH_MAX_M; cull_max.y += SR_SNOW_RIM_MAX_M; }
+        if (have_planes && !sr_aabb_in_frustum(planes, cull_min, cull_max)) {
             sr->stat_terrain_chunks_culled++;
             continue;
         }
@@ -1559,6 +1734,7 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
         int lod = (int)(dist / SR_TERRAIN_LOD_DIST);
         if (lod < 0) lod = 0;
         if (lod > SR_TERRAIN_MAX_LOD) lod = SR_TERRAIN_MAX_LOD;
+        if (displaced) lod = 0;
 
         JceMesh *cm = sr_terrain_chunk_mesh(sr, slot, cx, cz, lod);
         if (!cm) {
@@ -1567,54 +1743,67 @@ void sr_draw_terrain_chunks(JceSceneRenderer *sr, JceScene *scene,
             if (!cm) continue;
         }
 
+        if (mode == JCE_SCENE_VIEW_WIREFRAME) {
+            sr_draw_mesh_view_wireframe(sr, cm, view_id, model, false);
+            sr->stat_terrain_chunks_drawn++;
+            continue;
+        }
+
         /* Per-chunk state (re-bound every submit; BGFX_DISCARD_ALL clears it). */
         sr_inline_bind_pbr_global_overrides(
             sr, pbr, view_id, scene, list,
             (JceTexture){ layer_tex[0].idx },
-            (JceTexture){ layer_tex[3].idx },
+            layered ? (JceTexture){ layer_tex[3].idx } : (JceTexture){ UINT16_MAX },
             receiver_layer);
         bgfx_set_transform(model->raw[0], 1);
-        bgfx_set_texture(14, sr->s_terrain_layer1, layer_tex[1], UINT32_MAX);
-        bgfx_set_texture(15, sr->s_terrain_layer2, layer_tex[2], UINT32_MAX);
-        sr_terrain_material_bind(sr, &layer_data);
-        bgfx_set_uniform(sr->u_terrain_params, tparams, 1);
-        /* Stage 3 is fs_terrain.sc's s_cloudShadow -- the one stage terrain
-         * could free, because it held a declared-but-never-bound s_aoMap.
-         * Bound here rather than with the shared shadow state: the mesh
-         * shader uses stage 3 for a real AO map, so a global bind would
-         * overwrite it. This is terrain's ONLY draw path. */
-        sr_bind_cloud_shadow(sr);
-        /* Stage 1 is fs_terrain.sc's s_terrainAO -- the screen-space AO target.
-         * Bound after the material bind, which puts a metallic-roughness map
-         * there that this shader has never read. White when SSAO did not run,
-         * because an unbound sampler is undefined the moment something reads
-         * it, and the shader's own u_ssaoParams.x gate is what actually
-         * decides whether the value is used. */
-        {
-            bgfx_texture_handle_t ao_h = sr->white_tex;
-            if (sr->ssao_active_frame && sr->ssao_ao_idx != UINT16_MAX)
-                ao_h.idx = sr->ssao_ao_idx;
-            bgfx_set_texture(1, sr->s_terrain_ao, ao_h, UINT32_MAX);
-        }
+        if (layered) {
+            bgfx_set_texture(14, sr->s_terrain_layer1, layer_tex[1], UINT32_MAX);
+            bgfx_set_texture(15, sr->s_terrain_layer2, layer_tex[2], UINT32_MAX);
+            sr_terrain_material_bind(sr, &layer_data);
+            if (snow_look_active)
+                bgfx_set_uniform(material_cache->snow_look, snow_look_data, 1);
+            sr_terrain_bind_snow(sr, &snow,
+                displaced ? snow_geometry : (SrTerrainSnowGeometry){0}, wmn, wmx, tparams);
+            /* Stage 3 is fs_terrain.sc's s_cloudShadow -- the one stage terrain
+             * could free, because it held a declared-but-never-bound s_aoMap.
+             * Bound here rather than with the shared shadow state: the mesh
+             * shader uses stage 3 for a real AO map, so a global bind would
+             * overwrite it. This is terrain's ONLY draw path. */
+            sr_bind_cloud_shadow(sr);
+            /* Stage 1 is fs_terrain.sc's s_terrainAO -- the screen-space AO target.
+             * Bound after the material bind, which puts a metallic-roughness map
+             * there that this shader has never read. White when SSAO did not run,
+             * because an unbound sampler is undefined the moment something reads
+             * it, and the shader's own u_ssaoParams.x gate is what actually
+             * decides whether the value is used. */
+            {
+                bgfx_texture_handle_t ao_h = sr->white_tex;
+                if (sr->ssao_active_frame && sr->ssao_ao_idx != UINT16_MAX)
+                    ao_h.idx = sr->ssao_ao_idx;
+                bgfx_set_texture(1, sr->s_terrain_ao, ao_h, UINT32_MAX);
+            }
 
-        if (per_tile_splat) {
-            /* Bind this chunk's tile splat texture + remap the global terrain UV
-             * into the tile's local [0..1]. */
-            bgfx_texture_handle_t st =
-                sr_terrain_tile_splat_tex(sr, slot, cx, cz, tg_dim);
-            bgfx_set_texture(13, sr->s_terrain_splat,
-                BGFX_HANDLE_IS_VALID(st) ? st : sr->white_tex, UINT32_MAX);
-            float tile_uv[4] = { (float)cx / (float)tg_x,
-                                 (float)cz / (float)tg_z,
-                                 (float)tg_x, (float)tg_z };
-            bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
-        } else {
-            bgfx_set_texture(13, sr->s_terrain_splat, splat_h, UINT32_MAX);
-            float tile_uv[4] = { 0.0f, 0.0f, 1.0f, 1.0f };  /* identity remap */
-            bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
+            if (per_tile_splat) {
+                /* Bind this chunk's tile splat texture + remap the global terrain UV
+                 * into the tile's local [0..1]. */
+                bgfx_texture_handle_t st =
+                    sr_terrain_tile_splat_tex(sr, slot, cx, cz, tg_dim);
+                bgfx_set_texture(13, sr->s_terrain_splat,
+                    BGFX_HANDLE_IS_VALID(st) ? st : sr->white_tex, UINT32_MAX);
+                float tile_uv[4] = { (float)cx / (float)tg_x,
+                                     (float)cz / (float)tg_z,
+                                     (float)tg_x, (float)tg_z };
+                bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
+            } else {
+                bgfx_set_texture(13, sr->s_terrain_splat, splat_h, UINT32_MAX);
+                float tile_uv[4] = { 0.0f, 0.0f, 1.0f, 1.0f };  /* identity remap */
+                bgfx_set_uniform(sr->u_terrain_tile_uv, tile_uv, 1);
+            }
         }
 
         jce_mesh_submit_terrain(cm, sr->renderer, view_id);
+        if (mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED)
+            sr_draw_mesh_view_wireframe(sr, cm, view_id, model, true);
         sr->stat_terrain_chunks_drawn++;
     }
 }
@@ -1637,6 +1826,9 @@ bool sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
     if (!jce_scene_has_transform(scene, e)) return false;
 
     jce_mat4 model = jce_scene_get_world_matrix(scene, e);
+    SrTerrainSnowMarkers snow = {0};
+    const SrTerrainSnowGeometry snow_geometry = sr_terrain_collect_geometry(sr, scene, e,
+        sr->terrain_cache[slot].terrain, &model, &snow);
     int ncx = sr->terrain_cache[slot].chunk_nx;
     int ncz = sr->terrain_cache[slot].chunk_nz;
 
@@ -1662,24 +1854,39 @@ bool sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
     for (int cz = 0; cz < ncz; cz++)
     for (int cx = 0; cx < ncx; cx++) {
         int cidx = cz * ncx + cx;
+        jce_vec3 wmn = {0}, wmx = {0};
+        if (scull || snow_geometry.snow_amount > 0.0f)
+            sr_transform_aabb(&model, sr->terrain_cache[slot].chunk_min[cidx],
+                              sr->terrain_cache[slot].chunk_max[cidx], &wmn, &wmx);
+        const bool displaced = sr_terrain_chunk_snow_geometry(&snow, snow_geometry, wmn, wmx);
         if (scull) {
-            jce_vec3 wmn, wmx;
-            sr_transform_aabb(&model,
-                              sr->terrain_cache[slot].chunk_min[cidx],
-                              sr->terrain_cache[slot].chunk_max[cidx],
-                              &wmn, &wmx);
-            if (!sr_aabb_in_frustum(splanes, wmn, wmx)) {
+            jce_vec3 cull_min = wmn, cull_max = wmx;
+            if (displaced) { cull_min.y -= SR_SNOW_DEPTH_MAX_M; cull_max.y += SR_SNOW_RIM_MAX_M; }
+            if (!sr_aabb_in_frustum(splanes, cull_min, cull_max)) {
                 sr->stat_terrain_shadow_culled++;
                 continue;
             }
         }
         sr->stat_terrain_shadow_drawn++;
-        JceMesh *cm = sr->terrain_cache[slot].chunk_meshes[cidx];
-        if (!cm) cm = sr_terrain_chunk_mesh(sr, slot, cx, cz,
-                                            SR_TERRAIN_SHADOW_LOD);
+        JceMesh *cm = displaced ? sr_terrain_chunk_mesh(sr, slot, cx, cz, 0)
+                                : sr->terrain_cache[slot].chunk_meshes[cidx];
+        if (!cm && !displaced) cm = sr_terrain_chunk_mesh(sr, slot, cx, cz, SR_TERRAIN_SHADOW_LOD);
         if (!cm) continue;
         bgfx_set_transform(model.raw[0], 1);
-        jce_mesh_submit_shadow(cm, sr->renderer, view_id);
+        if (!displaced) {
+            jce_mesh_submit_shadow(cm, sr->renderer, view_id);
+            continue;
+        }
+        float params[4] = {0};
+        sr_terrain_bind_snow(sr, &snow, snow_geometry, wmn, wmx, params);
+        const bgfx_vertex_buffer_handle_t vb = {(uint16_t)jce_mesh_get_vbh(cm)};
+        const bgfx_index_buffer_handle_t ib = {(uint16_t)jce_mesh_get_ibh(cm)};
+        jce_enc_set_vertex_buffer(0, vb, 0, jce_mesh_vertex_count(cm));
+        if (BGFX_HANDLE_IS_VALID(ib))
+            jce_enc_set_index_buffer(ib, 0, jce_mesh_index_count(cm));
+        jce_enc_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS |
+                          BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+        jce_enc_submit(view_id, sr->terrain_material_cache->snow_depth, 0, BGFX_DISCARD_ALL);
     }
     return true;
 }

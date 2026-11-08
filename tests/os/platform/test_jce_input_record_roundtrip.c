@@ -220,9 +220,52 @@ static void test_what_reached_disk_replays_as_a_clean_prefix(void)
     expect_n(64);                           /* frames 0..63, then EOF */
 }
 
+static void test_replay_origin_is_current_successful_snapshot_only(void)
+{
+    JceInputRecorder *r;
+    JceInputFrame f;
+    JceInputEvent e;
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(NULL));
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    record_n(5);
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    r = jce_input_replay_open(TMP_PATH);
+    TEST_ASSERT_NOT_NULL(r);
+    TEST_ASSERT_TRUE(jce_input_replay_tick(r, g_input));
+    TEST_ASSERT_TRUE(jce_input_snapshot_was_replayed(g_input));
+    jce_input_capture(g_input, &f);
+    TEST_ASSERT_TRUE(jce_input_snapshot_was_replayed(g_input));
+    jce_input_update(g_input);
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    TEST_ASSERT_TRUE(jce_input_replay_tick(r, g_input));
+    TEST_ASSERT_TRUE(jce_input_snapshot_was_replayed(g_input));
+    TEST_ASSERT_TRUE(jce_input_apply(g_input, &f));
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    TEST_ASSERT_TRUE(jce_input_replay_tick(r, g_input));
+    TEST_ASSERT_TRUE(jce_input_snapshot_was_replayed(g_input));
+    f.version = 0;
+    TEST_ASSERT_FALSE(jce_input_apply(g_input, &f));
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    TEST_ASSERT_TRUE(jce_input_replay_tick(r, g_input));
+    memset(&e, 0, sizeof e);
+    e.size = sizeof e; e.kind = JCE_INPUT_EVENT_MOUSE_MOTION;
+    e.motion.x = 10; e.motion.y = 20; e.motion.dx = 1;
+    jce_input_submit(g_input, &e, 1);
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    TEST_ASSERT_TRUE(jce_input_replay_tick(r, g_input));
+    TEST_ASSERT_TRUE(jce_input_snapshot_was_replayed(g_input));
+    /* Deliberately no update: EOF itself must withdraw the last origin. */
+    TEST_ASSERT_FALSE(jce_input_replay_tick(r, g_input));
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+    jce_input_record_close(r);
+    TEST_ASSERT_NULL(jce_input_replay_open("missing_replay_origin_fixture.jirc"));
+    TEST_ASSERT_FALSE(jce_input_snapshot_was_replayed(g_input));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_replay_origin_is_current_successful_snapshot_only);
     RUN_TEST(test_three_frames_round_trip_in_order);
     RUN_TEST(test_frames_survive_the_flush_boundary);
     RUN_TEST(test_a_session_with_no_frames_leaves_a_valid_empty_file);

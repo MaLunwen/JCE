@@ -6,7 +6,7 @@
  *   - Category breakdown bar (CPU frame / render submit / GPU / wait).
  *   - Spike detector: frames exceeding a configurable threshold are
  *     highlighted in red and listed in a table.
- *   - Export-to-CSV button (writes to host FS via jce_fs_host_write_all).
+ *   - Complete CSV export, atomically published under the editor profile.
  *
  * Data is sampled from ImGui DeltaTime + jce_gfx_stats_capture() so the
  * panel works with or without Tracy.
@@ -16,11 +16,14 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_ui_state.h"
+#include "jce_profiler_observation.h"
+#include "jce_panel_profile_analyzer.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_log.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -33,16 +36,10 @@ namespace {
 /* Constants and ring buffer                                            */
 /* -------------------------------------------------------------------- */
 
-constexpr int   kBufLen     = 256;
+constexpr int   kBufLen     = JCE_EDITOR_PROFILE_ANALYZER_CAPACITY;
 constexpr float kDefaultMs  = 33.3f;   /* spike threshold default (~30 fps) */
 
-struct FrameRecord {
-    float    frame_ms  = 0.0f;
-    float    cpu_ms    = 0.0f;
-    float    gpu_ms    = 0.0f;
-    float    wait_ms   = 0.0f;
-    uint64_t frame_no  = 0;     /* stable id (ring index shifts every frame) */
-};
+using FrameRecord = JceEditorProfileAnalyzerRecord;
 
 struct State {
     FrameRecord buf[kBufLen]  = {};
@@ -52,6 +49,10 @@ struct State {
     bool        paused        = false;
     bool        show_spikes   = true;
     uint64_t    next_frame_no = 1;
+    bool        export_attempted = false;
+    JceEditorProfileAnalyzerExportResult export_result =
+        JceEditorProfileAnalyzerExportResult::Empty;
+    char        export_path[1024] = {};
 };
 
 State s;
@@ -92,19 +93,16 @@ void sample_frame(void)
     r.frame_ms = ImGui::GetIO().DeltaTime * 1000.0f;
 
     const JceFrameStats *st = jce_gfx_stats_capture();
-    if (st) {
-        int64_t cpu_freq = st->cpu_timer_freq > 0 ? st->cpu_timer_freq : 1;
-        int64_t gpu_freq = st->gpu_timer_freq > 0 ? st->gpu_timer_freq : 1;
-        /* CPU work = wall frame time minus GPU waits (else CPU==Frame and
-         * the panel cannot tell CPU-bound from GPU-bound). */
-        int64_t cpu_work = st->cpu_time_frame - st->wait_render - st->wait_submit;
-        if (cpu_work < 0) cpu_work = 0;
-        r.cpu_ms  = (float)((double)cpu_work * 1000.0 / (double)cpu_freq);
-        r.gpu_ms  = (float)((double)(st->gpu_time_end - st->gpu_time_begin)
-                            * 1000.0 / (double)gpu_freq);
-        r.wait_ms = (float)((double)(st->wait_render + st->wait_submit)
-                            * 1000.0 / (double)cpu_freq);
-    }
+    JceGpuTimingObservation gpu{};
+    const bool observed=jce_renderer_get_gpu_timing_observation(&gpu,sizeof(gpu));
+    const auto sample=jce_profiler_observe(st,observed ? &gpu : nullptr);
+    /* Actual backend CPU interval and separate API-thread wait. Neither is
+     * GPU time, and subtracting waits from other threads invents CPU work. */
+    r.cpu_available=sample.cpu_available; r.gpu_available=sample.gpu_available;
+    r.wait_available=sample.api_wait_available;
+    r.cpu_ms=static_cast<float>(sample.cpu_interval_ms);
+    r.gpu_ms=static_cast<float>(sample.gpu_ms);
+    r.wait_ms=static_cast<float>(sample.api_wait_ms);
     r.frame_no = s.next_frame_no++;
     push_record(r);
 }
@@ -115,37 +113,28 @@ void sample_frame(void)
 
 void export_csv(void)
 {
-    if (s.filled == 0) return;
-    /* Build CSV in a heap-allocated buffer (avoid large stack). */
-    const int line_est = 64;
-    int cap = s.filled * line_est + 256;
-    char *out = (char *)jce_malloc((size_t)cap);
-    if (!out) return;
+    s.export_attempted = true;
+    s.export_result = jce_editor_profile_analyzer_publish(
+        s.buf, s.head, s.filled, s.export_path, sizeof s.export_path);
+    jce_log_write(s.export_result == JceEditorProfileAnalyzerExportResult::Written
+                      ? JCE_LOG_LEVEL_INFO : JCE_LOG_LEVEL_WARN,
+                  "profile_analyzer", __FILE__, __LINE__,
+                  "CSV export: result=%d rows=%d path=%s",
+                  static_cast<int>(s.export_result), s.filled, s.export_path);
+}
 
-    int pos = 0;
-    {
-        int rem = cap - pos;
-        int n = snprintf(out + pos, (size_t)rem,
-                         "frame,frame_ms,cpu_ms,gpu_ms,wait_ms\n");
-        if (n > 0 && n < rem) pos += n;
+const char *export_result_key(JceEditorProfileAnalyzerExportResult result)
+{
+    using Result = JceEditorProfileAnalyzerExportResult;
+    switch (result) {
+    case Result::Written: return "profileAnalyzer.export.saved";
+    case Result::Empty: return "profileAnalyzer.export.empty";
+    case Result::Incomplete: return "profileAnalyzer.export.incomplete";
+    case Result::ProfileUnavailable: return "profileAnalyzer.export.pathUnavailable";
+    case Result::AllocationFailed: return "profileAnalyzer.export.allocationFailed";
+    case Result::WriteFailed: return "profileAnalyzer.export.writeFailed";
     }
-    for (int i = 0; i < s.filled; ++i) {
-        const FrameRecord &r = at(i);
-        int rem = cap - pos;
-        if (rem <= 1) break;
-        /* Clamp: snprintf returns the WOULD-HAVE length on truncation —
-         * adding it blindly walked pos past the buffer (heap OOB on write). */
-        int n = snprintf(out + pos, (size_t)rem,
-                         "%llu,%.3f,%.3f,%.3f,%.3f\n",
-                         (unsigned long long)r.frame_no,
-                         r.frame_ms, r.cpu_ms, r.gpu_ms, r.wait_ms);
-        if (n <= 0 || n >= rem) break;
-        pos += n;
-    }
-
-    bool ok = jce_fs_host_write_all("profile_export.csv", out, (uint64_t)pos);
-    (void)ok;
-    jce_free(out);
+    return "profileAnalyzer.export.incomplete";
 }
 
 /* -------------------------------------------------------------------- */
@@ -157,14 +146,15 @@ void draw_stats_summary(void)
     if (s.filled == 0) return;
 
     float sum_f = 0, sum_c = 0, sum_g = 0, sum_w = 0;
-    float mx_f  = 0, mx_c  = 0, mx_g  = 0;
+    float mx_f  = 0, mx_c  = 0, mx_g  = 0, mx_w=0;
+    int cpu_count=0,gpu_count=0,wait_count=0;
     int   spikes = 0;
     for (int i = 0; i < s.filled; ++i) {
         const FrameRecord &r = at(i);
         sum_f += r.frame_ms; mx_f = std::fmax(mx_f, r.frame_ms);
-        sum_c += r.cpu_ms;   mx_c = std::fmax(mx_c, r.cpu_ms);
-        sum_g += r.gpu_ms;   mx_g = std::fmax(mx_g, r.gpu_ms);
-        sum_w += r.wait_ms;
+        if(r.cpu_available) {sum_c+=r.cpu_ms;mx_c=std::fmax(mx_c,r.cpu_ms);++cpu_count;}
+        if(r.gpu_available) {sum_g+=r.gpu_ms;mx_g=std::fmax(mx_g,r.gpu_ms);++gpu_count;}
+        if(r.wait_available) {sum_w+=r.wait_ms;mx_w=std::fmax(mx_w,r.wait_ms);++wait_count;}
         if (r.frame_ms > s.spike_thresh) ++spikes;
     }
     float n = (float)s.filled;
@@ -175,17 +165,19 @@ void draw_stats_summary(void)
         ImGui::TableSetupColumn(jce_editor_i18n_or("profileAnalyzer.col.max",     "Max ms"),  ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableHeadersRow();
 
-        auto row = [&](const char *label, float avg, float peak) {
+        auto row = [&](const char *label, float avg, float peak, bool available=true) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(label);
-            ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", avg);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", peak);
+            ImGui::TableSetColumnIndex(1);
+            if(available) ImGui::Text("%.2f",avg); else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
+            ImGui::TableSetColumnIndex(2);
+            if(available) ImGui::Text("%.2f",peak); else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
         };
 
         row(jce_editor_i18n_or("profileAnalyzer.row.frame",  "Frame"),       sum_f / n, mx_f);
-        row(jce_editor_i18n_or("profileAnalyzer.row.cpu",    "CPU"),          sum_c / n, mx_c);
-        row(jce_editor_i18n_or("profileAnalyzer.row.gpu",    "GPU"),          sum_g / n, mx_g);
-        row(jce_editor_i18n_or("profileAnalyzer.row.wait",   "Wait"),         sum_w / n, -1.0f);
+        row(jce_editor_i18n("profiler.bar.cpu"),cpu_count ? sum_c/cpu_count : 0,mx_c,cpu_count>0);
+        row(jce_editor_i18n("profiler.bar.gpu"),gpu_count ? sum_g/gpu_count : 0,mx_g,gpu_count>0);
+        row(jce_editor_i18n("profiler.bar.wait"),wait_count ? sum_w/wait_count : 0,mx_w,wait_count>0);
 
         ImGui::EndTable();
     }
@@ -203,15 +195,19 @@ void draw_plots(void)
     ImGui::PlotLines(jce_editor_i18n_id("profileAnalyzer.plot.frame", "pa_frame"),
                      plot_frame_cb, nullptr, s.filled, 0,
                      nullptr, 0.0f, 50.0f, plot_sz);
-    ImGui::PlotLines(jce_editor_i18n_id("profileAnalyzer.plot.cpu", "pa_cpu"),
-                     plot_cpu_cb,   nullptr, s.filled, 0,
-                     nullptr, 0.0f, 33.3f, plot_sz);
-    ImGui::PlotLines(jce_editor_i18n_id("profileAnalyzer.plot.gpu", "pa_gpu"),
-                     plot_gpu_cb,   nullptr, s.filled, 0,
-                     nullptr, 0.0f, 33.3f, plot_sz);
-    ImGui::PlotLines(jce_editor_i18n_id("profileAnalyzer.plot.wait", "pa_wait"),
-                     plot_wait_cb,  nullptr, s.filled, 0,
-                     nullptr, 0.0f, 16.7f, plot_sz);
+    bool cpu_all=true,gpu_all=true,wait_all=true;
+    for(int i=0;i<s.filled;++i) {
+        cpu_all=cpu_all && at(i).cpu_available;
+        gpu_all=gpu_all && at(i).gpu_available;
+        wait_all=wait_all && at(i).wait_available;
+    }
+    if(cpu_all) ImGui::PlotLines(jce_editor_i18n("profiler.bar.cpu"),plot_cpu_cb,nullptr,s.filled,0,nullptr,0.0f,33.3f,plot_sz);
+    else ImGui::TextDisabled("%s: %s",jce_editor_i18n("profiler.bar.cpu"),jce_editor_i18n("profiler.value.unavailable"));
+    if(gpu_all) ImGui::PlotLines(jce_editor_i18n("profiler.bar.gpu"),plot_gpu_cb,nullptr,s.filled,0,nullptr,0.0f,33.3f,plot_sz);
+    else ImGui::TextDisabled("%s: %s",jce_editor_i18n("profiler.bar.gpu"),jce_editor_i18n("profiler.value.unavailable"));
+    if(wait_all) ImGui::PlotLines(jce_editor_i18n("profiler.bar.wait"),plot_wait_cb,nullptr,s.filled,0,nullptr,0.0f,16.7f,plot_sz);
+    else ImGui::TextDisabled("%s: %s",jce_editor_i18n("profiler.bar.wait"),jce_editor_i18n("profiler.value.unavailable"));
+    if(ImGui::IsItemHovered()) ImGui::SetTooltip("%s",jce_editor_i18n("profiler.verdict.tip"));
 }
 
 void draw_spike_table(void)
@@ -243,9 +239,9 @@ void draw_spike_table(void)
             ImGui::TableSetColumnIndex(0);
             ImGui::Text("%llu", (unsigned long long)r.frame_no);
             ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", r.frame_ms);
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", r.cpu_ms);
-            ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", r.gpu_ms);
-            ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", r.wait_ms);
+            ImGui::TableSetColumnIndex(2); if(r.cpu_available) ImGui::Text("%.2f",r.cpu_ms); else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
+            ImGui::TableSetColumnIndex(3); if(r.gpu_available) ImGui::Text("%.2f",r.gpu_ms); else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
+            ImGui::TableSetColumnIndex(4); if(r.wait_available) ImGui::Text("%.2f",r.wait_ms); else ImGui::TextDisabled("%s",jce_editor_i18n("profiler.value.unavailable"));
             ImGui::PopStyleColor();
         }
         ImGui::EndTable();
@@ -281,6 +277,10 @@ void draw_toolbar(void)
     ImGui::SameLine();
     if (ImGui::SmallButton(jce_editor_i18n_id("profileAnalyzer.exportCsv", "pa_csv")))
         export_csv();
+    if (s.export_attempted) {
+        ImGui::TextWrapped("%s", jce_editor_i18n(export_result_key(s.export_result)));
+        if (s.export_path[0]) ImGui::TextWrapped("%s", s.export_path);
+    }
 }
 
 } /* namespace */

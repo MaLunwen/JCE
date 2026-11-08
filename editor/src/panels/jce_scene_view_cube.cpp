@@ -5,6 +5,53 @@
 #include "jce_scene_view_internal.h"
 #include "ui/jce_editor_colors.h"
 
+/* These invisible items precede the full SceneViewInput item. A press in
+ * navigation chrome is never admitted to picking or authoring; ImGui's existing
+ * ActiveID retains ownership when the pointer leaves while held. */
+static bool submit_navigation_item(const char *id, JceSceneViewOverlayRect rect,
+                                   SceneViewCtx *ctx)
+{
+    if (!jce_scene_view_clip_overlay_rect(&rect, ctx->screen_pos.x,
+            ctx->screen_pos.y, ctx->avail.x, ctx->avail.y)) return false;
+    ImGui::SetCursorScreenPos(ImVec2(rect.x0, rect.y0));
+    ImGui::InvisibleButton(id, ImVec2(rect.x1 - rect.x0, rect.y1 - rect.y0),
+                           ImGuiButtonFlags_MouseButtonLeft |
+                           ImGuiButtonFlags_MouseButtonRight |
+                           ImGuiButtonFlags_MouseButtonMiddle);
+    ctx->navigation_hovered |= ImGui::IsItemHovered();
+    ctx->navigation_active |= ImGui::IsItemActive();
+    return ImGui::IsItemClicked(ImGuiMouseButton_Left);
+}
+
+void register_scene_viewport_input(SceneViewCtx *ctx, bool show_axis)
+{
+    ctx->navigation_hovered = false;
+    ctx->navigation_active = false;
+    ctx->axis_left_clicked = false;
+    ctx->cube_left_clicked = false;
+    const auto cube = jce_scene_view_cube_layout(ctx->screen_pos.x,
+        ctx->screen_pos.y, ctx->avail.x, ctx->avail.y);
+    ctx->cube_left_clicked = submit_navigation_item("##SceneViewCubeInput", cube.bounds, ctx);
+    if (show_axis) {
+        const auto axis = jce_scene_view_axis_layout(ctx->screen_pos.x,
+            ctx->screen_pos.y, ctx->avail.x, ctx->avail.y);
+        ctx->axis_left_clicked = submit_navigation_item("##SceneViewAxisInput", axis.bounds, ctx);
+    }
+    ImGui::SetCursorScreenPos(ctx->screen_pos);
+    ImGui::InvisibleButton("##SceneViewInput", ctx->avail,
+                           ImGuiButtonFlags_MouseButtonLeft |
+                           ImGuiButtonFlags_MouseButtonRight |
+                           ImGuiButtonFlags_MouseButtonMiddle);
+    ctx->viewport_hovered = ImGui::IsItemHovered();
+    ctx->viewport_active = ImGui::IsItemActive();
+    ctx->viewport_left_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    ctx->viewport_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+    /* Keep the viewport as LastItemData for the caller's immediate drop target.
+     * Restoring the post-Image cursor would set IsSetPos beyond CursorMaxPos by
+     * ItemSpacing, without an item to establish that extent at End(). */
+    /* ItemSize already leaves the cursor after the viewport. */
+}
+
 /* ── Helper: transform 3D direction by camera view matrix -> 2D ──── */
 
 static ImVec2 project_axis(const float *view16, float dx, float dy, float dz,
@@ -18,15 +65,11 @@ static ImVec2 project_axis(const float *view16, float dx, float dy, float dz,
 /* ── Axis Indicator (bottom-left corner) ─────────────────────────── */
 
 int draw_axis_indicator(ImDrawList *dl, ImVec2 origin, ImVec2 size,
-                        const float *view16)
+                        const float *view16, bool left_clicked)
 {
-    const float margin = 10.0f;
-    float radius = fminf(size.x, size.y) * 0.04f;
-    if (radius < 20.0f) radius = 20.0f;
-    if (radius > 45.0f) radius = 45.0f;
-
-    float cx = origin.x + margin + radius + 5.0f;
-    float cy = origin.y + size.y - margin - radius - 5.0f;
+    const auto layout = jce_scene_view_axis_layout(origin.x, origin.y, size.x, size.y);
+    const float radius = layout.radius;
+    const float cx = layout.center_x, cy = layout.center_y;
 
     dl->AddCircleFilled(ImVec2(cx, cy), radius + 8.0f, IM_COL32(30, 30, 40, 180), 32);
     dl->AddCircle(ImVec2(cx, cy), radius + 8.0f, IM_COL32(80, 80, 90, 120), 32, 1.0f);
@@ -67,7 +110,7 @@ int draw_axis_indicator(ImDrawList *dl, ImVec2 origin, ImVec2 size,
     }
 
     int clicked_axis = -1;
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (left_clicked) {
         ImVec2 mouse = ImGui::GetMousePos();
         float click_r = 12.0f;
         for (int i = 0; i < 3; i++) {
@@ -93,20 +136,15 @@ int draw_axis_indicator(ImDrawList *dl, ImVec2 origin, ImVec2 size,
 /* ── View Cube (top-right corner) ────────────────────────────────── */
 
 int draw_view_cube(ImDrawList *dl, ImVec2 origin, ImVec2 size,
-                   const float *view16)
+                   const float *view16, bool left_clicked)
 {
-    const float margin = 10.0f;
-    float cube_size = fminf(size.x, size.y) * 0.06f;
-    if (cube_size < 28.0f) cube_size = 28.0f;
-    if (cube_size > 50.0f) cube_size = 50.0f;
-
-    float cx = origin.x + size.x - margin - cube_size - 5.0f;
-    float cy = origin.y + margin + cube_size + 5.0f;
+    const auto layout = jce_scene_view_cube_layout(origin.x, origin.y, size.x, size.y);
+    const float cube_size = layout.radius;
+    const float cx = layout.center_x, cy = layout.center_y;
 
     /* Background. */
-    float bg_r = cube_size + 10.0f;
-    float bg_x0 = cx - bg_r, bg_y0 = cy - bg_r;
-    float bg_x1 = cx + bg_r, bg_y1 = cy + bg_r;
+    const float bg_x0 = layout.bounds.x0, bg_y0 = layout.bounds.y0;
+    const float bg_x1 = layout.bounds.x1, bg_y1 = layout.bounds.y1;
     dl->AddRectFilled(ImVec2(bg_x0, bg_y0), ImVec2(bg_x1, bg_y1),
                       IM_COL32(30, 30, 40, 160), 6.0f);
     dl->AddRect(ImVec2(bg_x0, bg_y0), ImVec2(bg_x1, bg_y1),
@@ -135,7 +173,7 @@ int draw_view_cube(ImDrawList *dl, ImVec2 origin, ImVec2 size,
                       ImVec2(hx + hw * 0.65f, hy + hh * 1.0f),
                       IM_COL32(30, 30, 40, 200));
 
-    if (home_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    if (home_hovered && left_clicked)
         return -2;
 
     /* 8 corners of a unit cube centered at origin. */
@@ -221,7 +259,7 @@ int draw_view_cube(ImDrawList *dl, ImVec2 origin, ImVec2 size,
                     IM_COL32(120, 120, 130, 120), 1.0f);
 
     int clicked_face = -1;
-    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    if (left_clicked) {
         for (int k = 5; k >= 0; k--) {
             int fi = face_order[k];
             if (face_depth[fi] < 0.0f) continue;

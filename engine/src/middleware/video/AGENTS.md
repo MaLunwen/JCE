@@ -13,6 +13,8 @@
 | Header | TU | Role |
 |--------|----|------|
 | `jce_video.h` / `jce_video_types.h` | `jce_video.cpp` | Public façade: open, decode frame, query metadata |
+| (private) `jce_video_slot_internal.h` | `jce_video.cpp` | Decoder/slot/queue declarations; ownership stays in the façade |
+| (private) `jce_video_lifecycle_trace.h` | `jce_video.cpp` | C99 seek-token/WAIT helpers over the existing core trace ring |
 | `jce_mp4_parser.h` | `jce_mp4_parser.c` | MP4/ISO-BMFF container |
 | `jce_webm_parser.h` | `jce_webm_parser.cpp` | WebM container (libwebm bridge) |
 | `jce_av1_decode.h` | `jce_av1_decode.c` | AV1 decode (dav1d) — royalty-free default |
@@ -208,3 +210,34 @@ Frame preparation rejects missing planes, nonpositive dimensions and undersized
 luma/chroma strides before any allocation or conversion. Failure preserves the
 previous RGBA pointer, capacity, dimensions and payload; this is a generic input
 contract guard, independent of diagnostic experiments.
+
+## Common lifecycle trace
+
+The core trace gate owns lifecycle observations independently of
+JCE_VIDEO_SEEK_TRACE logs. Disabled lifecycle producers do not allocate IDs or
+read extra clocks. Open records metadata-only versus an available decoder;
+decoder-open and actual decoder-read CPU scopes are nested under the owner.
+A false decoder-read result is pending/no-picture or EOF, not a blanket failure.
+The existing thread trampoline registers workers; video never registers twice.
+
+Queue-mutex-owned request tokens carry an owner ID and actual seek serial.
+Worker pickup moves the token, and only the worker terminates active work.
+A request overwritten or closed before pickup records cancellation without a
+false pickup. Queue readiness requires the actual q_count increment, current
+serial and a target picture; a push helper returning true after interruption
+or without pixels cannot certify readiness. Known seek failure/EOF and
+supersession have distinct terminals. Actual full-queue and EOF condition
+waits are paired WAIT events. Commit, pop, stale/old-generation/preroll/obsolete
+drop, clear and known queue allocation failures record scalar observations.
+No path, encoded input or pixel buffer appears in events.
+
+Close records the real worker join before streaming-audio, decoder and source
+release scopes. The private slot header only moves declarations out of the
+existing large bridge; there is no second decoder or profiler implementation.
+`test_jce_video_lifecycle_trace` consumes committed original AV1/VP9 clips through
+the actual public facade, plus exact seek-token controls. It checks disabled
+tracing, malformed open, queue WAIT, serial terminals and join-before-release.
+These CPU observations do not certify GPU upload, visible frames, speaker
+output or deadline/performance acceptance. Its silent clips do not exercise
+streaming-audio destruction; the metadata-only codec branch remains covered
+by the existing codec policy controls rather than being claimed by these clips.

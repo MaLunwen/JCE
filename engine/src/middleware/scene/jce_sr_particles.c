@@ -1,31 +1,81 @@
 /*
- * jce_sr_particles.c  Scene-renderer particle module (split from
- * jce_scene_renderer.c).
- *
- * CPU particle visualisation (debug-cross billboards) + compute-driven GPU
- * particles.  Pure move from the monolithic renderer; the two driver entry
- * points are declared in jce_sr_internal.h, everything else stays file-static.
+ * Scene particle rendering shared by the editor and shipping runtime.
+ * CPU simulation draws instanced billboards when supported, or expands
+ * ordinary indexed quads into transient buffers on older devices.
+ * The opt-in GPU simulation shares the instanced billboard shaders.
  */
 
 #include "jce_sr_internal.h"
 #include "renderer/jce_gpu_particles_internal.h"
 #include "jce_sr_debug_targets.h"
+#include "jce_sr_snow_mesh_cover.h"
+#include "jce_sr_rain_surface.h"
 
-/* ── CPU particle billboard sprite (shares the GPU pool's shaders) ─────
- *
- * CPU is the default scene particle route. The compute-driven GPU path is
- * explicit opt-in and currently supports a subset of authored features.
- * Alive particles from the scene-owned JceParticleSystem are packed into a
- * transient INSTANCE buffer (4x vec4 per particle — the exact layout the GPU
- * pool / cs_particle_update uses) and submitted with shared
- * vs_particle+fs_particle programs: a view-aligned soft-circle sprite (billboarded in the vertex
- * shader off u_invView, additive glow).  Single render path for the editor +
- * shipping runtime.  (Set JCE_GPU_PARTICLES_FORCE=1 to route to the GPU pool.) */
+typedef struct {
+    JceSceneRenderer *sr;
+    JceParticleCover cover;
+    bool collected;
+} SrPrecipitationCover;
 
-/* One instance = 4 vec4 (16 floats): i_data0=(pos,age) i_data2=colour
- * i_data3=(size,..); i_data1 unused (vel/life).  Matches vs_particle. */
-#define SR_PARTICLE_INST_STRIDE 64u
+/* Pack once per pass, only for an opted-in emitter. Geometry is borrowed
+ * only while packing, so edits and residency changes take effect next draw. */
+static bool sr_particle_is_precipitation(JceScene *scene, JceEntity emitter)
+{
+    return strcmp(jce_scene_get_entity_tag_name(scene, emitter), "Precipitation") == 0;
+}
 
+static const JceParticleCover *sr_particle_precipitation_cover(
+    SrPrecipitationCover *state, JceScene *scene)
+{
+    JceParticleCover *cover = &state->cover;
+    if (!state->collected) {
+        state->collected = true;
+        JceEntity roofs[JCE_PARTICLE_COVER_MAX];
+        const int count = jce_scene_find_all_with_tag(scene, "SnowOccluder", roofs,
+                                                       JCE_PARTICLE_COVER_MAX);
+        for (int i = 0; i < count && i < JCE_PARTICLE_COVER_MAX &&
+                        cover->count < JCE_PARTICLE_COVER_MAX; ++i) {
+            if (strcmp(jce_scene_get_entity_tag_name(scene, roofs[i]), "SnowOccluder") != 0)
+                continue;
+            const jce_mat4 world = jce_scene_get_world_matrix(scene, roofs[i]);
+            cover->count += sr_snow_mesh_cover(state->sr, scene, roofs[i], &world,
+                &cover->triangles[cover->count], JCE_PARTICLE_COVER_MAX - cover->count);
+        }
+        cover->triangles[0][0][3] = (float)cover->count;
+    }
+    return cover->count ? cover : NULL;
+}
+
+/* Follow the instantaneous direction back toward the sky. In the roof's
+ * XZ barycentric basis, solve t = roofY(xz + direction*t) - particleY. */
+static bool sr_particle_roof_blocks(const JceParticleCover *cover,
+                                    jce_vec3 pos, jce_vec3 velocity)
+{
+    if (!(velocity.y < -0.05f)) return false;
+    const float dx = velocity.x / velocity.y;
+    const float dz = velocity.z / velocity.y;
+    for (uint16_t i = 0; i < cover->count; ++i) {
+        const float (*triangle)[4] = cover->triangles[i];
+        const float *origin = triangle[0];
+        const float *basis = triangle[1];
+        const float *slope = triangle[2];
+        const float x = pos.x - origin[0], z = pos.z - origin[2];
+        const float u = basis[0]*x + basis[1]*z;
+        const float v = basis[2]*x + basis[3]*z;
+        const float du = basis[0]*dx + basis[1]*dz;
+        const float dv = basis[2]*dx + basis[3]*dz;
+        const float rise = 1.0f - (du*slope[0] + dv*slope[1]);
+        if (!(rise > 0.0001f)) continue;
+        const float lift = (origin[1] + (u*slope[0] + v*slope[1]) - pos.y) / rise;
+        if (!(lift > 0.08f && lift <= 24.0f)) continue;
+        const float hit_u = u + du*lift, hit_v = v + dv*lift;
+        if (hit_u >= -0.00002f && hit_v >= -0.00002f && hit_u + hit_v <= 1.00002f)
+            return true;
+    }
+    return false;
+}
+
+/* The 16-float CPU instance matches the compute pool's vertex layout. */
 typedef struct {
     float   *data;   /* transient instance buffer (16 floats per particle) */
     uint32_t count;
@@ -54,9 +104,18 @@ static void sr_particle_visit(const JceParticleView *p, void *ud)
 
 typedef struct {
     const JceParticleSystem *sys;
-    JceScene                *scene;
-    SrParticleBatch         *batch;
+    JceParticleVisitFn       visit;
+    void                    *batch;
+    SrPrecipitationCover    *precipitation;
+    const JceParticleCover  *cover;
 } SrParticleEachCtx;
+
+static void sr_particle_visit_under_cover(const JceParticleView *p, void *ud)
+{
+    SrParticleEachCtx *ctx = (SrParticleEachCtx *)ud;
+    if (!sr_particle_roof_blocks(ctx->cover, p->position, p->velocity))
+        ctx->visit(p, ctx->batch);
+}
 
 static void sr_particle_each_entity(JceScene *s, JceEntity e, void *ud)
 {
@@ -65,28 +124,18 @@ static void sr_particle_each_entity(JceScene *s, JceEntity e, void *ud)
     if (!c || !c->loaded || c->emitter_handle_idx == UINT32_MAX) return;
     if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
     /* GPU-forced emitters (JCE_GPU_PARTICLES_FORCE=1) draw on the GPU pool. */
-    if (jce_scene_particle_emitter_uses_gpu(c)) return;
+    if (jce_scene_particle_emitter_uses_gpu(s, c)) return;
     JceEmitterHandle h = { c->emitter_handle_idx };
-    jce_particles_emitter_for_each(ctx->sys, h, sr_particle_visit, ctx->batch);
+    ctx->cover = sr_particle_is_precipitation(s, e) ?
+        sr_particle_precipitation_cover(ctx->precipitation, s) : NULL;
+    if (ctx->cover)
+        jce_particles_emitter_for_each(ctx->sys, h, sr_particle_visit_under_cover, ctx);
+    else
+        jce_particles_emitter_for_each(ctx->sys, h, ctx->visit, ctx->batch);
 }
 
-/* Lazily build the sprite program (vs_particle+fs_particle), the shared unit
- * quad and the textured-flag uniform — mirrors jce_gpu_particles' render
- * resources so the CPU and GPU paths draw byte-identically. */
-static void sr_particle_sprite_lazy_init(JceSceneRenderer *sr)
+static void sr_particle_quad_init(JceSceneRenderer *sr)
 {
-    if (sr->particle_sprite_tried) return;
-    sr->particle_sprite_tried    = true;
-    sr->prog_particle_sprite.idx = UINT16_MAX;
-
-    JceShaderHandle h = shader_load_program(sr->pak, "particle");
-    sr->prog_particle_sprite.idx = h.idx;
-    if (h.idx == UINT16_MAX) {
-        LOG_WARN(LOG_TAG, "particle sprite shader (vs/fs_particle) not in PAK; "
-                          "CPU particles will not render");
-        return;
-    }
-
     bgfx_vertex_layout_t ql;
     bgfx_vertex_layout_begin(&ql, bgfx_get_renderer_type());
     bgfx_vertex_layout_add(&ql, BGFX_ATTRIB_POSITION,  3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
@@ -103,6 +152,26 @@ static void sr_particle_sprite_lazy_init(JceSceneRenderer *sr)
         bgfx_copy(qv, sizeof qv), &ql, BGFX_BUFFER_NONE);
     sr->particle_quad_ib = bgfx_create_index_buffer(
         bgfx_copy(qi, sizeof qi), BGFX_BUFFER_NONE);
+}
+
+/* The device caps and program layout stay paired for this renderer lifetime. */
+static void sr_particle_sprite_lazy_init(JceSceneRenderer *sr, bool instanced)
+{
+    if (sr->particle_sprite_tried) return;
+    sr->particle_sprite_tried = true;
+
+    JceShaderHandle h = instanced
+        ? shader_load_program(sr->pak, "particle")
+        : shader_load_program_named(sr->pak, "particle_expanded", "particle");
+    sr->prog_particle_sprite.idx = h.idx;
+    if (h.idx == UINT16_MAX) {
+        LOG_WARN(LOG_TAG, "%s particle sprite shader unavailable",
+                 instanced ? "instanced" : "expanded");
+        return;
+    }
+
+    if (instanced) sr_particle_quad_init(sr);
+    else LOG_INFO(LOG_TAG, "%s", "CPU particles use expanded transient quads");
     sr->u_particle_misc = bgfx_create_uniform("u_particle_misc",
                                               BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_particle_soft = bgfx_create_uniform("u_particle_soft",
@@ -177,9 +246,9 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
 {
     /* camera was unused (the billboard basis is u_invView, set by the view
      * transform); the soft fade needs its near/far to linearise depth. */
-    const JceParticleSystem *sys =
-        (const JceParticleSystem *)jce_scene_internal_particles_get(scene);
-    if (!sys) return;
+    const JceSceneParticleState *state = jce_scene_internal_particle_state(scene);
+    if (!state || !state->cpu) return;
+    const JceParticleSystem *sys = state->cpu;
     uint32_t alive = jce_particles_alive_count(sys);
     sr->cpu_particle_count_valid =
         sr_particle_cpu_snapshot(&sr->cpu_particle_count_tex, alive) &&
@@ -190,34 +259,43 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
     }
     if (alive == 0) return;
 
-    sr_particle_sprite_lazy_init(sr);
+    const bool instanced = (jce_renderer_get_caps() & JCE_CAP_INSTANCING) != 0;
+    sr_particle_sprite_lazy_init(sr, instanced);
     if (!BGFX_HANDLE_IS_VALID(sr->prog_particle_sprite)) return;
 
     const JceGpuParticleSoft soft = sr_particle_soft_frame(sr, camera);
+    SrPrecipitationCover precipitation = {.sr = sr};
+    uint32_t drawn;
+    if (instanced) {
+        if (!BGFX_HANDLE_IS_VALID(sr->particle_quad_vb) ||
+            !BGFX_HANDLE_IS_VALID(sr->particle_quad_ib)) return;
+        JceCvar *budget = jce_cvar_find("r.particles.cpu_upload_mb");
+        int mb = budget ? jce_cvar_get_int(budget) : 128;
+        if (mb < 0) mb = 0;
+        if (mb > 256) mb = 256;
+        SrParticleUpload upload;
+        if (!sr_particle_upload_begin(sr->renderer, alive, (uint32_t)mb, &upload)) return;
+        SrParticleBatch batch = {upload.data, 0u, upload.count};
+        SrParticleEachCtx ctx = {sys, sr_particle_visit, &batch, &precipitation, NULL};
+        if (jce_scene_count_particle_emitters(scene) > 0)
+            jce_scene_each_particle_emitter(scene, sr_particle_each_entity, &ctx);
+        if (!sr_particle_upload_bind(&upload, batch.count) || !batch.count) return;
 
-    JceCvar *budget = jce_cvar_find("r.particles.cpu_upload_mb");
-    int mb = budget ? jce_cvar_get_int(budget) : 128;
-    if (mb < 0) mb = 0;
-    if (mb > 256) mb = 256;
-    SrParticleUpload upload;
-    if (!sr_particle_upload_begin(&sr->cpu_particle_arena,
-            jce_renderer_get_frame_index(sr->renderer), alive, (uint32_t)mb, &upload)) return;
-    SrParticleBatch batch = {upload.data, 0u, upload.count};
-    SrParticleEachCtx ctx = { sys, scene, &batch };
-    /* Component-filtered walk (O(#emitters)); O(1) all-clear gate. */
-    if (jce_scene_count_particle_emitters(scene) > 0)
-        jce_scene_each_particle_emitter(scene, sr_particle_each_entity, &ctx);
-    sr_particle_upload_bind(&sr->cpu_particle_arena, &upload, batch.count);
-    if (batch.count == 0) return;
+        bgfx_set_vertex_buffer(0, sr->particle_quad_vb, 0, 4);
+        bgfx_set_index_buffer(sr->particle_quad_ib, 0, 6);
+        drawn = batch.count;
+    } else {
+        SrParticleExpandedUpload upload;
+        if (!sr_particle_expanded_begin(sr->renderer, alive, &upload)) return;
+        SrParticleEachCtx ctx = {sys, sr_particle_expanded_visit, &upload, &precipitation, NULL};
+        if (jce_scene_count_particle_emitters(scene) > 0)
+            jce_scene_each_particle_emitter(scene, sr_particle_each_entity, &ctx);
+        if (!sr_particle_expanded_bind(&upload)) return;
+        drawn = upload.count;
+    }
 
-    bgfx_set_vertex_buffer(0, sr->particle_quad_vb, 0, 4);
-    bgfx_set_index_buffer(sr->particle_quad_ib, 0, 6);
-
-    /* .x=0 → procedural soft circle.  .y=1 → allow motion-stretch: vs_particle
-     * elongates only the instances whose baked i_data1 (velocity*stretch) is
-     * non-zero, so round emitters are unaffected while rain reads as streaks.
-     * The GPU pool draw leaves .y=0, so its i_data1 (raw vel/life) never
-     * accidentally stretches. */
+    /* .x=0 selects the soft circle. CPU instances already carry
+     * velocity*stretch, so .y enables elongation with .w left at zero. */
     /* .z = soft-particle fade distance; 0 makes the shader skip the block, so
      * sampler stage 1 stays unbound and unread. */
     float misc[4] = { 0.0f, 1.0f, soft.fade_distance, 0.0f };
@@ -240,7 +318,7 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
     bgfx_submit(view_id, sr->prog_particle_sprite, 0, BGFX_DISCARD_ALL);
     if (sr->cpu_particle_count_valid)
         sr->cpu_particle_count_valid =
-            sr_particle_cpu_snapshot(&sr->cpu_particle_drawn_tex, batch.count);
+            sr_particle_cpu_snapshot(&sr->cpu_particle_drawn_tex, drawn);
 }
 
 /* ── GPU particles (compute-driven; P3-E wiring) ──────────────────────
@@ -252,9 +330,8 @@ void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
  * before the color view) and one instanced billboard draw into the color
  * view at the same transparency position as the CPU debug draw.
  *
- * KNOWN semantic divergences from the CPU path (by design of the compute
- * backend): always world-space, procedural soft-circle sprite (the authored
- * texture and world_space=false are ignored), additive blend. */
+ * GPU positions and box widths are in world space. Both paths use
+ * the billboard programs; the GPU path also binds its authored texture. */
 
 typedef struct {
     JceSceneRenderer *sr;
@@ -262,8 +339,10 @@ typedef struct {
     uint16_t          color_view;    /* base+0: instanced billboard draw   */
     float             dt;
     bool              dispatch;      /* false on 2nd+ render of a bgfx frame */
+    bool              rain_impacts;  /* current rain and ordered transparency */
     int              *creates_left;  /* per-frame create budget (stagger)  */
     JceGpuParticleSoft soft;         /* depth fade, or off (fade == 0)     */
+    SrPrecipitationCover precipitation;
 } SrGpuParticleCtx;
 
 static SrGpuParticleRec *sr_gpu_particle_find_or_add(JceSceneRenderer *sr,
@@ -291,10 +370,13 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
     JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
     if (!c) return;
     if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
-    if (!jce_scene_particle_emitter_uses_gpu(c)) return;
+    if (!jce_scene_particle_emitter_uses_gpu(s, c)) return;
 
     SrGpuParticleRec *rec = sr_gpu_particle_find_or_add(sr, e);
-    if (!rec) return;
+    if (!rec) {
+        jce_scene_internal_gpu_particles_set_blocked();
+        return;
+    }
 
     /* Authoring edits (asset path / quick-tune / gpu flag) rebuild the pool
      * so a changed max_particles takes effect. */
@@ -348,25 +430,39 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
     }
 
     rec->referenced = true;
+    const JceParticleEmitterDesc *d = &rec->desc;
+    const bool precipitation = sr_particle_is_precipitation(s, e);
+    const JceParticleCover *cover = precipitation ?
+        sr_particle_precipitation_cover(&ctx->precipitation, s) : NULL;
+    const bool want_rain = ctx->rain_impacts && precipitation && d->world_space &&
+        d->velocity_max.y < -0.05f;
+    jce_vec3 origin = jce_v3(0.0f, 0.0f, 0.0f);
+    if (ctx->dispatch || want_rain) {
+        const jce_mat4 world = jce_scene_get_world_matrix(s, e);
+        origin = jce_v3(world.col[3].x, world.col[3].y, world.col[3].z);
+    }
+    JceParticleRainSurface surface;
+    const JceParticleRainSurface *rain = want_rain &&
+        sr_water_shore_gpu_rain_surface(sr, s, origin, d->spawn_box, &surface) ? &surface : NULL;
 
     if (ctx->dispatch) {
-        const JceParticleEmitterDesc *d = &rec->desc;
 
-        /* Rate emission with fractional carry (+ the one-shot burst). */
-        rec->emit_accum += d->emit_rate * ctx->dt;
-        uint32_t n = (uint32_t)rec->emit_accum;
-        rec->emit_accum -= (float)n;
-        if (!rec->burst_done) {
-            if (d->emit_burst > 0.0f) n += (uint32_t)(d->emit_burst + 0.5f);
-            rec->burst_done = true;
+        /* Stop affects births; live particles still age on the GPU. */
+        uint32_t n = 0;
+        if (!c->emit_suppressed) {
+            rec->emit_accum += d->emit_rate * ctx->dt;
+            n = (uint32_t)rec->emit_accum;
+            rec->emit_accum -= (float)n;
+            if (!rec->burst_done) {
+                if (d->emit_burst > 0.0f) n += (uint32_t)(d->emit_burst + 0.5f);
+                rec->burst_done = true;
+            }
         }
-
-        jce_mat4 w = jce_scene_get_world_matrix(s, e);
 
         JceGpuParticleEmitConfig cfg;
         memset(&cfg, 0, sizeof(cfg));
         cfg.emit_count   = n;
-        cfg.origin       = jce_v3(w.raw[3][0], w.raw[3][1], w.raw[3][2]);
+        cfg.origin       = origin;
         cfg.velocity_min = d->velocity_min;
         cfg.velocity_max = d->velocity_max;
         cfg.lifetime_min = d->lifetime_min;
@@ -381,7 +477,8 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
         JceCvar *debug_stats = jce_cvar_find("r.particles.debug_stats");
         jce_gpu_particles_debug_enable(rec->sys,
             debug_stats && jce_cvar_get_bool(debug_stats));
-        jce_gpu_particles_update(rec->sys, ctx->compute_view, ctx->dt, &cfg);
+        jce_gpu_particles_update_box(rec->sys, ctx->compute_view, ctx->dt,
+                                     &cfg, d->spawn_box, rain, cover);
     }
 
     /* Authored billboard texture resolves through the renderer's async
@@ -393,22 +490,39 @@ static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
         tex_idx = t.idx;
     }
     JceTextureHandle tex_h = { tex_idx };
-    jce_gpu_particles_render_soft(rec->sys, ctx->color_view,
-                                  tex_h, rec->desc.blend_alpha, &ctx->soft);
+    jce_gpu_particles_render_stretched(rec->sys, ctx->color_view,
+        tex_h, d->blend_alpha, &ctx->soft, d->velocity_stretch, cover, rain);
+}
+
+static void sr_gpu_particles_sweep(JceSceneRenderer *sr, bool all)
+{
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++) {
+        SrGpuParticleRec *r = &sr->gpu_particles[i];
+        if (!r->used || (!all && r->referenced)) continue;
+        if (r->sys) jce_gpu_particles_destroy(r->sys);
+        memset(r, 0, sizeof(*r));
+    }
 }
 
 void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
                             const JceCamera *camera,
-                            uint16_t view_id_base, float dt_sec)
+                            uint16_t view_id_base, uint16_t color_view, float dt_sec)
 {
     if (!sr || !scene) return;
+    const uint64_t scene_id = jce_scene_internal_instance_id(scene);
+    if (sr->gpu_particle_scene_id != scene_id) {
+        sr_gpu_particles_sweep(sr, true);
+        sr->gpu_particle_scene_id = scene_id;
+        sr->gpu_particle_frame_valid = false;
+    }
 
     /* Un-mark first so the sweep also runs when the feature toggles off
      * (deferred pipeline toggle frees every pool next frame). */
     for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++)
         sr->gpu_particles[i].referenced = false;
 
-    if (sr->pak && jce_render_pipeline_is_feature_enabled("gpu_particles")) {
+    /* Let pool creation report a missing PAK through the same CPU fallback. */
+    if (jce_render_pipeline_is_feature_enabled("gpu_particles")) {
         /* Multi-viewport guard: the editor renders the scene more than once
          * per bgfx frame (scene view + game view); simulate/emit only on the
          * first render so dt is not applied twice. */
@@ -418,12 +532,15 @@ void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
 
         if (dt_sec > 0.1f) dt_sec = 0.1f;   /* clamp long frames (CPU parity) */
 
-        SrGpuParticleCtx ctx;
+        SrGpuParticleCtx ctx = {.precipitation = {.sr = sr}};
         ctx.sr           = sr;
         ctx.compute_view = (uint16_t)(view_id_base + JCE_VIEW_GPU_PARTICLE_OFFSET);
-        ctx.color_view   = view_id_base;
+        ctx.color_view   = color_view;
         ctx.dt           = dt_sec;
         ctx.dispatch     = dispatch;
+        const JceEnvironmentState *env = jce_scene_environment(scene);
+        ctx.rain_impacts = color_view != view_id_base && env &&
+            env->weather_type == JCE_ENV_WEATHER_RAIN && env->precipitation_rate > 0.0f;
         ctx.soft         = sr_particle_soft_frame(sr, camera);
         /* At most 2 NEW GPU particle systems created per bgfx frame (see the
          * stagger note in sr_gpu_particle_each) — only meter on the dispatch
@@ -441,12 +558,5 @@ void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
         }
     }
 
-    /* Sweep: records whose entity vanished, toggled back to CPU, or whose
-     * feature flag turned off are destroyed here. */
-    for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++) {
-        SrGpuParticleRec *r = &sr->gpu_particles[i];
-        if (!r->used || r->referenced) continue;
-        if (r->sys) jce_gpu_particles_destroy(r->sys);
-        memset(r, 0, sizeof(*r));
-    }
+    sr_gpu_particles_sweep(sr, false);
 }

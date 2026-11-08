@@ -36,8 +36,10 @@
  * speed into an actual sea state (a 20 m/s gale over a 2 km lake is chop, over
  * 500 km of open ocean it is a storm sea).
  *
- * PIERSON-MOSKOWITZ is the same expression with gamma = 1 (no peak
- * enhancement).  TMA is JONSWAP times the Kitaigorodskii depth-attenuation
+ * PIERSON-MOSKOWITZ uses gamma = 1, alpha = 0.0081 and
+ * wp = (0.877/1.026)*g/U10, independent of fetch. The 1.026 factor converts
+ * U10 to the U19.5 convention of the original fully developed spectrum.
+ * TMA is JONSWAP times the Kitaigorodskii depth-attenuation
  * factor phi(w,h), for shelf/coastal water where the bottom limits the
  * long-wave energy.
  *
@@ -108,10 +110,16 @@ float jce_ocean_spectrum_energy(const JceOceanSpectrumParams *p, float omega);
 float jce_ocean_spectrum_spreading(const JceOceanSpectrumParams *p,
                                    float omega, float theta);
 
-/* Convenience: per-wavevector amplitude under the deep-water dispersion
- * w = sqrt(g*k), i.e.
+/* Returns omega [rad/s] and optionally d(omega)/dk [m/s]. TMA uses
+ * sqrt(g*k*tanh(k*h)); other models keep sqrt(g*k). Invalid k or NULL
+ * configuration returns zero and writes a zero derivative. */
+double jce_ocean_spectrum_dispersion(const JceOceanSpectrumParams *p,
+                                    double k, double *group_velocity);
+
+/* Convenience: per-wavevector amplitude under the configured dispersion,
+ * including the finite-depth TMA Jacobian, i.e.
  *
- *     sqrt( (4*PI / k) * S(w) * D(w,theta) * |dw/dk| ),   dw/dk = g / (2*w)
+ *     sqrt( (4*PI / k) * S(w) * D(w,theta) * |dw/dk| )
  *
  * The 1/sqrt(L) patch-size factor is NOT applied (L is a property of the FFT
  * grid, not of the sea state): the caller forms

@@ -12,8 +12,42 @@
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_particles.h>
+#include "jce_scene_sky_celestial_internal.h"
+#include <jce/middleware/scene/jce_scene_cloud_shape.h>
+#include "renderer/jce_volumetric_fog_internal.h"
 
 JCE_EXTERN_C_BEGIN
+
+typedef struct JceSceneFogLookSettings {
+    bool authored;
+    JceVolumetricFogLook look;
+} JceSceneFogLookSettings;
+
+typedef struct JceSceneTerrainSnowLook {
+    float brightness;
+    float warmth;
+    float lowland_tint;
+    float micro_normal_strength;
+} JceSceneTerrainSnowLook;
+
+typedef struct JceSceneRenderLook {
+    JceSceneSkyCelestialSettings sky_celestial;
+    JceSceneSkyNightStyle sky_night;
+    JceSceneCloudShapeSettings cloud_shape;
+    JceSceneFogLookSettings fog;
+    double fog_wind_xz_m[2];
+    JceSceneTerrainSnowLook terrain_snow;
+} JceSceneRenderLook;
+
+const JceSceneRenderLook *jce_scene_internal_get_render_look(const JceScene *scene);
+JceSceneRenderLook *jce_scene_internal_render_look(JceScene *scene);
+
+/* Nonzero for a live scene. Stable across clear and distinct across lifetimes. */
+uint64_t jce_scene_internal_instance_id(const JceScene *s);
+
+/* True when the dirty ring covers changes since the cached transform
+ * generation. Its overflow flag must still be checked separately. */
+bool jce_scene_internal_dirty_base_matches(const JceScene *s, uint64_t xform);
 
 /* ── Entity names (jce_scene_names.c) ─────────────────────────────────
  *
@@ -38,9 +72,21 @@ void jce_scene_name_set_unique(JceScene *s, JceEntity e, const char *name);
 void jce_scene_name_reserve_for_scope(JceScene *s, JceEntity child,
                                       JceEntity parent);
 
-/* Scene-owned JceParticleSystem* (lazy; created by jce_scene_particles.c). */
-void  *jce_scene_internal_particles_get(const JceScene *s);
-void   jce_scene_internal_particles_set(JceScene *s, void *sys);
+typedef struct {
+    bool use_emitters;
+    float wetting_seconds;
+    float snowfall_seconds;
+} JceScenePrecipitationSettings;
+
+/* CPU simulation and authored weather presentation belong to the scene. */
+typedef struct {
+    JceParticleSystem *cpu;
+    JceScenePrecipitationSettings precipitation;
+} JceSceneParticleState;
+const JceSceneParticleState *jce_scene_internal_particle_state(const JceScene *s);
+JceSceneParticleState *jce_scene_internal_particle_state_mut(JceScene *s);
+bool jce_scene_weather_uses_emitters(const JceScene *s);
+void jce_scene_particles_shutdown(JceScene *s);
 
 /* ── GPU-particle routing (CPU sim vs compute sim) ────────────────────
  *
@@ -49,16 +95,15 @@ void   jce_scene_internal_particles_set(JceScene *s, void *sys);
  * GPU-routed component) and the scene renderer (jce_scene_renderer.c,
  * which owns the per-emitter JceGpuParticleSystem instances).
  *
- * True when the component requests GPU sim AND the pipeline feature
- * "gpu_particles" is on AND the device exposes compute AND no prior
- * GPU-system creation failed this process (blocked latch). */
-bool jce_scene_particle_emitter_uses_gpu(const JceParticleEmitterComponent *c);
+ * True when the scene opts in, the component requests GPU simulation, the
+ * pipeline and D3D11 capabilities allow it, and creation has not failed. */
+bool jce_scene_particle_emitter_uses_gpu(const JceScene *s,
+                                        const JceParticleEmitterComponent *c);
 
 /* Process-wide "GPU particles are broken, stay on CPU" latch.  Set by the
  * scene renderer when jce_gpu_particles_create() yields an unsupported /
  * failed system (e.g. shaders missing from the pak); logs once. */
 void   jce_scene_internal_gpu_particles_set_blocked(void);
-bool   jce_scene_internal_gpu_particles_blocked(void);
 
 /* Authoring-change marker for a particle emitter component (FNV-1a over
  * asset_path + legacy tuning fields + the gpu flag).  Never returns 0, so

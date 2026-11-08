@@ -16,6 +16,7 @@
 #include "jce_editor_config.h"
 #include "jce_editor_project.h"
 #include "jce_run_manager_internal.h"
+#include "jce_project_build_target.h"
 #include "jce_assetdb.h"
 #include "ui/jce_editor_panels.h"
 
@@ -99,8 +100,12 @@ static std::string resolve_executable(const std::string &configured)
     in.configured = configured;
     in.exe_suffix = kExeSuffix;
     in.parents    = { ".", "..", "../..", "../../..", "../../../.." };
-    for (int i = 0; kOutputDirs[i]; ++i)
-        in.output_dirs.push_back(kOutputDirs[i]);
+    const JceProject *project = jce_editor_project_get();
+    const bool project_mode = project && !jce_editor_project_is_engine_workspace();
+    if (!project_mode) {
+        for (int i = 0; kOutputDirs[i]; ++i)
+            in.output_dirs.push_back(kOutputDirs[i]);
+    }
 
     /* Project Settings > Build > Output Dir + CMake Target.  build_output_path
      * used to be persisted by the panel and read by nothing, so a custom output
@@ -114,11 +119,27 @@ static std::string resolve_executable(const std::string &configured)
                 in.target_name = ecfg.game_target_name;
         }
     }
-    /* Failing an explicit setting, the opened project names its own target. */
-    if (in.target_name.empty()) {
-        const JceProject *proj = jce_editor_project_get();
-        if (proj && proj->target_name && proj->target_name[0])
-            in.target_name = proj->target_name;
+    /* Explicit external target/path overrides retain priority. Ordinary
+     * project defaults use the manifest's artifact name, not its CMake target
+     * spelling, and the same native layout as Build/Pack. */
+    if (project_mode) {
+        const char *manifest_target = jce_project_build_initial_target(false,
+            project->target_name, project->name, nullptr);
+        if (in.target_name.empty()) in.target_name = manifest_target;
+        const bool manifest_name = in.target_name == manifest_target;
+        in.artifact_name = jce_project_build_exe_name(in.target_name,
+            manifest_name ? project->output_exe : nullptr);
+        const char *arch = jce_project_build_host_arch();
+        if (project_mode && arch && project->project_root && project->project_root[0]) {
+            const std::string build = jce_project_build_root(project->project_root,
+                jce_project_build_host_platform(), arch);
+            for (const char *variant : {"dist", "release", "debug"}) {
+                in.project_artifacts.push_back(
+                    jce_project_build_output_dir(build, variant) + "/" + in.artifact_name);
+            }
+        }
+    } else if (in.target_name.empty() && project && project->target_name && project->target_name[0]) {
+        in.target_name = project->target_name;
     }
 
     return jce_run_manager_resolve_path(in, run_path_exists, nullptr);

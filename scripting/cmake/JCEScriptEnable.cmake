@@ -49,7 +49,8 @@ set(_JCE_SCRIPT_ENABLE_DIR "${CMAKE_CURRENT_LIST_DIR}"
 #  jce_script_enable(<target>                                             #
 #                    [LANGUAGES <lang>...]   default: every one available #
 #                    [REQUIRED]              fail configure on a miss     #
-#                    [NO_STAGE])             skip the runtime copy        #
+#                    [NO_STAGE]              skip the runtime copy        #
+#                    [NATIVE_FACTORIES <provider>...])                    #
 #                                                                         #
 #  Links the language backends this build actually has, bakes the runtime #
 #  inputs they cannot discover, and generates the registration shim that   #
@@ -472,7 +473,15 @@ function(jce_script_enable JCE_SE_TARGET)
 	# a `;` passes through whole.  That is what lets each backend keep its C
 	# beside the code it registers, instead of this file assembling C out of
 	# CMake strings or carrying one #ifdef per language.
-	set(_out "${CMAKE_CURRENT_BINARY_DIR}/jce_script_enable/${JCE_SE_TARGET}")
+	# A deferred SDK admission may revisit a target from another directory.
+	# Keep its one registration source with the original scripting owner.
+	get_property(_out TARGET ${JCE_SE_TARGET} PROPERTY _JCE_SCRIPT_SHIM_DIR)
+	if(NOT _out)
+		set(_out "${CMAKE_CURRENT_BINARY_DIR}/jce_script_enable/${JCE_SE_TARGET}")
+		set(_new_shim ON)
+	else()
+		set(_new_shim OFF)
+	endif()
 	set(JCE_SE_INCLUDES "")
 	set(JCE_SE_FRAGMENTS "")
 	set(JCE_SE_HAS_NATIVE_MODULES 0)
@@ -553,9 +562,11 @@ function(jce_script_enable JCE_SE_TARGET)
 		"${_out}/jce_script_register_linked.h" @ONLY)
 	configure_file("${_JCE_SCRIPT_ENABLE_DIR}/jce_script_register_linked.c.in"
 		"${_out}/jce_script_register_linked.c" @ONLY)
-	target_sources(${JCE_SE_TARGET} PRIVATE
-		"${_out}/jce_script_register_linked.c")
-	target_include_directories(${JCE_SE_TARGET} PRIVATE "${_out}")
+	if(_new_shim)
+		target_sources(${JCE_SE_TARGET} PRIVATE
+			"${_out}/jce_script_register_linked.c")
+		target_include_directories(${JCE_SE_TARGET} PRIVATE "${_out}")
+	endif()
 
 	# ---- the shared libraries the LOADER looks for by name ------------ #
 	#
@@ -651,6 +662,10 @@ function(jce_script_enable JCE_SE_TARGET)
 
 	# The SDK config also declares jce_script_stage_runtime() for consumers that
 	# call it directly; the loop above covers callers of this function.
+	# Publish only successfully validated declarations for deferred admission.
+	set_property(TARGET ${JCE_SE_TARGET} PROPERTY _JCE_SCRIPT_ENABLED_LANGUAGES "${_got}")
+	set_property(TARGET ${JCE_SE_TARGET} PROPERTY _JCE_SCRIPT_NATIVE_FACTORIES "${_factories}")
+	set_property(TARGET ${JCE_SE_TARGET} PROPERTY _JCE_SCRIPT_SHIM_DIR "${_out}")
 	message(STATUS
 		"JCE scripting: ${JCE_SE_TARGET} runs lua (built in) plus ${_got}")
 endfunction()

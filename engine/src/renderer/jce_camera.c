@@ -88,6 +88,15 @@ JceCamera *jce_camera_create(const JceCameraDesc *desc)
     return cam;
 }
 
+JceCamera *jce_camera_clone(const JceCamera *source)
+{
+    if (!source) return NULL;
+    JceCamera *clone = (JceCamera *)JCE_CALLOC(1, sizeof(*clone));
+    if (!clone) return NULL;
+    *clone = *source;
+    return clone;
+}
+
 void jce_camera_destroy(JceCamera *cam)
 {
     JCE_FREE(cam);

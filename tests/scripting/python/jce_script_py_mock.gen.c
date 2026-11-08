@@ -1673,6 +1673,19 @@ static bool mock_stat_flush(void *user)
     return g_mode != JCE_MOCK_MODE_MISS;
 }
 
+static void mock_viewport_size(void *user, float out_wh[2])
+{
+    char line[1024];
+    unsigned h = mock_hash("viewport_size");
+
+    (void)user;
+    (void)h;
+    snprintf(line, sizeof line, "CALL viewport_size()");
+    mock_emit(line);
+    out_wh[0] = (float)(h + 0u) + 0.25f;
+    out_wh[1] = (float)(h + 1u) + 0.25f;
+}
+
 static void mock_json_free(void *user, char *s)
 {
     char line[1024];
@@ -1802,6 +1815,7 @@ JCE_MOCK_EXPORT const JceScriptHost *jce_mock_host(int mode)
     g_host.stat_set = mock_stat_set;
     g_host.stat_get = mock_stat_get;
     g_host.stat_flush = mock_stat_flush;
+    g_host.viewport_size = mock_viewport_size;
     g_host.json_free = mock_json_free;
     if (mode == JCE_MOCK_MODE_NORELEASE) {
         g_host.json_free = NULL;

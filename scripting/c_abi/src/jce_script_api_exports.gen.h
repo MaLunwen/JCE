@@ -10,14 +10,14 @@
 #ifndef JCE_SCRIPT_API_EXPORTS_GEN_H
 #define JCE_SCRIPT_API_EXPORTS_GEN_H
 
-#define JCE_SCRIPT_API_EXPORT_COUNT 111
+#define JCE_SCRIPT_API_EXPORT_COUNT 112
 
 /* The host member with the highest vtable_index, and the entry point
  * that reaches it.  The short-host test truncates AT this member's
  * offset, so it keeps withholding the real tail as the struct grows
  * instead of testing a member that stopped being last. */
-#define JCE_SCRIPT_API_TAIL_MEMBER stat_flush
-#define JCE_SCRIPT_API_TAIL_ENTRY  "jce_script_api_stat_flush"
+#define JCE_SCRIPT_API_TAIL_MEMBER viewport_size
+#define JCE_SCRIPT_API_TAIL_ENTRY  "jce_script_api_get_viewport_size"
 
 static const char *const
 kJceScriptApiExports[JCE_SCRIPT_API_EXPORT_COUNT] = {
@@ -58,6 +58,7 @@ kJceScriptApiExports[JCE_SCRIPT_API_EXPORT_COUNT] = {
     "jce_script_api_get_touch",
     "jce_script_api_get_touch_count",
     "jce_script_api_get_velocity",
+    "jce_script_api_get_viewport_size",
     "jce_script_api_get_world_position",
     "jce_script_api_has_component",
     "jce_script_api_is_action_down",

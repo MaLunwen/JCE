@@ -21,6 +21,7 @@
  * the frame on a read-back or silently answer "nothing" mid-drag.
  */
 
+#include "jce_sr_internal.h"
 #include "jce_terrain_cache.h"
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_terrain.h>
@@ -30,6 +31,7 @@
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_renderer.h>
@@ -39,18 +41,33 @@
 #include <jce/resource/jce_pak_loader.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_model_deform_internal.h"
+#include "renderer/jce_model_pick_internal.h"
+#include "renderer/jce_pick_capability_internal.h"
+#include "renderer/jce_render_encoder.h"
+#include "renderer/jce_upload_metrics.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <float.h>
 #include <limits.h>
 #include <string.h>
 
+#undef LOG_TAG
 #define LOG_TAG "scene_pick"
 
 #define PICK_MAX_IDS       4095u
 #define PICK_MAX_ENTITIES  4096u
 #define PICK_TERRAIN_MAX   16
 #define PICK_MODEL_MAX     32
+
+typedef struct PickTerrainMesh {
+    bgfx_vertex_buffer_handle_t vertices;
+    bgfx_index_buffer_handle_t  indices;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    float bounds_min[3];
+    float bounds_max[3];
+} PickTerrainMesh;
 
 typedef struct PickTerrainCache {
     char        path[256];
@@ -61,7 +78,7 @@ typedef struct PickTerrainCache {
      * against: when the editor sculpts, the cache drops the terrain and the
      * revision moves, and this mesh is rebuilt instead of picking against
      * ground that no longer exists. */
-    JceMesh    *mesh;
+    PickTerrainMesh mesh;
     uint64_t    revision;
     bool        used;
     bool        failed;
@@ -139,12 +156,7 @@ typedef struct PickEntityList {
 
 bool jce_scene_pick_supported(void)
 {
-    const bgfx_caps_t *caps = bgfx_get_caps();
-    if (!caps)
-        return false;
-    return (caps->supported &
-            (BGFX_CAPS_TEXTURE_READ_BACK | BGFX_CAPS_TEXTURE_BLIT)) ==
-           (BGFX_CAPS_TEXTURE_READ_BACK | BGFX_CAPS_TEXTURE_BLIT);
+    return jce_pick_gpu_readback_available();
 }
 
 static void pick_invalidate_target(JceScenePickPass *pass)
@@ -299,19 +311,22 @@ static bool pick_ensure_rect_readback(JceScenePickPass *pass,
     return true;
 }
 
+static void pick_clear_terrain_entry(PickTerrainCache *entry)
+{
+    /* The pair is published together. A zero count owns no handles. */
+    if (entry->mesh.vertex_count) {
+        bgfx_destroy_vertex_buffer(entry->mesh.vertices);
+        bgfx_destroy_index_buffer(entry->mesh.indices);
+    }
+    memset(entry, 0, sizeof(*entry));
+}
+
 static void pick_destroy_terrain_cache(JceScenePickPass *pass)
 {
     if (!pass)
         return;
-    for (int i = 0; i < PICK_TERRAIN_MAX; i++) {
-        PickTerrainCache *tc = &pass->terrain[i];
-        if (tc->mesh)
-            jce_mesh_destroy(tc->mesh);
-        /* The JceTerrain is BORROWED from the scene's terrain cache and freed
-         * there.  Freeing it here would leave the renderer and the physics
-         * world holding a dangling pointer to the same grid. */
-        memset(tc, 0, sizeof(*tc));
-    }
+    for (int i = 0; i < PICK_TERRAIN_MAX; i++)
+        pick_clear_terrain_entry(&pass->terrain[i]);
 }
 
 static void pick_destroy_model_cache(JceScenePickPass *pass)
@@ -335,6 +350,39 @@ void jce_scene_pick_invalidate_model_cache(JceScenePickPass *pass)
     pick_destroy_model_cache(pass);
 }
 
+static void pick_load_builtin_programs(JceScenePickPass *pass,
+    const JceScenePickDesc *desc)
+{
+    pass->prog_mesh.idx = UINT16_MAX;
+    pass->prog_pbr.idx = UINT16_MAX;
+    pass->prog_skinned.idx = UINT16_MAX;
+    /* Dedicated pick programs (engine/shaders/pbr/{vs_pick,vs_pick_skinned,
+     * fs_pick}.sc). They use an EMPTY varying interface so a single fs_pick
+     * links with both the static and skinned pick vertex shaders — bgfx
+     * requires the VS-output and FS-input varying sets to match exactly, which
+     * the old (vs_pbr + standard fs_pick_id) pairing could not satisfy. Static
+     * geometry uses prog_mesh; prog_pbr aliases it (model static parts); skinned
+     * parts use prog_skinned. */
+    pass->prog_mesh = (bgfx_program_handle_t)
+        { shader_load_program_named(desc->pak, "pick", "pick").idx };
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    const bool compatibility = jce_graphics_api_is_compatibility_gl_es(
+        api.build_tier, api.backend);
+    if (!compatibility)
+        pass->prog_skinned = (bgfx_program_handle_t)
+            { shader_load_program_named(desc->pak, "pick_skinned", "pick").idx };
+    /* Compatibility submits CPU-deformed vertices through the static
+     * pick program. No bone-palette GPU program is needed there. */
+    /* prog_pbr aliases prog_mesh (same static pick program) — NOT a second
+     * load, so it is not destroyed twice in jce_scene_pick_destroy. */
+    pass->prog_pbr = pass->prog_mesh;
+    if (!BGFX_HANDLE_IS_VALID(pass->prog_mesh))
+        LOG_WARN(LOG_TAG, "pick/pick shader unavailable");
+    if (!compatibility && !BGFX_HANDLE_IS_VALID(pass->prog_skinned))
+        LOG_WARN(LOG_TAG, "pick_skinned/pick shader unavailable");
+
+}
+
 JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc)
 {
     if (!desc || !desc->renderer)
@@ -355,34 +403,21 @@ JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc)
     pass->view_id = desc->view_id ? desc->view_id
                                   : (uint16_t)JCE_VIEW_EDITOR_PICK;
     pass->readback_view_id = (uint16_t)(pass->view_id + 1u);
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (pass->view_id == JCE_VIEW_EDITOR_PICK && caps &&
+        caps->limits.maxViews > JCE_VIEW_EDITOR_PICK_READBACK) {
+        /* Some backends advance sorted blits by physical view ID. An early
+         * remapped view can otherwise consume this blit before the ID draw. */
+        pass->readback_view_id = JCE_VIEW_EDITOR_PICK_READBACK;
+    }
     pass->fbo.idx = UINT16_MAX;
     pass->color.idx = UINT16_MAX;
     pass->depth.idx = UINT16_MAX;
     pass->readback_tex.idx = UINT16_MAX;
     pass->rect_readback_tex.idx = UINT16_MAX;
-    pass->prog_mesh.idx = UINT16_MAX;
-    pass->prog_pbr.idx = UINT16_MAX;
-    pass->prog_skinned.idx = UINT16_MAX;
     pass->u_pick_id.idx = UINT16_MAX;
 
-    /* Dedicated pick programs (engine/shaders/pbr/{vs_pick,vs_pick_skinned,
-     * fs_pick}.sc). They use an EMPTY varying interface so a single fs_pick
-     * links with both the static and skinned pick vertex shaders — bgfx
-     * requires the VS-output and FS-input varying sets to match exactly, which
-     * the old (vs_pbr + standard fs_pick_id) pairing could not satisfy. Static
-     * geometry uses prog_mesh; prog_pbr aliases it (model static parts); skinned
-     * parts use prog_skinned. */
-    pass->prog_mesh = (bgfx_program_handle_t)
-        { shader_load_program_named(desc->pak, "pick", "pick").idx };
-    pass->prog_skinned = (bgfx_program_handle_t)
-        { shader_load_program_named(desc->pak, "pick_skinned", "pick").idx };
-    /* prog_pbr aliases prog_mesh (same static pick program) — NOT a second
-     * load, so it is not destroyed twice in jce_scene_pick_destroy. */
-    pass->prog_pbr = pass->prog_mesh;
-    if (!BGFX_HANDLE_IS_VALID(pass->prog_mesh))
-        LOG_WARN(LOG_TAG, "pick/pick shader unavailable");
-    if (!BGFX_HANDLE_IS_VALID(pass->prog_skinned))
-        LOG_WARN(LOG_TAG, "pick_skinned/pick shader unavailable");
+    pick_load_builtin_programs(pass, desc);
 
     pass->u_pick_id = bgfx_create_uniform("u_pickId",
                                           BGFX_UNIFORM_TYPE_VEC4,
@@ -459,6 +494,29 @@ static bool pick_build_model(JceScene *scene, JceEntity e, jce_mat4 *out_model)
     return true;
 }
 
+/* File-backed glTF is a JceModel, not a JceMesh primitive.  Match the
+ * main scene renderer's glTF path routing in the ID pass; rendering a cube
+ * proxy instead breaks viewport clicks on real model silhouettes. */
+static bool pick_path_equal_ci(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    for (;;) {
+        unsigned char c = (unsigned char)*a++;
+        unsigned char d = (unsigned char)*b++;
+        if (c >= 'A' && c <= 'Z') c = (unsigned char)(c + ('a' - 'A'));
+        if (d >= 'A' && d <= 'Z') d = (unsigned char)(d + ('a' - 'A'));
+        if (c != d) return false;
+        if (c == 0) return true;
+    }
+}
+
+static bool pick_is_gltf_model_path(const char *path)
+{
+    const char *ext = path ? strrchr(path, '.') : NULL;
+    return ext && (pick_path_equal_ci(ext, ".glb") ||
+                   pick_path_equal_ci(ext, ".gltf"));
+}
+
 static JceMesh *pick_resolve_mesh_renderer(JceScenePickPass *pass,
                                            const JceMeshRenderer *mr)
 {
@@ -506,64 +564,118 @@ static JceTerrain *pick_load_terrain(void *ud, const char *path)
     return jce_terrain_load_file(load_path);
 }
 
-static JceMesh *pick_build_terrain_mesh(JceTerrain *terrain)
+static bool pick_build_terrain_mesh(JceTerrain *terrain, PickTerrainMesh *out)
 {
-    if (!terrain)
-        return NULL;
+    const int width = jce_terrain_width(terrain);
+    const int height = jce_terrain_height(terrain);
+    const int chunk = jce_terrain_chunk_size(terrain);
+    /* Bound the int arithmetic in the existing chunk helpers and the bytes
+     * passed to bgfx. Reject before querying a malformed grid's chunk sizes. */
+    if (width < 2 || height < 2 || chunk <= 0 ||
+        (int64_t)width - 2 + chunk > INT_MAX ||
+        (int64_t)height - 2 + chunk > INT_MAX ||
+        (uint64_t)(width - 1) * (uint64_t)(height - 1) >
+            UINT32_MAX / (6u * sizeof(uint32_t)))
+        return false;
 
-    int ncx = jce_terrain_chunk_count_x(terrain);
-    int ncz = jce_terrain_chunk_count_z(terrain);
-    int total_v = 0;
-    int total_i = 0;
-    for (int cz = 0; cz < ncz; cz++) {
-        for (int cx = 0; cx < ncx; cx++) {
+    const int ncx = jce_terrain_chunk_count_x(terrain);
+    const int ncz = jce_terrain_chunk_count_z(terrain);
+    uint32_t total_v = 0, total_i = 0;
+    int chunk_v = 0;
+    for (int cz = 0; cz < ncz; ++cz) {
+        for (int cx = 0; cx < ncx; ++cx) {
             int v = 0, i = 0;
             jce_terrain_chunk_mesh_size(terrain, cx, cz, 0, &v, &i);
-            total_v += v;
-            total_i += i;
+            if (v < 0 || i < 0 || (uint32_t)v > UINT32_MAX / (3u * sizeof(float)) - total_v ||
+                (uint32_t)i > UINT32_MAX / sizeof(uint32_t) - total_i)
+                return false;
+            total_v += (uint32_t)v;
+            total_i += (uint32_t)i;
+            if (v > chunk_v) chunk_v = v;
         }
     }
-    if (total_v <= 0 || total_i <= 0)
-        return NULL;
+    if (!total_v || !total_i || (size_t)chunk_v > SIZE_MAX / sizeof(JceTerrainVertex))
+        return false;
 
-    JceTerrainVertex *verts =
-        (JceTerrainVertex *)JCE_MALLOC((size_t)total_v * sizeof(*verts));
-    uint32_t *indices =
-        (uint32_t *)JCE_MALLOC((size_t)total_i * sizeof(*indices));
-    if (!verts || !indices) {
-        if (verts) JCE_FREE(verts);
-        if (indices) JCE_FREE(indices);
-        return NULL;
+    JceTerrainVertex *scratch = (JceTerrainVertex *)JCE_MALLOC((size_t)chunk_v * sizeof(*scratch));
+    float (*positions)[3] = (float (*)[3])JCE_MALLOC((size_t)total_v * sizeof(*positions));
+    uint32_t *indices = (uint32_t *)JCE_MALLOC((size_t)total_i * sizeof(*indices));
+    PickTerrainMesh next = {0};
+    next.vertices.idx = UINT16_MAX;
+    next.indices.idx = UINT16_MAX;
+    bool ready = false;
+    if (!scratch || !positions || !indices) goto done;
+    for (int axis = 0; axis < 3; ++axis) {
+        next.bounds_min[axis] = FLT_MAX;
+        next.bounds_max[axis] = -FLT_MAX;
     }
 
-    int v_off = 0;
-    int i_off = 0;
-    for (int cz = 0; cz < ncz; cz++) {
-        for (int cx = 0; cx < ncx; cx++) {
-            int wrote_v = 0;
-            int wrote_i = 0;
-            jce_terrain_chunk_build_mesh(terrain, cx, cz, 0,
-                                         verts + v_off, total_v - v_off,
-                                         indices + i_off, total_i - i_off,
-                                         &wrote_v, &wrote_i);
-            for (int k = 0; k < wrote_i; k++)
-                indices[i_off + k] += (uint32_t)v_off;
-            v_off += wrote_v;
-            i_off += wrote_i;
+    uint32_t v_off = 0, i_off = 0;
+    for (int cz = 0; cz < ncz; ++cz) {
+        for (int cx = 0; cx < ncx; ++cx) {
+            int wrote_v = 0, wrote_i = 0;
+            jce_terrain_chunk_build_mesh(terrain, cx, cz, 0, scratch, chunk_v,
+                                          indices + i_off, (int)(total_i - i_off),
+                                          &wrote_v, &wrote_i);
+            if (wrote_v <= 0 || wrote_v > chunk_v || (uint32_t)wrote_v > total_v - v_off ||
+                wrote_i < 0 || (uint32_t)wrote_i > total_i - i_off)
+                goto done;
+            for (int k = 0; k < wrote_i; ++k) {
+                uint32_t *index = &indices[i_off + (uint32_t)k];
+                if (*index >= (uint32_t)wrote_v) goto done;
+                *index += v_off;
+            }
+            for (int k = 0; k < wrote_v; ++k) {
+                const float xyz[3] = {scratch[k].px, scratch[k].py, scratch[k].pz};
+                for (int axis = 0; axis < 3; ++axis) {
+                    const float p = xyz[axis];
+                    positions[v_off + (uint32_t)k][axis] = p;
+                    if (p < next.bounds_min[axis]) next.bounds_min[axis] = p;
+                    if (p > next.bounds_max[axis]) next.bounds_max[axis] = p;
+                }
+            }
+            v_off += (uint32_t)wrote_v;
+            i_off += (uint32_t)wrote_i;
         }
     }
+    /* A terrain with only holes has no geometry to submit. */
+    if (!i_off) goto done;
 
-    JceMesh *mesh = jce_mesh_create((const JceMeshVertex *)verts,
-                                    (uint32_t)v_off,
-                                    indices,
-                                    (uint32_t)i_off);
-    JCE_FREE(verts);
+    bgfx_vertex_layout_t layout;
+    bgfx_vertex_layout_begin(&layout, bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_POSITION, 3, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&layout);
+    const uint32_t vertex_bytes = v_off * (uint32_t)sizeof(*positions);
+    const bgfx_memory_t *vmem = bgfx_copy(positions, vertex_bytes);
+    if (!vmem) goto done;
+    next.vertices = bgfx_create_vertex_buffer(vmem, &layout, BGFX_BUFFER_NONE);
+    jce_upload_metrics_record(JCE_UPLOAD_STATIC_VERTEX, vertex_bytes,
+                              BGFX_HANDLE_IS_VALID(next.vertices));
+    if (!BGFX_HANDLE_IS_VALID(next.vertices)) goto done;
+
+    const uint32_t index_bytes = i_off * (uint32_t)sizeof(*indices);
+    const bgfx_memory_t *imem = bgfx_copy(indices, index_bytes);
+    if (!imem) goto done;
+    next.indices = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+    jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, index_bytes,
+                              BGFX_HANDLE_IS_VALID(next.indices));
+    if (!BGFX_HANDLE_IS_VALID(next.indices)) goto done;
+    next.vertex_count = v_off;
+    next.index_count = i_off;
+    *out = next;
+    ready = true;
+
+done:
+    if (!ready && BGFX_HANDLE_IS_VALID(next.vertices))
+        bgfx_destroy_vertex_buffer(next.vertices);
     JCE_FREE(indices);
-    return mesh;
+    JCE_FREE(positions);
+    JCE_FREE(scratch);
+    return ready;
 }
 
-static JceMesh *pick_resolve_terrain(JceScenePickPass *pass, JceScene *scene,
-                                     const JceTerrainComponent *tc)
+static const PickTerrainMesh *pick_resolve_terrain(JceScenePickPass *pass,
+    JceScene *scene, const JceTerrainComponent *tc)
 {
     if (!pass || !scene || !tc || !tc->visible || !tc->terrain_path[0])
         return NULL;
@@ -587,8 +699,7 @@ static JceMesh *pick_resolve_terrain(JceScenePickPass *pass, JceScene *scene,
     /* A stale borrow is a rebuild, not a reuse: the terrain this mesh was
      * built from may already have been freed by an invalidate. */
     if (slot >= 0 && pass->terrain[slot].revision != rev) {
-        if (pass->terrain[slot].mesh) jce_mesh_destroy(pass->terrain[slot].mesh);
-        memset(&pass->terrain[slot], 0, sizeof(pass->terrain[slot]));
+        pick_clear_terrain_entry(&pass->terrain[slot]);
         free_slot = slot;
         slot = -1;
     }
@@ -603,17 +714,14 @@ static JceMesh *pick_resolve_terrain(JceScenePickPass *pass, JceScene *scene,
         /* Borrowed -- never freed here. */
         JceTerrain *terrain = jce_terrain_cache_acquire(
             tcache, tc->terrain_path, pick_load_terrain, pass);
-        if (terrain)
-            entry->mesh = pick_build_terrain_mesh(terrain);
+        entry->failed = !terrain || !pick_build_terrain_mesh(terrain, &entry->mesh);
         entry->revision = jce_terrain_cache_revision(tcache, tc->terrain_path);
-        if (!terrain || !entry->mesh)
-            entry->failed = true;
     }
 
     if (slot < 0)
         return NULL;
     PickTerrainCache *entry = &pass->terrain[slot];
-    return entry->failed ? NULL : entry->mesh;
+    return entry->failed ? NULL : &entry->mesh;
 }
 
 static JceModel *pick_resolve_model(JceScenePickPass *pass,
@@ -627,16 +735,12 @@ static JceModel *pick_resolve_model(JceScenePickPass *pass,
      * duplicate — vertex buffers AND material textures the pick shader never
      * samples — is pure waste.
      *
-     * Lifetime contract of the borrow: SrModelCache has no eviction — entries
-     * are freed only in jce_scene_renderer_destroy() — and the sole consumer
-     * (editor) destroys the pick pass BEFORE the scene renderer
-     * (jce_editor_scene_render_shutdown), so a pointer borrowed here cannot
-     * dangle. The pass still must not HOLD it: the borrowed model is used for
-     * the current ID render only, re-resolved on every jce_scene_pick_render
-     * (once per click), and never inserted into model_cache — so
-     * pick_destroy_model_cache continues to free exclusively pick-owned
-     * loads. If the renderer cache is still async-pending (model NULL) or has
-     * no entry, fall through to the standalone path below. */
+     * Borrow only for the current ID render and re-resolve on every click.
+     * The attached renderer must outlive this pass; cache invalidation and
+     * eligible runtime eviction may retire a previously returned pointer.
+     * Never retain it or insert it into the standalone model_cache: that cache
+     * destroys only its own loads. The editor destroys this pass before its
+     * scene renderer. A pending/missing shared model falls through below. */
     if (pass->scene_renderer) {
         JceModel *borrowed = (JceModel *)jce_scene_renderer_get_model(
             pass->scene_renderer, path);
@@ -657,9 +761,10 @@ static JceModel *pick_resolve_model(JceScenePickPass *pass,
      * toward their 4096 cap and the process commit past available VRAM,
      * ending in an access violation. The render is on-demand now (once per
      * click request), but the cache stays essential: without it every CLICK
-     * would still re-load and leak every skeletal model. The callback result
-     * is owned by this cache and freed exactly once in
-     * pick_destroy_model_cache, identical to the jce_model_load_gltf path. */
+     * would still re-load and leak every skeletal model. A successful callback
+     * transfers an independently owned model into this standalone cache,
+     * exactly as documented by JceSceneRendererCallbacks.load_model. It is
+     * freed once in pick_destroy_model_cache, as on the built-in load path. */
     int slot = -1;
     int free_slot = -1;
     for (int i = 0; i < PICK_MODEL_MAX; i++) {
@@ -699,8 +804,7 @@ static JceModel *pick_resolve_model(JceScenePickPass *pass,
 }
 
 static JceMesh *pick_resolve_entity_mesh(JceScenePickPass *pass,
-                                         JceScene *scene,
-                                         JceEntity e)
+    JceScene *scene, JceEntity e, const PickTerrainMesh **terrain_mesh)
 {
     if (!pass || !scene)
         return NULL;
@@ -714,10 +818,22 @@ static JceMesh *pick_resolve_entity_mesh(JceScenePickPass *pass,
 
     if (jce_scene_has_terrain(scene, e)) {
         JceTerrainComponent *tc = jce_scene_get_terrain(scene, e);
-        return pick_resolve_terrain(pass, scene, tc);
+        *terrain_mesh = pick_resolve_terrain(pass, scene, tc);
     }
 
     return NULL;
+}
+
+static void pick_submit_terrain(JceScenePickPass *pass, const PickTerrainMesh *mesh,
+                                bool double_sided)
+{
+    bgfx_set_vertex_buffer(0, mesh->vertices, 0, mesh->vertex_count);
+    bgfx_set_index_buffer(mesh->indices, 0, mesh->index_count);
+    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+                     BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA;
+    if (!double_sided) state |= BGFX_STATE_CULL_CW;
+    bgfx_set_state(state, 0);
+    jce_enc_submit_implicit(pass->view_id, pass->prog_mesh, 0, BGFX_DISCARD_ALL);
 }
 
 static bool pick_register_entity(JceScenePickPass *pass, JceEntity e,
@@ -784,6 +900,57 @@ static bool pick_culled(const jce_vec4 planes[6], bool have, const jce_mat4 *mod
     pick_transform_aabb(model, jce_v3(lmn[0],lmn[1],lmn[2]),
                         jce_v3(lmx[0],lmx[1],lmx[2]), &wmn, &wmx);
     return !pick_aabb_in_frustum(planes, wmn, wmx);
+}
+
+typedef struct PickModelId {
+    bgfx_uniform_handle_t uniform;
+    float color[4];
+} PickModelId;
+
+static void pick_set_model_id(void *user)
+{
+    const PickModelId *id = (const PickModelId *)user;
+    bgfx_set_uniform(id->uniform, id->color, 1);
+}
+
+static SrAnimInstance *pick_current_anim(JceSceneRenderer *sr, JceScene *scene,
+                                         JceEntity entity, const JceModel *asset)
+{
+    SrAnimInstance *anim = sr && sr->anim_storage_scene == scene
+        ? sr_find_anim_instance(sr, entity) : NULL;
+    if (anim && anim->model != asset)
+        anim = NULL;
+    return anim;
+}
+
+static void pick_submit_model(JceScenePickPass *pass, JceScene *scene,
+                              JceEntity entity, JceModel *asset,
+                              const jce_mat4 *world, const jce_vec4 planes[6])
+{
+    SrAnimInstance *anim = pick_current_anim(pass->scene_renderer, scene,
+                                             entity, asset);
+    uint32_t joints = anim ? anim->skin_palette_count : 0;
+    JceModelMorphVbCb vb_cb = anim ? sr_anim_geometry_vb_cb(anim) : NULL;
+
+    /* Bind-pose bounds can reject vertices moved into view by the current
+     * skeletal or morph pose. Without posed bounds leave clipping to the GPU. */
+    float bounds_min[3], bounds_max[3];
+    if (!joints && !vb_cb &&
+        jce_model_get_aabb(asset, bounds_min, bounds_max) &&
+        pick_culled(planes, true, world, bounds_min, bounds_max))
+        return;
+
+    PickModelId id;
+    id.uniform = pass->u_pick_id;
+    if (!pick_register_entity(pass, entity, id.color))
+        return;
+
+    jce_model_submit_pick_id_deformed(
+        asset, pass->renderer, pass->view_id, world,
+        joints ? anim->skin_palette : NULL, joints,
+        (JceShaderHandle){ pass->prog_pbr.idx },
+        (JceShaderHandle){ pass->prog_skinned.idx },
+        vb_cb, anim, pick_set_model_id, &id);
 }
 
 bool jce_scene_pick_render(JceScenePickPass *pass,
@@ -894,20 +1061,8 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
                 JceModel *model_asset =
                     pick_resolve_model(pass, sa->skeleton_path);
                 if (model_asset) {
-                    float clmn[3], clmx[3];
-                    if (jce_model_get_aabb(model_asset, clmn, clmx) &&
-                        pick_culled(cull_planes, true, &model, clmn, clmx))
-                        continue;   /* off-screen — not pickable */
-                    float color[4];
-                    if (!pick_register_entity(pass, e, color))
-                        continue;
-
-                    bgfx_set_uniform(pass->u_pick_id, color, 1);
-                    jce_model_submit_pick_id(
-                        model_asset, pass->renderer, pass->view_id, &model,
-                        NULL, 0,
-                        (JceShaderHandle){ pass->prog_pbr.idx },
-                        (JceShaderHandle){ pass->prog_skinned.idx });
+                    pick_submit_model(pass, scene, e, model_asset, &model,
+                                      cull_planes);
                     continue;
                 }
             }
@@ -971,16 +1126,37 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
             }
         }
 
-        JceMesh *mesh = pick_resolve_entity_mesh(pass, scene, e);
-        if (!mesh)
+        /* An authored glTF MeshRenderer is rendered by the ENGINE as a
+         * JceModel (node hierarchy + submeshes).  The old ID pass tried
+         * load_mesh(glb), then silently used the builtin cube on failure.
+         * That made a visible building/tree unclickable except within a tiny
+         * cube at its origin. Borrow the render-owned model when possible;
+         * the existing bounded pick_resolve_model fallback retains ownership
+         * of any standalone asset. Do not fabricate a cube for missing GLBs. */
+        if (jce_scene_has_mesh_renderer(scene, e)) {
+            const JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+            if (mr && mr->visible && pick_is_gltf_model_path(mr->mesh_path)) {
+                if (!BGFX_HANDLE_IS_VALID(pass->prog_pbr))
+                    continue;
+                JceModel *asset = pick_resolve_model(pass, mr->mesh_path);
+                if (!asset)
+                    continue;  /* not ready, rather than a fake pick proxy */
+                pick_submit_model(pass, scene, e, asset, &model, cull_planes);
+                continue;
+            }
+        }
+
+        const PickTerrainMesh *terrain_mesh = NULL;
+        JceMesh *mesh = pick_resolve_entity_mesh(pass, scene, e, &terrain_mesh);
+        if (!mesh && !terrain_mesh)
             continue;
 
-        {
-            float clmn[3], clmx[3];
-            jce_mesh_get_aabb(mesh, clmn, clmx);
-            if (pick_culled(cull_planes, true, &model, clmn, clmx))
-                continue;   /* off-screen — not pickable */
-        }
+        float clmn[3], clmx[3];
+        if (mesh) jce_mesh_get_aabb(mesh, clmn, clmx);
+        if (pick_culled(cull_planes, true, &model,
+                        terrain_mesh ? terrain_mesh->bounds_min : clmn,
+                        terrain_mesh ? terrain_mesh->bounds_max : clmx))
+            continue;   /* off-screen — not pickable */
 
         bool double_sided = false;
         if (jce_scene_has_mesh_renderer(scene, e)) {
@@ -995,14 +1171,16 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
 
         bgfx_set_uniform(pass->u_pick_id, color, 1);
         bgfx_set_transform(model.raw[0], 1);
-        jce_mesh_submit_pick_id(mesh, pass->renderer,
-                                pass->view_id,
-                                (JceShaderHandle){ pass->prog_mesh.idx },
-                                double_sided);
+        if (terrain_mesh) {
+            pick_submit_terrain(pass, terrain_mesh, double_sided);
+        } else {
+            jce_mesh_submit_pick_id(mesh, pass->renderer, pass->view_id,
+                                    (JceShaderHandle){ pass->prog_mesh.idx }, double_sided);
+        }
     }
 
     /* Service the deferred request against THIS render. The blit on
-       readback_view_id (= view_id + 1) executes after the pick view within
+       readback_view_id executes after the pick view within
        the same bgfx frame, so the read pixels and the snapshotted ID map are
        always consistent. Coordinates are clamped here because the viewport
        may have resized between the click and this service frame. */
@@ -1185,4 +1363,48 @@ bool jce_scene_pick_poll_rect(JceScenePickPass *pass,
 
     pass->rect_pending = false;
     return true;
+}
+
+JceSceneRayPickResult jce_scene_pick_model_ray(
+    JceSceneRenderer *sr, JceScene *scene, uint64_t entity,
+    jce_vec3 origin, jce_vec3 direction, float max_t, float *out_t)
+{
+    if (!sr || !scene || !out_t || !isfinite(max_t) || max_t <= 0.0f)
+        return JCE_SCENE_RAY_PICK_UNAVAILABLE;
+    if (!jce_scene_entity_alive(scene, entity) || !pick_entity_enabled(scene, entity))
+        return JCE_SCENE_RAY_PICK_MISS;
+
+    const JceSkeletalAnimatorComponent *sa =
+        jce_scene_get_skeletal_animator(scene, entity);
+    const JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, entity);
+    const char *path = NULL;
+    if (sa && sa->skeleton_path[0] &&
+        jce_scene_component_enabled(scene, entity, JCE_COMP_FLAG_SKELETAL_ANIMATOR))
+        path = sa->skeleton_path;
+    else if (mr && pick_is_gltf_model_path(mr->mesh_path)) {
+        if (!mr->visible ||
+            !jce_scene_component_enabled(scene, entity, JCE_COMP_FLAG_MESH_RENDERER))
+            return JCE_SCENE_RAY_PICK_MISS;
+        path = mr->mesh_path;
+    }
+    if (!path)
+        return JCE_SCENE_RAY_PICK_UNAVAILABLE;
+
+    const JceModel *asset = jce_scene_renderer_get_model(sr, path);
+    jce_mat4 world;
+    if (!asset || !pick_build_model(scene, entity, &world))
+        return JCE_SCENE_RAY_PICK_MISS;
+
+    const SrAnimInstance *anim = pick_current_anim(sr, scene, entity, asset);
+    const uint32_t joints = anim ? anim->skin_palette_count : 0u;
+    const uint32_t weights = anim ? anim->morph_count : 0u;
+    const JceModelRayResult result = jce_model_pick_ray(
+        asset, &world, joints ? anim->skin_palette : NULL, joints,
+        weights ? anim->morph_weights : NULL, weights,
+        origin, direction, max_t, out_t);
+    if (result == JCE_MODEL_RAY_HIT)
+        return JCE_SCENE_RAY_PICK_HIT;
+    if (result == JCE_MODEL_RAY_MISS)
+        return JCE_SCENE_RAY_PICK_MISS;
+    return JCE_SCENE_RAY_PICK_UNAVAILABLE;
 }

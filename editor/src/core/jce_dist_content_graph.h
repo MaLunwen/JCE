@@ -15,6 +15,8 @@ struct JceDistContentGraphAsset {
 
 struct JceDistContentGraph {
     std::vector<JceDistContentGraphAsset> assets;
+    /* Sorted canonical names admitted by exact selected-graph membership. */
+    std::vector<std::string> confidential_paths;
     std::string snapshot_path;
 };
 
@@ -23,6 +25,10 @@ using JceDistContentGraphLogFn = void (*)(int level, const char *message,
 
 int jce_dist_content_graph_host_platform(void);
 
+/* SDK stock shaders are a final public-packer fallback: active VFS and project
+ * bytes retain their existing precedence. Relative SDK roots use the public
+ * host current-directory/path facade; resolution failure rejects graph creation.
+ * An empty SDK root disables fallback. */
 bool jce_dist_content_graph_build(const std::string &project_root,
                                   const std::string &generated_dir,
                                   const std::string &reports_dir,
@@ -30,6 +36,8 @@ bool jce_dist_content_graph_build(const std::string &project_root,
                                   JceDistContentGraphLogFn log_fn,
                                   void *log_user,
                                   JceDistContentGraph *out_graph,
-                                  std::string *out_error);
+                                  std::string *out_error,
+                                  const std::string &sdk_root = std::string(),
+                                  const std::string &prepared_root = std::string());
 
 #endif /* JCE_DIST_CONTENT_GRAPH_H */

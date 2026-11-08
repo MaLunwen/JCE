@@ -180,7 +180,8 @@ static bool jce_cook_path_is_srgb(const char *path)
 
 /* Auto-select a GPU texture format from the target platform (only when the
  * caller didn't force one). Desktop -> BC (BC5 normals, BC3 colour);
- * mobile/web -> ASTC. Platform AUTO keeps RGBA8 (uncompressed).
+ * mobile -> ASTC. Web and platform AUTO keep portable RGBA8: ASTC is an
+ * optional WebGL extension, not guaranteed by the Web target contract.
  *
  * LUTs are always RGBA8: they are decoded by jce_texture_load_lut_3d as
  * raw pixel strips and block-compression destroys their precision. */
@@ -197,8 +198,9 @@ static int jce_cook_auto_texture_format(const char *path, int target_platform)
                                                  : JCEASSET_TEXFMT_BC3;
     case JCE_COOK_PLATFORM_ANDROID:
     case JCE_COOK_PLATFORM_IOS:
-    case JCE_COOK_PLATFORM_WEB:
         return JCEASSET_TEXFMT_ASTC_4x4;
+    case JCE_COOK_PLATFORM_WEB:
+        return JCEASSET_TEXFMT_RGBA8;
     default:
         return JCEASSET_TEXFMT_RGBA8;   /* AUTO -> uncompressed */
     }

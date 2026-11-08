@@ -7,7 +7,7 @@
  *
  * Pattern: mirrors jce_panel_postfx.cpp — extern "C" for all C includes,
  * static state, ensure_init(), _content() for embedding in the docked window,
- * _tick() for any per-frame housekeeping (currently just guards init).
+ * _tick() for per-frame synchronization of the current author request.
  */
 
 #include "jce_panel_common.h"
@@ -42,8 +42,11 @@ static struct {
 
 static void ensure_init(void)
 {
+    /* Project/Bundle changes and other panels can replace the global policy.
+     * Refresh before this draw's immediate edits, retaining author intent when
+     * hardware clamps the effective descriptor. Path/status drafts stay local. */
+    jce_render_pipeline_get_requested(&s_rp.desc);
     if (s_rp.initialized) return;
-    jce_render_pipeline_get(&s_rp.desc);
     s_rp.asset_path[0] = '\0';
     s_rp.status_msg[0] = '\0';
     s_rp.initialized   = true;
@@ -395,6 +398,34 @@ void jce_editor_panel_render_pipeline_content(void)
 
     if (changed)
         jce_render_pipeline_apply(&s_rp.desc);
+
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+    if (ImGui::CollapsingHeader(jce_editor_i18n(
+            "panel.render_pipeline.effective.title"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        /* Observe the committed policy once, after this draw's edits. Never
+         * copy hardware/backend clamps into the authoring or Save descriptor. */
+        JceRenderPipelineDesc effective;
+        jce_render_pipeline_get(&effective);
+        ImGui::TextWrapped("%s", jce_editor_i18n("panel.render_pipeline.effective.help"));
+        const auto readout = [](const char *label, const char *authored, const char *applied) {
+            ImGui::Text(jce_editor_i18n("panel.render_pipeline.effective.values"),
+                        jce_editor_i18n(label), authored, applied);
+        };
+        const char *on = jce_editor_i18n("panel.project_settings.field.on");
+        const char *off = jce_editor_i18n("panel.project_settings.field.off");
+        readout("panel.render_pipeline.format.hdr_color",
+                s_rp.desc.hdr_color ? on : off, effective.hdr_color ? on : off);
+        readout("panel.render_pipeline.feature.taa",
+                s_rp.desc.enable_taa ? on : off, effective.enable_taa ? on : off);
+        char authored[32], applied[32];
+        snprintf(authored, sizeof(authored), "%u", (unsigned)s_rp.desc.csm_cascade_count);
+        snprintf(applied, sizeof(applied), "%u", (unsigned)effective.csm_cascade_count);
+        readout("panel.render_pipeline.quality.cascade_count", authored, applied);
+        snprintf(authored, sizeof(authored), "%.2f", (double)s_rp.desc.render_scale);
+        snprintf(applied, sizeof(applied), "%.2f", (double)effective.render_scale);
+        readout("panel.render_pipeline.quality.render_scale", authored, applied);
+    }
+    ImGui::PopStyleColor();
 }
 
 /* ── Tick ─────────────────────────────────────────────────────────── */

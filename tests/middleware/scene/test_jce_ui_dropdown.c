@@ -339,6 +339,10 @@ static void test_unreachable_expanded_popup_collapses(void)
     TEST_ASSERT_FALSE_MESSAGE(dd_of(s, dd)->expanded,
         "an expanded popup that the pointer cannot reach stayed open");
 
+    /* The no-pointer layout frame cannot imply a released button. Observe
+     * up before a fresh click, rather than acquiring an already held press. */
+    step(uc, s, MAIN_CX, row_cy(1), false, true);
+    TEST_ASSERT_EQUAL_UINT64(0, jce_ui_canvas_last_clicked(uc));
     /* And the button underneath is clickable, which is the point. */
     click_at(uc, s, MAIN_CX, row_cy(1));
     TEST_ASSERT_EQUAL_UINT64_MESSAGE((uint64_t)btn,

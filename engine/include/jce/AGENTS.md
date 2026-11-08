@@ -34,11 +34,11 @@
 4. **No platform macros** (`_WIN32`, `__APPLE__`, `__linux__`, `__ANDROID__`, `__EMSCRIPTEN__`). If a public symbol differs per OS, hide it behind a function pointer table.
 5. **Layer order in `api.h` is law.** Higher-layer headers may include lower-layer ones, NEVER reverse.
 6. **Naming**: functions `jce_<module>_<verb>()`, types `JceXxx`, enums `JCE_<MODULE>_<VALUE>`, macros `JCE_UPPER`.
-7. **No inline implementation** beyond trivial getters; keep TU coupling minimal. Definitions live in `engine/src/**`.
+7. **No inline implementation** beyond trivial getters and pure value predicates; keep TU coupling minimal. Nontrivial definitions live in `engine/src/**`. Header-only helpers own no state, allocation, IO or platform access.
 8. **ABI-stable structs**: add new fields only at the END, gated by `size`/`version` fields; never reorder.
 9. **No C++ features**: no `bool` from `<stdbool.h>` exposed in struct layouts (use `int` or `uint8_t` for ABI), no `_Generic`, no anonymous union in public structs unless `JCE_C11` is asserted. **Recorded exemption — tagged unions:** `JceEvent` (`os/platform/jce_window_event.h`) and `JceInputEvent` (`os/platform/jce_input_event.h`) use an anonymous union. `JCE_C11` does not exist in this tree; every supported compiler accepts the construct in C99 mode, and naming the member would put two spellings of the same access into every consumer. The exemption is for the union ONLY, and it does not certify either struct's full layout: `JceInputEvent` uses `uint8_t`/`int32_t` throughout the rest of its fields, so the union is the only thing it needs excused; `JceEvent` predates this rule and does not itself comply — `JceKeyboardEvent.repeat` is `bool` and `JceEvent.type` is the enum `JceEventType`, not an ABI-stable integer — so it is cited here only as the anonymous-union precedent, not as a template for the rest of rule 9. No new public struct may reintroduce `bool` or `_Generic` under cover of this note.
 10. **Doxygen-style comments** on every public symbol; describe ownership, threading, and error model.
-11. **Frame-pointer & symbol export**: every public function must be `JCE_API` decorated (defined in `jce_compat.h`) so DLL exports + FFI work everywhere.
+11. **Frame-pointer & symbol export**: every externally linked public function must be `JCE_API` decorated (defined in `jce_compat.h`) so DLL exports + FFI work everywhere. Trivial `JCE_INLINE` helpers have internal linkage and are compile-time source conveniences, not exported FFI symbols.
 12. **Script asset text is VFS-only**: `jce.asset_read_text()` accepts normalized relative asset paths, rejects absolute/traversal/backslash forms, and caps a single read at `JCE_SCRIPT_TEXT_ASSET_MAX_BYTES` (1 MiB).
 13. **Runtime touches are transient**: `JceRuntimeInput.touches` is append-only ABI state at the end of the struct, bounded by `JCE_RUNTIME_MAX_TOUCHES` (5), replaced in stable platform order by `jce_runtime_set_touch_input()`, and cleared at the next step unless the host resubmits it.
 
@@ -87,3 +87,41 @@
 本引擎头与库一起发，所以答案是重建——**写下来，而不是默认**。
 线格式不受影响：`.seq` 存的是**点号名字**（`bindProp` 与旧的 `"<id>/<prop>"`），
 从来不是整数，所以已授权的序列在任何重新编号下都存活。
+
+
+## Packaged-only default runtime policy
+
+`application/jce_default_main.inc.h` retains ordinary developer behavior by
+default. The explicit `JCE_DEFAULT_MAIN_PACKAGED_ONLY=1` stock consumer policy
+requires `JCE_DEFAULT_MAIN_PACKAGED_SCENE_ALLOWED(path)` to query its actually
+inspected typed Bundle graph. A missing boot manifest is allowed only for one
+mounted, admitted Bundle scene; present invalid boot metadata still fails.
+Every selected scene, including the QA environment override, passes that hook.
+The finite content-discovery branches skip adjacent projects/cooked files and
+use the existing isolated active VFS. Pipeline content resets to the tier
+preset and then resolves the packed asset; normal player graphics preferences
+are reapplied. Absolute host APIs, user saves/preferences and diagnostic output
+remain available: this content-source policy is not a process sandbox.
+
+The compilerless host and its complete-owner CPU controls belong to
+`tools/runtime/`; package production/sealing belongs to `tools/build/stock_app.py`.
+Those source/CPU controls do not certify a refreshed SDK, native runtime link,
+relocation, scripting behavior, pixels or low-end memory budgets.
+
+The additive jce_input_snapshot_was_replayed query belongs to the public input
+owner. It observes current successful JIRC snapshot origin without exposing a
+setter or resizing public structs/JIRC frames. Its documented main-thread
+lifetime ends on input update, ordinary apply/refusal, live ingestion or replay
+failure/EOF. Public SDK/generator validation is required before delivery; a
+source-only addition is not a refreshed SDK.
+
+## Stock startup-scene diagnostics
+
+The shared default entry records the actual startup scene only after the serial
+VFS loader succeeds and the boot-path owner is published. Existing explicit
+PERF logging, a nonempty KPI capture path, or enabled Core tracing retain this
+one load record through a direct public logger call even in Dist. The normal
+LOG_INFO path and JCE_LOG_NONE behavior remain unchanged; no new ABI, diagnostic
+file or process-global state is introduced. Logger filtering/delivery is still
+the logger's authority. A boot manifest or requested scene is not proof of load,
+and this record is not asset, script, GPU, audio or frame-performance acceptance.

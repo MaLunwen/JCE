@@ -31,6 +31,8 @@ struct JceRunResolveInputs {
     std::string              exe_suffix;         /* ".exe" on Windows, else "" */
     std::string              build_output_path;  /* Project Settings > Build */
     std::string              target_name;        /* config target, else project */
+    std::string              artifact_name;      /* actual manifest/output filename */
+    std::vector<std::string> project_artifacts;  /* current project, shared layout */
     std::vector<std::string> output_dirs;        /* well-known preset out dirs */
     std::vector<std::string> parents;            /* ".", "..", "../..", ... */
 };
@@ -39,13 +41,14 @@ struct JceRunResolveInputs {
  * Resolution order (first hit wins):
  *   1. `configured` as-is, then with exe_suffix appended
  *   2. relative `configured` under each of `parents`
- *   3. <build_output_path>/<target_name>
- *   4. <parent>/<output_dir>/<target_name> for every pair
+ *   3. <build_output_path>/<artifact_name>, or target_name for legacy inputs
+ *   4. Current-project artifact candidates supplied by the shared build owner
+ *   5. <parent>/<output_dir>/<artifact_name> for legacy workspace inputs
  * Returns `configured` unchanged when nothing matched, so the caller can print
  * it as a diagnostic.  An EMPTY `configured` skips stages 1-2 rather than
  * short-circuiting the whole function: since the shipped default is empty,
- * stages 3-4 are exactly what has to run.  An EMPTY `target_name` skips stages
- * 3-4 rather than probing a name the editor invented.
+ * stages 3-5 are exactly what has to run. Empty artifact/target names skip
+ * guessed-name searches; explicit current-project candidates remain separate.
  */
 std::string jce_run_manager_resolve_path(const JceRunResolveInputs &in,
                                          JceRunPathExists exists, void *user);

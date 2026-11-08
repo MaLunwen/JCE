@@ -12,6 +12,23 @@
     "native/build/snake_c.dll"
   ],
   "script_assemblies": [
-    "build/win32-x86_64/csharp/SnakeScripts.dll"
-  ]
+    "csharp/build/SnakeScripts.dll"
+  ],
+  "required_languages": [
+    "lua",
+    "js",
+    "python",
+    "java",
+    "c",
+    "cpp",
+    "csharp"
+  ],
+  "native_script_factories": [
+    "snake_c_module",
+    "snake_cpp_module"
+  ],
+  "native_script_refs": {
+    "scripts/gamemanager.jcec": "scripts/GameManager.jcec",
+    "scripts/snakebody.jcecpp": "scripts/SnakeBody.jcecpp"
+  }
 }

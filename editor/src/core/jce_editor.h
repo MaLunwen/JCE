@@ -37,6 +37,24 @@ bool jce_editor_process_event(const JceEvent *event);
    Call between jce_renderer_begin_frame and jce_renderer_end_frame. */
 void jce_editor_update(JceWindow *window);
 
+/* CPU-only config/project-state flush. Refresh the existing UI clock only
+   when UI rendering is suppressed; never invokes NewFrame or scene save hooks. */
+void jce_editor_tick_cpu_services(float dt, bool refresh_ui_clock);
+
+enum JceEditorScreenshotLease {
+    JCE_EDITOR_SCREENSHOT_BACKBUFFER = 1,
+    JCE_EDITOR_SCREENSHOT_SCENE = 2,
+    JCE_EDITOR_SCREENSHOT_GAME = 3
+};
+/* Shared renderer file-slot admission and matching viewport completion. */
+bool jce_editor_request_viewport_screenshot(unsigned owner, uint16_t texture,
+    uint16_t view, uint16_t width, uint16_t height, const char *path, int yflip);
+int jce_editor_viewport_capture_poll(unsigned owner);
+
+/* Main-thread backbuffer request. Acceptance is not file-write completion. */
+bool jce_editor_request_screenshot(const char *path, bool interactive,
+                                   unsigned source);
+
 /* Query whether the editor overlay is currently visible. */
 bool jce_editor_is_active(void);
 

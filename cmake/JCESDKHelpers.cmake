@@ -20,7 +20,7 @@
 #       [STRIP_DEBUG_PATHS])
 #
 # Links editor-prebuilt assets into <target> when
-# `JCE_PROJECT_PREBUILT_ASSETS_OBJ`, `JCE_PROJECT_PREBUILT_ASSETS_ASM`, or
+# `JCE_PROJECT_PREBUILT_ASSETS_PAK` (Web), `JCE_PROJECT_PREBUILT_ASSETS_OBJ`, `JCE_PROJECT_PREBUILT_ASSETS_ASM`, or
 # `JCE_PROJECT_PREBUILT_ASSETS_C` is set.  Manual SDK consumers can still
 # provide `${JCE_PAK_EXECUTABLE}` and let this helper pack resource dirs.
 #
@@ -32,6 +32,7 @@
 # assets_pak_data / assets_pak_data_size by default.
 
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/JCESDKTarget.cmake")
 
 # Language activation belongs to directory scope, never a helper function.
 # Prebuilt assembly and generated PAK/bundle wrappers share this requirement.
@@ -65,39 +66,6 @@ function(_jce_target_embed_binary TARGET INPUT SYMBOL OUTPUT)
 		set_source_files_properties("${OUTPUT}" PROPERTIES EXTERNAL_OBJECT TRUE)
 	endif()
 	target_sources(${TARGET} PRIVATE "${OUTPUT}")
-endfunction()
-
-# Resolve the architecture stamped into generated COFF objects from the
-# compiler target, never from CMAKE_SYSTEM_PROCESSOR.  The latter is empty for
-# MSVC Hostx64/arm64 and may describe the host for Hostx64/x86.
-function(_jce_msvc_coff_arch OUT_VAR)
-	set(_arch "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
-	if(NOT _arch)
-		set(_arch "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
-	endif()
-	if(NOT _arch)
-		set(_arch "${MSVC_CXX_ARCHITECTURE_ID}")
-	endif()
-	if(NOT _arch)
-		set(_arch "${MSVC_C_ARCHITECTURE_ID}")
-	endif()
-	string(TOLOWER "${_arch}" _arch)
-
-	if(_arch MATCHES "^(x64|amd64|x86_64)$")
-		set(_coff_arch x64)
-	elseif(_arch MATCHES "^(x86|i[3-6]86)$")
-		set(_coff_arch x86)
-	elseif(_arch MATCHES "^(arm64|aarch64)$")
-		set(_coff_arch arm64)
-	elseif(_arch MATCHES "^(arm|armv7.*)$")
-		set(_coff_arch arm)
-	else()
-		message(FATAL_ERROR
-			"Unsupported MSVC target architecture for COFF: '${_arch}' "
-			"(CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}')")
-	endif()
-
-	set(${OUT_VAR} "${_coff_arch}" PARENT_SCOPE)
 endfunction()
 
 # ------------------------------------------------------------------ #
@@ -291,15 +259,281 @@ endfunction()
 # `dist` is a JCE variant layered on top of CMake Release, so checking #
 # CMAKE_BUILD_TYPE for "Dist" is incorrect.                           #
 # ------------------------------------------------------------------ #
+# Shared single-HTML policy, independent of asset source and build variant.
+function(_jce_configure_web_target TARGET)
+	if(NOT EMSCRIPTEN)
+		return()
+	endif()
+	get_target_property(_jce_web_configured ${TARGET} JCE_WEB_TARGET_CONFIGURED)
+	if(_jce_web_configured)
+		return()
+	endif()
+	set_target_properties(${TARGET} PROPERTIES
+		JCE_WEB_TARGET_CONFIGURED TRUE SUFFIX ".html")
+	# The private bridge ships beside this helper in an installed SDK. Repo
+	# builds resolve the same owned file, never an upstream or browser patch.
+	set(_jce_web_bridge "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/jce_webgl_interop.js")
+	if(NOT EXISTS "${_jce_web_bridge}")
+		set(_jce_web_bridge "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../engine/src/os/platform/jce_webgl_interop.js")
+	endif()
+	if(NOT EXISTS "${_jce_web_bridge}")
+		message(FATAL_ERROR "JCE Web query bridge unavailable; refresh the SDK")
+	endif()
+	target_link_options(${TARGET} PRIVATE
+		-sSINGLE_FILE=1 -sSINGLE_FILE_BINARY_ENCODE=0
+		-Wl,--wrap=emscripten_glGetInternalformativ
+		"SHELL:--js-library \"${_jce_web_bridge}\"")
+	set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${_jce_web_bridge}")
+endfunction()
+
+# CheckIPOSupported rebuilds its scratch project on every call. Cache only an
+# actual success for an exact native C/CXX probe identity. Opaque toolchains and
+# unknown identities keep the original real-probe behavior, including failures.
+function(_jce_run_ipo_probe OUT_RESULT OUT_ERROR)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT _ok OUTPUT _error)
+    set(${OUT_RESULT} "${_ok}" PARENT_SCOPE)
+    set(${OUT_ERROR} "${_error}" PARENT_SCOPE)
+endfunction()
+
+function(_jce_ipo_fingerprint OUT_FINGERPRINT)
+    set(${OUT_FINGERPRINT} "" PARENT_SCOPE)
+    set(_reason_out "${ARGV1}")
+    if(_reason_out)
+        set(${_reason_out} "" PARENT_SCOPE)
+    endif()
+    get_property(_enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+    if(NOT _enabled_languages OR CMAKE_VERSION VERSION_LESS 3.23)
+        if(_reason_out)
+            set(_key ENABLED_LANGUAGES)
+            if(_enabled_languages)
+                set(_key CMAKE_VERSION)
+            endif()
+            set(${_reason_out} "languages_or_version|${_key}" PARENT_SCOPE)
+        endif()
+        return()
+    endif()
+    # The default CMake probe selects CXX/C/CUDA/Fortran, ignoring RC and ASM.
+    # Keep its full enabled set in the identity, but never change the real probe's
+    # language arguments. Only its native C/CXX subset is cache-qualified here.
+    set(_languages "")
+    foreach(_language IN LISTS _enabled_languages)
+        if(NOT _language MATCHES "^(C|CXX|RC|ASM)$")
+            if(_reason_out)
+                set(${_reason_out} "language_or_compiler|ENABLED_LANGUAGES" PARENT_SCOPE)
+            endif()
+            return()
+        endif()
+    endforeach()
+    foreach(_language IN ITEMS CXX C)
+        if(_language IN_LIST _enabled_languages)
+            list(APPEND _languages "${_language}")
+        endif()
+    endforeach()
+    if(NOT _languages)
+        if(_reason_out)
+            set(${_reason_out} "languages_or_version|ENABLED_LANGUAGES" PARENT_SCOPE)
+        endif()
+        return()
+    endif()
+    foreach(_language IN LISTS _enabled_languages)
+        set(_parts COMPILER_LOADED COMPILER)
+        if(_language MATCHES "^(C|CXX)$")
+            list(APPEND _parts COMPILER_ID COMPILER_VERSION)
+        endif()
+        foreach(_part IN LISTS _parts)
+            if(NOT CMAKE_${_language}_${_part})
+                if(_reason_out)
+                    set(${_reason_out} "language_or_compiler|CMAKE_${_language}_${_part}" PARENT_SCOPE)
+                endif()
+                return()
+            endif()
+        endforeach()
+    endforeach()
+    # These inputs may execute nested, try-compile-specific includes which are
+    # not represented by the parent's effective compiler variables. Do not guess.
+    foreach(_opaque IN ITEMS CMAKE_TOOLCHAIN_FILE CMAKE_MODULE_PATH
+            CMAKE_USER_MAKE_RULES_OVERRIDE CMAKE_USER_MAKE_RULES_OVERRIDE_C
+            CMAKE_USER_MAKE_RULES_OVERRIDE_CXX CMAKE_USER_MAKE_RULES_OVERRIDE_RC
+            CMAKE_USER_MAKE_RULES_OVERRIDE_ASM CMAKE_C_COMPILER_LAUNCHER
+            CMAKE_CXX_COMPILER_LAUNCHER CMAKE_C_LINKER_LAUNCHER
+            CMAKE_CXX_LINKER_LAUNCHER CMAKE_RC_COMPILER_LAUNCHER
+            CMAKE_ASM_COMPILER_LAUNCHER CMAKE_RC_LINKER_LAUNCHER
+            CMAKE_ASM_LINKER_LAUNCHER CMAKE_PROJECT_INCLUDE
+            CMAKE_PROJECT_INCLUDE_BEFORE CMAKE_PROJECT_TOP_LEVEL_INCLUDES
+            CMAKE_TRY_COMPILE_PLATFORM_VARIABLES)
+        if(DEFINED ${_opaque} AND NOT "${${_opaque}}" STREQUAL "")
+            if(_reason_out)
+                set(${_reason_out} "opaque_input|${_opaque}" PARENT_SCOPE)
+            endif()
+            return()
+        endif()
+    endforeach()
+    set(_names CMAKE_VERSION CMAKE_COMMAND CMAKE_ROOT CMAKE_GENERATOR
+        CMAKE_GENERATOR_PLATFORM CMAKE_GENERATOR_TOOLSET CMAKE_GENERATOR_INSTANCE
+        CMAKE_MAKE_PROGRAM CMAKE_BUILD_TYPE CMAKE_CONFIGURATION_TYPES
+        CMAKE_MSVC_RUNTIME_LIBRARY CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+        CMAKE_SYSTEM_NAME CMAKE_SYSTEM_VERSION CMAKE_SYSTEM_PROCESSOR
+        CMAKE_SIZEOF_VOID_P CMAKE_CROSSCOMPILING CMAKE_SYSROOT
+        CMAKE_SYSROOT_COMPILE CMAKE_SYSROOT_LINK CMAKE_OSX_SYSROOT
+        CMAKE_OSX_ARCHITECTURES CMAKE_OSX_DEPLOYMENT_TARGET
+        CMAKE_TOOLCHAIN_FILE CMAKE_TRY_COMPILE_CONFIGURATION
+        CMAKE_TRY_COMPILE_TARGET_TYPE CMAKE_TRY_COMPILE_NO_PLATFORM_VARIABLES
+        CMAKE_AR CMAKE_RANLIB CMAKE_LINKER CMAKE_MT)
+    foreach(_language IN LISTS _enabled_languages)
+        foreach(_suffix IN ITEMS COMPILER COMPILER_ARG1 COMPILER_ID
+                COMPILER_VERSION COMPILER_VERSION_INTERNAL COMPILER_TARGET
+                COMPILER_EXTERNAL_TOOLCHAIN COMPILER_FRONTEND_VARIANT
+                COMPILER_ARCHITECTURE_ID COMPILER_AR COMPILER_RANLIB
+                COMPILER_LINKER COMPILER_WORKS STANDARD STANDARD_REQUIRED
+                STANDARD_LIBRARIES EXTENSIONS SIMULATE_ID SIMULATE_VERSION
+                SIZEOF_DATA_PTR LIBRARY_ARCHITECTURE)
+            list(APPEND _names "CMAKE_${_language}_${_suffix}")
+        endforeach()
+    endforeach()
+    get_cmake_property(_variables VARIABLES)
+    foreach(_name IN LISTS _variables)
+        # Compiler-ID log/scratch variables exist only on the first configure;
+        # they are observations, not inputs to the IPO compiler/link invocation.
+        if(_name MATCHES "^CMAKE_(C|CXX|RC|ASM)_FLAGS($|_)" OR
+           _name MATCHES "^CMAKE_(C|CXX|RC|ASM)_(IMPLICIT|COMPILE|LINK|ARCHIVE)_" OR
+           _name MATCHES "^_CMAKE_(C|CXX)_IPO_" OR
+           _name MATCHES "^CMAKE_(EXE|STATIC|SHARED|MODULE)_LINKER_FLAGS" OR
+           _name MATCHES "^CMAKE_FIND_ROOT_PATH")
+            list(APPEND _names "${_name}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _names)
+    list(SORT _names)
+    set(_identity "jce-ipo-native-success-v1;enabled=${_enabled_languages};probe=${_languages}\n")
+    foreach(_name IN LISTS _names)
+        if(DEFINED ${_name})
+            string(LENGTH "${${_name}}" _length)
+            string(APPEND _identity "${_name}:defined:${_length}:${${_name}}\n")
+        else()
+            string(APPEND _identity "${_name}:undefined\n")
+        endif()
+    endforeach()
+    foreach(_policy IN ITEMS CMP0069 CMP0137 CMP0138 CMP0091 CMP0141)
+        if(POLICY ${_policy})
+            cmake_policy(GET ${_policy} _value)
+            string(APPEND _identity "${_policy}:${_value}\n")
+        endif()
+    endforeach()
+    foreach(_name IN ITEMS PATH INCLUDE LIB LIBPATH CL _CL_ LINK _LINK_ CC CXX CFLAGS
+            CXXFLAGS LDFLAGS SDKROOT MACOSX_DEPLOYMENT_TARGET)
+        if(DEFINED ENV{${_name}})
+            string(LENGTH "$ENV{${_name}}" _length)
+            string(APPEND _identity "ENV_${_name}:defined:${_length}:$ENV{${_name}}\n")
+        else()
+            string(APPEND _identity "ENV_${_name}:undefined\n")
+        endif()
+    endforeach()
+    set(_files "${CMAKE_CURRENT_FUNCTION_LIST_FILE}"
+        "${CMAKE_ROOT}/Modules/CheckIPOSupported.cmake")
+    foreach(_language IN LISTS _languages)
+        if(_language STREQUAL "C")
+            set(_extension c)
+        else()
+            set(_extension cpp)
+        endif()
+        list(APPEND _files
+            "${CMAKE_ROOT}/Modules/CheckIPOSupported/CMakeLists-${_language}.txt.in"
+            "${CMAKE_ROOT}/Modules/CheckIPOSupported/foo.${_extension}"
+            "${CMAKE_ROOT}/Modules/CheckIPOSupported/main.${_extension}")
+    endforeach()
+    set(_tools CMAKE_COMMAND CMAKE_MAKE_PROGRAM CMAKE_AR CMAKE_RANLIB CMAKE_LINKER CMAKE_MT)
+    foreach(_language IN LISTS _enabled_languages)
+        list(APPEND _tools CMAKE_${_language}_COMPILER
+            CMAKE_${_language}_COMPILER_AR CMAKE_${_language}_COMPILER_RANLIB
+            CMAKE_${_language}_COMPILER_LINKER)
+    endforeach()
+    foreach(_tool IN LISTS _tools)
+        if(DEFINED ${_tool} AND NOT "${${_tool}}" STREQUAL "" AND
+           NOT "${${_tool}}" STREQUAL ":")
+            if(NOT IS_ABSOLUTE "${${_tool}}")
+                if(_reason_out)
+                    set(${_reason_out} "non_absolute_tool|${_tool}" PARENT_SCOPE)
+                endif()
+                return()
+            endif()
+            list(APPEND _files "${${_tool}}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES _files)
+    # Only within this configure: metadata selects the already computed digest.
+    # Every new configure content-hashes the real files again, even at identical
+    # mtime/size. Tools and modules must remain stable during configuration.
+    set(_state "${_identity}")
+    foreach(_file IN LISTS _files)
+        if(NOT EXISTS "${_file}" OR IS_DIRECTORY "${_file}")
+            if(_reason_out)
+                set(${_reason_out} "missing_input_file|${_file}" PARENT_SCOPE)
+            endif()
+            return()
+        endif()
+        file(REAL_PATH "${_file}" _real)
+        file(SIZE "${_real}" _size)
+        file(TIMESTAMP "${_real}" _mtime "%Y-%m-%dT%H:%M:%S.%fZ" UTC)
+        string(APPEND _state "${_file}:${_real}:${_size}:${_mtime}\n")
+    endforeach()
+    string(SHA256 _state_key "${_state}")
+    get_property(_fingerprint GLOBAL PROPERTY "_JCE_IPO_IDENTITY_${_state_key}")
+    if(NOT _fingerprint)
+        foreach(_file IN LISTS _files)
+            file(REAL_PATH "${_file}" _real)
+            file(SHA256 "${_real}" _sha)
+            string(APPEND _identity "FILE:${_file}:${_real}:${_sha}\n")
+        endforeach()
+        string(SHA256 _fingerprint "${_identity}")
+        set_property(GLOBAL PROPERTY "_JCE_IPO_IDENTITY_${_state_key}" "${_fingerprint}")
+        list(LENGTH _files _hash_count)
+        message(STATUS "JCE dist IPO: fingerprinted ${_hash_count} input files")
+    endif()
+    set(${OUT_FINGERPRINT} "${_fingerprint}" PARENT_SCOPE)
+endfunction()
+
+function(_jce_check_ipo_cached OUT_RESULT OUT_ERROR)
+    _jce_ipo_fingerprint(_fingerprint _reason)
+    set(_cache "JCE_IPO_SUCCESS_${_fingerprint}")
+    if(_fingerprint AND DEFINED CACHE{${_cache}} AND "${${_cache}}" STREQUAL "YES")
+        set(${OUT_RESULT} YES PARENT_SCOPE)
+        set(${OUT_ERROR} "" PARENT_SCOPE)
+        message(VERBOSE "JCE dist IPO: reuse verified successful probe ${_fingerprint}")
+        return()
+    endif()
+    if(NOT _fingerprint)
+        string(SHA256 _reason_key "${_reason}")
+        get_property(_reported GLOBAL PROPERTY "_JCE_IPO_FALLBACK_${_reason_key}")
+        if(NOT _reported)
+            string(REPLACE "|" ";" _detail "${_reason}")
+            list(GET _detail 0 _code)
+            list(GET _detail 1 _key)
+            message(STATUS "JCE dist IPO: real probe; cache unavailable reason=${_code} key=${_key}")
+            set_property(GLOBAL PROPERTY "_JCE_IPO_FALLBACK_${_reason_key}" TRUE)
+        endif()
+    endif()
+    _jce_run_ipo_probe(_ok _error)
+    if(_fingerprint AND _ok STREQUAL "YES")
+        set(${_cache} YES CACHE INTERNAL "Successful IPO probe for exact JCE inputs")
+    endif()
+    set(${OUT_RESULT} "${_ok}" PARENT_SCOPE)
+    set(${OUT_ERROR} "${_error}" PARENT_SCOPE)
+endfunction()
+
 function(jce_configure_application_target TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR
 			"jce_configure_application_target: '${TARGET}' is not a target.")
 	endif()
+	get_target_property(_jce_target_type ${TARGET} TYPE)
+	if(NOT _jce_target_type STREQUAL "EXECUTABLE")
+		return()
+	endif()
+	_jce_configure_web_target(${TARGET})
 	if(NOT JCE_BUILD_VARIANT STREQUAL "dist")
 		return()
 	endif()
-	get_target_property(_jce_target_type ${TARGET} TYPE)
 	get_target_property(_jce_dist_configured ${TARGET} JCE_DIST_TARGET_CONFIGURED)
 	if(NOT _jce_target_type STREQUAL "EXECUTABLE" OR _jce_dist_configured)
 		return()
@@ -312,8 +546,7 @@ function(jce_configure_application_target TARGET)
 		CXX_VISIBILITY_PRESET hidden
 		VISIBILITY_INLINES_HIDDEN YES)
 
-	include(CheckIPOSupported)
-	check_ipo_supported(RESULT _jce_ipo_ok OUTPUT _jce_ipo_error)
+	_jce_check_ipo_cached(_jce_ipo_ok _jce_ipo_error)
 	if(_jce_ipo_ok)
 		set_target_properties(${TARGET} PROPERTIES
 			INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE
@@ -457,6 +690,20 @@ function(_jce_prepare_runtime_boot_manifest TARGET PROJECT_FILE OUT_DIR OUT_FILE
 	set(${OUT_FILE} "${_boot_file}" PARENT_SCOPE)
 endfunction()
 
+# Web boot reads the archive through MEMFS, for raw and authenticated PAKs.
+function(_jce_embed_web_archive TARGET PAK SYMBOL)
+	_jce_configure_web_target(${TARGET})
+	file(TO_CMAKE_PATH "${PAK}" _web_pak)
+	target_link_options(${TARGET} PRIVATE
+		"SHELL:--embed-file \"${_web_pak}@/game_assets.pak\"")
+	set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${PAK}")
+	set(_stub "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_wasm_pak_stub.c")
+	file(WRITE "${_stub}"
+		"const unsigned char ${SYMBOL}[1] = {0};\n"
+		"const unsigned long ${SYMBOL}_size = 0;\n")
+	target_sources(${TARGET} PRIVATE "${_stub}")
+endfunction()
+
 function(jce_target_embed_pak TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_pak: '${TARGET}' is not a target.")
@@ -478,6 +725,20 @@ function(jce_target_embed_pak TARGET)
 		# Default matches the engine's expected externs:
 		# `assets_pak_data` + `assets_pak_data_size`.
 		set(EP_SYMBOL_PREFIX "assets_pak_data")
+	endif()
+
+	if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_PAK AND
+	   NOT "${JCE_PROJECT_PREBUILT_ASSETS_PAK}" STREQUAL "")
+		if(NOT EMSCRIPTEN OR NOT EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_PAK}")
+			message(FATAL_ERROR "Prebuilt Web PAK requires Emscripten and an existing archive.")
+		endif()
+		if(NOT EP_SYMBOL_PREFIX STREQUAL "assets_pak_data")
+			message(FATAL_ERROR "Prebuilt Web PAK uses symbol prefix assets_pak_data.")
+		endif()
+		_jce_embed_web_archive(${TARGET} "${JCE_PROJECT_PREBUILT_ASSETS_PAK}" "${EP_SYMBOL_PREFIX}")
+		add_custom_target(${TARGET}_pak DEPENDS "${JCE_PROJECT_PREBUILT_ASSETS_PAK}")
+		add_dependencies(${TARGET} ${TARGET}_pak)
+		return()
 	endif()
 
 	if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_OBJ AND
@@ -506,6 +767,9 @@ function(jce_target_embed_pak TARGET)
 				"jce_target_embed_pak: editor prebuilt assets use "
 				"symbol prefix assets_pak_data, but '${TARGET}' requested "
 				"'${EP_SYMBOL_PREFIX}'.")
+		endif()
+		if(NOT CMAKE_ASM_COMPILER_LOADED)
+			enable_language(ASM)
 		endif()
 		set_source_files_properties("${JCE_PROJECT_PREBUILT_ASSETS_ASM}"
 			PROPERTIES GENERATED TRUE)
@@ -553,7 +817,7 @@ function(jce_target_embed_pak TARGET)
 	if(NOT JCE_PAK_EXECUTABLE)
 		message(FATAL_ERROR
 			"jce_target_embed_pak: no prebuilt assets were provided "
-			"(JCE_PROJECT_PREBUILT_ASSETS_OBJ/ASM/C), and "
+			"(JCE_PROJECT_PREBUILT_ASSETS_PAK/OBJ/ASM/C), and "
 			"JCE_PAK_EXECUTABLE is not set. Build through the JCE "
 			"editor, or provide a host packer explicitly for manual "
 			"CMake builds.")
@@ -676,20 +940,7 @@ function(jce_target_embed_pak TARGET)
 		add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}" "${_bom_file}")
 		add_dependencies(${TARGET} ${TARGET}_pak)
 
-		# A Web executable is one HTML artifact: code and MEMFS assets are inline.
-		set_target_properties(${TARGET} PROPERTIES SUFFIX ".html")
-		target_link_options(${TARGET} PRIVATE
-			-sSINGLE_FILE=1 -sSINGLE_FILE_BINARY_ENCODE=0
-			"SHELL:--embed-file ${EP_PAK_FILE}@/game_assets.pak")
-		set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${EP_PAK_FILE}")
-
-		# 1-byte stub: the engine links against assets_pak_data / _size even on
-		# web (the real PAK is loaded from MEMFS at /game_assets.pak).
-		set(_wasm_stub "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_wasm_pak_stub.c")
-		file(WRITE "${_wasm_stub}"
-			"const unsigned char ${EP_SYMBOL_PREFIX}[1] = {0};\n"
-			"const unsigned long ${EP_SYMBOL_PREFIX}_size = 0;\n")
-		target_sources(${TARGET} PRIVATE "${_wasm_stub}")
+		_jce_embed_web_archive(${TARGET} "${EP_PAK_FILE}" "${EP_SYMBOL_PREFIX}")
 		return()
 	endif()
 
@@ -861,7 +1112,8 @@ function(jce_add_pak TARGET)
 	cmake_parse_arguments(AP "${_opts}" "${_one}" "${_multi}" ${ARGN})
 
 	# ---- 1. Editor path: prebuilt assets already cooked + packed. --- #
-	if((DEFINED JCE_PROJECT_PREBUILT_ASSETS_OBJ AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}") OR
+	if((DEFINED JCE_PROJECT_PREBUILT_ASSETS_PAK AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_PAK}") OR
+	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_OBJ AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}") OR
 	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_ASM AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_ASM}") OR
 	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_C   AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_C}"))
 		jce_target_embed_pak(${TARGET} ${ARGN})

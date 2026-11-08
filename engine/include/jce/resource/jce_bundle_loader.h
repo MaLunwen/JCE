@@ -25,8 +25,9 @@
  *
  * Thread safety: catalog open/close/mount/unmount are NOT thread-safe;
  * call them from the main thread.  The loader is intentionally simple
- * — async loading is the caller's responsibility (start a worker, do
- * mount() on the worker, then signal main).
+ * — asynchronous work may pre-read and validate independently owned data.
+ * Catalog mount/unmount and shared filesystem mutation stay serialized on
+ * their owner thread; inspection adds no catalog/VFS thread-safety promise.
  *
  * Layer: Resource (Layer 3).  Pure C, FFI-safe.
  */
@@ -127,6 +128,24 @@ JCE_API JceBundleFile *jce_bundle_file_open_memory(
                                              const void *data,
                                              size_t size,
                                              const char *mount_name_or_null);
+/* Offline inspection never mounts a filesystem. expected_target must be one
+ * exact token: windows, linux, macos, android, ios, web or auto. A modern auto
+ * Bundle is portable to every admitted target; expected auto admits only auto.
+ * Unknown/NULL tokens fail. The ordinary open APIs always use the compiled
+ * runtime target, independent of inspection calls or ambient environment.
+ * Manifest, dependency, payload and optional file-sidecar checks are shared
+ * with runtime loading. Legacy 1.0 remains the existing metadata-limited policy;
+ * inspection cannot certify a target or typed graph absent from that format.
+ * Memory bytes are borrowed until close; use the ordinary inspectors/close.
+ * Its borrowed Pak remains read-only: the canonical SDK provider rejects this
+ * same handle through both FS mount entry points and Pak fallback attachment.
+ * Custom decoding providers or separately reopening bytes are outside this
+ * admission contract; this API does not implement a security sandbox. */
+JCE_API JceBundleFile *jce_bundle_file_inspect_memory(const void *data,
+                                                    size_t size,
+                                                    const char *expected_target);
+JCE_API JceBundleFile *jce_bundle_file_inspect_file(const char *jbundle_path,
+                                                  const char *expected_target);
 JCE_API void           jce_bundle_file_close(JceBundleFile *bf);
 
 /* Inspectors. */

@@ -14,6 +14,7 @@
  */
 
 #include "jce_panel_common.h"
+#include "jce_panel_hotkey_search.h"
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
@@ -210,8 +211,7 @@ static void draw_hotkey_reference(void)
         jce_hotkey_chord_label(jce_hotkey_get(id), chord, sizeof(chord));
 
         if (s_hk_filter[0] &&
-            !jce_panel_contains_ci(name, s_hk_filter) &&
-            !jce_panel_contains_ci(id_str, s_hk_filter) &&
+            !jce_panel_hotkey_matches_filter(id, s_hk_filter) &&
             !jce_panel_contains_ci(chord, s_hk_filter))
             continue;
 
@@ -258,14 +258,14 @@ extern "C" void jce_editor_panel_user_guide_content(void)
         const char *ch_title = jce_editor_i18n(ch->title_key);
 
         /* Filter: keep the chapter if its title or any topic title hits. */
-        bool ch_hit = !s_filter[0] || jce_panel_contains_ci(ch_title, s_filter);
-        bool any_topic_hit = false;
-        if (s_filter[0]) {
-            for (int t = 0; t < ch->topic_count && !any_topic_hit; t++)
-                if (jce_panel_contains_ci(jce_editor_i18n(ch->topics[t].title_key),
-                                s_filter))
-                    any_topic_hit = true;
-            if (!ch_hit && !any_topic_hit) continue;
+        const bool ch_hit = jce_editor_i18n_search_match(
+            ch->title_key, nullptr, s_filter, nullptr);
+        if (!ch_hit) {
+            bool any_topic_hit = false;
+            for (int t = 0; t < ch->topic_count && !any_topic_hit; ++t)
+                any_topic_hit = jce_editor_i18n_search_match(
+                    ch->topics[t].title_key, nullptr, s_filter, nullptr);
+            if (!any_topic_hit) continue;
         }
 
         ImGuiTreeNodeFlags tf = ImGuiTreeNodeFlags_SpanAvailWidth;
@@ -274,7 +274,9 @@ extern "C" void jce_editor_panel_user_guide_content(void)
         if (!open) continue;
         for (int t = 0; t < ch->topic_count; t++) {
             const char *tt = jce_editor_i18n(ch->topics[t].title_key);
-            if (s_filter[0] && !ch_hit && !jce_panel_contains_ci(tt, s_filter)) continue;
+            if (!ch_hit && !jce_editor_i18n_search_match(
+                    ch->topics[t].title_key, nullptr, s_filter, nullptr))
+                continue;
             bool selected = (c == s_sel_chapter && t == s_sel_topic);
             if (ImGui::Selectable(tt, selected)) {
                 s_sel_chapter = c;
@@ -287,7 +289,8 @@ extern "C" void jce_editor_panel_user_guide_content(void)
     /* Virtual hotkey-reference chapter. */
     {
         const char *hk_title = jce_editor_i18n("guide.hotkeys.title");
-        if (!s_filter[0] || jce_panel_contains_ci(hk_title, s_filter)) {
+        if (jce_editor_i18n_search_match(
+                "guide.hotkeys.title", nullptr, s_filter, nullptr)) {
             bool selected = (s_sel_chapter == k_hotkey_chapter_index);
             if (ImGui::Selectable(hk_title, selected)) {
                 s_sel_chapter = k_hotkey_chapter_index;

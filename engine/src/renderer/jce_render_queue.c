@@ -18,6 +18,7 @@
 #include <jce/renderer/jce_render_queue.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_instance_upload.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <stdlib.h>
@@ -205,7 +206,9 @@ void jce_rq_push_instanced(JceRenderQueue *rq, const JceDrawCmd *cmd,
                             const JceInstanceBatch *batch)
 {
     if (!rq || !cmd || !batch || batch->instance_count == 0
-        || batch->stride_vec4 < 4 || (!batch->data && !batch->persist_vb)) {
+        || batch->stride_vec4 < 4 || batch->stride_vec4 > UINT16_MAX / 16u
+        || batch->instance_count > SIZE_MAX / ((size_t)batch->stride_vec4 * 16u)
+        || (!batch->data && !batch->persist_vb)) {
         return;
     }
     if (!rq_grow_if_needed(rq)) return;
@@ -324,153 +327,162 @@ static void rq_apply_state(const JceDrawCmd *c)
     if (c->stencil) jce_enc_set_stencil(c->stencil, BGFX_STENCIL_NONE);
 }
 
-static void rq_submit_single(const JceRqEntry *e)
+static bool rq_program_valid(uint16_t program)
+{
+    return jce_shader_deferred_resolve(program) != UINT16_MAX;
+}
+
+static void rq_bind_mesh(const JceDrawCmd *c)
+{
+    bgfx_vertex_buffer_handle_t vb = {(uint16_t)c->mesh_vbh};
+    bgfx_index_buffer_handle_t ib = {(uint16_t)c->mesh_ibh};
+    jce_enc_set_vertex_buffer(0, vb, 0, UINT32_MAX);
+    if (ib.idx != UINT16_MAX)
+        jce_enc_set_index_buffer(ib, c->first_index, c->index_count);
+    rq_apply_state(c);
+}
+
+static bool rq_submit_single(const JceRqEntry *e, JceInstanceUploadOwner *owner)
 {
     const JceDrawCmd *c = &e->cmd;
-    jce_enc_set_transform(c->transform.raw[0], 1);
-
-    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)c->mesh_vbh };
-    bgfx_index_buffer_handle_t  ibh = { (uint16_t)c->mesh_ibh };
-    jce_enc_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
-    /* Non-indexed mesh: skip the bind (see rq_submit_explicit_instanced). */
-    if (ibh.idx != UINT16_MAX)
-        jce_enc_set_index_buffer(ibh, c->first_index, c->index_count);
-    rq_apply_state(c);
-
-    /* For n=1, prefer the non-instance program variant: avoids feeding a
-     * 1-element instance buffer to a shader that declares per-instance
-     * inputs (D3D12 PSO creation rejects this in some configurations).
-     * Caller may pass program_single=0xFFFF if no non-instance variant
-     * exists, in which case we fall back to the instance program +
-     * 1-element instance buffer. */
-    uint16_t prog_idx = (c->program_single != UINT16_MAX) ? c->program_single
-                                                          : c->program;
-
+    uint16_t index = c->program_single != UINT16_MAX ? c->program_single : c->program;
+    if (!rq_program_valid(index)) return false;
     if (c->program_single == UINT16_MAX) {
-        const uint16_t stride_bytes = 64;
-        if (bgfx_get_avail_instance_data_buffer(1, stride_bytes) >= 1) {
-            bgfx_instance_data_buffer_t idb;
-            bgfx_alloc_instance_data_buffer(&idb, 1, stride_bytes);
-            /* alloc clamps idb.num to remaining transient space — under the
-             * opt-in parallel path two workers can race the avail-check/alloc
-             * gap, so re-read before the copy (serial path: idb.num==1 always). */
-            if (idb.num >= 1) {
-                memcpy(idb.data, c->transform.raw[0], stride_bytes);
-                jce_enc_set_instance_data_buffer(&idb, 0, 1);
+        if (owner) {
+            JceInstanceUpload upload;
+            if (!jce_instance_upload_begin(owner, jce_renderer_instance_upload_epoch(), 1, 64, 128, &upload))
+                return false;
+            memcpy(upload.data, c->transform.raw[0], 64);
+            if (!jce_instance_upload_commit(owner, &upload, 1) ||
+                !jce_instance_upload_bind_encoder(owner, &upload, 1, jce_tls_encoder)) {
+                jce_instance_upload_discard(owner, &upload);
+                return false;
             }
+        } else {
+            bgfx_instance_data_buffer_t data;
+            if (bgfx_get_avail_instance_data_buffer(1, 64) < 1) return false;
+            bgfx_alloc_instance_data_buffer(&data, 1, 64);
+            if (data.num < 1 || !data.data || data.size < 64) return false;
+            memcpy(data.data, c->transform.raw[0], 64);
+            jce_enc_set_instance_data_buffer(&data, 0, 1);
         }
     }
-
-    bgfx_program_handle_t prog = { prog_idx };
-    jce_enc_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
-}
-
-static void rq_submit_explicit_instanced(const JceRqEntry *e)
-{
-    const JceDrawCmd *c = &e->cmd;
-    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)c->mesh_vbh };
-    bgfx_index_buffer_handle_t  ibh = { (uint16_t)c->mesh_ibh };
-    jce_enc_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
-    /* Non-indexed mesh (e.g. a glTF skinned prim without indices): bgfx's
-     * convention is to simply not set an index buffer — passing the invalid
-     * handle into the encoder is UB that AVs under re-entrant renders. */
-    if (ibh.idx != UINT16_MAX)
-        jce_enc_set_index_buffer(ibh, c->first_index, c->index_count);
-
-    if (e->inst_persist_vb) {
-        /* 千万 S1: instance data is GPU-resident — bind it directly, no copy. */
-        bgfx_dynamic_vertex_buffer_handle_t dvb = { (uint16_t)(e->inst_persist_vb - 1u) };
-        jce_enc_set_instance_data_from_dynamic_vertex_buffer(dvb, 0, e->inst_count);
-    } else {
-        uint16_t stride_b = (uint16_t)(e->inst_stride_vec4 * 16u);
-        if (bgfx_get_avail_instance_data_buffer(e->inst_count, stride_b) < e->inst_count)
-            return;
-        bgfx_instance_data_buffer_t idb;
-        bgfx_alloc_instance_data_buffer(&idb, e->inst_count, stride_b);
-        /* re-read idb.num: alloc clamps to remaining transient space, and on the
-         * opt-in parallel path the avail-check/alloc gap is unsynchronized
-         * (serial path: idb.num==e->inst_count always → byte-identical). */
-        uint32_t got = idb.num < e->inst_count ? idb.num : e->inst_count;
-        memcpy(idb.data, e->inst_data, (size_t)got * stride_b);
-        jce_enc_set_instance_data_buffer(&idb, 0, got);
-    }
-    rq_apply_state(c);
-
-    bgfx_program_handle_t prog = { c->program };
-    jce_enc_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
-}
-
-static bool rq_submit_auto_batched(const JceRqEntry *entries,
-                                    uint32_t start, uint32_t end)
-{
-    uint32_t n = end - start;
-    const uint16_t stride_bytes = 64;  /* 4 vec4 = 4x4 matrix */
-    if (bgfx_get_avail_instance_data_buffer(n, stride_bytes) < n) {
-        return false;
-    }
-    bgfx_instance_data_buffer_t idb;
-    bgfx_alloc_instance_data_buffer(&idb, n, stride_bytes);
-    /* re-read idb.num: alloc clamps to remaining transient space, and on the
-     * opt-in parallel path the avail-check/alloc gap is unsynchronized — copy
-     * only what was allocated (serial path: idb.num==n → byte-identical). */
-    uint32_t got = idb.num < n ? idb.num : n;
-    uint8_t *dst = idb.data;
-    for (uint32_t i = start; i < start + got; i++) {
-        memcpy(dst, entries[i].cmd.transform.raw[0], stride_bytes);
-        dst += stride_bytes;
-    }
-
-    const JceDrawCmd *c = &entries[start].cmd;
-    bgfx_vertex_buffer_handle_t vbh = { (uint16_t)c->mesh_vbh };
-    bgfx_index_buffer_handle_t  ibh = { (uint16_t)c->mesh_ibh };
-    jce_enc_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
-    /* Non-indexed mesh: skip the bind (see rq_submit_explicit_instanced). */
-    if (ibh.idx != UINT16_MAX)
-        jce_enc_set_index_buffer(ibh, c->first_index, c->index_count);
-    jce_enc_set_instance_data_buffer(&idb, 0, got);
-    rq_apply_state(c);
-
-    bgfx_program_handle_t prog = { c->program };
-    jce_enc_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
+    jce_enc_set_transform(c->transform.raw[0], 1);
+    rq_bind_mesh(c);
+    bgfx_program_handle_t program = {index};
+    jce_enc_submit(c->view_id, program, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
     return true;
 }
 
-/* Flush entries [start, end): bind material + submit, auto-batching runs bounded
- * by `end` (a run straddling a chunk boundary splits into two instanced submits
- * — same pixels). bgfx calls route through the encoder shim. */
+/* Every admitted slice binds its own material/state; BGFX_DISCARD_ALL resets
+ * these after each submit. Owner mutation is confined to serial API-thread use. */
+static uint32_t rq_submit_instances(JceRenderQueue *rq, const JceRqEntry *e,
+    const JceRqEntry *matrices, uint32_t count, JceInstanceUploadOwner *owner,
+    JceRenderQueueStats *stats)
+{
+    const JceDrawCmd *c = &e->cmd;
+    if (!rq_program_valid(c->program)) return 0;
+    uint16_t stride = matrices ? 64 : (uint16_t)(e->inst_stride_vec4 * 16u);
+    uint32_t done = 0;
+    do {
+        uint32_t got = count - done;
+        bgfx_instance_data_buffer_t transient;
+        JceInstanceUpload upload;
+        bool generic = owner && (stride == 64 || stride == 80);
+        uint8_t *data = NULL;
+        if (e->inst_persist_vb) {
+            got = count;
+        } else if (generic) {
+            if (!jce_instance_upload_begin(owner, jce_renderer_instance_upload_epoch(), got, stride, 128, &upload)) break;
+            got = upload.count;
+            data = (uint8_t *)upload.data;
+        } else {
+            uint32_t available = bgfx_get_avail_instance_data_buffer(got, stride);
+            if (!available) break;
+            if (available < got) got = available;
+            bgfx_alloc_instance_data_buffer(&transient, got, stride);
+            if (transient.num < got) got = transient.num;
+            if (transient.size / stride < got) got = transient.size / stride;
+            if (!got || !transient.data) break;
+            data = transient.data;
+        }
+        if (data) {
+            if (matrices) {
+                for (uint32_t n = 0; n < got; ++n)
+                    memcpy(data + (size_t)n * stride, matrices[done + n].cmd.transform.raw[0], 64);
+            } else {
+                memcpy(data, (uint8_t *)e->inst_data + (size_t)done * stride, (size_t)got * stride);
+            }
+        }
+        if (generic && !e->inst_persist_vb) {
+            if (!jce_instance_upload_commit(owner, &upload, got) ||
+                !jce_instance_upload_bind_encoder(owner, &upload, got, jce_tls_encoder)) {
+                jce_instance_upload_discard(owner, &upload);
+                break;
+            }
+        } else if (e->inst_persist_vb) {
+            bgfx_dynamic_vertex_buffer_handle_t vb = {(uint16_t)(e->inst_persist_vb - 1u)};
+            jce_enc_set_instance_data_from_dynamic_vertex_buffer(vb, 0, got);
+        } else {
+            jce_enc_set_instance_data_buffer(&transient, 0, got);
+        }
+        if (rq->bind_material) rq->bind_material(c->material_key, rq->bind_material_user);
+        rq_bind_mesh(c);
+        bgfx_program_handle_t program = {c->program};
+        jce_enc_submit(c->view_id, program, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
+        ++stats->submits_out;
+        if (matrices && got >= 2) ++stats->batches_merged;
+        stats->instances_total += got;
+        done += got;
+    } while (done < count);
+    if (done < count)
+        LOG_WARN(LOG_TAG, "instance upload incomplete: requested=%u submitted=%u stride=%u", count, done, stride);
+    return done;
+}
+
 static void rq_flush_range(JceRenderQueue *rq, uint32_t start, uint32_t end,
-                           bool disable_instancing, bool have_binder,
-                           JceRenderQueueStats *st)
+    bool disable_instancing, bool have_binder, JceRenderQueueStats *stats,
+    JceInstanceUploadOwner *owner)
 {
     uint32_t i = start;
     while (i < end) {
-        JceRqEntry *e = &rq->entries[i];
-        if (have_binder)
-            rq->bind_material(e->cmd.material_key, rq->bind_material_user);
-        if (e->inst_persist_vb) {
-            rq_submit_explicit_instanced(e); st->submits_out++; i++; continue;
+        JceRqEntry *entry = &rq->entries[i];
+        /* no_batch/disable_instancing disable automatic merging, not the
+         * authored payload of an explicit batch (including tint attributes). */
+        if (entry->inst_persist_vb || entry->inst_data) {
+            rq_submit_instances(rq, entry, NULL, entry->inst_count, owner, stats);
+            ++i;
+            continue;
         }
-        if (e->inst_data && !disable_instancing) {
-            rq_submit_explicit_instanced(e); st->submits_out++; i++; continue;
+        uint32_t last = i + 1;
+        if (!entry->inst_data)
+            while (last < end && rq_can_batch(entry, &rq->entries[last])) ++last;
+        uint32_t done = 0;
+        if (!disable_instancing && last - i >= 2) {
+            done = rq_submit_instances(rq, entry, &rq->entries[i], last - i, owner, stats);
         }
-        if (e->inst_data && disable_instancing) {
-            rq_submit_single(e); st->submits_out++; i++; continue;
+        for (uint32_t n = i + done; n < last; ++n) {
+            if (have_binder) rq->bind_material(rq->entries[n].cmd.material_key, rq->bind_material_user);
+            if (rq_submit_single(&rq->entries[n], owner)) ++stats->submits_out;
         }
-        uint32_t j = i + 1;
-        while (j < end && rq_can_batch(e, &rq->entries[j])) j++;
-        uint32_t run = j - i;
-        if (!disable_instancing && run >= 2 &&
-            rq_submit_auto_batched(rq->entries, i, j)) {
-            st->submits_out++; st->batches_merged++; st->instances_total += run;
-        } else {
-            for (uint32_t k = i; k < j; k++) {
-                if (have_binder && k > i)
-                    rq->bind_material(rq->entries[k].cmd.material_key, rq->bind_material_user);
-                rq_submit_single(&rq->entries[k]); st->submits_out++;
-            }
-        }
-        i = j;
+        i = last;
     }
+}
+
+/* Reserve-aware conservative admission before worker dispatch. The estimate
+ * includes alignment per command, even when sorted runs will share a slice. */
+static bool rq_parallel_fits(const JceRenderQueue *rq, const JceInstanceUploadOwner *owner)
+{
+    uint64_t bytes = owner ? owner->transient_reserve_bytes : 0;
+    for (uint32_t i = 0; i < rq->count; ++i) {
+        const JceRqEntry *e = &rq->entries[i];
+        if (e->inst_persist_vb) continue;
+        uint64_t count = e->inst_data ? e->inst_count : 1;
+        uint64_t stride = e->inst_data ? (uint64_t)e->inst_stride_vec4 * 16u : 64u;
+        bytes += count * stride + 15u;
+        if (bytes > UINT32_MAX) return false;
+    }
+    return bytes <= (uint64_t)bgfx_get_avail_instance_data_buffer(UINT32_MAX / 64u, 64) * 64u;
 }
 
 /* ── Parallel submit (lever ①, opt-in JCE_PARALLEL_SUBMIT) ──────────────────
@@ -509,7 +521,7 @@ static void rq_flush_chunk(uint32_t begin, uint32_t end, void *user)
     if (jce_thread_current_id() == c->api_tid) {
         jce_render_encoder_set(NULL);
         rq_flush_range(c->rq, begin, end,
-                       c->disable_instancing, c->have_binder, &c->stats[ci]);
+                       c->disable_instancing, c->have_binder, &c->stats[ci], NULL);
         return;
     }
     bgfx_encoder_t *enc = bgfx_encoder_begin(true);
@@ -520,7 +532,7 @@ static void rq_flush_chunk(uint32_t begin, uint32_t end, void *user)
     }
     jce_render_encoder_set(enc);
     rq_flush_range(c->rq, begin, end,
-                   c->disable_instancing, c->have_binder, &c->stats[ci]);
+                   c->disable_instancing, c->have_binder, &c->stats[ci], NULL);
     jce_render_encoder_set(NULL);
     bgfx_encoder_end(enc);
 }
@@ -529,7 +541,7 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
 {
     JCE_PROFILE_ZONE_N("RenderQueue::Flush");
     if (!rq || rq->count == 0) { JCE_PROFILE_ZONE_END; return; }
-    (void)renderer;
+    JceInstanceUploadOwner *owner = renderer ? jce_renderer_instance_upload_owner(renderer) : NULL;
 
     static int s_disable_inst_env = -1;
     if (s_disable_inst_env < 0) {
@@ -563,7 +575,8 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
      * per-view seq counter = physical submit order, so splitting it across
      * worker encoders would scramble back-to-front alpha blending. The opaque
      * queue is depth-tested (order-independent), so it parallelizes safely. */
-    if (mt_enabled && nworkers > 1 && have_binder && !rq->no_batch && rq->count >= RQ_MT_MIN) {
+    if (mt_enabled && nworkers > 1 && have_binder && !rq->no_batch && rq->count >= RQ_MT_MIN
+        && rq_parallel_fits(rq, owner)) {
         /* Warm every per-frame shared cache (light_env repack, baked-GI/fog
          * snapshots, lazy ensure_uniforms) ONCE on the main thread so the worker
          * binds are read-only; bgfx_discard drops the pending state off the
@@ -592,14 +605,14 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
             if (ctx.defer_end[k] > ctx.defer_begin[k]) {
                 jce_render_encoder_set(NULL);
                 rq_flush_range(rq, ctx.defer_begin[k], ctx.defer_end[k],
-                               disable_instancing, have_binder, &ctx.stats[k]);
+                               disable_instancing, have_binder, &ctx.stats[k], owner);
             }
             st.submits_out     += ctx.stats[k].submits_out;
             st.batches_merged  += ctx.stats[k].batches_merged;
             st.instances_total += ctx.stats[k].instances_total;
         }
     } else {
-        rq_flush_range(rq, 0, rq->count, disable_instancing, have_binder, &st);
+        rq_flush_range(rq, 0, rq->count, disable_instancing, have_binder, &st, owner);
     }
 
     rq_free_owned_inst(rq);

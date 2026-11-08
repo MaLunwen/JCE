@@ -1,0 +1,111 @@
+# Complete private scheduler and real Game input bridge; no window or GPU.
+function(jce_editor_event_fixture_schedule_controls)
+    set(owner "${CMAKE_SOURCE_DIR}/editor/src/core/jce_editor_event_fixture_schedule.h")
+    set(main "${CMAKE_SOURCE_DIR}/editor/src/jce_editor_main.cpp")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${owner}" "${main}")
+    file(READ "${owner}" source)
+    file(READ "${main}" main_source)
+    foreach(wire IN ITEMS
+            "g_game_events.begin(getenv(\"JCE_KPI_GAME_EVENTS\"),\n        getenv(\"JCE_KPI_GAME_EVENTS_CLOCK\"), getenv(\"JCE_KPI_GAME_EVENTS_START\"));"
+            "g_game_events.end(jce_editor_game_input_bridge_shared());"
+            "g_game_events.validate_active(jce_editor_game_input_bridge_shared(),"
+            "    editor_game_event_fixture();")
+        string(FIND "${main_source}" "${wire}" first)
+        string(FIND "${main_source}" "${wire}" last REVERSE)
+        if(first LESS 0 OR NOT first EQUAL last)
+            message(FATAL_ERROR "Event scheduler requires its unique actual host wire: ${wire}")
+        endif()
+    endforeach()
+    string(FIND "${main_source}" "g_game_events.validate_active(" validation_offset)
+    string(FIND "${main_source}" "        jce_editor_game_input_bridge_sync_replay(" replay_offset)
+    string(FIND "${main_source}" "        (void)jce_editor_game_input_bridge_commit(" commit_offset)
+    if(validation_offset GREATER_EQUAL replay_offset OR replay_offset GREATER_EQUAL commit_offset)
+        message(FATAL_ERROR "Elapsed fixture validation must precede actual replay/commit")
+    endif()
+    # Keep the complete actual main dispatch body as a compiler input, separately
+    # from the helper controls. No copied scheduling/dispatch policy.
+    string(FIND "${main_source}" "static void editor_game_event_fixture(void)" begin)
+    string(FIND "${main_source}" "\nstatic void editor_app_draw" end)
+    if(begin LESS 0 OR end LESS_EQUAL begin)
+        message(FATAL_ERROR "Event fixture main body bounds missing")
+    endif()
+    math(EXPR length "${end} - ${begin}")
+    string(SUBSTRING "${main_source}" ${begin} ${length} main_body)
+    set(main_path "${CMAKE_CURRENT_BINARY_DIR}/event-fixture-schedule/main_body.inc")
+    jce_test_write_if_changed("${main_path}" "${main_body}")
+    # Compile the actual pre-commit guard as well as the draw-side dispatch.
+    string(FIND "${main_source}" "    /* Refuse a retired elapsed source before it can enter a changed runtime. */" pre_begin)
+    string(FIND "${main_source}" "    if (jce_state_get_play_state() == JCE_PLAY_PLAYING) {" pre_end)
+    if(pre_begin LESS 0 OR pre_end LESS_EQUAL pre_begin)
+        message(FATAL_ERROR "Event fixture pre-commit guard bounds missing")
+    endif()
+    math(EXPR pre_length "${pre_end} - ${pre_begin}")
+    string(SUBSTRING "${main_source}" ${pre_begin} ${pre_length} pre_body)
+    set(pre_path "${CMAKE_CURRENT_BINARY_DIR}/event-fixture-schedule/pre_commit.inc")
+    jce_test_write_if_changed("${pre_path}"
+        "static void fixture_pre_commit() {\n${pre_body}}\n")
+    set(marker "        if (elapsed) {\n            const bool valid = admitted(vp, playing, runtime);")
+    string(FIND "${source}" "${marker}" first)
+    string(FIND "${source}" "${marker}" last REVERSE)
+    if(first LESS 0 OR NOT first EQUAL last)
+        message(FATAL_ERROR "Event fixture old-frame control requires unique actual scheduler gate")
+    endif()
+    string(REPLACE "${marker}"
+        "        if (false) { /* old frame scheduler ignores elapsed clock and start marker */\n            const bool valid = admitted(vp, playing, runtime);"
+        old_source "${source}")
+    set(old_path "${CMAKE_CURRENT_BINARY_DIR}/event-fixture-schedule/old_frame_no_start.h")
+    jce_test_write_if_changed("${old_path}" "${old_source}")
+    set(retained_marker "        if (elapsed && (active || end_pending) && bridge &&")
+    string(FIND "${source}" "${retained_marker}" first)
+    string(FIND "${source}" "${retained_marker}" last REVERSE)
+    if(first LESS 0 OR NOT first EQUAL last)
+        message(FATAL_ERROR "Retained admission control requires its unique actual helper gate")
+    endif()
+    string(REPLACE "${retained_marker}" "        if (elapsed && active && data && bridge &&"
+        old_retained_source "${source}")
+    set(old_retained_path "${CMAKE_CURRENT_BINARY_DIR}/event-fixture-schedule/old_retained_admission.h")
+    jce_test_write_if_changed("${old_retained_path}" "${old_retained_source}")
+    set(pre_marker "    if (g_game_events.elapsed &&\n        (g_game_events.active || g_game_events.end_pending))")
+    string(FIND "${pre_body}" "${pre_marker}" first)
+    string(FIND "${pre_body}" "${pre_marker}" last REVERSE)
+    if(first LESS 0 OR NOT first EQUAL last)
+        message(FATAL_ERROR "Retained admission control requires its unique actual main gate")
+    endif()
+    string(REPLACE "${pre_marker}" "    if (g_game_events.elapsed && g_game_events.active)"
+        old_pre_body "${pre_body}")
+    set(old_pre_path "${CMAKE_CURRENT_BINARY_DIR}/event-fixture-schedule/old_pre_commit.inc")
+    jce_test_write_if_changed("${old_pre_path}"
+        "static void fixture_pre_commit() {\n${old_pre_body}}\n")
+    foreach(mode IN ITEMS current old_frame_no_start old_retained_admission)
+        set(target test_jce_editor_event_fixture_schedule)
+        set(kind unit)
+        set(input "${owner}")
+        set(pre_input "${pre_path}")
+        if(mode STREQUAL "old_retained_admission")
+            string(APPEND target _old_retained_admission)
+            set(kind contract)
+            set(input "${old_retained_path}")
+            set(pre_input "${old_pre_path}")
+        elseif(mode STREQUAL "old_frame_no_start")
+            string(APPEND target _old_frame_no_start)
+            set(kind contract)
+            set(input "${old_path}")
+        endif()
+        jce_add_cxx_test(${target} KIND ${kind}
+            SOURCES test_jce_editor_event_fixture_schedule.cpp
+                "${CMAKE_SOURCE_DIR}/editor/src/core/jce_editor_game_input_bridge.cpp"
+            LINK jce_core jce_platform)
+        target_compile_definitions(${target} PRIVATE
+            JCE_EDITOR_EVENT_FIXTURE_SCHEDULE_OWNER="${input}"
+            JCE_EDITOR_EVENT_FIXTURE_MAIN_OWNER="${main_path}"
+            JCE_EDITOR_EVENT_FIXTURE_PRE_COMMIT_OWNER="${pre_input}")
+        target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}/editor/src/core")
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${target}-files")
+        set_tests_properties(${target} PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${target}-files")
+        if(NOT mode STREQUAL "current")
+            set_tests_properties(${target} PROPERTIES WILL_FAIL TRUE)
+        endif()
+    endforeach()
+endfunction()
+jce_editor_event_fixture_schedule_controls()

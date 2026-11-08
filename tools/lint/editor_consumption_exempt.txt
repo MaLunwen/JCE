@@ -37,6 +37,11 @@ jce_anim_clip_destroy # Releases caller-owned standalone JSON clips; editor mode
 
 # --- api_core.h: the engine owns the per-frame profiler snapshot ------------
 jce_perf_phase_frame_tick                 # engine frame loop rotates the completed phase snapshot; a second editor call erased benchmark KPI samples
+jce_fs_probe_read                       # Runtime rt_mixer_read_config (engine/src/application/jce_rt_audio.c) conservatively probes the implicit Settings/audio_mixer.json source before optional-default resolution; UNKNOWN and explicit requests still reach the actual reader. The Editor Audio Mixer authors that file and jce_editor_play.cpp passes an explicit mixer_config_path, which intentionally bypasses the optional-default probe. This is runtime source-policy plumbing, not a separate editor authoring action or proof of a direct editor probe.
+
+# --- api_app.h: JCE_MAIN delegates native ownership to the shared host -------
+jce_engine_create_owned                  # Application jce_main_sdl.c owns the Editor's native engine slot via JCE_MAIN in editor/src/jce_editor_main.cpp; JNI uses the same explicit owner API. Editor callbacks receive JceServices and must not create a second engine or host lifecycle.
+jce_engine_try_destroy                   # Application jce_main_sdl.c retains and retries the Editor's engine slot until teardown completes; JNI follows the same contract. Editor app_exit closes its own Play/services state and returns to this shared host, rather than destroying the executing engine recursively.
 
 # --- api_script.h: the RUNTIME owns the script VM lifecycle -----------------
 # editor/src/panels/jce_panel_inspector_gameplay.cpp:883 draw_comp_script()
@@ -238,6 +243,7 @@ jce_draw_filled_rect_view_xf  # the rect draw with a 2D transform, called by jce
 jce_draw_textured_rect_view_xf  # same pair, textured. See jce_draw_filled_rect_view_xf.
 jce_text_draw_scaled_view_xf  # a text run through the same 2D transform, so a UI label turns WITH its panel rather than staying upright inside it. Called from jce_ui_canvas.c; the editor's text is ImGui's.
 jce_postfx_set_depth_of_field  # the engine owns this push. Only jce_scene_renderer.c has the camera, and the focus distances must be projected through the SAME matrix that filled the depth buffer -- doing it anywhere else is how a per-backend depth-convention bug gets in. The editor authors the numbers on JceSceneRenderingSettings and the renderer converts them; the panel does read jce_postfx_get_depth_of_field_active to say when the effect is on but invisible.
+jce_scene_renderer_render_linear  # Engine scene/probe capture owns the linear PBR render scope and restores its private state after each face. Editor Inspector and Reflection Probes enter that owner through jce_scene_probe_capture_begin, maintained by jce_editor_scene_render.cpp. Direct panel rendering would bypass the shared capture/readback lifetime and view reservation. This exemption names indirect ownership, not physical UI or GPU qualification.
 jce_postfx_get_depth_of_field  # asks "is the flag set", which the editor already knows: it is the JceSceneRenderingSettings field the panel itself edits. The question a panel needs is the OTHER one -- is it doing anything -- and that is jce_postfx_get_depth_of_field_active, which the panel consumes.
 jce_scene_set_content_size_fitter  # reached through the component REGISTRY's function-pointer table (reg_set_content_size_fitter in jce_scene_components_json.c), never by name, which is how every other component's set/has/remove already sits inside this gate's baseline. The editor edits the component through jce_scene_get_content_size_fitter, which it does consume.
 jce_scene_has_content_size_fitter  # same: the REG entry passes it as the presence predicate. This component is flagless because the 64-bit JCE_COMP_FLAG space is full, so presence IS its enable gate.
@@ -290,6 +296,7 @@ jce_static_batch_visible_runs  # pure arithmetic over a member table and a visib
 jce_skinned_mesh_set_submit_index_range  # the per-submit index-range override, armed by the colour pass for static-batch member culling and cleared by the submit. Same shape and same reason as jce_skinned_mesh_set_submit_state and _set_submit_stencil, neither of which the editor names either: they are how ONE draw is parameterised, and the editor authors what is drawn rather than how a submit is bound.
 jce_model_set_draw_index_runs  # arms index RUNS for the next model draw, so a merged static batch submits only the members the frustum can see. Armed by the scene renderer (jce_sr_batch.c) and applied at the bottom of jce_model_draw_program; the editor's half of this contract is the Build Profiles panel's Static Batching tab, which decides WHICH meshes merge. It lives at the bottom precisely because a static model reaches a draw through several ladders with several exits -- four wirings at individual draw sites each looked right and each reached nothing, measured -- and that is not a decision a panel can make either. Same shape as jce_model_set_draw_lod beside it, which the editor does not name for the same reason.
 jce_ssgi_render_albedo  # jce_ssgi_render plus the receiver's albedo target, called once per frame by the scene renderer. The editor's half of this contract is the Rendering settings it authors -- the scene's `ssgi` flag, ssgiIntensity, ssgiRadius, and the render pipeline's SSGI feature -- and the pass consumes them; which texture the march samples as albedo is not a designer decision. Same shape and same reason as jce_ssgi_render beside it, which the editor does not name either.
+jce_model_submit_wireframe_overlay # Standalone SDK model drawing accepts a caller-owned palette. The editor calls jce_scene_renderer_submit_model_wireframe to reuse the current scene instance's bone and morph geometry.
 jce_model_morph_anim_count  # promoted from the PRIVATE engine/src/renderer/jce_model.h on 2026-09-18 because the scene renderer drives blendshape animation from it and cannot reach that header from engine/src/middleware/ -- it was calling it through an implicit declaration, which returns int. Same family as jce_model_node_count / _prim_vertex_count / _prim_morph beside it in the public header: narrow accessors that exist so a RENDERER can walk a model without the internal structs. The editor's half of morph authoring is the Animation Editor's blendshape weights, which edits the component; enumerating the model's imported weight TRACKS is what the runtime does with that data.
 jce_model_morph_anim_track  # see jce_model_morph_anim_count above -- same promotion, same reason, and this is the one whose returned pointer the implicit declaration was truncating to 32 bits.
 jce_humanoid_ik_two_bone  # The SOLVER. Its callers are both in the renderer: the kind-7 humanoid-limb constraint (jce_sr_anim.c) and effector preservation on retarget (jce_sr_anim_retarget.c). Neither is an editor capability -- the editor AUTHORS the goal (a limb picker in the Animation Rigging panel, which now also warns when this rig's limb is not a parent chain and the solve will be refused) and the renderer runs it. The 2026-09-18 wording here said "no caller", which stopped being true on 09-19; an exemption that outlives its reason is how a wrong conclusion survives longest in this tree.
@@ -418,3 +425,47 @@ jce_scene_renderer_snapshot_gpu_survivors # optional asynchronous profiler/captu
 jce_cursor_create_rgba8 # Public OS pixel constructor consumed by native scene modules in Editor Play and packaged games; editor chrome uses system cursor shapes.
 jce_cursor_reset # Native scene-module lifecycle restores the default cursor on Play stop; the editor does not own a game cursor.
 jce_input_primary_pointer # Standalone logical-window pointer for Canvas/RmlUI; Editor Game View owns ImGui screen-to-panel-to-render mapping and must not replace it with window-local coordinates.
+
+jce_renderer_screenshot_poll # Application facade owns completion; editor consumes jce_screenshot_poll without duplicate renderer polling.
+
+jce_engine_request_quit # SUCCESS-only compatibility wrapper used by engine/application consumers; editor headless uses jce_engine_request_quit_with_result for the same exit capability and failure result.
+
+jce_game_module_active_scene # Query-only borrowed-scene access for in-process game-module callbacks; Editor Play owns and sets the binding through jce_game_module_set_active_scene. This newly formalized declaration exposes an existing exported module ABI, not a second editor scene owner or an extra scene-control feature.
+
+jce_window_get_point_size # The native default_main mouse/touch host resolves SDL physical window points before drawable Canvas conversion. Editor input stays in ImGui point space and its Game View subviewport; querying the whole native window here cannot supply the subviewport extent and would duplicate the wrong coordinate owner.
+jce_window_point_to_pixels # The native default_main ScriptHost/Canvas adapter converts physical SDL points to whole-window drawable pixels once. Editor Game View already resolves ImGui point coordinates through its local subviewport policy; adding whole-window conversion there would double-scale or offset embedded viewport input. Exact SDL-coordinate controls cover the native adapter separately.
+
+jce_runtime_create_with_platform_services # Compatibility constructor forwards to jce_runtime_create_with_options with NULL/zero options through the same platform-service owner. Editor Play consumes create_with_options to publish its Game View FBO dimensions before script initialization; an extra old-constructor call would create a second runtime without that required initial viewport. Preserve the legacy ABI for existing consumers.
+
+# Water Spectrum is authored through its Inspector and the existing scene registry.
+jce_scene_has_water_spectrum # WaterSpectrum REG presence callback is consumed by the Inspector through the existing component registry; direct get/set/default calls live in its drawer and Add Component adapter.
+jce_scene_remove_water_spectrum # WaterSpectrum REG removal callback is consumed by the Inspector component menu and history; a direct extra editor call would bypass that owner.
+jce_scene_acquire_water_field # Shared scene water acquisition is consumed by the scene renderer for Editor views and runtime buoyancy for Play; panels author Water/WaterSpectrum without creating a second simulation or clock.
+jce_water_field_set_acquire_spectrum # Lower-level transactional field configuration is consumed by jce_scene_acquire_water_field, which resolves the Inspector-authored optional component for renderer and Play together.
+jce_water_fft_configure_spectrum # FFT construction is consumed by the shared WaterField owner after resolving WaterSpectrum; Editor panels must not evolve or configure a separate FFT instance.
+
+jce_scene_has_water_foam # WaterFoam presence is consumed by the Inspector through the existing component registry; its drawer and Add Component adapter use the direct getter/setter/default.
+jce_scene_remove_water_foam # WaterFoam removal is consumed by the Inspector component menu and history through the registry removal callback; direct panel calls would bypass that owner.
+
+jce_scene_has_water_crest # Inspector presence is consumed through the scene component registry. Its drawer and Add Component adapter call the getter/setter/default directly.
+jce_scene_remove_water_crest # Inspector removal and edit history call the scene component registry removal callback.
+
+jce_scene_has_water_caustics # Inspector presence is consumed through the scene component registry. The drawer and Add Component adapter call the getter/setter/default directly.
+jce_scene_remove_water_caustics # Inspector removal and edit history use the scene component registry callback.
+
+jce_scene_has_water_nearshore # Inspector presence is consumed through the existing component registry. The drawer and Add Component adapter call the getter, setter and default directly.
+jce_scene_remove_water_nearshore # Inspector removal and edit history use the existing scene component registry callback.
+jce_scene_water_nearshore_surface # The shared runtime buoyancy and scene renderer consume the composite water sample. The Inspector authors its inputs through the component API.
+jce_scene_has_water_motion # Inspector presence is consumed through the WaterMotion component registry callback. The drawer and Add Component adapter call the getter, setter and default directly.
+jce_scene_remove_water_motion # Inspector removal and edit history use the WaterMotion component registry callback.
+jce_scene_has_water_optics # Inspector presence is consumed through the WaterOptics component registry callback. The drawer and Add Component adapter call the getter, setter and default directly.
+jce_scene_remove_water_optics # Inspector removal and edit history use the WaterOptics component registry callback.
+jce_scene_has_water_caustic_detail # Inspector presence is consumed through the WaterCausticDetail component registry callback. The drawer and Add Component adapter call the getter, setter and default directly.
+jce_scene_remove_water_caustic_detail # Inspector removal and edit history use the WaterCausticDetail component registry callback.
+
+# Inspector and Add Component use jce_scene_has_comp -> registered has callback.
+# The selection overlay consumes the nullable getter directly.
+jce_scene_has_trigger_volume            # TriggerVolume presence via the Scene component registry, not a duplicate direct query
+
+jce_scene_has_water_normal_detail # Inspector presence uses jce_scene_has_comp through the registered WaterNormalDetail has callback; the drawer and Add Component call getter/setter/default directly.
+jce_scene_remove_water_normal_detail # Editor component removal and history use jce_scene_remove_comp through the registered WaterNormalDetail remove callback.

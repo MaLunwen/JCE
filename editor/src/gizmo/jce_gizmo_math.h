@@ -146,43 +146,71 @@ static inline bool gm_world_to_screen(const JceGizmoCamera *cam,
 
 /* ── Screen → World ray ────────────────────────────────────────────── */
 
-static inline void gm_screen_to_ray(const JceGizmoCamera *cam,
-                                     float screen_x, float screen_y,
-                                     float ray_origin[3],
-                                     float ray_dir[3])
+/* Unproject both clip endpoints. The ray uses world-distance units. */
+static inline bool gm_screen_to_clip_ray(const JceGizmoCamera *cam,
+                                         float screen_x, float screen_y,
+                                         bool homogeneous_depth,
+                                         float ray_origin[3],
+                                         float ray_dir[3], float *ray_length)
 {
-    /* NDC coords */
+    if (!(cam->viewport_size[0] > 0.0f && cam->viewport_size[1] > 0.0f))
+        return false;
+
     float ndc_x = ((screen_x - cam->viewport_origin[0]) / cam->viewport_size[0]) * 2.0f - 1.0f;
     float ndc_y = 1.0f - ((screen_y - cam->viewport_origin[1]) / cam->viewport_size[1]) * 2.0f;
 
-    float vp[16];
+    float vp[16], inv_vp[16];
     gm_m4_mul(vp, cam->proj, cam->view);
+    if (!gm_m4_invert(inv_vp, vp))
+        return false;
 
-    float inv_vp[16];
-    gm_m4_invert(inv_vp, vp);
+    /* The common inverse returns identity when the determinant is too small. */
+    const jce_mat4 identity = jce_m4_identity();
+    if (memcmp(inv_vp, identity.raw, sizeof(inv_vp)) == 0) {
+        for (int i = 0; i < 16; ++i)
+            if (vp[i] != identity.raw[i / 4][i % 4])
+                return false;
+    }
 
-    /* Unproject near and far */
-    float near_ndc[4] = { ndc_x, ndc_y, -1.0f, 1.0f };
-    float far_ndc[4]  = { ndc_x, ndc_y,  1.0f, 1.0f };
+    float near_ndc[4] = { ndc_x, ndc_y, homogeneous_depth ? -1.0f : 0.0f, 1.0f };
+    float far_ndc[4]  = { ndc_x, ndc_y, 1.0f, 1.0f };
     float near_w[4], far_w[4];
     gm_m4_mul_v4(near_w, inv_vp, near_ndc);
     gm_m4_mul_v4(far_w,  inv_vp, far_ndc);
 
-    if (fabsf(near_w[3]) < 1e-8f || fabsf(far_w[3]) < 1e-8f) {
-        gm_v3_copy(ray_origin, cam->eye);
-        ray_dir[0] = 0; ray_dir[1] = 0; ray_dir[2] = -1;
-        return;
-    }
+    if (!(fabsf(near_w[3]) >= 1e-8f && fabsf(far_w[3]) >= 1e-8f))
+        return false;
 
     float inv_nw = 1.0f / near_w[3];
     float inv_fw = 1.0f / far_w[3];
     float near_p[3] = { near_w[0]*inv_nw, near_w[1]*inv_nw, near_w[2]*inv_nw };
     float far_p[3]  = { far_w[0]*inv_fw,  far_w[1]*inv_fw,  far_w[2]*inv_fw  };
-
-    gm_v3_copy(ray_origin, near_p);
     float d[3];
     gm_v3_sub(d, far_p, near_p);
-    gm_v3_normalize(ray_dir, d);
+    float length = jce_v3_len(GM_V3_CREF(d));
+    if (!(length > 1e-8f && isfinite(length)))
+        return false;
+
+    gm_v3_copy(ray_origin, near_p);
+    GM_V3_REF(ray_dir) = jce_v3_scale(GM_V3_CREF(d), 1.0f / length);
+    if (ray_length)
+        *ray_length = length;
+    return true;
+}
+
+static inline void gm_screen_to_ray(const JceGizmoCamera *cam,
+                                     float screen_x, float screen_y,
+                                     float ray_origin[3],
+                                     float ray_dir[3])
+{
+    if (gm_screen_to_clip_ray(cam, screen_x, screen_y, true,
+                              ray_origin, ray_dir, NULL))
+        return;
+
+    gm_v3_copy(ray_origin, cam->eye);
+    ray_dir[0] = 0;
+    ray_dir[1] = 0;
+    ray_dir[2] = -1;
 }
 
 /* ── Ray-Axis closest approach ─────────────────────────────────────── */

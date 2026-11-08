@@ -18,7 +18,8 @@
 JCE_EXTERN_C_BEGIN
 
 /* Fill `out` with `n` bytes from the OS CSPRNG (BCryptGenRandom on
- * Windows, /dev/urandom elsewhere).  Returns true when the bytes are
+ * modern Windows, CryptGenRandom on the opt-in XP legacy build,
+ * /dev/urandom elsewhere).  Returns true when the bytes are
  * cryptographically secure.  On the rare failure path the buffer is
  * still filled — with a time/pointer-mixed DEV-ONLY fallback — and the
  * function returns false so callers can warn that the result must not

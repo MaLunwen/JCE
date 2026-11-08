@@ -15,24 +15,14 @@
 #define LOG_TAG "game_module"
 #define MAX_MODULES 16
 
-/* Editor and CK both need a way to tell the default module which scene
- * to tick.  We expose a static setter (private to the engine, visible
- * to the editor through the same symbol). */
+/* Borrowed active scene; the embedding host owns its lifetime. */
 static JceScene *s_active_scene = NULL;
 
-/* Public so the editor can hand us the scene pointer right before Play
- * fires.  Declared here to avoid expanding the public header before the
- * design stabilizes. */
-JCE_API void jce_game_module_set_active_scene(JceScene *scene);
 void jce_game_module_set_active_scene(JceScene *scene)
 {
     s_active_scene = scene;
 }
 
-/* Getter mirroring the setter above (used by the editor's Systems
- * panel via the scene-systems introspection helpers).  Declared here
- * to avoid expanding the public header before the design stabilizes. */
-JCE_API JceScene *jce_game_module_active_scene(void);
 JceScene *jce_game_module_active_scene(void)
 {
     return s_active_scene;

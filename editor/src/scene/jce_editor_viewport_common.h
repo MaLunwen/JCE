@@ -23,6 +23,7 @@
 #ifndef JCE_EDITOR_VIEWPORT_COMMON_H
 #define JCE_EDITOR_VIEWPORT_COMMON_H
 
+#include "core/jce_editor.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -448,23 +449,93 @@ inline bool jce_editor_viewport_apply_fullscreen_effects(
  * read the bridge.  The composite view (+21) sits past the postfx chain's worst
  * case (+18).  flip_v: on bottom-left-origin backends (GL) the postfx RT's
  * sampling orientation is inverted relative to the bridge/canvas convention.
- * Returns true when a composite happened — the caller then drops its postfx
- * output handle, because the bridge IS the frame. */
+ * Returns true when a composite happened -- the caller then drops its postfx
+ * output handle, because the bridge IS the frame. With no possible later
+ * bridge writer/consumer, D3D11 may present the pipeline-owned output directly.
+ * The output stays borrowed until the next render/resize/shutdown; no target
+ * ownership, temporal history or screenshot lease moves to this helper. */
 inline bool jce_editor_viewport_composite_postfx(JceOffscreenTarget *bridge,
                                                  uint16_t            view_base,
                                                  uint16_t            postfx_tex,
                                                  uint32_t            width,
-                                                 uint32_t            height)
+                                                 uint32_t            height,
+                                                 const JceRenderer  *renderer,
+                                                 JceScene           *scene,
+                                                 bool                canvas_enabled,
+                                                 bool                bridge_tail)
 {
     if (!bridge || postfx_tex == UINT16_MAX) return false;
     /* An empty chain borrows scene colour. Sampling it while writing the
      * same attachment is undefined; the bridge already holds the result. */
     if (postfx_tex == jce_offscreen_target_get_color_texture(bridge)) return false;
+    const bool origin_bottom_left = jce_renderer_origin_bottom_left();
+    /* Direct display keeps the existing top-left D3D11 UV convention. Other
+     * backends retain their orientation-normalizing copy. Any Canvas is a
+     * conservative writer, even when disabled or currently outside the view.
+     * Query now, without retaining scene pointers or duplicating Canvas policy.
+     * The caller still runs Canvas input/focus/event retirement in place. */
+    if (!bridge_tail && renderer && !origin_bottom_left &&
+        jce_renderer_get_backend(renderer) == JCE_BACKEND_D3D11) {
+        bool has_canvas = false;
+        if (canvas_enabled && scene)
+            jce_scene_each_canvas(scene, [](JceScene *, JceEntity, void *user) {
+                *static_cast<bool *>(user) = true;
+            }, &has_canvas);
+        if (!canvas_enabled || (scene && !has_canvas)) return false;
+    }
     const uint16_t comp_view = (uint16_t)(
         view_base + JCE_EDITOR_VP_POSTFX_COMPOSITE_OFFSET);
     jce_offscreen_target_composite_texture(bridge, comp_view, postfx_tex,
                                            (uint16_t)width, (uint16_t)height,
-                                           jce_renderer_origin_bottom_left());
+                                           origin_bottom_left);
+    return true;
+}
+
+/* Game View only: color-preserving screen overlays may finish the current
+ * PostFX target directly. Consume public allocation metadata, never requested
+ * pipeline size or current format policy. Scene View keeps its existing tail.
+ * The UI pass clears NONE and uses blended color/scissor, without depth or
+ * stencil. Camera/world/unknown Canvas modes keep the conservative bridge path.
+ * The pipeline owns the borrowed pair until the next apply/resize/destruction;
+ * this caller submits Canvas, display and capture before any such mutation. */
+inline bool jce_editor_game_postfx_overlay_target(JceOffscreenTarget *bridge,
+                                                  const JcePostFXPipeline *postfx,
+                                                  uint16_t postfx_tex,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  const JceRenderer *renderer,
+                                                  JceScene *scene,
+                                                  bool bridge_tail,
+                                                  uint16_t *overlay_fb)
+{
+    if (overlay_fb) *overlay_fb = UINT16_MAX;
+    if (bridge_tail || !bridge || !renderer || !scene || !overlay_fb ||
+        postfx_tex == UINT16_MAX || jce_renderer_origin_bottom_left() ||
+        jce_renderer_get_backend(renderer) != JCE_BACKEND_D3D11) return false;
+    JcePostFXOutputTarget output{};
+    output.struct_size = sizeof(output);
+    output.version = JCE_POSTFX_OUTPUT_TARGET_VERSION;
+    if (!jce_postfx_get_output_target(postfx, &output) ||
+        output.kind != JCE_POSTFX_OUTPUT_OWNED ||
+        output.texture.idx != postfx_tex || output.framebuffer == UINT16_MAX)
+        return false;
+    uint32_t bridge_width = 0, bridge_height = 0;
+    if (!jce_offscreen_target_get_extent(bridge, &bridge_width, &bridge_height) ||
+        !width || !height || output.width != width || output.height != height ||
+        bridge_width != width || bridge_height != height) return false;
+    const uint32_t bridge_format = jce_offscreen_target_is_hdr(bridge)
+        ? JCE_POSTFX_OUTPUT_FORMAT_RGBA16F : JCE_POSTFX_OUTPUT_FORMAT_RGBA8;
+    if (output.format != bridge_format) return false;
+    if (output.texture.idx == jce_offscreen_target_get_color_texture(bridge) ||
+        output.framebuffer == jce_offscreen_target_get_frame_buffer(bridge)) return false;
+    bool overlays_only = true;
+    jce_scene_each_canvas(scene, [](JceScene *owner, JceEntity entity, void *user) {
+        const JceCanvasComponent *canvas = jce_scene_get_canvas(owner, entity);
+        if (!canvas || canvas->render_mode != JCE_CANVAS_OVERLAY)
+            *static_cast<bool *>(user) = false;
+    }, &overlays_only);
+    if (!overlays_only) return false;
+    *overlay_fb = output.framebuffer;
     return true;
 }
 
@@ -480,30 +551,40 @@ inline uint16_t jce_editor_viewport_ui_overlay_view(uint16_t view_base,
 
 /* Submit a headless read-back capture of the texture the viewport DISPLAYS.
  * Once PostFX has been composited the bridge holds the final frame; otherwise
- * the postfx output is the source and reads back bottom-up on every backend.
+ * the PostFX output is the source. Both sources use the backend's framebuffer
+ * origin, matching the panel UV convention: only bottom-left origins flip.
  * The blit view (+24) is past the postfx chain (+18), the postfx→bridge
  * composite (+21) and the canvas-UI overlay (+22), so the read-back sees the
- * fully composited frame of the SAME bgfx frame.  Poll
- * jce_renderer_readback_capture_poll() each frame until it returns non-zero. */
+ * fully composited frame of the SAME bgfx frame. Poll the matching editor
+ * Scene/Game completion wrapper; the core retains the shared file-slot lease. */
 inline bool jce_editor_viewport_screenshot_submit(JceOffscreenTarget *bridge,
                                                   uint16_t            view_base,
                                                   uint16_t            postfx_tex,
                                                   uint16_t            width,
                                                   uint16_t            height,
-                                                  const char         *path)
+                                                  const char         *path,
+                                                  unsigned            owner)
 {
     if (!bridge) return false;
     uint16_t source = postfx_tex;
-    int      yflip  = 1;   /* postfx RT reads back bottom-up on every backend */
+    const int yflip = jce_renderer_origin_bottom_left() ? 1 : 0;
     if (source == UINT16_MAX) {
+        /* Capture the bridge's allocation, not the requested render size.
+         * A PostFX source has its own extent and keeps the caller's dimensions. */
+        uint32_t target_width = 0, target_height = 0;
+        if (!jce_offscreen_target_get_extent(bridge, &target_width, &target_height) ||
+            !target_width || !target_height ||
+            target_width > UINT16_MAX || target_height > UINT16_MAX)
+            return false;
+        width = static_cast<uint16_t>(target_width);
+        height = static_cast<uint16_t>(target_height);
         source = jce_offscreen_target_get_color_texture(bridge);
-        yflip  = jce_renderer_origin_bottom_left() ? 1 : 0;
     }
     if (source == UINT16_MAX) return false;
     const uint16_t blit_view =
         (uint16_t)(view_base + JCE_EDITOR_VP_SCREENSHOT_OFFSET);
-    return jce_renderer_readback_capture_submit(source, blit_view,
-                                                width, height, path, yflip);
+    return jce_editor_request_viewport_screenshot(owner, source, blit_view,
+                                                   width, height, path, yflip);
 }
 
 /* ── Occlusion culling ────────────────────────────────────────────── */

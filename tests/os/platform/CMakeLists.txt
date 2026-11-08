@@ -73,6 +73,7 @@ jce_add_unit_test(test_jce_input_mouse_mask
 jce_add_unit_test(test_jce_input_record_roundtrip
     SOURCES test_jce_input_record_roundtrip.c
     LINK    jce_platform jce_core)
+include("${CMAKE_CURRENT_LIST_DIR}/input_replay_origin_controls.cmake")
 
 # The committed v1 .jirc fixture, and the harness that produced it.
 #
@@ -234,3 +235,383 @@ endif()
 jce_add_unit_test(test_jce_input_mouse_tap
     SOURCES test_jce_input_mouse_tap.c
     LINK jce_platform jce_core)
+
+# Exact adapter TU is included by the fixture with controlled SDL providers.
+# No OS window, event activation or actual GPU is involved.
+jce_add_unit_test(test_jce_window_flags
+    SOURCES test_jce_window_flags.c
+    LINK jce_core sdl::sdl
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+
+
+# Exact Windows owner with counted Win ports: no real HWND/mutex/UI activation.
+# DIST strips INFO macros, while explicit startup refusal and opt-in lock
+# diagnostics use the common direct logger. The old PID guard is a runtime fail.
+if(WIN32)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_single_instance.c"
+        "${CMAKE_SOURCE_DIR}/engine/src/application/jce_engine.c")
+    file(READ "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_single_instance.c" _si_identity_owner)
+    string(REGEX MATCHALL "actual_pid != published_pid" _si_identity_marks "${_si_identity_owner}")
+    list(LENGTH _si_identity_marks _si_identity_mark_count)
+    if(NOT _si_identity_mark_count EQUAL 1)
+        message(FATAL_ERROR "Single instance old PID guard requires one actual owner comparison")
+    endif()
+    string(REPLACE "actual_pid != published_pid" "false" _si_identity_old "${_si_identity_owner}")
+    if(_si_identity_old STREQUAL _si_identity_owner)
+        message(FATAL_ERROR "Single instance identity mutation did not change actual owner")
+    endif()
+    set(_si_identity_old_path "${CMAKE_CURRENT_BINARY_DIR}/single-instance-mutation/jce_single_instance_old_pid.c")
+    file(READ "${CMAKE_SOURCE_DIR}/engine/src/application/jce_engine.c" _si_engine_owner)
+    set(_si_engine_begin_anchor "    if (!allow_multiple_instances &&\n        !jce_single_instance_lock(e->config.window_title)) {")
+    set(_si_engine_end_anchor "    if (!e->headless && allow_multiple_instances)")
+    set(_si_engine_failure_begin_anchor "\nfail:\n")
+    set(_si_engine_failure_end_anchor "\n}\n\nJceEngine *jce_engine_create(")
+    foreach(_si_anchor IN ITEMS begin end failure_begin failure_end)
+        string(FIND "${_si_engine_owner}" "${_si_engine_${_si_anchor}_anchor}" _si_engine_${_si_anchor})
+        string(FIND "${_si_engine_owner}" "${_si_engine_${_si_anchor}_anchor}" _si_engine_anchor_last REVERSE)
+        if(_si_engine_${_si_anchor} LESS 0 OR NOT _si_engine_${_si_anchor} EQUAL _si_engine_anchor_last)
+            message(FATAL_ERROR "Single instance fixture needs one actual engine ${_si_anchor} boundary")
+        endif()
+    endforeach()
+    if(_si_engine_end LESS_EQUAL _si_engine_begin OR
+       _si_engine_failure_begin LESS_EQUAL _si_engine_end OR
+       _si_engine_failure_end LESS_EQUAL _si_engine_failure_begin)
+        message(FATAL_ERROR "Single instance fixture needs the actual engine startup refusal block")
+    endif()
+    math(EXPR _si_engine_size "${_si_engine_end} - ${_si_engine_begin}")
+    string(SUBSTRING "${_si_engine_owner}" ${_si_engine_begin} ${_si_engine_size} _si_engine_block)
+    set(_si_engine_block_path "${CMAKE_CURRENT_BINARY_DIR}/single-instance-mutation/engine_single_instance_block.inc")
+    math(EXPR _si_engine_failure_size "${_si_engine_failure_end} - ${_si_engine_failure_begin}")
+    string(SUBSTRING "${_si_engine_owner}" ${_si_engine_failure_begin} ${_si_engine_failure_size} _si_engine_failure)
+    set(_si_engine_failure_path "${CMAKE_CURRENT_BINARY_DIR}/single-instance-mutation/engine_single_instance_failure.inc")
+    foreach(_si_kind IN ITEMS identity_old engine_block engine_failure)
+        set(_si_content "${_si_${_si_kind}}")
+        set(_si_path "${_si_${_si_kind}_path}")
+        jce_test_write_if_changed("${_si_path}" "${_si_content}")
+    endforeach()
+    foreach(_si_target IN ITEMS test_jce_single_instance_identity test_jce_single_instance_identity_old_pid)
+        if(_si_target STREQUAL "test_jce_single_instance_identity")
+            set(_si_test_kind unit)
+        else()
+            set(_si_test_kind contract)
+        endif()
+        jce_add_unit_test(${_si_target} KIND ${_si_test_kind}
+            SOURCES test_jce_single_instance_identity.c
+            LINK jce_core
+            INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+        target_compile_definitions(${_si_target} PRIVATE JCE_DIST=1
+            JCE_TEST_SINGLE_INSTANCE_ENGINE_BLOCK="${_si_engine_block_path}"
+            JCE_TEST_SINGLE_INSTANCE_ENGINE_FAILURE="${_si_engine_failure_path}")
+        if(MSVC)
+            target_compile_options(${_si_target} PRIVATE /Zc:preprocessor)
+        endif()
+    endforeach()
+    target_compile_definitions(test_jce_single_instance_identity_old_pid PRIVATE
+        JCE_TEST_SINGLE_INSTANCE_OWNER="${_si_identity_old_path}")
+    set_tests_properties(test_jce_single_instance_identity_old_pid PROPERTIES WILL_FAIL TRUE)
+else()
+    jce_test_suite_skipped("single-instance-windows-identity"
+        "Windows HWND/PID counted-port controls require the Windows SDK compiler; POSIX activation is not implemented")
+endif()
+
+# Exact cached point/drawable owner; providers count creation/resize queries.
+set(_window_coordinates_owner "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_window.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_window_coordinates_owner}")
+file(READ "${_window_coordinates_owner}" _window_coordinates_source)
+set(_window_coordinates_x "(double)x * win->pixel_w / win->point_w")
+set(_window_coordinates_y "(double)y * win->pixel_h / win->point_h")
+foreach(_window_coordinates_marker IN ITEMS "${_window_coordinates_x}" "${_window_coordinates_y}")
+    string(FIND "${_window_coordinates_source}" "${_window_coordinates_marker}" _first)
+    string(FIND "${_window_coordinates_source}" "${_window_coordinates_marker}" _last REVERSE)
+    if(_first LESS 0 OR NOT _first EQUAL _last)
+        message(FATAL_ERROR "Window point control requires one actual coordinate scale")
+    endif()
+endforeach()
+string(REPLACE "${_window_coordinates_x}" "(double)x" _window_coordinates_old "${_window_coordinates_source}")
+string(REPLACE "${_window_coordinates_y}" "(double)y" _window_coordinates_old "${_window_coordinates_old}")
+set(_window_coordinates_old_path "${CMAKE_CURRENT_BINARY_DIR}/window-coordinates/jce_window_old_scale.c")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/window-coordinates")
+unset(_window_coordinates_previous)
+if(EXISTS "${_window_coordinates_old_path}")
+    file(READ "${_window_coordinates_old_path}" _window_coordinates_previous)
+endif()
+if(NOT _window_coordinates_previous STREQUAL _window_coordinates_old)
+    file(WRITE "${_window_coordinates_old_path}" "${_window_coordinates_old}")
+endif()
+foreach(_window_coordinates_target IN ITEMS test_jce_window_coordinates test_jce_window_coordinates_old_scale)
+    set(_window_coordinates_kind integration)
+    if(_window_coordinates_target STREQUAL "test_jce_window_coordinates_old_scale")
+        set(_window_coordinates_kind contract)
+    endif()
+    jce_add_unit_test(${_window_coordinates_target} KIND ${_window_coordinates_kind}
+        SOURCES test_jce_window_coordinates.c
+        LINK jce_platform jce_core sdl::sdl
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/os/platform")
+    if(_window_coordinates_target STREQUAL "test_jce_window_coordinates_old_scale")
+        target_compile_definitions(${_window_coordinates_target} PRIVATE
+            JCE_WINDOW_COORDINATE_OWNER="${_window_coordinates_old_path}")
+    endif()
+endforeach()
+set_tests_properties(test_jce_window_coordinates_old_scale PROPERTIES WILL_FAIL TRUE)
+unset(_window_coordinates_owner)
+unset(_window_coordinates_source)
+unset(_window_coordinates_x)
+unset(_window_coordinates_y)
+unset(_window_coordinates_marker)
+unset(_window_coordinates_old)
+unset(_window_coordinates_old_path)
+unset(_window_coordinates_previous)
+unset(_window_coordinates_target)
+unset(_window_coordinates_kind)
+
+# Complete startup observation TU with typed counted SDL/CCD/COM/heap ports.
+# Runtime mutations must fail ordinary unchanged Unity assertions, never crash.
+set(_window_adapter_owner "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_window_adapter.c")
+set(_window_adapter_legacy_owner "${CMAKE_CURRENT_SOURCE_DIR}/jce_test_window_adapter_legacy.inc")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_window_adapter_owner}" "${_window_adapter_legacy_owner}")
+file(READ "${_window_adapter_owner}" _window_adapter_source)
+set(_window_adapter_marker "if(record.luid_low==source.luid_low && record.luid_high==source.luid_high){candidate=i;++matches;}")
+string(FIND "${_window_adapter_source}" "${_window_adapter_marker}" _window_adapter_first)
+string(FIND "${_window_adapter_source}" "${_window_adapter_marker}" _window_adapter_last REVERSE)
+if(_window_adapter_first LESS 0 OR NOT _window_adapter_first EQUAL _window_adapter_last)
+    message(FATAL_ERROR "Window adapter mutation requires one actual source-LUID comparison")
+endif()
+string(REPLACE "${_window_adapter_marker}"
+    "if(record.luid_low!=source.luid_low && record.luid_high==source.luid_high){candidate=i;++matches;}"
+    _window_adapter_wrong_luid "${_window_adapter_source}")
+set(_window_adapter_mutant_dir "${CMAKE_CURRENT_BINARY_DIR}/window-display-adapter")
+file(MAKE_DIRECTORY "${_window_adapter_mutant_dir}")
+set(_window_adapter_first_key_wire "if(first_key!=candidate){out->reason=JCE_WINDOW_ADAPTER_BACKEND_KEY_MISMATCH;goto done;}")
+string(FIND "${_window_adapter_source}" "${_window_adapter_first_key_wire}" _window_adapter_first)
+string(FIND "${_window_adapter_source}" "${_window_adapter_first_key_wire}" _window_adapter_last REVERSE)
+if(_window_adapter_first LESS 0 OR NOT _window_adapter_first EQUAL _window_adapter_last)
+    message(FATAL_ERROR "Window adapter key controls require one actual backend first-match guard")
+endif()
+string(REPLACE "${_window_adapter_first_key_wire}"
+    "if(duplicate!=1){out->reason=JCE_WINDOW_ADAPTER_BACKEND_KEY_MISMATCH;goto done;}"
+    _window_adapter_old_strict_key "${_window_adapter_source}")
+string(REPLACE "${_window_adapter_first_key_wire}"
+    "if(false){out->reason=JCE_WINDOW_ADAPTER_BACKEND_KEY_MISMATCH;goto done;}"
+    _window_adapter_old_first_only "${_window_adapter_source}")
+set(_window_adapter_kinds wrong_luid old_strict_key old_first_only)
+if(WIN32)
+    # The old route resolves the same misleading virtual DXGI output and omits
+    # CCD topology validation, as the former owner did. All other owner code is
+    # kept from this exact source, including LUID-to-desc selection and cleanup.
+    file(READ "${_window_adapter_legacy_owner}" _window_adapter_legacy_function)
+    set(_window_adapter_ccd_wire "    bool observed=display_source_ccd(ctx,&ctx->snapshots[0],reason);")
+    string(FIND "${_window_adapter_source}" "${_window_adapter_ccd_wire}" _window_adapter_first)
+    string(FIND "${_window_adapter_source}" "${_window_adapter_ccd_wire}" _window_adapter_last REVERSE)
+    if(_window_adapter_first LESS 0 OR NOT _window_adapter_first EQUAL _window_adapter_last)
+        message(FATAL_ERROR "Legacy-output control requires exactly one actual CCD begin wire")
+    endif()
+    set(_window_adapter_begin "static bool display_begin(")
+    string(FIND "${_window_adapter_source}" "${_window_adapter_begin}" _window_adapter_first)
+    string(FIND "${_window_adapter_source}" "${_window_adapter_begin}" _window_adapter_last REVERSE)
+    if(_window_adapter_first LESS 0 OR NOT _window_adapter_first EQUAL _window_adapter_last)
+        message(FATAL_ERROR "Legacy-output control requires exactly one native begin owner")
+    endif()
+    string(REPLACE "${_window_adapter_begin}" "${_window_adapter_legacy_function}\n${_window_adapter_begin}"
+        _window_adapter_old_dxgi_output "${_window_adapter_source}")
+    string(REPLACE "${_window_adapter_ccd_wire}"
+        "    bool observed=display_source_legacy_output(ctx,&ctx->snapshots[0],reason);"
+        _window_adapter_old_dxgi_output "${_window_adapter_old_dxgi_output}")
+    string(FIND "${_window_adapter_old_dxgi_output}" "static bool display_verify(" _window_adapter_verify_begin)
+    string(FIND "${_window_adapter_old_dxgi_output}" "static void display_finish(" _window_adapter_verify_end)
+    if(_window_adapter_verify_begin LESS 0 OR _window_adapter_verify_end LESS_EQUAL _window_adapter_verify_begin)
+        message(FATAL_ERROR "Legacy-output control requires actual native topology verification body")
+    endif()
+    math(EXPR _window_adapter_verify_size "${_window_adapter_verify_end} - ${_window_adapter_verify_begin}")
+    string(SUBSTRING "${_window_adapter_old_dxgi_output}" ${_window_adapter_verify_begin}
+        ${_window_adapter_verify_size} _window_adapter_verify_owner)
+    string(FIND "${_window_adapter_verify_owner}" "display_source_ccd(ctx,&ctx->snapshots[1],reason)" _window_adapter_verify_guard)
+    string(FIND "${_window_adapter_verify_owner}" "memcmp(a->paths,b->paths" _window_adapter_verify_path_guard)
+    string(FIND "${_window_adapter_verify_owner}" "monitor!=ctx->monitor" _window_adapter_verify_monitor_guard)
+    if(_window_adapter_verify_guard LESS 0 OR _window_adapter_verify_path_guard LESS 0 OR _window_adapter_verify_monitor_guard LESS 0)
+        message(FATAL_ERROR "Legacy-output control refuses an incomplete topology owner extraction")
+    endif()
+    string(REPLACE "${_window_adapter_verify_owner}"
+        "static bool display_verify(void *user,const JceWindowDisplaySource *source,JceWindowAdapterReason *reason)\n{\n    (void)source;return display_deadline((JceWindowDxgiContext *)user,reason);\n}\n"
+        _window_adapter_old_dxgi_output "${_window_adapter_old_dxgi_output}")
+    list(APPEND _window_adapter_kinds old_dxgi_output)
+endif()
+foreach(_window_adapter_kind IN LISTS _window_adapter_kinds)
+    set(_window_adapter_mutant_path "${_window_adapter_mutant_dir}/jce_window_adapter_${_window_adapter_kind}.c")
+    unset(_window_adapter_previous)
+    if(EXISTS "${_window_adapter_mutant_path}")
+        file(READ "${_window_adapter_mutant_path}" _window_adapter_previous)
+    endif()
+    if(NOT _window_adapter_previous STREQUAL _window_adapter_${_window_adapter_kind})
+        file(WRITE "${_window_adapter_mutant_path}" "${_window_adapter_${_window_adapter_kind}}")
+    endif()
+endforeach()
+if(JCE_PLATFORM_WINDOWS)
+    jce_add_unit_test(test_jce_window_dxgi_legacy KIND unit
+        SOURCES test_jce_window_dxgi_legacy.c LINK jce_core
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+endif()
+
+jce_add_unit_test(test_jce_window_adapter KIND unit
+    SOURCES test_jce_window_adapter.c LINK jce_core sdl::sdl
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/os/platform")
+if(MSVC)
+    target_compile_options(test_jce_window_adapter PRIVATE /Zc:preprocessor)
+endif()
+foreach(_window_adapter_kind IN LISTS _window_adapter_kinds)
+    set(_window_adapter_target "test_jce_window_adapter_${_window_adapter_kind}")
+    jce_add_unit_test(${_window_adapter_target} KIND contract
+        SOURCES test_jce_window_adapter.c LINK jce_core sdl::sdl
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/os/platform")
+    target_compile_definitions(${_window_adapter_target} PRIVATE
+        JCE_WINDOW_ADAPTER_OWNER="${_window_adapter_mutant_dir}/jce_window_adapter_${_window_adapter_kind}.c")
+    if(MSVC)
+        target_compile_options(${_window_adapter_target} PRIVATE /Zc:preprocessor)
+    endif()
+    set_tests_properties(${_window_adapter_target} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+
+# Complete private Web sample owner; legal counts remain provider observations.
+set(_webgl_query_owner "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_webgl_query_internal.c")
+set(_webgl_query_js "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_webgl_interop.js")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_webgl_query_owner}" "${_webgl_query_js}")
+file(READ "${_webgl_query_owner}" _webgl_query_source)
+set(_webgl_query_initial_wire "    if(count>0) samples[0]=0;")
+set(_webgl_query_gate_wire "    if(target!=0x8d41u || pname!=0x80a9u || !renderbuffer_query_format(format,extensions)) {\n        provider->error(provider->user,JCE_WEBGL_INVALID_ENUM);\n        return JCE_WEBGL_QUERY_BAD_ENUM;\n    }")
+set(_webgl_control_dir "${CMAKE_CURRENT_BINARY_DIR}/webgl-query-controls")
+file(MAKE_DIRECTORY "${_webgl_control_dir}")
+foreach(_webgl_variant IN ITEMS normal old_uninitialized_samples old_query_gate)
+    set(_webgl_content "${_webgl_query_source}")
+    set(_webgl_target test_jce_webgl_query)
+    set(_webgl_kind unit)
+    if(NOT _webgl_variant STREQUAL "normal")
+        set(_webgl_target "test_jce_webgl_query_${_webgl_variant}")
+        set(_webgl_kind contract)
+        if(_webgl_variant STREQUAL "old_uninitialized_samples")
+            set(_webgl_wire "${_webgl_query_initial_wire}")
+        else()
+            set(_webgl_wire "${_webgl_query_gate_wire}")
+        endif()
+        string(FIND "${_webgl_query_source}" "${_webgl_wire}" _webgl_first)
+        string(FIND "${_webgl_query_source}" "${_webgl_wire}" _webgl_last REVERSE)
+        if(_webgl_first LESS 0 OR NOT _webgl_first EQUAL _webgl_last)
+            message(FATAL_ERROR "Web query control needs one exact actual wire")
+        endif()
+        string(REPLACE "${_webgl_wire}" "/* historical omitted wire */"
+            _webgl_content "${_webgl_query_source}")
+    endif()
+    set(_webgl_path "${_webgl_control_dir}/${_webgl_variant}.c")
+    unset(_webgl_previous)
+    if(EXISTS "${_webgl_path}")
+        file(READ "${_webgl_path}" _webgl_previous)
+    endif()
+    if(NOT _webgl_previous STREQUAL _webgl_content)
+        file(WRITE "${_webgl_path}" "${_webgl_content}")
+    endif()
+    jce_add_unit_test(${_webgl_target} KIND ${_webgl_kind}
+        SOURCES test_jce_webgl_query.c LINK jce_core
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/os/platform")
+    target_compile_definitions(${_webgl_target} PRIVATE
+        "JCE_WEBGL_QUERY_OWNER=\"${_webgl_path}\"")
+    if(MSVC)
+        target_compile_options(${_webgl_target} PRIVATE /Zc:preprocessor)
+    endif()
+    if(NOT _webgl_variant STREQUAL "normal")
+        set_tests_properties(${_webgl_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+
+# Execute the complete JS bridge with counted CPU ports when Node is available.
+find_program(_jce_webgl_node NAMES node nodejs)
+if(_jce_webgl_node)
+    file(READ "${_webgl_query_js}" _webgl_js_source)
+    foreach(_webgl_variant IN ITEMS normal missing_error missing_context_reset missing_epoch)
+        set(_webgl_js_path "${_webgl_query_js}")
+        set(_webgl_test test_jce_webgl_interop_js)
+        set(_webgl_kind unit)
+        if(NOT _webgl_variant STREQUAL "normal")
+            set(_webgl_kind contract)
+            set(_webgl_test "test_jce_webgl_interop_js_${_webgl_variant}")
+            if(_webgl_variant STREQUAL "missing_error")
+                set(_webgl_wire "GL.recordError(error);")
+            elseif(_webgl_variant STREQUAL "missing_context_reset")
+                set(_webgl_wire "      if (JceWebGlQueryContext.context) jceWebGlInvalidateContext();")
+            else()
+                set(_webgl_wire "    JceWebGlQueryContext.epoch = next;")
+            endif()
+            string(FIND "${_webgl_js_source}" "${_webgl_wire}" _webgl_first)
+            string(FIND "${_webgl_js_source}" "${_webgl_wire}" _webgl_last REVERSE)
+            if(_webgl_first LESS 0 OR NOT _webgl_first EQUAL _webgl_last)
+                message(FATAL_ERROR "Web JS control needs one exact actual wire")
+            endif()
+            string(REPLACE "${_webgl_wire}" "/* omitted wire */"
+                _webgl_js_content "${_webgl_js_source}")
+            set(_webgl_js_path "${_webgl_control_dir}/${_webgl_variant}.js")
+            file(WRITE "${_webgl_js_path}" "${_webgl_js_content}")
+        endif()
+        add_test(NAME "${_webgl_test}" COMMAND "${_jce_webgl_node}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_jce_webgl_interop.js" "${_webgl_js_path}")
+        jce_set_test_kind("${_webgl_test}" "${_webgl_kind}")
+        set_tests_properties("${_webgl_test}" PROPERTIES
+            TIMEOUT 30 ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
+        set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV "${_webgl_test}")
+        if(NOT _webgl_variant STREQUAL "normal")
+            set_tests_properties("${_webgl_test}" PROPERTIES WILL_FAIL TRUE)
+        endif()
+    endforeach()
+else()
+    jce_test_suite_skipped("engine/webgl-query-js"
+        "Node unavailable: actual JS CPU controls are not registered")
+endif()
+
+# Full SDL window owner with typed ports; model only its Web fill branch after
+# native public/SDL headers. No browser context, OS window or GPU is created.
+set(_window_fill_owner "${CMAKE_SOURCE_DIR}/engine/src/os/platform/jce_window.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_window_fill_owner}")
+file(READ "${_window_fill_owner}" _window_fill_source)
+set(_window_fill_wire "        flags |= SDL_WINDOW_FILL_DOCUMENT;")
+string(FIND "${_window_fill_source}" "${_window_fill_wire}" _window_fill_first)
+string(FIND "${_window_fill_source}" "${_window_fill_wire}" _window_fill_last REVERSE)
+if(_window_fill_first LESS 0 OR NOT _window_fill_first EQUAL _window_fill_last)
+    message(FATAL_ERROR "Web window fill control requires one exact production wire")
+endif()
+string(REPLACE "${_window_fill_wire}" "        (void)flags;"
+    _window_fill_old "${_window_fill_source}")
+set(_window_fill_old_path "${CMAKE_CURRENT_BINARY_DIR}/window-fill/jce_window_missing_fill.c")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/window-fill")
+unset(_window_fill_previous)
+if(EXISTS "${_window_fill_old_path}")
+    file(READ "${_window_fill_old_path}" _window_fill_previous)
+endif()
+if(NOT _window_fill_previous STREQUAL _window_fill_old)
+    file(WRITE "${_window_fill_old_path}" "${_window_fill_old}")
+endif()
+foreach(_window_fill_target IN ITEMS test_jce_window_web_fill test_jce_window_host_fill
+        test_jce_window_web_fill_missing_flag)
+    set(_window_fill_kind unit)
+    set(_window_fill_web 1)
+    if(_window_fill_target STREQUAL "test_jce_window_host_fill")
+        set(_window_fill_web 0)
+    elseif(_window_fill_target STREQUAL "test_jce_window_web_fill_missing_flag")
+        set(_window_fill_kind contract)
+    endif()
+    jce_add_unit_test(${_window_fill_target} KIND ${_window_fill_kind}
+        SOURCES test_jce_window_web_fill.c
+        LINK jce_core sdl::sdl
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+            "${CMAKE_SOURCE_DIR}/engine/src/os/platform")
+    target_compile_definitions(${_window_fill_target} PRIVATE
+        JCE_WINDOW_FILL_WEB_CONTROL=${_window_fill_web})
+    if(_window_fill_kind STREQUAL "contract")
+        target_compile_definitions(${_window_fill_target} PRIVATE
+            JCE_WINDOW_FILL_OWNER="${_window_fill_old_path}")
+        set_tests_properties(${_window_fill_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+foreach(_window_fill_variable IN ITEMS owner source wire first last old old_path
+        previous target kind web)
+    unset(_window_fill_${_window_fill_variable})
+endforeach()
+unset(_window_fill_variable)

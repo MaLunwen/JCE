@@ -18,11 +18,10 @@ typedef struct {
 static PhaseSlot s_slots[JCE_PERF_PHASE_MAX_SLOTS];
 static int       s_slot_count = 0;
 static int       s_enabled    = 0;
-/* Per-frame snapshot: delta of each slot's window accumulator between the
- * last two frame_tick() calls.  Lets the editor profiler read true per-frame
- * phase costs without resetting the report window (single reset owner). */
+/* Per-frame samples have their own pending bucket: a report may reset its
+ * window before the next tick consumes the completed frame. */
 static double    s_frame_ms[JCE_PERF_PHASE_MAX_SLOTS];
-static double    s_prev_accum[JCE_PERF_PHASE_MAX_SLOTS];
+static double    s_pending_ms[JCE_PERF_PHASE_MAX_SLOTS];
 
 void jce_perf_phase_set_enabled(int on)
 {
@@ -34,36 +33,28 @@ int jce_perf_phase_enabled(void)
     return s_enabled;
 }
 
-/* Idempotent within a frame.
- *
- * Two callers now drive this: the engine's player loop (every frame, every
- * app) and the editor's update. A second tick with no phase samples between it
- * and the first computes an all-zero delta and CLOBBERS the snapshot with
- * zeros -- which reads as "this frame cost nothing", not as "you ticked
- * twice". Guarding on the window total makes the second call a no-op and lets
- * both callers stay, which matters because the editor's call has to keep
- * working for a host that drives the engine some other way. */
-static double s_last_tick_total = -1.0;
+/* Sample presence and snapshot availability are independent of duration.
+ * Keep both flags in the existing state word; an all-zero completed frame
+ * remains available, and reports never change either flag. */
+enum {
+    PHASE_SAMPLE_PENDING = 1,
+    PHASE_SNAPSHOT_AVAILABLE = 2
+};
+static int s_frame_state = 0;
 
 void jce_perf_phase_frame_tick(void)
 {
-    double total = 0.0;
-    for (int i = 0; i < s_slot_count; ++i) total += s_slots[i].accum_ms;
-    if (s_slot_count > 0 && total == s_last_tick_total) return;
-    s_last_tick_total = total;
-
+    if (!(s_frame_state & PHASE_SAMPLE_PENDING)) return;
     for (int i = 0; i < s_slot_count; ++i) {
-        double d = s_slots[i].accum_ms - s_prev_accum[i];
-        s_frame_ms[i]   = (d >= 0.0) ? d : s_slots[i].accum_ms; /* report reset */
-        s_prev_accum[i] = s_slots[i].accum_ms;
+        s_frame_ms[i] = s_pending_ms[i];
+        s_pending_ms[i] = 0.0;
     }
+    s_frame_state = PHASE_SNAPSHOT_AVAILABLE;
 }
 
 int jce_perf_phase_frame_has_data(void)
 {
-    for (int i = 0; i < s_slot_count; ++i)
-        if (s_frame_ms[i] > 0.0) return 1;
-    return 0;
+    return (s_frame_state & PHASE_SNAPSHOT_AVAILABLE) != 0;
 }
 
 int jce_perf_phase_count(void)
@@ -86,6 +77,8 @@ void jce_perf_phase_add(const char *name, double ms)
         /* Fast path: pointer equality (string literal reuse). */
         if (s_slots[i].name == name) {
             s_slots[i].accum_ms += ms;
+            s_pending_ms[i] += ms;
+            s_frame_state |= PHASE_SAMPLE_PENDING;
             return;
         }
     }
@@ -93,6 +86,8 @@ void jce_perf_phase_add(const char *name, double ms)
     for (int i = 0; i < s_slot_count; ++i) {
         if (s_slots[i].name && SDL_strcmp(s_slots[i].name, name) == 0) {
             s_slots[i].accum_ms += ms;
+            s_pending_ms[i] += ms;
+            s_frame_state |= PHASE_SAMPLE_PENDING;
             return;
         }
     }
@@ -104,6 +99,8 @@ void jce_perf_phase_add(const char *name, double ms)
     if (s_slot_count < JCE_PERF_PHASE_MAX_SLOTS) {
         s_slots[s_slot_count].name     = name;
         s_slots[s_slot_count].accum_ms = ms;
+        s_pending_ms[s_slot_count] = ms;
+        s_frame_state |= PHASE_SAMPLE_PENDING;
         s_slot_count++;
     } else {
         static int warned = 0;
@@ -176,12 +173,10 @@ static void perf_phase_report_scaled(char *out, int out_sz, double scale)
         out[pos] = '\0';
     }
 
-    /* Reset accumulators; keep name registrations for subsequent windows.
-     * Keep the frame-tick baseline in sync so the next per-frame delta does
-     * not go negative. */
+    /* Reset only the reporting window. Pending per-frame samples and the
+     * completed snapshot survive until their own tick boundary. */
     for (int i = 0; i < s_slot_count; ++i) {
         s_slots[i].accum_ms = 0.0;
-        s_prev_accum[i]     = 0.0;
     }
 }
 

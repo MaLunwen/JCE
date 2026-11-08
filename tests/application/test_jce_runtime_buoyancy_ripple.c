@@ -125,9 +125,9 @@ static void test_a_falling_body_disturbs_the_water(void)
     /* Watch the surface under the body, and remember the FIRST time it moved.
      *
      * The direction of that first motion is the only thing that pins the SIGN
-     * at the call site: rt_apply_buoyancy passes -vel.y, and a falling body has
-     * vel.y < 0, so the impulse speed is positive and the header defines
-     * positive as downward. Flip the sign there and the energy is deposited
+     * at the call site: the private continuous driver receives upward vel.y.
+     * A falling body has vel.y < 0, so its target surface velocity is downward.
+     * Flip the sign there and the energy is deposited
      * just the same -- the pond still ripples, the test above still passes, and
      * the water rises to meet a falling object. Mutation showed exactly that:
      * every other assertion here survived the flip. */
@@ -253,11 +253,65 @@ static void test_the_grid_advances_with_no_bodies_at_all(void)
     jce_scene_destroy(sc);
 }
 
+
+/* A floating body's own repeated wake is a coupled system, not just an
+ * impulse sign check. A long real-runtime run must remain near this flat pond
+ * for ordinary authored strength/drag and render cadences. */
+static void test_coupled_buoyancy_and_wake_remain_bounded(void)
+{
+    const float frame_dts[] = {1.0f / 60.0f, 1.0f / 30.0f, 1.0f / 15.0f,
+                               1.0f / 60.0f, 1.0f / 30.0f, 1.0f / 30.0f};
+    const float fixed_dts[] = {1.0f / 60.0f, 1.0f / 60.0f, 1.0f / 60.0f,
+                               1.0f / 120.0f, 1.0f / 30.0f, 0.02f};
+    for (int cadence = 0; cadence < 6; ++cadence) {
+        JceScene *sc = jce_scene_create();
+        TEST_ASSERT_NOT_NULL(sc);
+        add_water(sc);
+        JceEntity body = add_floater(sc, 3.0f);
+        JceBuoyancyComponent bc = *jce_scene_get_buoyancy(sc, body);
+        bc.buoyancy_strength = 28.0f;
+        bc.drag = 5.5f;
+        jce_scene_set_buoyancy(sc, body, &bc);
+        JceRuntimeDesc desc = {0};
+        desc.scene = sc;
+        desc.enable_physics = true;
+        desc.fixed_timestep = fixed_dts[cadence];
+        JceRuntime *rt = jce_runtime_create(&desc);
+        TEST_ASSERT_NOT_NULL(rt);
+        bool bounded = true;
+        float worst = 0.0f;
+        const int frames = (int)(30.0f / frame_dts[cadence]);
+        for (int i = 0; i < frames; ++i) {
+            jce_runtime_step(rt, frame_dts[cadence]);
+            const JceTransform *tr = jce_scene_get_transform(sc, body);
+            const float y = tr->position.y;
+            if (fabsf(y) > worst) worst = fabsf(y);
+            if (!isfinite(y) || fabsf(y) > 20.0f) {
+                printf("coupled buoyancy escaped: cadence=%d frame=%d y=%g\n",
+                       cadence, i, (double)y);
+                bounded = false;
+                break;
+            }
+        }
+        const float final_y = jce_scene_get_transform(sc, body)->position.y;
+        printf("coupled cadence=%d frame_dt=%g fixed_dt=%g max_abs_y=%g final_y=%g\n",
+               cadence, (double)frame_dts[cadence], (double)fixed_dts[cadence],
+               (double)worst, (double)final_y);
+        jce_runtime_destroy(rt);
+        jce_scene_destroy(sc);
+        TEST_ASSERT_TRUE_MESSAGE(bounded,
+            "ordinary buoyancy/wake feedback escaped a flat pond");
+        TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.03f, -9.81f / 28.0f, final_y,
+            "the coupled body did not settle at the buoyancy equilibrium");
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_a_falling_body_disturbs_the_water);
     RUN_TEST(test_the_disturbance_reaches_the_float_height);
     RUN_TEST(test_the_grid_advances_with_no_bodies_at_all);
+    RUN_TEST(test_coupled_buoyancy_and_wake_remain_bounded);
     return UNITY_END();
 }

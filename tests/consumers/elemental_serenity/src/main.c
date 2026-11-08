@@ -22,7 +22,6 @@
 
 #include <jce/api_platform.h>
 
-#include "es_scene_orchestrator.h"
 #include "es_aid_mood.h"
 #include "es_camera.h"   /* left-drag orbit + wheel zoom → BeautyCam vcam */
 #include "es_perf.h"     /* [P] perf panel — win-x64 vs wasm comparison */
@@ -43,10 +42,7 @@ static bool  s_shoot_enabled = false;
 static int   s_shoot_idx     = -1;
 static float s_shoot_t       = 0.0f;
 static bool  s_shot_taken    = false;
-static EsSceneOrchestrator *s_ai_orchestrator = NULL;
 static EsAidMood           *s_aid_mood        = NULL;
-static bool  s_aid_throttle_off = false;  /* ES_AID_NO_THROTTLE=1 to disable */
-static uint32_t s_aid_throttle_ms = 66;   /* ES_AID_THROTTLE_MS override (per-frame sleep during gen) */
 
 static const char *ES_SHOOT_PLAN[8] = {
     "spring_night", "spring_day", "winter_night", "winter_day",
@@ -96,7 +92,12 @@ static bool es_app_init(const JceServices *svc, void *ud)
      * with "no script VM claims its extension" in the log and nothing on
      * screen to say which entity lost.  The engine registers only Lua, and it
      * registers that lazily; every other backend is the application's job. */
+#if defined(ES_SCRIPT_ENABLE_SHIM)
+    if (!es_script_langs_register())
+        return false;
+#else
     es_script_langs_register();
+#endif
 
     if (!app_init(svc, ud))
         return false;
@@ -105,25 +106,11 @@ static bool es_app_init(const JceServices *svc, void *ud)
      * "the probe is not in the scene" and "the script never ran" produce the
      * same zero, and they have different fixes. */
     es_script_probe_init(s_scene);
-    /* App-wide UI font: LXGW WenKai (霞鹜文楷) for both the HUD and any UIText
-     * that leaves its font_path empty (perf panel, mood buttons).  App-scoped —
-     * the editor and other apps keep the built-in default. */
-    jce_ui_canvas_set_default_font("fonts/LXGWWenKai-Regular.ttf");
-    s_ai_orchestrator = es_scene_orchestrator_create(s_runtime,
-                                                     s_runtime_fs);
-    if (!s_ai_orchestrator) {
-        app_exit(ud);
-        return false;
-    }
-    if (!es_scene_orchestrator_request_next(s_ai_orchestrator)) {
-        es_scene_orchestrator_destroy(s_ai_orchestrator);
-        s_ai_orchestrator = NULL;
-        app_exit(ud);
-        return false;
-    }
-    /* ai_dispatch grass-mood experience: NULL when the SDK has no private
-     * module -- that is "feature absent", never a startup failure. */
-    s_aid_mood = es_aid_mood_create(s_runtime, s_scene);
+    /* Blank selects the shared system UI font with CJK/stock fallback. */
+    jce_ui_canvas_set_default_font("");
+    /* Optional plan provider. Missing bootstrap is visible as UNAVAILABLE;
+     * the same serialized Lua preset/apply/ack UI remains usable in every host. */
+    s_aid_mood = es_aid_mood_create(s_runtime, s_scene, s_runtime_fs);
     /* Orbit camera (left-drag rotate, wheel zoom — reference OrbitControls) now
      * lives in the scene's Lua director (update_camera), NOT here: the director
      * runs in editor Play AND the shipped runtime, so both drive the BeautyCam
@@ -140,16 +127,10 @@ static bool es_app_init(const JceServices *svc, void *ud)
 static void es_app_update(float dt, void *ud)
 {
     app_update(dt, ud);                  /* runtime step = Lua director  */
-    if (s_ai_orchestrator && s_svc && s_svc->input &&
+    if (s_runtime && s_svc && s_svc->input &&
         jce_input_key_pressed(s_svc->input, JCE_KEY_N))
-        es_scene_orchestrator_request_next(s_ai_orchestrator);
-    es_scene_orchestrator_update(s_ai_orchestrator, dt);
-    es_aid_mood_update(s_aid_mood, dt,
-                       (s_svc && s_svc->input) ? s_svc->input : NULL);
-    /* on-screen AI panel: "Generate New Scene" + 8 place-type buttons +
-     * progress/status.  Builds itself on first call; polls the canvas
-     * default_main owns (s_ui_canvas).  No-op in a stub (no SDK module). */
-    es_aid_mood_ui(s_aid_mood, s_ui_canvas, dt);
+        jce_runtime_dispatch_ui_click(s_runtime, 0u, "es_mood_next");
+    es_aid_mood_update(s_aid_mood, dt);
     /* Orbit camera now lives in the Lua director (update_camera) so editor Play
      * and this runtime drive the BeautyCam identically — do NOT also run the
      * app-side es_camera here or the two would fight over the same vcam. */
@@ -158,25 +139,11 @@ static void es_app_update(float dt, void *ud)
     es_script_probe_update(s_scene, dt);
     es_autoshoot_update(dt);
 
-    /* While an AI request is in flight, cap the render loop to ~30 FPS.  The
-     * gateway/LLM call runs on a worker thread, so an uncapped diorama (hundreds
-     * of FPS) would hog the GPU the local inference server shares, dropping it
-     * from ~50 to ~10-20 tok/s and pushing a generation past 10 s.  Yielding the
-     * GPU for the ~6 s wait keeps inference near full speed; normal frames are
-     * untouched.  Disable with ES_AID_NO_THROTTLE=1. */
-    if (!s_aid_throttle_off && s_aid_throttle_ms &&
-        es_aid_mood_is_generating(s_aid_mood))
-        jce_thread_sleep_ms(s_aid_throttle_ms);
 }
 
-/* Draw = stock scene/postfx/UI, then the AI placement debug overlay on top
- * (no-op unless ES_AID_DEBUG_VIZ=1).  s_camera/s_svc come from default_main. */
 static void es_app_draw(const JceServices *svc, void *ud)
 {
     app_draw(svc, ud);
-    if (s_aid_mood && svc && svc->renderer && svc->window)
-        es_aid_mood_debug_draw(s_aid_mood, svc->renderer, svc->window,
-                               s_camera);
 }
 
 static void es_app_exit(void *ud)
@@ -187,8 +154,6 @@ static void es_app_exit(void *ud)
     es_script_probe_report("exit");
     es_aid_mood_destroy(s_aid_mood);
     s_aid_mood = NULL;
-    es_scene_orchestrator_destroy(s_ai_orchestrator);
-    s_ai_orchestrator = NULL;
     app_exit(ud);
     es_script_langs_shutdown();
 }
@@ -202,13 +167,6 @@ static JceAppDesc elemental_serenity_get_desc(void)
     {
         const char *as = getenv("ES_AUTOSHOOT");
         s_shoot_enabled = (as && as[0] == '1');
-        const char *nt = getenv("ES_AID_NO_THROTTLE");
-        s_aid_throttle_off = (nt && nt[0] == '1');
-        const char *tm = getenv("ES_AID_THROTTLE_MS");
-        if (tm && tm[0]) {
-            int v = atoi(tm);
-            if (v >= 0 && v <= 500) s_aid_throttle_ms = (uint32_t)v;
-        }
     }
 
     JceAppDesc d = (JceAppDesc){0};

@@ -7,6 +7,7 @@
 
 #include <jce/middleware/net/jce_net_quant.h>
 
+#include "os/core/jce_half_internal.h"
 #include <math.h>
 #include <string.h>
 
@@ -17,48 +18,7 @@
 
 uint16_t jce_quant_f32_to_f16(float v)
 {
-    uint32_t u;
-    memcpy(&u, &v, 4);
-
-    uint32_t sign = (u >> 16) & 0x8000u;
-    int32_t  exp  = (int32_t)((u >> 23) & 0xFFu) - 127 + 15;
-    uint32_t mant = u & 0x7FFFFFu;
-
-    if (exp >= 31) {
-        /* Inf or NaN. */
-        if (((u >> 23) & 0xFFu) == 0xFFu && mant != 0u) {
-            return (uint16_t)(sign | 0x7E00u);    /* qNaN */
-        }
-        return (uint16_t)(sign | 0x7C00u);        /* +/- Inf */
-    }
-    if (exp <= 0) {
-        if (exp < -10) {
-            /* Underflow to signed zero. */
-            return (uint16_t)sign;
-        }
-        /* Subnormal: shift mantissa with implicit leading 1. */
-        mant |= 0x800000u;
-        uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half  = mant >> shift;
-        /* Round-to-nearest-even. */
-        uint32_t rem   = mant & ((1u << shift) - 1u);
-        uint32_t mid   = 1u << (shift - 1u);
-        if (rem > mid || (rem == mid && (half & 1u))) half += 1u;
-        return (uint16_t)(sign | half);
-    }
-
-    /* Normal: round mantissa to 10 bits. */
-    uint32_t half_mant = mant >> 13;
-    uint32_t rem       = mant & 0x1FFFu;
-    if (rem > 0x1000u || (rem == 0x1000u && (half_mant & 1u))) {
-        half_mant += 1u;
-        if (half_mant == 0x400u) {
-            half_mant = 0u;
-            exp      += 1;
-            if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
-        }
-    }
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | half_mant);
+    return jce_float_to_half(v);
 }
 
 /* The decode itself moved to jce_math.h, which is the one layer the renderer

@@ -26,6 +26,11 @@ longer the current authority or an available implementation.
 
 ## Implementation and delivery
 
+The optional JNI shared-library metadata force-loads its Application host on
+macOS so JVM-discovered exports survive static archive selection; Windows/Linux
+already retain that archive. The Core config TU is not duplicated in Application.
+This metadata is not proof of a build for the absent consumer implementation.
+
 - Use public installed JCE SDK headers and the shared JceAppDesc/runtime loop.
 - Keep game rules, scripts, assets, generators and project-only tools here.
 - Never include engine/src, third-party, SDL, bgfx or editor implementation.

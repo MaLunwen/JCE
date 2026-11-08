@@ -1,0 +1,48 @@
+{
+  "contract": {
+    "name": "jce.scene",
+    "major": 1,
+    "minor": 0
+  },
+  "scene": {
+    "version": 1,
+    "entities": [
+      {
+        "id": 1,
+        "name": "enemy-1",
+        "parentId": 0,
+        "components": [
+          {
+            "type": "Transform",
+            "posX": 0,
+            "posY": 0,
+            "posZ": 0,
+            "scaleX": 1,
+            "scaleY": 1,
+            "scaleZ": 1,
+            "rotX": 0,
+            "rotY": 0,
+            "rotZ": 0
+          },
+          {
+            "type": "MeshRenderer",
+            "meshPath": "models/ufo.glb",
+            "meshShape": 0,
+            "albedoTex": "textures/ufo-yellow.jpg",
+            "visible": true,
+            "baseColorR": 1,
+            "baseColorG": 1,
+            "baseColorB": 1,
+            "baseColorA": 1,
+            "metallic": 0,
+            "roughness": 0.85,
+            "castsShadow": true,
+            "receivesShadow": true,
+            "materialPath": "materials/classic.mat.json",
+            "materialOverrides": 127
+          }
+        ]
+      }
+    ]
+  }
+}

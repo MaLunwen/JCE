@@ -21,7 +21,7 @@
  * The guard has TWO spellings and grepping for only the first will convince
  * you this file is broken when it is not:
  *
- *     s->have_host && s->host.<member>          107 functions
+ *     s->have_host && s->host.<member>          108 functions
  *     !s->have_host || !s->host.<member>        1 function (jce.get_touch),
  *                                               where an index_base binding
  *                                               folds the guard into its
@@ -584,7 +584,7 @@ static int l_jce_get_pointer_delta(lua_State *L)
 }
 
 /* jce.get_pointer_position — shape: void_out_array
- * Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime. */
+ * Viewport-local Canvas pixel x, y, width, height (native drawable or Editor GameView FBO after render_scale); zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime. */
 static int l_jce_get_pointer_position(lua_State *L)
 {
     JceScript *s = jce_script_self_from_upvalue(L);
@@ -1482,6 +1482,19 @@ static int l_jce_stat_flush(lua_State *L)
     return 1;
 }
 
+/* jce.get_viewport_size — shape: void_out_array
+ * Host presentation width and height in Canvas pixels (native drawable or Editor GameView FBO after render_scale), independent of pointer availability, focus or hover. Persistent until the host replaces or clears it; unavailable or absent sized-host callbacks return zero, zero. */
+static int l_jce_get_viewport_size(lua_State *L)
+{
+    JceScript *s = jce_script_self_from_upvalue(L);
+    float out_wh[2] = { 0.0f, 0.0f };
+    if (s->have_host && s->host.viewport_size)
+        s->host.viewport_size(s->host.user, out_wh);
+    lua_pushnumber(L, (lua_Number)out_wh[0]);
+    lua_pushnumber(L, (lua_Number)out_wh[1]);
+    return 2;
+}
+
 const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "get_position",
     "set_position",
@@ -1591,6 +1604,7 @@ const char *const JCE_SCRIPT_GENERATED_BINDING_NAMES[] = {
     "stat_set",
     "stat_get",
     "stat_flush",
+    "get_viewport_size",
 };
 
 void jce_script_install_generated_bindings(JceScript *s)
@@ -1704,6 +1718,7 @@ void jce_script_install_generated_bindings(JceScript *s)
     jce_script_register_binding(L, s, "stat_set", l_jce_stat_set);
     jce_script_register_binding(L, s, "stat_get", l_jce_stat_get);
     jce_script_register_binding(L, s, "stat_flush", l_jce_stat_flush);
+    jce_script_register_binding(L, s, "get_viewport_size", l_jce_get_viewport_size);
     /* json_null: lightuserdata_sentinel — no register_binding call,
      * so no source regex can see it.
      * tests/middleware/script/test_jce_script_table_shape.c can. */

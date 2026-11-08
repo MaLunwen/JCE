@@ -20,7 +20,7 @@
  * The guard has TWO spellings and grepping for only the first will convince
  * you this file is broken when it is not:
  *
- *     s->have_host && s->host.<member>          107 functions
+ *     s->have_host && s->host.<member>          108 functions
  *     !s->have_host || !s->host.<member>        1 function (jce.get_touch),
  *                                               where an index_base binding
  *                                               folds the guard into its
@@ -1043,7 +1043,7 @@ static JSValue js_jce_get_pointer_delta(JSContext *ctx, JSValueConst this_val,
 }
 
 /* jce.get_pointer_position - shape: void_out_array
- * Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime. */
+ * Viewport-local Canvas pixel x, y, width, height (native drawable or Editor GameView FBO after render_scale); zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime. */
 static JSValue js_jce_get_pointer_position(JSContext *ctx, JSValueConst this_val,
                                            int argc, JSValueConst *argv)
 {
@@ -2651,6 +2651,24 @@ static JSValue js_jce_stat_flush(JSContext *ctx, JSValueConst this_val,
     return ret;
 }
 
+/* jce.get_viewport_size - shape: void_out_array
+ * Host presentation width and height in Canvas pixels (native drawable or Editor GameView FBO after render_scale), independent of pointer availability, focus or hover. Persistent until the host replaces or clears it; unavailable or absent sized-host callbacks return zero, zero. */
+static JSValue js_jce_get_viewport_size(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+{
+    JceJsScript *s = (JceJsScript *)JS_GetContextOpaque(ctx);
+    JSValue ret = JS_UNDEFINED;
+    (void)this_val; (void)argc; (void)argv;
+    if (!s) return JS_UNDEFINED;
+    float out_wh[2] = { 0.0f, 0.0f };
+    if (s->have_host && s->host.viewport_size)
+        s->host.viewport_size(s->host.user, out_wh);
+    ret = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, ret, 0, JS_NewFloat64(ctx, (double)out_wh[0]));
+    JS_SetPropertyUint32(ctx, ret, 1, JS_NewFloat64(ctx, (double)out_wh[1]));
+    return ret;
+}
+
 const char *const JCE_SCRIPT_JS_BINDING_NAMES[] = {
     "get_position",
     "set_position",
@@ -2760,6 +2778,7 @@ const char *const JCE_SCRIPT_JS_BINDING_NAMES[] = {
     "stat_set",
     "stat_get",
     "stat_flush",
+    "get_viewport_size",
 };
 
 static const JSCFunctionListEntry k_jce_fns[] = {
@@ -2871,6 +2890,7 @@ static const JSCFunctionListEntry k_jce_fns[] = {
     JS_CFUNC_DEF("stat_set", 2, js_jce_stat_set),
     JS_CFUNC_DEF("stat_get", 2, js_jce_stat_get),
     JS_CFUNC_DEF("stat_flush", 0, js_jce_stat_flush),
+    JS_CFUNC_DEF("get_viewport_size", 0, js_jce_get_viewport_size),
 };
 
 bool jce_script_js_install_bindings(JceJsScript *s)

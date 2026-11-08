@@ -9,8 +9,8 @@
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/platform/jce_host_font.h>
 
-#include <stdlib.h>   /* getenv, for the system font dir */
 #include <stdio.h>
 #include <string.h>
 
@@ -41,6 +41,11 @@ static struct {
      * fixes and why it invalidates the same generation. */
     char     fallbacks[512];
     unsigned gen;
+    unsigned system_font_gen;
+    bool     system_fonts_resolved;
+    char     system_latin[1024];
+    char     system_cjk[1024];
+    char     system_symbols[1024];
 } s_uc;
 
 void jce_ui_canvas_set_asset_root(const char *root_dir)
@@ -71,6 +76,12 @@ void jce_ui_canvas_set_font_fallbacks(const char *paths_semicolon)
     s_uc.gen++;
 }
 
+void jce_ui_canvas_invalidate_resources(void)
+{
+    ++s_uc.gen;
+    LOG_DEBUG(LOG_TAG, "resources phase=invalidated generation=%u", s_uc.gen);
+}
+
 unsigned    uc_resource_generation(void)   { return s_uc.gen; }
 const char *uc_resource_default_font(void) { return s_uc.default_font; }
 const char *uc_resource_asset_root(void)   { return s_uc.asset_root; }
@@ -91,77 +102,34 @@ static bool uc_path_is_absolute(const char *p)
     return p[1] == ':' && (p[2] == '/' || p[2] == '\\');
 }
 
-/* The system UI font, as an absolute host path.
- *
- * WHY THIS EXISTS.  UC_DEFAULT_FONT is "fonts/JCE.ttf", and that string is
- * what every UIText with an empty font_path resolved to.  JCE.ttf is a
- * hand-drawn glyph set that ships with the engine's sample content -- it is
- * artwork, not a UI face -- so the engine's silent default was a decorative
- * font, and every scene copied from a sample inherited it by name as well.
- * A default that is also the only obvious example becomes the answer
- * everybody gives.
- *
- * So an unspecified UI font now means "the one this machine uses for its own
- * UI", and JCE.ttf is only what you get when you ask for it.
- *
- * Deliberately a short, fixed list rather than a font-config dependency:
- * this runs in the engine, on every platform it ships to, and the failure
- * mode of guessing wrong is one more fallback step -- not a missing feature.
- * The names are the default UI face of each platform, newest first, then a
- * broadly-installed Latin face.  Returns false if none is readable, and the
- * caller then falls back exactly as it did before. */
-static bool uc_system_ui_font(char *out, size_t out_size)
+/* System candidates are paths, not font owners. Resolve once per resource
+ * generation; each Canvas retains its existing independent atlas/cache owner. */
+static void uc_resolve_system_fonts(void)
 {
-#if JCE_PLATFORM_WINDOWS
-    const char *dir = getenv("WINDIR");
-    static const char *names[] = { "segoeui.ttf", "tahoma.ttf",
-                                   "arial.ttf", NULL };
-    char probe[1024];
-    int i;
-    if (!dir || !dir[0]) dir = "C:\\Windows";
-    for (i = 0; names[i]; ++i) {
-        snprintf(probe, sizeof probe, "%s\\Fonts\\%s", dir, names[i]);
-        if (jce_fs_host_exists_file(probe)) {
-            jce_strlcpy(out, probe, out_size);
-            return true;
-        }
-    }
-#elif JCE_PLATFORM_APPLE
-    static const char *paths[] = {
-        "/System/Library/Fonts/SFNS.ttf",
-        "/System/Library/Fonts/Helvetica.ttc",
-        "/Library/Fonts/Arial.ttf", NULL };
-    int i;
-    for (i = 0; paths[i]; ++i) {
-        if (jce_fs_host_exists_file(paths[i])) {
-            jce_strlcpy(out, paths[i], out_size);
-            return true;
-        }
-    }
-#else
-    static const char *paths[] = {
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf", NULL };
-    int i;
-    for (i = 0; paths[i]; ++i) {
-        if (jce_fs_host_exists_file(paths[i])) {
-            jce_strlcpy(out, paths[i], out_size);
-            return true;
-        }
-    }
-#endif
-    (void)out; (void)out_size;
-    return false;
+    if (s_uc.system_fonts_resolved && s_uc.system_font_gen == s_uc.gen) return;
+    jce_host_default_font(JCE_HOST_FONT_UI_LATIN, s_uc.system_latin,
+                          sizeof s_uc.system_latin);
+    jce_host_default_font(JCE_HOST_FONT_UI_CJK, s_uc.system_cjk,
+                          sizeof s_uc.system_cjk);
+    jce_host_default_font(JCE_HOST_FONT_UI_SYMBOLS, s_uc.system_symbols,
+                          sizeof s_uc.system_symbols);
+    s_uc.system_font_gen = s_uc.gen;
+    s_uc.system_fonts_resolved = true;
 }
 
 bool uc_resource_system_ui_font(char *out, size_t out_size)
 {
-    if (!out || out_size == 0) return false;
+    if (!out || !out_size) return false;
     out[0] = '\0';
-    return uc_system_ui_font(out, out_size);
+    uc_resolve_system_fonts();
+    if (!s_uc.system_latin[0] || strlen(s_uc.system_latin) + 1 > out_size)
+        return false;
+    memcpy(out, s_uc.system_latin, strlen(s_uc.system_latin) + 1);
+    return true;
 }
+
+static const char uc_stock_cjk_key[] = "@stock-cjk";
+static const char uc_stock_cjk_path[] = "fonts/JCE-CJK-Fallback.ttf";
 
 JceFont *uc_open_font_path(const JcePakArchive *pak, const char *p,
                            int px, bool sdf)
@@ -181,6 +149,14 @@ JceFont *uc_open_font_path(const JcePakArchive *pak, const char *p,
      * it bounds how far a glyph can be magnified before the edge runs out
      * of information. */
     if (sdf) jce_font_set_sdf_spread(8);
+
+    /* The stock cache key is distinct from an authored asset path. Only
+     * the Canvas PAK may provide the licensed fallback bytes. */
+    if (strcmp(p, uc_stock_cjk_key) == 0) {
+        if (pak) f = jce_font_open_ex(pak, uc_stock_cjk_path, (float)px, cps, n);
+        if (sdf) jce_font_set_sdf_spread(0);
+        return f;
+    }
 
     /* An ABSOLUTE path is already a host path and must not be joined to the
      * asset root -- that is what a system UI font looks like, and joining it
@@ -230,9 +206,53 @@ JceFont *uc_open_font_path(const JcePakArchive *pak, const char *p,
  * A fallback that fails to open is skipped and said so once: silently drawing
  * tofu is what this whole path exists to stop, so "the font you named is not
  * there" must not look like "your text has no glyphs". */
-void uc_attach_fallbacks(JceUICanvas *uc, JceFont *f, int px, bool sdf)
+void uc_attach_fallbacks(JceUICanvas *uc, JceFont *f, const char *primary_path,
+                         int px, bool sdf)
 {
-    if (!f || !s_uc.fallbacks[0]) return;
+    if (!f) return;
+    if (!s_uc.fallbacks[0]) {
+        /* An explicit component/project font or fallback list keeps its own
+         * policy. Only the ordinary system/stock default gains CJK/Symbols leaves. */
+        if (s_uc.default_font[0] || !primary_path) return;
+        uc_resolve_system_fonts();
+        if (strcmp(primary_path, UC_DEFAULT_FONT) &&
+            strcmp(primary_path, s_uc.system_latin)) return;
+        bool cjk = false, symbols = false;
+        if (s_uc.system_cjk[0]) {
+            cjk = strcmp(primary_path, s_uc.system_cjk) == 0;
+        }
+        if (s_uc.system_cjk[0] && !cjk) {
+            JceFont *fb = uc_get_font_leaf(uc, s_uc.system_cjk, px, sdf);
+            cjk = fb && jce_font_add_fallback(f, fb);
+            if (!cjk)
+                LOG_WARN(LOG_TAG, "font phase=system_cjk_rejected primary=%s "
+                         "path=%s px=%d generation=%u", primary_path,
+                         s_uc.system_cjk, px, s_uc.gen);
+        }
+        if (s_uc.system_symbols[0]) {
+            symbols = strcmp(primary_path, s_uc.system_symbols) == 0 ||
+                (cjk && strcmp(s_uc.system_symbols, s_uc.system_cjk) == 0);
+        }
+        if (s_uc.system_symbols[0] && !symbols) {
+            JceFont *fb = uc_get_font_leaf(uc, s_uc.system_symbols, px, sdf);
+            symbols = fb && jce_font_add_fallback(f, fb);
+            if (!symbols)
+                LOG_WARN(LOG_TAG, "font phase=system_symbols_rejected primary=%s "
+                         "path=%s px=%d generation=%u", primary_path,
+                         s_uc.system_symbols, px, s_uc.gen);
+        }
+        if (!cjk || !symbols) {
+            JceFont *fb = uc_get_font_leaf(uc, uc_stock_cjk_key, px, sdf);
+            if (fb && jce_font_add_fallback(f, fb))
+                LOG_INFO(LOG_TAG, "font phase=stock_fallback_ready owner=canvas_resources "
+                         "path=%s px=%d generation=%u", uc_stock_cjk_path, px, s_uc.gen);
+            else
+                LOG_WARN(LOG_TAG, "font phase=stock_fallback_unavailable owner=canvas_resources "
+                         "cjk=%u symbols=%u generation=%u", (unsigned)cjk,
+                         (unsigned)symbols, s_uc.gen);
+        }
+        return;
+    }
 
     const char *cur = s_uc.fallbacks;
     while (*cur) {
@@ -242,11 +262,15 @@ void uc_attach_fallbacks(JceUICanvas *uc, JceFont *f, int px, bool sdf)
         if (len > 0 && len < sizeof one) {
             memcpy(one, cur, len);
             one[len] = '\0';
-            JceFont *fb = uc_get_font(uc, one, px, sdf);
+            /* Leaf cache entries never receive the global list themselves.
+             * A primary may also be selected as a leaf elsewhere; those roles
+             * own distinct objects so no later attachment creates a cycle. */
+            JceFont *fb = primary_path && strcmp(primary_path, one) == 0
+                ? f : uc_get_font_leaf(uc, one, px, sdf);
             if (fb && fb != f) {
                 if (!jce_font_add_fallback(f, fb))
-                    LOG_WARN(LOG_TAG, "font fallback chain full, dropping %s",
-                             one);
+                    LOG_WARN(LOG_TAG, "font phase=fallback_rejected path=%s "
+                             "px=%d reason=chain_contract", one, px);
             } else if (!fb) {
                 LOG_WARN(LOG_TAG, "font fallback not found: %s @%dpx",
                          one, px);

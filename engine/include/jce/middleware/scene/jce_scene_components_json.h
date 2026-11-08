@@ -25,7 +25,8 @@ typedef struct JceFileSystem JceFileSystem;
 
 /* Parse a scene JSON root (flat entity array format) into an existing scene.
  * Entities are appended to the scene; existing entities are not cleared.
- * Handles contract envelope, flat array, and legacy formats.
+ * Handles contract envelope, flat array, and legacy formats. Array/node order
+ * authors relative entity order; both loader modes preserve it when remapping IDs.
  * Returns the number of entities loaded, or -1 on error. */
 JCE_API int jce_scene_load_json(JceScene *scene, const JceJson *root);
 
@@ -103,12 +104,14 @@ JCE_API void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
  * Caller owns the returned tree and must release it with jce_json_free(). */
 JCE_API JceJson *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e);
 
-/* Serialize all entities in the scene to a JSON root (flat entity array).
+/* Serialize all entities in authored creation order to a flat entity array.
+ * Table migration and recycled IDs do not reorder it; loading preserves the
+ * relative order. The private ordinal is scene-local, not a persistent ID.
  * Caller owns the returned tree and must release it with jce_json_free(). */
 JCE_API JceJson *jce_scene_save_json(const JceScene *scene);
 
 /* Serialize a subtree (root + all transitive descendants in the
- * parent/child hierarchy) to a JSON root. Used by the prefab system.
+ * parent/child hierarchy) in authored sibling order. Used by the prefab system.
  * Caller owns the returned tree and must release it with jce_json_free(). */
 JCE_API JceJson *jce_scene_save_subtree_json(const JceScene *scene, JceEntity root);
 

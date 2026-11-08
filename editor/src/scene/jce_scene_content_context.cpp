@@ -21,7 +21,7 @@ std::string join_path(const char *root, const char *child,
 
 JceEditorSceneContentPaths jce_editor_scene_content_paths(
     bool isolated, const char *project_root, const char *source_assets,
-    const char *cooked_assets)
+    const char *cooked_assets, const char *loose_asset_root)
 {
     JceEditorSceneContentPaths paths;
     paths.isolated = isolated;
@@ -30,8 +30,14 @@ JceEditorSceneContentPaths jce_editor_scene_content_paths(
         return paths;
     }
 
-    if (!project_root || !project_root[0])
+    if (!project_root || !project_root[0]) {
+        if (loose_asset_root && loose_asset_root[0]) {
+            paths.particle_asset_root = loose_asset_root;
+            paths.render_settings_primary =
+                join_path(loose_asset_root, "render_settings.json");
+        }
         return paths;
+    }
 
     const char *source = source_assets && source_assets[0]
                              ? source_assets : "resources/assets";

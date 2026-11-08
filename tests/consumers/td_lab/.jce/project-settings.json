@@ -1,0 +1,33 @@
+{
+  "graphics": {
+    "color_space": 0,
+    "hdr": false,
+    "default_msaa": 1,
+    "anisotropic_textures": 0
+  },
+  "player": {
+    "default_screen_width": 1280,
+    "default_screen_height": 720
+  },
+  "quality": {
+    "current_level": 0,
+    "levels": [
+      {
+        "name": "Reference",
+        "pixel_light_count": 1,
+        "texture_quality": 0,
+        "anisotropic": 0,
+        "anti_aliasing": 0,
+        "soft_particles": false,
+        "realtime_reflection_probes": false,
+        "shadow_quality": 2,
+        "shadow_resolution": 0,
+        "shadow_distance": 250,
+        "shadow_cascades": 1,
+        "vsync_count": 1,
+        "target_framerate": 0,
+        "lod_bias": 1
+      }
+    ]
+  }
+}

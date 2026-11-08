@@ -233,6 +233,13 @@ typedef struct JceInputFrame {
 /* Capture the current input state into `out`.  Safe to call any time. */
 JCE_API void jce_input_capture(const JceInput *input, JceInputFrame *out);
 
+/* True only after a successful jce_input_replay_tick applied the current
+ * snapshot. NULL returns false. Main thread, borrowed input lifetime. Normal
+ * update/apply (including refusal), live ingestion, replay failure and EOF
+ * clear this observation; an environment request is not replay evidence.
+ * This is CPU snapshot origin, not recording durability or physical input. */
+JCE_API bool jce_input_snapshot_was_replayed(const JceInput *input);
+
 /* Override the current input state from a previously captured frame.  After
  * this call, the next jce_input_update() rolls cur->prev as usual.  Returns
  * false if the frame version does not match.

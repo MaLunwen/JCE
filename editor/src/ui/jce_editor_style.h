@@ -35,13 +35,11 @@ int  jce_editor_get_theme(void);
    both use this so the accepted spellings can never drift apart. */
 int  jce_editor_theme_from_string(const char *s);
 
-/* Load fonts and set the default. Resolution priority for each font:
-     1. user override path (if non-NULL and file exists)
-     2. system font (e.g. Ink Free / KaiTi installed on the host OS)
-   No fonts are bundled — if both lookups fail, the editor falls back to
-   ImGui's built-in proggy font for that role.
-   Override paths may be NULL or empty.
-   Must be called before jce_imgui_renderer_rebuild_fonts(). */
+/* Load fonts and set the default. Explicit user paths win. Latin next tries
+   installed Segoe Print, then system UI Sans; CJK uses an installed CJK face.
+   Missing system Latin falls back to the licensed stock Aileron subset, then
+   ImGui's built-in font. A missing CJK face is explicitly diagnosed.
+   Override paths may be NULL or empty. Call outside an active ImGui frame. */
 bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
                            const char *en_override,
                            const char *zh_override);

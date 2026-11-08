@@ -202,6 +202,25 @@ static void test_the_specular_chain_has_every_mip_and_gets_rougher(void)
     free(src); free(chain);
 }
 
+static void test_probe_chain_layout_includes_high_resolution_tail_mips(void)
+{
+    static const struct { uint32_t edge, mips; size_t bytes; } cases[] = {
+        {1u, 1u, 24u}, {16u, 5u, 8184u}, {64u, 7u, 131064u},
+        {128u, 8u, 524280u}, {256u, 9u, 2097144u}, {512u, 10u, 8388600u}
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        TEST_ASSERT_EQUAL_UINT32(cases[i].mips, jce_ibl_cube_mip_count(cases[i].edge));
+        TEST_ASSERT_EQUAL_size_t(cases[i].bytes, jce_ibl_cube_mipchain_bytes(cases[i].edge));
+    }
+    /* Counts and allocation sizes must refuse narrow/backend overflow, not
+     * wrap into a small allocation that convolution would then overrun. */
+    static const uint32_t invalid[] = {0u, 65535u, 65536u, UINT32_MAX};
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        TEST_ASSERT_EQUAL_UINT32(0u, jce_ibl_cube_mip_count(invalid[i]));
+        TEST_ASSERT_EQUAL_size_t(0u, jce_ibl_cube_mipchain_bytes(invalid[i]));
+    }
+}
+
 /* ── The container round trip ─────────────────────────────────────────
  *
  * A mip chain is only worth writing if it is read back the same way, and the
@@ -503,6 +522,100 @@ static float t_f16_to_f32(uint16_t h)
     float f; memcpy(&f, &b, 4); return f;
 }
 
+static void test_high_resolution_full_chains_survive_real_writer_and_parse(void)
+{
+    static const uint32_t edges[] = {256u, 512u};
+    for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); ++i) {
+        const uint32_t edge = edges[i], expected_mips = i == 0u ? 9u : 10u;
+        const uint32_t mips = jce_ibl_cube_mip_count(edge);
+        TEST_ASSERT_EQUAL_UINT32(expected_mips, mips);
+        for (uint32_t bpp = 4u; bpp <= 8u; bpp += 4u) {
+            const size_t bytes = jce_ibl_cube_mipchain_bytes(edge) * (bpp / 4u);
+            uint8_t *chain = (uint8_t *)calloc(bytes, 1u);
+            TEST_ASSERT_NOT_NULL(chain);
+            size_t offset = 0u;
+            for (uint32_t mip = 0; mip < mips; ++mip) {
+                const uint32_t side = edge >> mip;
+                const size_t face_bytes = (size_t)side * side * bpp;
+                for (uint32_t face = 0; face < 6u; ++face) {
+                    if (bpp == 4u) {
+                        for (uint32_t c = 0; c < 4u; ++c)
+                            chain[offset + face * face_bytes + c] =
+                                (uint8_t)(mip * 17u + face * 3u + c);
+                    } else {
+                        uint16_t *pixel = (uint16_t *)(void *)
+                            (chain + offset + face * face_bytes);
+                        for (uint32_t c = 0; c < 4u; ++c)
+                            pixel[c] = t_f32_to_f16((float)(1u + mip + face + c));
+                    }
+                }
+                offset += face_bytes * 6u;
+            }
+            TEST_ASSERT_EQUAL_size_t(bytes, offset);
+            const char *path = "test_probe_high_chain.ktx";
+            TEST_ASSERT_TRUE(jce__ktx2_write_cubemap(path, edge, mips, chain, bpp));
+            uint64_t file_bytes = 0u;
+            void *file = jce_fs_host_read_all(path, &file_bytes);
+            TEST_ASSERT_NOT_NULL(file);
+            TEST_ASSERT_EQUAL_UINT64((uint64_t)bytes + 64u + 4u * expected_mips,
+                                     file_bytes);
+            uint32_t got_edge = 0u, got_mips = 0u, got_bpp = 0u;
+            size_t got_bytes = 0u;
+            uint8_t *parsed = NULL;
+            TEST_ASSERT_TRUE(jce__ktx_parse_cubemap(file, (size_t)file_bytes,
+                &got_edge, &got_mips, &parsed, &got_bytes, &got_bpp));
+            TEST_ASSERT_EQUAL_UINT32(edge, got_edge);
+            TEST_ASSERT_EQUAL_UINT32(expected_mips, got_mips);
+            TEST_ASSERT_EQUAL_UINT32(bpp, got_bpp);
+            TEST_ASSERT_EQUAL_size_t(bytes, got_bytes);
+            const size_t per_face = bytes / 6u;
+            size_t wire_mip = 0u, side_mip = 0u;
+            for (uint32_t mip = 0; mip < mips; ++mip) {
+                const size_t side = edge >> mip, face_bytes = side * side * bpp;
+                for (uint32_t face = 0; face < 6u; ++face)
+                    TEST_ASSERT_EQUAL_MEMORY(chain + wire_mip + face * face_bytes,
+                        parsed + face * per_face + side_mip, bpp);
+                wire_mip += face_bytes * 6u;
+                side_mip += face_bytes;
+            }
+            jce_free(parsed);
+            jce_fs_buffer_free(file);
+            free(chain);
+            remove(path);
+        }
+    }
+}
+
+static void test_high_resolution_hdr_convolution_fills_the_one_pixel_tail(void)
+{
+    const uint32_t edge = 256u;
+    const size_t input_words = (size_t)edge * edge * 6u * 4u;
+    const size_t output_words = jce_ibl_cube_mipchain_bytes(edge);
+    TEST_ASSERT_EQUAL_UINT32(9u, jce_ibl_cube_mip_count(edge));
+    uint16_t *input = (uint16_t *)calloc(input_words, sizeof(uint16_t));
+    uint16_t *output = (uint16_t *)calloc(output_words, sizeof(uint16_t));
+    TEST_ASSERT_NOT_NULL(input); TEST_ASSERT_NOT_NULL(output);
+    for (size_t pixel = 0; pixel < input_words / 4u; ++pixel) {
+        input[pixel * 4u + 0u] = t_f32_to_f16(4.0f);
+        input[pixel * 4u + 1u] = t_f32_to_f16(4.0f);
+        input[pixel * 4u + 2u] = t_f32_to_f16(4.0f);
+        input[pixel * 4u + 3u] = t_f32_to_f16(1.0f);
+    }
+    jce_ibl_convolve_cube_specular_rgba16f(input, edge, output);
+    TEST_ASSERT_EQUAL_MEMORY(input, output, input_words * sizeof(uint16_t));
+    /* The old eight-level cube path stopped at 2x2 and left these six
+     * 1x1 pixels untouched. Uniform HDR radiance must remain above white. */
+    const size_t last_mip = output_words - 6u * 4u;
+    for (uint32_t face = 0; face < 6u; ++face) {
+        for (uint32_t c = 0; c < 3u; ++c)
+            TEST_ASSERT_FLOAT_WITHIN(0.04f, 4.0f,
+                t_f16_to_f32(output[last_mip + face * 4u + c]));
+        TEST_ASSERT_EQUAL_UINT16(t_f32_to_f16(1.0f),
+                                 output[last_mip + face * 4u + 3u]);
+    }
+    free(output); free(input);
+}
+
 #define HDR_RADIANCE 4.0f   /* four times white paper: a lamp, not a wall */
 
 static void test_hdr_keeps_the_radiance_that_ldr_provably_cannot(void)
@@ -737,7 +850,10 @@ int main(void)
     RUN_TEST(test_irradiance_is_not_a_copy_of_the_radiance);
     RUN_TEST(test_the_cube_sampler_addresses_the_faces_it_thinks_it_does);
     RUN_TEST(test_the_specular_chain_has_every_mip_and_gets_rougher);
+    RUN_TEST(test_probe_chain_layout_includes_high_resolution_tail_mips);
     RUN_TEST(test_the_chain_survives_write_then_parse);
+    RUN_TEST(test_high_resolution_full_chains_survive_real_writer_and_parse);
+    RUN_TEST(test_high_resolution_hdr_convolution_fills_the_one_pixel_tail);
     RUN_TEST(test_the_capture_basis_matches_the_cube_convention);
     RUN_TEST(test_every_face_is_a_different_direction);
     RUN_TEST(test_captured_faces_become_the_artefact);

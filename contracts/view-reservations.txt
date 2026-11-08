@@ -44,6 +44,13 @@
 100-116
 63-63
 26-27
+64-66
+69-69
+94-95
+96-96
+97-97
+98-98
+99-99
 [bases]
 # Every base a scene render is driven from, and the fixed absolute ids.  The
 # two editor viewports render in the SAME frame, so their spans must not
@@ -54,8 +61,8 @@
 50   editor-overlay
 60   editor-material-preview
 70   editor-pick
-71   editor-pick-readback
 120  editor-game-view
+248  editor-pick-readback           Late stock GPU blit, after all scene-remapped and planar views
 250  imgui
 252  occlusion-proxy
 254  ui-overlay

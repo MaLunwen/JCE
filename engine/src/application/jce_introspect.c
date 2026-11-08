@@ -397,8 +397,11 @@ size_t JCE_CALL jce_introspect_stats_json(const JceScene *scene,
     }
 
     jce_mem_profile_get_total(&cur, &peak);
+    jce_json_set_number(root, "memory_tag_peak_sum_bytes", (double)peak);
+    jce_mem_profile_get_aggregate_totals(&cur, &peak);
     jce_json_set_number(root, "memory_current_bytes", (double)cur);
     jce_json_set_number(root, "memory_peak_bytes", (double)peak);
+    jce_json_set_string(root, "memory_scope", "voluntary-tagged");
 
     if (!jce_perf_phase_enabled() || !jce_perf_phase_frame_has_data()) {
         jce_json_set_bool(root, "frame_phases_available", false);

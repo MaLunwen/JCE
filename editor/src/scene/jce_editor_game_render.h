@@ -13,6 +13,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <jce/application/jce_engine.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +90,12 @@ void jce_editor_game_render_reset_occlusion(void);
 void jce_editor_game_render_set_ui_pointer(float x, float y,
                                            bool down, bool valid);
 
+/* Owner-thread Play camera admission/release. Allocation failure refuses Play
+ * before Runtime creation; end is idempotent and independent of viewport draws.
+ * The stopped preview object remains untouched, including projection and roll. */
+bool jce_editor_game_render_begin_play_camera(void);
+void jce_editor_game_render_end_play_camera(void);
+
 /* Hand the game renderer the live Play-mode runtime (NULL to detach on stop).
  * While set, canvas UI events drained after the overlay render are dispatched to
  * its gameplay script VM, so in-editor Play exercises UIButton on_click / widget
@@ -116,7 +123,25 @@ void jce_editor_game_render_key_edit(int scancode, unsigned short mod);
  * this frame's hovered scroll view. */
 void jce_editor_game_render_scroll(float dx, float dy);
 
-/* Render one frame at the requested viewport size. The texture handle
+/* Resolve requested presentation pixels through the current pipeline once.
+ * No OS query. Pointer, runtime extent and Canvas use this resolved extent. */
+void jce_editor_game_render_resolve_extent(uint32_t width, uint32_t height,
+                                          uint32_t *out_w, uint32_t *out_h);
+
+/* Optional current app.draw diagnostics, reset before every layout. The
+ * copied public POD contains CPU observations only and retains no pointers. */
+void jce_editor_game_render_observation_begin(bool enabled);
+void jce_editor_game_render_observation_policy(uint32_t reason);
+void jce_editor_game_render_observation_request(uint32_t width, uint32_t height);
+void jce_editor_game_render_observation_image(uint16_t texture);
+bool jce_editor_game_render_observation_copy(JceFrameViewportObservation *out);
+
+/* Current Game bridge extent after this renderer frame's completed CPU draw.
+ * Reads committed target metadata only, never a suggested extent or GPU timer.
+ * Returns false/zero for stale, refused, uninitialized or missing targets. */
+bool jce_editor_game_render_get_committed_extent(uint32_t *width, uint32_t *height);
+
+/* Render one frame at the resolved Canvas/FBO size. The texture handle
  * returned by jce_editor_game_render_get_texture() is updated in-place. */
 void jce_editor_game_render_frame(uint32_t width, uint32_t height);
 
@@ -128,10 +153,18 @@ uint16_t jce_editor_game_render_get_texture(void);
  * asynchronous and shares the renderer's single readback queue; poll once per
  * editor frame until the return value is non-zero (-1 idle, 0 pending,
  * 1 written, 2 failed). */
-bool jce_editor_game_render_screenshot(const char *path);
+typedef struct JceEditorGameScreenshotFrame {
+    uint32_t source_frame;
+    uint32_t submit_frame;
+} JceEditorGameScreenshotFrame;
+
+/* Optional frame receipt is written only after the readback is admitted. */
+bool jce_editor_game_render_screenshot(
+    const char *path, JceEditorGameScreenshotFrame *frame);
 int jce_editor_game_render_capture_poll(void);
 
-/* Access the FPS fly-camera so the panel can drive movement / look. */
+/* Borrow the current display camera for owner-thread movement/look: the Play
+ * camera until Stop, otherwise stopped preview. Do not retain across Stop. */
 JceCamera *jce_editor_game_render_get_camera(void);
 
 /* Reset the FPS camera to a sensible default (slightly above the origin

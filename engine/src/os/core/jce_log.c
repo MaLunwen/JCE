@@ -20,6 +20,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_timer.h>
+#include "jce_log_internal.h"
 
 #include <SDL3/SDL.h>
 #include <stdarg.h>
@@ -78,8 +79,15 @@ static int to_android_prio(JceLogLevel level)
 
 /* -- Global state -------------------------------------------------- */
 
-static JceLogLevel g_min_level = JCE_LOG_LEVEL_INFO;
-static bool        g_colors    = true;
+/* One logger status owner. Initialization resets only the final-close result;
+ * level/color configuration retains its existing setter/restart semantics. */
+static struct {
+    JceLogLevel min_level;
+    bool colors;
+    JceLogFinalClose final_close;
+} g_log_status = { JCE_LOG_LEVEL_INFO, true, JCE_LOG_FINAL_CLOSE_UNOBSERVED };
+
+JceLogFinalClose jce_log_final_close_internal(void) { return g_log_status.final_close; }
 
 /* Per-thread display name (e.g. "MAIN", "RENDER"). */
 #ifdef _MSC_VER
@@ -504,7 +512,7 @@ static void emit_message(const JceLogMessage *m,
     const char *lvl   = level_str(m->level);
     const char *lclr  = level_color(m->level);
 
-    if (g_colors) {
+    if (g_log_status.colors) {
         fprintf(stderr,
                 ANSI_GRAY  "%s" ANSI_RESET " "
                 ANSI_PURPLE "[%s]" ANSI_RESET " "
@@ -668,6 +676,7 @@ static int SDLCALL log_backend_func(void *data)
 
 void jce_log_init(void)
 {
+    g_log_status.final_close = JCE_LOG_FINAL_CLOSE_UNOBSERVED;
 #ifdef SDL_PLATFORM_WINDOWS
     /* Enable ANSI escape codes on Windows 10+ console. */
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -680,7 +689,7 @@ void jce_log_init(void)
     /* The colour decision is the SAME question this call already answers.
      * GetConsoleMode fails when stderr is a file or a pipe, so its result is
      * exactly "is stderr a console?" -- and until now it was used only to turn
-     * VT processing on and then discarded, while g_colors stayed
+     * VT processing on and then discarded, while the color flag stayed
      * unconditionally true.  So `jce_editor.exe > log.txt 2>&1` wrote raw
      * ANSI escapes into the file: a persisted log full of \033[96m.
      *
@@ -693,21 +702,28 @@ void jce_log_init(void)
      * changes the DEFAULT from "always colour" to "colour a terminal". */
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
     if (hErr == INVALID_HANDLE_VALUE) {
-        g_colors = false;
+        g_log_status.colors = false;
     } else {
         DWORD mode = 0;
         if (GetConsoleMode(hErr, &mode)) {
             SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         } else {
-            g_colors = false;   /* redirected to a file or a pipe */
+            g_log_status.colors = false;   /* redirected to a file or a pipe */
         }
     }
 #else
     /* Same rule everywhere else, asked the POSIX way. */
-    g_colors = isatty(STDERR_FILENO) ? true : false;
+    g_log_status.colors = isatty(STDERR_FILENO) ? true : false;
 #endif
 
 #ifdef JCE_LOG_ASYNC
+    if (g_ring && !g_backend_thread) {
+        /* Quiescence retains the existing ring, file and observer ownership. */
+        SDL_SetAtomicInt(&g_running, 1);
+        g_backend_thread = SDL_CreateThread(log_backend_func, "JCE-Log", NULL);
+        if (!g_backend_thread) SDL_SetAtomicInt(&g_running, 0);
+        return;
+    }
     if (!g_ring) {
         JceLogRing *ring = jce_log_ring_create();
         SDL_Mutex *file_mtx = SDL_CreateMutex();
@@ -752,10 +768,10 @@ void jce_log_init(void)
 #endif
 }
 
-void jce_log_shutdown(void)
+void jce_log_quiesce_internal(void)
 {
 #ifdef JCE_LOG_ASYNC
-    if (!g_ring) return;
+    if (!g_ring || !g_backend_thread) return;
 
     /* Signal backend to stop and wait for it to drain. */
     SDL_SetAtomicInt(&g_running, 0);
@@ -765,17 +781,28 @@ void jce_log_shutdown(void)
 
     SDL_WaitThread(g_backend_thread, NULL);
     g_backend_thread = NULL;
+#endif
+}
+
+void jce_log_shutdown(void)
+{
+#ifdef JCE_LOG_ASYNC
+    if (!g_ring) return;
+    jce_log_quiesce_internal();
 
     jce_log_ring_destroy(g_ring);
     g_ring = NULL;
 
     if (g_log_file) {
-        SDL_CloseIO(g_log_file);
+        const bool flushed = SDL_FlushIO(g_log_file);
+        const bool closed = SDL_CloseIO(g_log_file);
+        g_log_status.final_close = flushed && closed ? JCE_LOG_FINAL_CLOSE_API_OK
+                                         : JCE_LOG_FINAL_CLOSE_API_FAILED;
         g_log_file = NULL;
-    }
+    } else g_log_status.final_close = JCE_LOG_FINAL_CLOSE_NO_FILE;
     g_log_path[0] = '\0';
     g_file_bytes  = 0;
-    /* g_file_cfg is deliberately kept, like g_min_level / g_colors / g_sink. */
+    /* File config, status level/colors and sink deliberately survive shutdown. */
     if (g_file_mtx) {
         SDL_DestroyMutex(g_file_mtx);
         g_file_mtx = NULL;
@@ -789,7 +816,7 @@ void jce_log_shutdown(void)
         g_flush_mtx = NULL;
     }
     /* Safe now: the backend thread is joined, so no sink call is in flight.
-       g_sink itself is deliberately kept, like g_min_level / g_colors. */
+       The sink itself is deliberately kept, like status level/colors. */
     if (g_sink_mtx) {
         SDL_DestroyMutex(g_sink_mtx);
         g_sink_mtx = NULL;
@@ -807,7 +834,7 @@ void jce_log_flush(void)
     if (!g_ring || !g_backend_thread ||
         !g_flush_mtx || !g_flush_cond ||
         !SDL_GetAtomicInt(&g_running)) {
-        fflush(stderr);
+        log_backend_flush_outputs();
         return;
     }
 
@@ -903,12 +930,12 @@ bool jce_log_get_file_config(JceLogFileConfig *out)
 
 void jce_log_set_level(JceLogLevel level)
 {
-    g_min_level = level;
+    g_log_status.min_level = level;
 }
 
 void jce_log_set_colors(bool enabled)
 {
-    g_colors = enabled;
+    g_log_status.colors = enabled;
 }
 
 void jce_log_set_thread_name(const char *name)
@@ -928,11 +955,50 @@ void jce_log_set_sink(JceLogSinkFn fn, void *user)
     SDL_UnlockMutex(g_sink_mtx);
 }
 
+/* Keep ordinary messages byte-for-byte. A bounded record must never present
+ * an incomplete diagnostic as complete. required_bytes excludes the NUL and
+ * is supplied by the same (only) formatting call, not a second format pass. */
+static void log_format_message(JceLogMessage *message, const char *fmt, va_list ap)
+{
+    char *out = message->message;
+    const size_t capacity = sizeof(message->message);
+    const int required = vsnprintf(out, capacity, fmt, ap);
+    if (required >= 0 && (size_t)required < capacity) return;
+    if (required < 0) {
+        static const char error[] = "[jce_log_format_error]";
+        memcpy(out, error, sizeof(error));
+        return;
+    }
+
+    static const char marker[] = " [jce_log_truncated required_bytes=";
+    char digits[sizeof(unsigned int) * 3u + 1u];
+    size_t digit_count = 0;
+    unsigned int remaining = (unsigned int)required;
+    do {
+        digits[digit_count++] = (char)('0' + remaining % 10u);
+        remaining /= 10u;
+    } while (remaining != 0);
+
+    const size_t suffix_size = sizeof(marker) - 1u + digit_count + 1u;
+    size_t prefix_size = capacity - 1u - suffix_size;
+    /* out[prefix_size] is the first removed byte. For valid UTF-8, retreat to
+     * its leading byte if the new boundary would split a codepoint. The
+     * suffix leaves room before vsnprintf's own potentially partial tail. */
+    while (prefix_size != 0 &&
+           ((unsigned char)out[prefix_size] & 0xc0u) == 0x80u)
+        --prefix_size;
+    memcpy(out + prefix_size, marker, sizeof(marker) - 1u);
+    size_t at = prefix_size + sizeof(marker) - 1u;
+    while (digit_count != 0) out[at++] = digits[--digit_count];
+    out[at++] = ']';
+    out[at] = '\0';
+}
+
 void jce_log_write(JceLogLevel level, const char *tag,
                    const char *file, int line,
                    const char *fmt, ...)
 {
-    if (level < g_min_level) return;
+    if (level < g_log_status.min_level) return;
 
     /* Build the log message on the stack. */
     JceLogMessage m;
@@ -955,11 +1021,11 @@ void jce_log_write(JceLogLevel level, const char *tag,
     /* Format the user message. */
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(m.message, sizeof(m.message), fmt, ap);
+    log_format_message(&m, fmt, ap);
     va_end(ap);
 
 #ifdef JCE_LOG_ASYNC
-    if (g_ring) {
+    if (g_ring && g_backend_thread) {
         jce_log_ring_push(g_ring, &m);
         return;
     }
@@ -974,7 +1040,7 @@ void jce_log_write_v(JceLogLevel level, const char *tag,
                      const char *file, int line,
                      const char *fmt, va_list ap)
 {
-    if (level < g_min_level) return;
+    if (level < g_log_status.min_level) return;
 
     /* Build the log message on the stack. */
     JceLogMessage m;
@@ -995,10 +1061,10 @@ void jce_log_write_v(JceLogLevel level, const char *tag,
     }
 
     /* Format the user message using provided va_list. */
-    vsnprintf(m.message, sizeof(m.message), fmt, ap);
+    log_format_message(&m, fmt, ap);
 
 #ifdef JCE_LOG_ASYNC
-    if (g_ring) {
+    if (g_ring && g_backend_thread) {
         jce_log_ring_push(g_ring, &m);
         return;
     }

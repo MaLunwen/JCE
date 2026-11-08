@@ -9,5 +9,15 @@
   "generated_by": "jce automation project.create",
   "script_modules": [
     "native/build/mines_controller.dll"
-  ]
+  ],
+  "required_languages": [
+    "lua",
+    "c"
+  ],
+  "native_script_factories": [
+    "mines_module"
+  ],
+  "native_script_refs": {
+    "scripts/minescontroller.jcec": "scripts/MinesController.jcec"
+  }
 }

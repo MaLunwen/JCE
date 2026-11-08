@@ -28,6 +28,8 @@
 #include "middleware/animation/jce_morph_gpu.h"   /* GPU blendshape deform */
 
 #include <jce/resource/jce_pak_loader.h>
+#include "renderer/jce_skinned_mesh_deform_internal.h"
+#include "renderer/jce_model_deform_internal.h"
 
 /* FEATURE 3.1 last-mile — per-instance morph (blendshape) weight resolution.
  *
@@ -51,7 +53,7 @@
  * primitive, or UINT16_MAX to fall through to the static skinned VB.  The same
  * callback (and the same ai) MUST drive both color and shadow so the cast
  * silhouette matches the morphed, lit mesh. */
-uint16_t sr_morph_vb_cb(void *user, uint32_t node, uint32_t prim)
+static uint16_t sr_morph_vb_cb(void *user, uint32_t node, uint32_t prim)
 {
     const SrAnimInstance *ai = (const SrAnimInstance *)user;
     if (!ai) return (uint16_t)UINT16_MAX;
@@ -183,6 +185,213 @@ void sr_deform_morph_prims(JceSceneRenderer *sr, SrAnimInstance *ai)
     memcpy(ai->morph_last_weights, ai->morph_weights,
            ai->morph_count * sizeof(float));
     ai->morph_last_count = (int)ai->morph_count;
+}
+
+/* Compatibility keeps one posed buffer per primitive and instance. The
+ * immutable model still owns the source geometry, layout and index buffers. */
+typedef struct {
+    const JceSkinnedMesh *mesh;
+    const JceMorphData *morph;
+    uint32_t node;
+    uint32_t primitive;
+    bgfx_dynamic_vertex_buffer_handle_t buffer;
+    bool ready;
+} SrCpuDeformPrimitive;
+
+struct SrCpuDeformState {
+    uint32_t count;
+    bool warned;
+    SrCpuDeformPrimitive primitives[];
+};
+
+static const JceSkinnedMesh *cpu_deform_mesh(const JceModel *model, uint32_t n,
+                                            uint32_t p, const JceMorphData **md)
+{
+    const JceSkinnedMesh *mesh = jce_model_prim_skinned_mesh(model, n, p);
+    if (!mesh)
+        return NULL;
+    *md = jce_model_prim_morph(model, n, p);
+    if (*md && jce_morph_vertex_count(*md) != jce_skinned_mesh_vertex_count(mesh))
+        *md = NULL;
+    return *md || jce_skinned_mesh_is_skinned(mesh) ? mesh : NULL;
+}
+
+static SrCpuDeformState *cpu_deform_create(const JceModel *model)
+{
+    const uint32_t nodes = jce_model_node_count(model);
+    const size_t capacity = (SIZE_MAX - sizeof(SrCpuDeformState)) /
+                            sizeof(SrCpuDeformPrimitive);
+    uint32_t count = 0;
+    for (uint32_t n = 0; n < nodes; ++n) {
+        const uint32_t primitives = jce_model_node_prim_count(model, n);
+        for (uint32_t p = 0; p < primitives; ++p) {
+            const JceMorphData *md;
+            if (cpu_deform_mesh(model, n, p, &md)) {
+                if (count == UINT32_MAX || (size_t)count == capacity)
+                    return NULL;
+                ++count;
+            }
+        }
+    }
+    SrCpuDeformState *state = JCE_CALLOC(
+        1, sizeof(*state) + count * sizeof(*state->primitives));
+    if (!state)
+        return NULL;
+    for (uint32_t n = 0; n < nodes; ++n) {
+        const uint32_t primitives = jce_model_node_prim_count(model, n);
+        for (uint32_t p = 0; p < primitives; ++p) {
+            const JceMorphData *md;
+            const JceSkinnedMesh *mesh = cpu_deform_mesh(model, n, p, &md);
+            if (!mesh)
+                continue;
+            SrCpuDeformPrimitive *slot = &state->primitives[state->count++];
+            *slot = (SrCpuDeformPrimitive){mesh, md, n, p, {UINT16_MAX}, false};
+        }
+    }
+    return state;
+}
+
+void sr_free_cpu_deform(SrAnimInstance *ai)
+{
+    SrCpuDeformState *state = ai->cpu_deform;
+    if (!state)
+        return;
+    ai->cpu_deform = NULL;
+    for (uint32_t i = 0; i < state->count; ++i) {
+        if (BGFX_HANDLE_IS_VALID(state->primitives[i].buffer))
+            bgfx_destroy_dynamic_vertex_buffer(state->primitives[i].buffer);
+    }
+    JCE_FREE(state);
+}
+
+static uint16_t cpu_deform_vb_cb(void *user, uint32_t node, uint32_t primitive)
+{
+    const SrAnimInstance *ai = user;
+    const SrCpuDeformState *state = ai->cpu_deform;
+    uint32_t left = 0, right = state->count;
+    while (left < right) {
+        const uint32_t mid = left + (right - left) / 2u;
+        const SrCpuDeformPrimitive *slot = &state->primitives[mid];
+        if (slot->node == node && slot->primitive == primitive)
+            return slot->ready ? slot->buffer.idx : UINT16_MAX;
+        if (slot->node < node || (slot->node == node && slot->primitive < primitive))
+            left = mid + 1u;
+        else
+            right = mid;
+    }
+    return UINT16_MAX;
+}
+
+JceModelMorphVbCb sr_anim_geometry_vb_cb(const SrAnimInstance *ai)
+{
+    if (!ai)
+        return NULL;
+    if (ai->cpu_deform && ai->cpu_deform->count > 0)
+        return cpu_deform_vb_cb;
+    return ai->morph_vb_count > 0 ? sr_morph_vb_cb : NULL;
+}
+
+static bool cpu_deform_upload(SrCpuDeformPrimitive *slot, const SrAnimInstance *ai,
+                              const jce_mat4 *palette, uint32_t joints)
+{
+    const JceSkinnedMesh *mesh = slot->mesh;
+    const bool skin = jce_skinned_mesh_is_skinned(mesh);
+    const bool morph = slot->morph && ai->morph_count > 0;
+    slot->ready = false;
+    if (!skin && !morph)
+        return true;
+
+    const uint32_t vertices = jce_skinned_mesh_vertex_count(mesh);
+    const uint32_t stride = jce_skinned_mesh_stride(mesh);
+    const void *base = jce_skinned_mesh_base_verts(mesh);
+    const bgfx_vertex_layout_t *layout = jce_skinned_mesh_layout(mesh);
+    if (!base || !layout || !vertices || !stride || vertices > UINT32_MAX / stride)
+        return false;
+    if (!BGFX_HANDLE_IS_VALID(slot->buffer)) {
+        slot->buffer = bgfx_create_dynamic_vertex_buffer(
+            vertices, layout, BGFX_BUFFER_NONE);
+        if (!BGFX_HANDLE_IS_VALID(slot->buffer))
+            return false;
+    }
+
+    const uint32_t bytes = vertices * stride;
+    const bgfx_memory_t *mem = bgfx_alloc(bytes);
+    if (!mem)
+        return false;
+    memcpy(mem->data, base, bytes);
+    if (morph)
+        jce_morph_apply(slot->morph, ai->morph_weights, ai->morph_count,
+                        mem->data, mem->data, vertices, stride,
+                        (int32_t)jce_skinned_mesh_pos_offset(mesh),
+                        (int32_t)jce_skinned_mesh_normal_offset(mesh));
+    if (skin)
+        jce_skin_deform_vertices((JceSkinnedVertex *)mem->data, vertices,
+                                 palette, joints);
+    bgfx_update_dynamic_vertex_buffer(slot->buffer, 0, mem);
+    slot->ready = true;
+    return true;
+}
+
+void sr_deform_cpu_skin_prims(SrAnimInstance *ai)
+{
+    if (!ai || !ai->model)
+        return;
+    if (!ai->cpu_deform)
+        ai->cpu_deform = cpu_deform_create(ai->model);
+    SrCpuDeformState *state = ai->cpu_deform;
+    if (!state || !state->count)
+        return;
+
+    uint32_t joints = ai->skin_palette_count;
+    if (joints > JCE_MAX_BONES)
+        joints = JCE_MAX_BONES;
+    const bool same_pose = joints == ai->prev_skin_palette_count &&
+        (!joints || memcmp(ai->skin_palette, ai->prev_skin_palette,
+                           joints * sizeof(jce_mat4)) == 0);
+    const size_t weight_bytes = ai->morph_count * sizeof(float);
+    if (same_pose && ai->morph_last_count == (int)ai->morph_count &&
+        memcmp(ai->morph_last_weights, ai->morph_weights, weight_bytes) == 0)
+        return;
+
+    jce_mat4 bind[JCE_MAX_BONES];
+    const jce_mat4 *palette = ai->skin_palette;
+    const JceSkeleton *skeleton = jce_model_get_skeleton(ai->model);
+    if (!joints && skeleton) {
+        joints = jce_skeleton_joint_count(skeleton);
+        if (joints > JCE_MAX_BONES)
+            joints = JCE_MAX_BONES;
+        jce_skeleton_evaluate(skeleton, NULL, bind, joints);
+        palette = bind;
+    }
+
+    bool complete = true;
+    for (uint32_t i = 0; i < state->count; ++i) {
+        if (!cpu_deform_upload(&state->primitives[i], ai, palette, joints))
+            complete = false;
+    }
+    if (!complete && !state->warned) {
+        state->warned = true;
+        LOG_WARN(LOG_TAG, "compatibility skin buffer unavailable for entity %llu",
+                 (unsigned long long)ai->entity);
+    }
+    memcpy(ai->morph_last_weights, ai->morph_weights, weight_bytes);
+    ai->morph_last_count = complete ? (int)ai->morph_count : -1;
+}
+
+void jce_scene_renderer_submit_model_wireframe(
+    JceSceneRenderer *sr, JceScene *scene, uint64_t entity,
+    const JceModel *model, uint16_t view_id, const jce_mat4 *world)
+{
+    if (!sr || !scene || !model)
+        return;
+    SrAnimInstance *ai = sr->anim_storage_scene == scene
+        ? sr_find_anim_instance(sr, entity) : NULL;
+    if (ai && ai->model != model)
+        ai = NULL;
+    const uint32_t joints = ai ? ai->skin_palette_count : 0;
+    jce_model_submit_view_wireframe(
+        model, sr->renderer, view_id, world, joints ? ai->skin_palette : NULL,
+        joints, sr_anim_geometry_vb_cb(ai), ai, true, NULL, NULL);
 }
 
 /* Sample the active clip's morph-weight track into `out`.

@@ -25,12 +25,14 @@ short-circuit the others; the aggregate exit code is non-zero if any
 individual lint fails. CI calls this as the single entry point.
 
 Usage:
-  python tools/lint/run_all.py
+  python tools/lint/run_all.py --stock-wrapper-exe <explicit-native-jce_bin2obj>
+  # No wrapper input leaves that native subject NOT_MEASURED/SKIP.
   # exits 0 if all lints pass, 1 if any fail.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
@@ -49,10 +51,13 @@ LINTS = [
     ("tools/lint/check_release_version.py", ["--self-check"]),
     "check_repository_hygiene.py",
     ("tools/tests/test_shader_lint.py", []),
+    "check_bgfx_view_name_length.py",
+    ("tools/tests/test_bgfx_view_name_length.py", []),
     ("tools/tests/test_shader_cache.py", []),
     ("tools/tests/test_cache_lock.py", []),
     ("tools/tests/test_bundle_command.py", []),
     ("tools/tests/test_format_has_producer.py", []),
+    ("tools/tests/test_self_tests_run.py", []),
     ("tools/tests/test_delivery_profile.py", []),
     ("tools/tests/test_project_bundle_inputs.py", []),
     ("tools/tests/test_write_sha256.py", []),
@@ -61,6 +66,16 @@ LINTS = [
     ("tools/tests/test_conan_config.py", []),
     ("tools/tests/test_editor_lifecycle_probe.py", []),
     ("tools/tests/test_lifecycle_trace_report.py", []),
+    ("tools/tests/test_filesystem_read_observation.py", []),
+    ("tools/tests/test_shader_provenance_observation.py", []),
+    ("tools/tests/test_renderer_submission_observation.py", []),
+    ("tools/tests/test_offscreen_configure_observation.py", []),
+    ("tools/tests/test_screenshot_request_observation.py", []),
+    ("tools/tests/test_gpu_view_observation.py", []),
+    ("tools/tests/test_gpu_submission_join.py", []),
+    ("tools/tests/test_render_pipeline_observation.py", []),
+    ("tools/tests/test_readback_operation_observation.py", []),
+    ("tools/tests/test_instance_upload_trace_report.py", []),
     ("tools/tests/test_canvas_transparent_draw.py", []),
     ("tools/tests/test_shader_deferred.py", []),
     ("tools/tests/test_postfx_device_format.py", []),
@@ -68,8 +83,30 @@ LINTS = [
     ("tools/tests/test_postfx_history.py", []),
     ("tools/tests/test_renderer_owned_cleanup.py", []),
     ("tools/tests/test_material_owned_cleanup.py", []),
+    ("tools/tests/test_font_atlas_failure.py", []),
+    ("tools/tests/test_image_tga_admission.py", []),
+    ("tools/tests/test_host_font_selection.py", []),
+    ("tools/tests/test_shadow_target_demand.py", []),
+    ("tools/tests/test_canvas_texture_budget.py", []),
+    ("tools/tests/test_editor_scene_canvas_unwind.py", []),
+    ("tools/tests/test_editor_play_presentation.py", []),
+    ("tools/tests/test_game_view_backend_selection.py", []),
+    ("tools/tests/test_grass_inspector_history.py", []),
+    ("tools/tests/test_scene_renderer_cache_recovery.py", []),
+    ("tools/tests/test_mem_profile_contract.py", []),
+    ("tools/tests/test_realloc_accounting_contract.py", []),
+    ("tools/tests/test_memory_residency_probe.py", []),
+    ("tools/tests/test_memory_commit_probe.py", []),
+    ("tools/tests/test_presentation_report.py", []),
+    ("tools/tests/test_script_runtime_log.py", []),
+    ("tools/tests/test_editor_benchmark_log.py", []),
     ("tools/tests/test_static_script_api.py", []),
     ("tools/tests/test_sdk_host_tools.py", []),
+    ("tools/tests/test_sdk_target.py", []),
+    ("tools/tests/test_sdk_target_admission.py", []),
+    ("tools/tests/test_ipo_probe_cache.py", []),
+    ("tools/tests/test_sdk_consumer_gates.py", []),
+    ("tests/sdk_smoke/test_stage_dist_fixture.py", []),
     ("tools/tests/test_static_native_registry.py", []),
     ("tools/tests/test_native_registry.py", []),
     ("tools/tests/test_render_pipeline_gles_targets.py", []),
@@ -80,12 +117,36 @@ LINTS = [
     ("tools/tests/test_bundle_shader_refs.py", []),
     ("tools/tests/test_stock_shader_resolver.py", []),
     ("tools/tests/test_embed_stock_cmake.py", []),
+    ("tools/tests/test_lint_stock_wrapper_input.py", []),
+    ("tools/tests/test_generated_output_defaults.py", []),
+    ("tools/tests/test_i18n_pack_order.py", []),
     ("tools/tests/test_build_driver.py", []),
+    ("tools/tests/test_test_domain_registration.py", []),
     ("tools/tests/test_standalone.py", []),
+    ("tools/tests/test_stock_app.py", []),
+    ("tools/tests/test_sdk_outputs.py", []),
+    ("tools/tests/test_sdk_product.py", []),
+    ("tools/tests/test_accept_artifact_discovery.py", []),
     ("tools/tests/test_editor_portability_probe.py", []),
     ("tools/tests/test_benchmark_suite.py", []),
+    ("tools/tests/test_perf_bench.py", []),
     ("tools/tests/test_benchmark_report.py", []),
     ("tools/tests/test_conan_configuration.py", []),
+    ("tools/tests/test_xp_vm.py", []),
+    ("tools/tests/test_xp_editor.py", []),
+    ("tools/tests/test_xp_target_policy.py", []),
+    ("tools/tests/test_windows_owned_launcher.py", []),
+    ("tools/tests/test_xp_vm_owned.py", []),
+    ("tools/tests/test_xp_vm_inputs.py", []),
+    ("tools/tests/test_xp_vm_window.py", []),
+    ("tools/tests/test_xp_vm_background.py", []),
+    ("tools/tests/test_xp_vm_terminal.py", []),
+    ("tools/tests/test_bgfx_compatibility_tier.py", []),
+    ("tools/tests/test_bgfx_blit_emulation.py", []),
+    ("tools/tests/test_bgfx_bx_debug.py", []),
+    ("tools/tests/test_shader_compatibility.py", []),
+    ("tools/tests/test_shader_stock_policy.py", []),
+    ("tools/tests/test_shader_artifact_root.py", []),
     ("tools/tests/test_llm_transport.py", []),
     ("tools/tests/test_skills_paths.py", []),
     ("tools/tests/test_pack_skill.py", []),
@@ -211,7 +272,9 @@ LINTS = [
     "check_provenance_claims.py",
     "check_authored_path_consumed.py",
     "check_component_field_consumed.py",
+    ("tools/tests/test_component_field_consumed.py", []),
     "check_component_serializer_roundtrip.py",
+    ("tools/tests/test_component_serializer_helpers.py", []),
     "check_shader_uniform_bound.py",
     "check_exported_symbol_declared.py",
     # The editor's Play path and the shipped game each hand-build a
@@ -290,7 +353,16 @@ LINTS = [
     "check_raw_allocator.py",
     "check_sdk_asset_embed_shape.py",
     "check_project_build_layout.py",
+    ("tools/tests/test_project_build_layout.py", []),
+    ("tools/tests/test_bgfx_allocator_trace.py", []),
+    ("tools/tests/test_host_pak_dependency_ownership.py", []),
+    ("tools/tests/test_singleton_ownership.py", []),
+    ("tests/consumers/elemental_serenity/tools/test_stage_portable_bundle.py", []),
+    ("tests/consumers/benchmark/tools/test_probe_capture_suite.py", []),
     "check_jce_tests_closure.py",
+    ("tools/tests/test_editor_consumption_implementation.py", []),
+    ("tools/tests/test_jce_tests_closure.py", []),
+    ("tools/tests/test_exported_symbol_declared.py", []),
     "check_env_light_authority.py",
     "check_water_field_authority.py",
     "check_terrain_single_owner.py",
@@ -427,10 +499,27 @@ LINTS = [
 EXIT_SKIPPED = 2
 
 
-def resolve(entry) -> tuple[Path, list[str], str]:
+STOCK_WRAPPER_ENTRY = "tools/tests/test_embed_stock_cmake.py"
+
+
+def stock_wrapper_path(value: str) -> Path:
+    """An explicit native subject, never a guessed source/build artifact."""
+    try:
+        path = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise argparse.ArgumentTypeError(f"stock wrapper unavailable: {error}") from error
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"stock wrapper must be a file: {path}")
+    return path
+
+
+def resolve(entry, *, stock_wrapper_exe: Path | None = None) -> tuple[Path, list[str], str]:
     if isinstance(entry, tuple):
-        rel, argv = entry
-        return REPO_ROOT / rel, list(argv), " ".join([rel, *argv])
+        rel, inputs = entry
+        argv = list(inputs)
+        if rel == STOCK_WRAPPER_ENTRY and stock_wrapper_exe is not None:
+            argv.extend(["--exe", str(stock_wrapper_exe)])
+        return REPO_ROOT / rel, argv, " ".join([rel, *argv])
     return LINT_DIR / entry, [], entry
 
 
@@ -460,11 +549,12 @@ _INTERPRETER_FAULTS = (
 # Private suites are local additions, never prerequisites of the public core.
 _PRIVATE_DIR = REPO_ROOT / "private/tools/lint"
 _PRIVATE_CHECKS = ['check_ai_tooling.py', 'check_automation_contract.py', 'check_requirement_traceability.py', 'check_automation_write_declared.py', 'check_editor_automation_undo.py', 'check_no_ui_automation.py', 'check_introspection_parity.py']
+_PRIVATE_UNAVAILABLE: list[str] = []
 for _name in _PRIVATE_CHECKS:
     if (_PRIVATE_DIR / _name).is_file():
         LINTS.append(("private/tools/lint/" + _name, []))
     else:
-        print("Private suite unavailable (not a PASS): " + _name)
+        _PRIVATE_UNAVAILABLE.append(_name)
 
 # ---------------------------------------------------------------------------
 #  A SECOND FAULT FAMILY, AND IT MUST NOT BE RETRIED.
@@ -626,12 +716,22 @@ def _crash_shaped(rc, out, skip_code):
 #
 # If a spurious failure recurs after this, the cache was not it, and that is
 # worth more than a guess that happened to be followed by quiet.
-def run_one(entry) -> tuple[str, int, str]:
-    path, argv, label = resolve(entry)
+def run_one(entry, *, stock_wrapper_exe: Path | None = None) -> tuple[str, int, str]:
+    path, argv, label = resolve(entry, stock_wrapper_exe=stock_wrapper_exe)
     if not path.is_file():
         return label, 127, f"(skipped: {label} not found)"
+    stock_subject = path == REPO_ROOT / STOCK_WRAPPER_ENTRY
+    if stock_subject and stock_wrapper_exe is None:
+        return label, EXIT_SKIPPED, (
+            "NOT_MEASURED: explicit native stock wrapper not supplied; "
+            "use run_all.py --stock-wrapper-exe PATH. No configure/build ran.")
     env = dict(os.environ)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    # Absolute script execution supplies its own directory, not the repo root.
+    # Keep caller import paths after that root without changing process globals.
+    inherited_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + inherited_pythonpath if inherited_pythonpath else "")
 
     def _spawn():
         return subprocess.run(
@@ -668,10 +768,16 @@ def run_one(entry) -> tuple[str, int, str]:
             proc = _spawn()
 
     out = (proc.stdout or "") + (proc.stderr or "")
-    return label, proc.returncode, out.rstrip()
+    code = proc.returncode
+    if stock_subject and code == EXIT_SKIPPED:
+        # This module requires --exe. With an explicit subject, parser/tool
+        # exit 2 is a failed invocation, never its unavailable-subject protocol.
+        code = 1
+        out = "Stock wrapper invocation failed (original exit 2; NOT a SKIP).\n" + out
+    return label, code, out.rstrip()
 
 
-DEFAULT_LOG = REPO_ROOT / "reports" / "lint-failure.txt"
+DEFAULT_LOG = REPO_ROOT / "build" / "reports" / "lint-failure.txt"
 
 
 def write_transcript(results, failed):
@@ -711,12 +817,18 @@ def write_transcript(results, failed):
         return None
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run all public source gates")
+    parser.add_argument("--stock-wrapper-exe", type=stock_wrapper_path,
+                        help="explicit native jce_bin2obj for actual stock CMake controls")
+    args = parser.parse_args(argv)
+    for name in _PRIVATE_UNAVAILABLE:
+        print("Private suite unavailable (not a PASS): " + name)
     print(f"running {len(LINTS)} lint(s)...")
     print("=" * 72)
     results: list[tuple[str, int, str]] = []
     for s in LINTS:
-        results.append(run_one(s))
+        results.append(run_one(s, stock_wrapper_exe=args.stock_wrapper_exe))
 
     skipped = [(s, c, o) for (s, c, o) in results if c == EXIT_SKIPPED]
     failures = [(s, c, o) for (s, c, o) in results

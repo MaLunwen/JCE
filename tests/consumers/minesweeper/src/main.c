@@ -9,7 +9,6 @@
 #include "board.h"
 #include <math.h>
 
-extern const JceCModuleDesc *mines_module(void);
 static const JceServices *services;
 static JcePlatformServices *records;
 static JceLlmHandle ai_handle;
@@ -20,11 +19,12 @@ static int64_t get_best(const char *key) {return jce_platform_stat_get(records,k
 static int put_best(const char *key,int64_t value) {
     return records && jce_platform_stat_set(records,key,value) && jce_platform_flush(records);
 }
-static void publish(void) {jce_script_vm_cpp_add_module(mines_module());}
 static bool init(const JceServices *svc,void *ud) {
     const char *base=getenv("MINES_SAVE_DIR");char path[1024];
     services=svc;self_test=getenv("MINES_SELF_TEST")!=NULL;
     if(self_test) {int result=mines_self_test();jce_engine_request_quit();return result==0;}
+    /* Generated NATIVE_FACTORIES owns the only static publication. */
+    if(jce_script_register_linked_languages(NULL)<0) return false;
     if(!base || !base[0]) {
         base=getenv("LOCALAPPDATA");if(!base || !base[0]) base=getenv("HOME");
         if(!base || !base[0]) base=".";
@@ -33,7 +33,6 @@ static bool init(const JceServices *svc,void *ud) {
     records=jce_platform_init_local(base);
     snprintf(ai_work,sizeof ai_work,"%s/ai",base);jce_fs_host_create_directory(ai_work);
     mines_records_backend(get_best,put_best);
-    jce_script_register_linked_languages(publish);
     return app_init(svc,ud);
 }
 static void request_ai(void) {

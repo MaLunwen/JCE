@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -33,6 +34,7 @@ extern "C" {
 #include "core/jce_editor_automation.h"
 
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_env.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_sysinfo.h>
@@ -49,10 +51,16 @@ extern "C" {
 }
 
 #include "core/jce_editor.h"
+#include "core/jce_editor_event_fixture_schedule.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_cadence.h"
+#include "core/jce_editor_renderer_startup.h"
 #include "core/jce_editor_game_input_bridge.h"
 #include "core/jce_editor_headless_build.h"
+#include "core/jce_editor_host_services.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_play_transaction.h"
+#include "core/jce_editor_recorder.h"
 #include "core/jce_run_manager.h"
 #include "core/jce_build_manager.h"
 #include "core/jce_cook_manager.h"
@@ -69,6 +77,16 @@ extern "C" void jce_editor_register_builtin_modules(void);
 
 struct EditorState {
     const JceServices *svc;
+    bool startup_config_valid = false;
+    bool cpu_services_ready = false;
+    float update_dt = 0.0f; /* Same host interval, measured by the service poll. */
+    JceEditorCadence cadence;
+    JceEditorCadenceRates cadence_rates;
+    uint64_t cadence_generation = UINT64_MAX;
+    bool cadence_diagnostics_enabled = false;
+    unsigned cadence_diagnostics = 0;
+    int cadence_logged_fps = -1;
+    uint32_t cadence_logged_flags = UINT32_MAX;
 };
 static EditorState g_state;
 
@@ -76,13 +94,17 @@ static uint64_t g_startup_t0;
 static bool g_startup_reported;
 static uint64_t g_last_update_counter;
 static bool g_headless_build_mode;
+static JceEditorEventFixture g_game_events;
 
 static void editor_shutdown_diag(const char *phase)
 {
     const char *diag = getenv("JCE_SHUTDOWN_DIAG");
     if (!diag || !diag[0] || diag[0] == '0')
         return;
-    LOG_INFO("editor-main", "shutdown: %s", phase);
+    /* This explicitly requested diagnostic also works in DIST, where the
+     * ordinary INFO macros are removed. Keep the logger level/sink contract. */
+    jce_log_write(JCE_LOG_LEVEL_INFO, "editor-main", __FILE__, __LINE__,
+                  "shutdown: %s", phase);
     jce_log_flush();
 }
 
@@ -189,47 +211,78 @@ static void log_first_frame_kpi(void)
    (legacy ~/.jce/editor-config.json is a read-only fallback until it is
    retired to *.migrated — see jce_editor_config.cpp). */
 
-static std::string to_lower_copy(const char *s)
+static bool configure_engine_renderer_from_editor_config(void)
 {
-    if (!s) return std::string();
-    std::string out(s);
-    std::transform(out.begin(), out.end(), out.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return out;
+    return jce_editor_apply_startup_renderer(jce_editor_config_load,
+                                             jce_engine_set_renderer_override,
+                                             jce_renderer_set_gpu_adapter_preference);
 }
 
-static int renderer_name_to_backend_enum(const char *renderer_name)
+/* Diagnostic selection is fixed for one host initialization. */
+static void editor_cadence_diagnostics_begin(EditorState &state)
 {
-    std::string r = to_lower_copy(renderer_name);
-    if (r.empty() || r == "auto")                           return 0;  /* JCE_BACKEND_AUTO */
-    if (r == "d3d11" || r == "direct3d11" || r == "dx11")   return 1;  /* JCE_BACKEND_D3D11 */
-    if (r == "d3d12" || r == "direct3d12" || r == "dx12")   return 2;  /* JCE_BACKEND_D3D12 */
-    if (r == "vulkan" || r == "vk")                         return 3;  /* JCE_BACKEND_VULKAN */
-    if (r == "opengl" || r == "gl")                         return 4;  /* JCE_BACKEND_OPENGL */
-    if (r == "opengl es" || r == "opengles" || r == "gles") return 5;  /* JCE_BACKEND_OPENGLES*/
-    if (r == "metal")                                       return 6;  /* JCE_BACKEND_METAL   */
-    return -1;
+    state.cadence_diagnostics_enabled =
+        jce_env_flag_enabled(getenv("JCE_EDITOR_CADENCE_DIAG"));
+    state.cadence_diagnostics = 0;
+    state.cadence_logged_fps = -1;
+    state.cadence_logged_flags = UINT32_MAX;
 }
 
-static void configure_engine_renderer_from_editor_config(void)
+static void editor_cadence_refresh(EditorState &state)
 {
-    JceEditorConfig ecfg;
-    if (!jce_editor_config_load(&ecfg))
-        return;
-
-    int backend = renderer_name_to_backend_enum(ecfg.renderer);
-    if (backend < 0)
-        return;
-
-    jce_engine_set_renderer_override(backend);
+    const uint64_t generation = jce_editor_config_generation();
+    if (state.cadence_generation == generation) return;
+    JceEditorConfig config;
+    (void)jce_editor_config_load(&config); /* Missing profile still seeds defaults. */
+    state.cadence_rates = jce_editor_cadence_rates(config);
+    state.cadence_generation = generation;
 }
-
-/* ── JceAppDesc callbacks ──────────────────────────────────────────── */
+static void editor_cadence_update(EditorState &state, uint64_t now)
+{
+    editor_cadence_refresh(state);
+    uint32_t flags = 0;
+    const bool valid = state.svc && jce_window_get_flags(state.svc->window, &flags);
+    JceInputFrame input = {};
+    if (state.svc && state.svc->input) jce_input_capture(state.svc->input, &input);
+    const auto previous_mode = state.cadence.mode;
+    jce_editor_play_host_tick(state.cadence_rates.idle, state.cadence_rates.play_background, state.cadence_rates.play);
+    jce_editor_cadence_tick(state.cadence, state.cadence_rates, now,
+        jce_time_perf_freq(), flags, valid, jce_editor_cadence_input_held(input),
+        jce_state_get_play_state() != JCE_PLAY_STOPPED);
+    if (state.cadence_diagnostics_enabled &&
+        state.cadence_diagnostics < 32u &&
+        (state.cadence_diagnostics == 0u || previous_mode != state.cadence.mode ||
+         state.cadence_logged_fps != jce_engine_get_target_fps() ||
+         state.cadence_logged_flags != flags)) {
+        ++state.cadence_diagnostics;
+        state.cadence_logged_fps = jce_engine_get_target_fps();
+        state.cadence_logged_flags = flags;
+        jce_log_write(JCE_LOG_LEVEL_INFO, "editor.cadence", __FILE__, __LINE__,
+            "cadence: mode=%u target_fps=%d rates=%d/%d/%d preview_limit=%d flags_valid=%d flags=0x%x vsync=%d",
+            (unsigned)state.cadence.mode, jce_engine_get_target_fps(),
+            state.cadence_rates.active, state.cadence_rates.idle,
+            state.cadence_rates.background, state.cadence_rates.play,
+            valid ? 1 : 0, (unsigned)flags,
+            state.svc && state.svc->renderer && !jce_renderer_is_fallback(state.svc->renderer)
+                ? (jce_renderer_get_vsync(state.svc->renderer) ? 1 : 0) : -1);
+    }
+}
 
 static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
+    st->cpu_services_ready = false;
+    st->update_dt = 0.0f;
+    g_last_update_counter = 0;
+    if (!st->startup_config_valid) {
+        /* Invalid profile paths must not continue with a CWD game config.
+         * The descriptor selected headless before engine/device creation. */
+        jce_log_write(JCE_LOG_LEVEL_ERROR, "editor-main", __FILE__, __LINE__,
+                      "startup rejected: editor profile/config path or renderer request invalid");
+        return false;
+    }
     st->svc = svc;
+    editor_cadence_diagnostics_begin(*st);
 
     /* BEFORE anything that could assert.  Without this the editor's default
      * for a broken engine invariant is abort(), which takes the user's
@@ -238,8 +291,12 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 
     if (g_headless_build_mode) {
         jce_build_manager_init();
-        return jce_editor_headless_build_initialize();
+        st->cpu_services_ready = jce_editor_headless_build_initialize();
+        return st->cpu_services_ready;
     }
+
+    g_game_events.begin(getenv("JCE_KPI_GAME_EVENTS"),
+        getenv("JCE_KPI_GAME_EVENTS_CLOCK"), getenv("JCE_KPI_GAME_EVENTS_START"));
 
     /* Editor authoring default: float the render pipeline to at least HIGH so the
      * stylized look (toon shading, 5-mip bloom, stylized sky dome, wrap/rim look
@@ -319,6 +376,11 @@ static bool editor_app_init(const JceServices *svc, void *ud)
     if (!jce_editor_init(svc->pak, svc->window))
         return false;
 
+    jce_editor_play_bind_services(svc);
+    editor_cadence_refresh(*st);
+    jce_editor_cadence_begin(st->cadence, st->cadence_rates,
+        jce_time_perf_counter(), jce_time_perf_freq());
+
     /* Configure engine-owned PostFX defaults. The pipeline itself is
      * created/destroyed by the engine scene renderer. */
     JceSceneRenderer *sr = jce_editor_get_scene_renderer();
@@ -330,12 +392,16 @@ static bool editor_app_init(const JceServices *svc, void *ud)
         jce_postfx_enable(pfx, JCE_POSTFX_FXAA, true);
     }
 
+    st->cpu_services_ready = true;
     return true;
 }
 
 static void editor_app_exit(void *ud)
 {
     (void)ud;
+    g_state.cpu_services_ready = false; /* Stop callbacks before closing any child/UI owner. */
+    g_state.cadence_diagnostics_enabled = false;
+    if (!g_state.startup_config_valid) return; /* No editor owner was initialized. */
     editor_shutdown_diag("application callback begin");
     if (g_headless_build_mode) {
         jce_editor_headless_build_shutdown();
@@ -343,37 +409,49 @@ static void editor_app_exit(void *ud)
         editor_shutdown_diag("headless application stopped");
         return;
     }
+    g_game_events.end(jce_editor_game_input_bridge_shared());
     /* Detach dialogs before tearing down the window. */
     jce_host_dialog_set_parent_jce_window(NULL);
     editor_shutdown_diag("host dialogs detached");
-    jce_editor_game_render_shutdown();
-    editor_shutdown_diag("game renderer stopped");
-    jce_editor_scene_render_shutdown();
-    editor_shutdown_diag("scene renderer stopped");
-    jce_editor_shutdown();
-    editor_shutdown_diag("editor UI stopped");
+    /* Capture callbacks and the encoder must retire while their owners live. */
+    jce_editor_recorder_stop();
+    editor_shutdown_diag("recorder stopped");
+    /* Stop owns script/runtime teardown and still needs the live view services. */
+    jce_editor_exit_after_play(
+        jce_state_get_play_state() != JCE_PLAY_STOPPED,
+        [] {
+            jce_state_stop();
+            editor_shutdown_diag("play runtime stopped");
+        },
+        [] {
+            jce_editor_play_bind_services(nullptr);
+            jce_editor_game_render_shutdown();
+            editor_shutdown_diag("game renderer stopped");
+            jce_editor_scene_render_shutdown();
+            editor_shutdown_diag("scene renderer stopped");
+            jce_editor_shutdown();
+            editor_shutdown_diag("editor UI stopped");
+        });
+    /* Stop above restores the authoring presentation before releasing its cap. */
+    g_state.cadence.suspended = false;
+    jce_editor_cadence_end(g_state.cadence);
 }
 
 static void editor_app_update(float dt, void *ud)
 {
-    (void)dt;
     (void)ud;
 
-    if (g_headless_build_mode) {
-        jce_build_manager_poll();
-        jce_editor_headless_build_poll();
-        return;
-    }
-
-    /* Engine passes 0.0f; compute a real delta from the perf counter. */
-    uint64_t now = jce_time_perf_counter();
-    float real_dt = 0.0f;
-    if (g_last_update_counter != 0) {
-        real_dt = (float)(now - g_last_update_counter) / (float)jce_time_perf_freq();
-        if (real_dt > 0.1f)
-            real_dt = 0.1f; /* clamp to avoid spiral */
-    }
-    g_last_update_counter = now;
+    if (!g_state.cpu_services_ready || g_headless_build_mode) return;
+    /* The pre-render poll measured this same host interval once. */
+    const float real_dt = dt == 0.0f ? 0.0f : g_state.update_dt;
+    if (real_dt == 0.0f) return; /* Restored wall interval is never fixed-dt catch-up. */
+    /* The Engine already resolved the explicit QA step; reuse its callback dt
+     * for stopped simulation previews without changing wall-clock services. */
+    static const bool fixed_preview_dt = [] {
+        const char *value = std::getenv("JCE_FRAME_DT_FIXED");
+        return value && value[0];
+    }();
+    const float preview_dt = fixed_preview_dt ? dt : real_dt;
 
     /* Drive a frame-sliced scene open (large-scene startup / open).  While
      * this is in flight the layout draws a modal "Loading…" overlay that
@@ -387,6 +465,11 @@ static void editor_app_update(float dt, void *ud)
      * core/jce_editor_scene_file_watch.h. */
     jce_editor_scene_file_watch_poll();
 
+    /* Refuse a retired elapsed source before it can enter a changed runtime. */
+    if (g_game_events.elapsed &&
+        (g_game_events.active || g_game_events.end_pending))
+        g_game_events.validate_active(jce_editor_game_input_bridge_shared(),
+            jce_state_get_play_state() == JCE_PLAY_PLAYING, jce_editor_play_get_runtime());
     if (jce_state_get_play_state() == JCE_PLAY_PLAYING) {
         JceRuntimeTouch touches[JCE_RUNTIME_MAX_TOUCHES] = {};
         int kept = 0;
@@ -418,6 +501,9 @@ static void editor_app_update(float dt, void *ud)
             play_commit_step,
             play_commit_position,
         };
+        jce_editor_game_input_bridge_sync_replay(
+            jce_editor_game_input_bridge_shared(),
+            g_state.svc ? g_state.svc->input : nullptr);
         (void)jce_editor_game_input_bridge_commit(
             jce_editor_game_input_bridge_shared(), touches, kept,
             g_state.svc ? g_state.svc->actions : nullptr,
@@ -443,7 +529,7 @@ static void editor_app_update(float dt, void *ud)
      * != PLAYING first, which is the same bug the state enum exists to make
      * visible. */
     if (jce_state_get_play_state() == JCE_PLAY_STOPPED)
-        jce_scene_environment_advance(jce_state_get_scene(), real_dt);
+        jce_scene_environment_advance(jce_state_get_scene(), preview_dt);
     jce_state_stress_move_tick(real_dt);   /* JCE_STRESS_MOVERS L2 soak (inert unless set) */
 
     /* VideoPlayer-as-texture and ParticleEmitter previews in Scene View while
@@ -452,22 +538,14 @@ static void editor_app_update(float dt, void *ud)
     if (jce_state_get_play_state() == JCE_PLAY_STOPPED) {
         JceScene *scene = jce_state_get_scene();
         if (scene) {
-            jce_scene_video_update(scene, (double)real_dt, NULL, NULL);
-            jce_scene_particles_update(scene, real_dt);
+            jce_scene_video_advance(scene, (double)real_dt, NULL, NULL);
+            jce_scene_particles_update(scene, preview_dt);
         }
     }
 
-    jce_run_manager_poll();
-    /* Drive the cmake build subprocess every frame so save-hook
-     * triggered repacks (which can run with no UI dialog open) still
-     * stream their log lines to the console and detect completion. */
-    jce_build_manager_poll();
-    jce_cook_manager_poll();
-    jce_state_scene_serial_poll();   /* async post-save mesh validation */
-    /* Drive an in-flight Automation call: it is a subprocess and this
-     * loop never blocks on one. See core/jce_editor_automation.h. */
+    /* Automation may advance a mutating recipe/dialog workflow; retain its
+     * visible owner. Audited child/log/flush services run before render admission. */
     jce_editor_automation_poll();
-    jce_asset_path_index_poll();     /* swap in a finished async reindex */
 
     /* Drain any folder/file dialog results enqueued by SDL worker threads.
      * Must run on the main thread before ImGui consumes the affected
@@ -491,72 +569,13 @@ static void editor_app_update(float dt, void *ud)
 #endif
 }
 
-/* Explicit QA producer: normalized Game-image events enter the same editor
- * event processor as platform input. No runtime values or viewport ownership
- * are overridden. Each row: Play frame, M/B/W, x, y, a, b. B: button/down;
- * M: normalized displacement; W: vertical steps. Not hardware-input evidence. */
+/* Explicit synthetic QA producer; normal platform input and viewport ownership
+ * remain authoritative. The session owner snapshots configuration at init. */
 static void editor_game_event_fixture(void)
 {
-    struct FixtureBuffer {
-        char *data = nullptr;
-        size_t offset = 0;
-        void reset() { jce_fs_buffer_free(data); data = nullptr; offset = 0; }
-        ~FixtureBuffer() { reset(); }
-    };
-    static FixtureBuffer file;
-    static bool checked = false, pending = false;
-    static unsigned frame = 0, due = 0;
-    static char kind = 0;
-    static float x = 0, y = 0, a = 0, b = 0;
-    if (!checked) {
-        checked = true;
-        const char *path = getenv("JCE_KPI_GAME_EVENTS");
-        if (path && path[0]) {
-            uint64_t read = 0, total = 0;
-            file.data = static_cast<char *>(jce_fs_host_read_capped(path, 1048576, &read, &total));
-            if (read != total) file.reset();
-        }
-        if (path && path[0] && !file.data)
-            LOG_ERROR("editor-main", "Game event fixture cannot open: %s", path);
-    }
-    if (!file.data || jce_state_get_play_state() != JCE_PLAY_PLAYING) return;
-    const auto &vp = jce_editor_game_input_bridge_shared()->viewport;
-    if (!vp.visible || vp.width <= 0 || vp.height <= 0) return;
-    ++frame;
-    for (;;) {
-        if (!pending) {
-            int consumed = 0;
-            if (sscanf(file.data + file.offset, " %u %c %f %f %f %f %n",
-                       &due, &kind, &x, &y, &a, &b, &consumed) != 6 || consumed <= 0) {
-                file.reset(); return;
-            }
-            file.offset += static_cast<size_t>(consumed);
-            pending = true;
-        }
-        if (due > frame) return;
-        JceEvent e{};
-        if (kind == 'M') {
-            e.type = JCE_EVENT_MOUSE_MOTION;
-            e.motion.x = vp.x + x * vp.width;
-            e.motion.y = vp.y + y * vp.height;
-            e.motion.xrel = a * vp.width;
-            e.motion.yrel = b * vp.height;
-        } else if (kind == 'B') {
-            e.type = b ? JCE_EVENT_MOUSE_BUTTON_DOWN : JCE_EVENT_MOUSE_BUTTON_UP;
-            e.button.x = vp.x + x * vp.width;
-            e.button.y = vp.y + y * vp.height;
-            e.button.button = static_cast<uint8_t>(a);
-        } else if (kind == 'W') {
-            e.type = JCE_EVENT_MOUSE_WHEEL; e.wheel.y = a;
-        } else {
-            LOG_ERROR("editor-main", "Unknown Game event fixture kind: %c", kind);
-            file.reset(); return;
-        }
-        jce_editor_process_event(&e);
-        LOG_WARN("editor-main", "Game event fixture frame=%u type=%c owner=%d hovered=%d",
-                 frame, kind, static_cast<int>(vp.owner), vp.hovered ? 1 : 0);
-        pending = false;
-    }
+    g_game_events.update(jce_editor_game_input_bridge_shared(),
+        jce_state_get_play_state() == JCE_PLAY_PLAYING,
+        jce_editor_play_get_runtime(), jce_editor_process_event);
 }
 
 static void editor_app_draw(const JceServices *svc, void *ud)
@@ -592,7 +611,10 @@ static void editor_app_event(const JceEvent *event, void *ud)
     if (g_headless_build_mode)
         return;
 
-    if (event->type == JCE_EVENT_QUIT
+    if (jce_editor_cadence_input_event(event->type))
+        jce_editor_cadence_activity(g_state.cadence, jce_time_perf_counter());
+
+    if ((event->type == JCE_EVENT_QUIT || event->type == JCE_EVENT_WINDOW_CLOSE)
         && !jce_editor_layout_is_quit_confirmed())
     {
         jce_editor_layout_request_quit();
@@ -601,9 +623,39 @@ static void editor_app_event(const JceEvent *event, void *ud)
     jce_editor_process_event(event);
 }
 
+/* This callback is invoked once per host iterate before render admission.
+ * It must not execute gameplay, scene mutations, ImGui or GPU uploads. */
+static void editor_poll_cpu_services(void)
+{
+    if (!g_state.cpu_services_ready) return;
+    const uint64_t now = jce_time_perf_counter();
+    const uint64_t freq = jce_time_perf_freq();
+    float dt = 0.0f;
+    if (g_last_update_counter != 0 && now >= g_last_update_counter && freq > 0) {
+        dt = (float)((double)(now - g_last_update_counter) / (double)freq);
+        if (dt > 0.1f) dt = 0.1f;
+    }
+    g_last_update_counter = now;
+    g_state.update_dt = dt;
+    bool refresh_ui_clock = false;
+    if (!g_headless_build_mode) {
+        editor_cadence_update(g_state, now);
+        uint32_t flags = 0, width = 0, height = 0;
+        if (g_state.svc && g_state.svc->window) {
+            const bool flags_valid = jce_window_get_flags(g_state.svc->window, &flags);
+            jce_window_get_size(g_state.svc->window, &width, &height);
+            refresh_ui_clock = width == 0 || height == 0 ||
+                (flags_valid && (flags & (JCE_WINDOW_MINIMIZED | JCE_WINDOW_HIDDEN)) != 0);
+        }
+    }
+    jce_editor_host_services_poll(g_headless_build_mode, dt, refresh_ui_clock);
+}
+
 static bool editor_should_quit(void *ud)
 {
     (void)ud;
+    if (!g_state.cpu_services_ready) return false;
+    editor_poll_cpu_services();
     return g_headless_build_mode
         ? jce_editor_headless_build_should_quit()
         : jce_editor_layout_is_quit_confirmed();
@@ -882,18 +934,21 @@ extern "C" JceAppDesc editor_app_get_desc(void)
     jce_trace_set_enabled(true);
     jce_trace_thread_register("MAIN");
 
-    /* Apply renderer override before jce_engine_create() picks a backend. */
+    /* Both GUI and headless builds are Editor hosts. Bind their own INI before
+     * engine creation; CWD .config/jce.ini remains the game's config owner. */
+    g_state.startup_config_valid = jce_editor_bind_startup_config(
+        jce_editor_dotjce_path, jce_engine_set_config_path);
     g_headless_build_mode =
         jce_editor_headless_build_environment_present();
-    if (!g_headless_build_mode)
-        configure_engine_renderer_from_editor_config();
+    if (g_state.startup_config_valid && !g_headless_build_mode)
+        g_state.startup_config_valid = configure_engine_renderer_from_editor_config();
 
     JceAppDesc desc = {};
     desc.name          = "JCE Editor";
     desc.maximized     = true;
     desc.window_width  = 1600;
     desc.window_height = 900;
-    desc.headless   = g_headless_build_mode;
+    desc.headless   = g_headless_build_mode || !g_state.startup_config_valid;
     desc.init      = editor_app_init;
     desc.exit      = editor_app_exit;
     desc.update    = editor_app_update;

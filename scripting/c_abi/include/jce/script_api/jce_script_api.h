@@ -67,7 +67,7 @@ extern "C" {
 
 /* Entry points that are a manifest entry; the library exports these plus
  * the 3 meta entry points below. */
-#define JCE_SCRIPT_API_ENTRY_COUNT 108
+#define JCE_SCRIPT_API_ENTRY_COUNT 109
 
 /* Opaque: the library owns the host copy, the caller owns nothing. */
 typedef struct JceScriptApi JceScriptApi;
@@ -398,9 +398,10 @@ JCE_SCRIPT_API void jce_script_api_get_pointer_delta(JceScriptApi *api,
                                                      float out_xy[2]);
 
 /* jce_script_api_get_pointer_position -- shape: void_out_array, since 1
- * Viewport-local logical pixel x, y, width, height; zero dimensions indicate
- * unavailable input. The sample is frame-transient and shared by Editor Game
- * View and standalone runtime.
+ * Viewport-local Canvas pixel x, y, width, height (native drawable or Editor
+ * GameView FBO after render_scale); zero dimensions indicate unavailable
+ * input. The sample is frame-transient and shared by Editor Game View and
+ * standalone runtime.
  */
 JCE_SCRIPT_API void jce_script_api_get_pointer_position(JceScriptApi *api,
                                                         float out_xywh[4]);
@@ -884,6 +885,15 @@ JCE_SCRIPT_API int jce_script_api_stat_get(JceScriptApi *api, const char * id,
 /* jce_script_api_stat_flush -- shape: value_return, since 1
  */
 JCE_SCRIPT_API bool jce_script_api_stat_flush(JceScriptApi *api);
+
+/* jce_script_api_get_viewport_size -- shape: void_out_array, since 1
+ * Host presentation width and height in Canvas pixels (native drawable or
+ * Editor GameView FBO after render_scale), independent of pointer
+ * availability, focus or hover. Persistent until the host replaces or clears
+ * it; unavailable or absent sized-host callbacks return zero, zero.
+ */
+JCE_SCRIPT_API void jce_script_api_get_viewport_size(JceScriptApi *api,
+                                                     float out_wh[2]);
 
 #ifdef __cplusplus
 }

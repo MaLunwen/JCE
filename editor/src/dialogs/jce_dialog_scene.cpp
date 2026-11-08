@@ -193,7 +193,10 @@ void jce_editor_dialog_open_scene(bool *p_open)
         char defp[1024];
         compute_default_scene_path(defp, sizeof(defp), "");
         open_file_dialog_async(jce_editor_i18n("menu.file.openScene"),
-                               defp[0] ? defp : NULL, kSceneFilter,
+                               defp[0] ? defp : NULL,
+                               jce_editor_i18n_or("fileDialog.filter.scene_or_bundle",
+                                   "Scene / Bundle (*.scene *.scene.json *.jbundle);;"
+                                   "All Files (*.*)"),
                                s.path, sizeof(s.path),
                                &s.ready, &s.cancelled);
         return;

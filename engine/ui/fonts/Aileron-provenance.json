@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "asset": "fonts/Aileron-Regular.ttf",
+  "family": "Aileron",
+  "style": "Regular",
+  "source": "https://github.com/python-pillow/Pillow/blob/12.3.0/src/PIL/ImageFont.py",
+  "upstream_license": "https://dotcolon.net/fonts/aileron/",
+  "copyright": "No Rights Reserved.",
+  "bytes": 12676,
+  "sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f",
+  "glyph_count": 113,
+  "cjk_coverage": false,
+  "modified": false
+}

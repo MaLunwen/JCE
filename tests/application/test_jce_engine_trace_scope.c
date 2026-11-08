@@ -1,5 +1,6 @@
 /* Actual bootstrap scope trace contract; no window or renderer. */
 #include "unity.h"
+#include <jce/os/core/jce_env.h>
 #include "application/jce_engine_trace_scope.h"
 
 void setUp(void)
@@ -107,9 +108,62 @@ static void test_result_macro_evaluates_once_and_records_actual_outcome(void)
     TEST_ASSERT_EQUAL_UINT32(0, jce_trace_read(&cursor, events, 6));
 }
 
+static void test_public_environment_flags_and_application_agreement(void)
+{
+    static const struct {
+        const char *value;
+        JceBool enabled;
+    } flags[] = {
+        { NULL, 0 },
+        { "", 0 },
+        { "0", 0 },
+        { "0anything", 0 },
+        { "00", 0 },
+        { "1", 1 },
+        { "false", 1 },
+        { "off", 1 },
+        { "true", 1 },
+        { "yes", 1 },
+        { "anything", 1 },
+        { " 0", 1 }
+    };
+
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++) {
+        TEST_ASSERT_EQUAL_UINT8(flags[i].enabled,
+                               jce_env_flag_enabled(flags[i].value));
+        TEST_ASSERT_EQUAL_UINT8(flags[i].enabled,
+                               (JceBool)engine_trace_flag_enabled(flags[i].value));
+    }
+
+    TEST_ASSERT_FALSE(engine_trace_policy("0", "false", NULL, NULL, false));
+    TEST_ASSERT_TRUE(engine_trace_policy(NULL, "false", NULL, NULL, false));
+    TEST_ASSERT_TRUE(engine_trace_policy("1", "0anything", NULL, NULL, false));
+}
+
+static void test_environment_flags_and_explicit_trace_precedence(void)
+{
+    TEST_ASSERT_FALSE(engine_trace_flag_enabled(NULL));
+    TEST_ASSERT_FALSE(engine_trace_flag_enabled(""));
+    TEST_ASSERT_FALSE(engine_trace_flag_enabled("0"));
+    TEST_ASSERT_FALSE(engine_trace_flag_enabled("0anything"));
+    TEST_ASSERT_TRUE(engine_trace_flag_enabled("1"));
+    TEST_ASSERT_FALSE(engine_trace_policy("", "", NULL, NULL, false));
+    TEST_ASSERT_FALSE(engine_trace_policy(NULL, "0", NULL, NULL, false));
+    TEST_ASSERT_FALSE(engine_trace_policy("0", "1", NULL, NULL, false));
+    TEST_ASSERT_FALSE(engine_trace_policy("0", NULL, NULL, NULL, true));
+    TEST_ASSERT_TRUE(engine_trace_policy(NULL, NULL, NULL, NULL, true));
+    TEST_ASSERT_TRUE(engine_trace_policy("", "1", NULL, NULL, false));
+    TEST_ASSERT_TRUE(engine_trace_policy("1", "0", NULL, NULL, false));
+    TEST_ASSERT_TRUE(engine_trace_policy("0", "0", "capture.json", NULL, false));
+    TEST_ASSERT_TRUE(engine_trace_policy("0", "0", NULL, "capture.json", false));
+    TEST_ASSERT_FALSE(engine_trace_policy("0", "0", "", "", true));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_public_environment_flags_and_application_agreement);
+    RUN_TEST(test_environment_flags_and_explicit_trace_precedence);
     RUN_TEST(test_disabled_scope_emits_nothing);
     RUN_TEST(test_nested_scopes_restore_parent_and_preserve_failure);
     RUN_TEST(test_result_macro_evaluates_once_and_records_actual_outcome);

@@ -623,6 +623,10 @@ static JceAppDesc smoke_get_desc(void)
     d.should_quit   = smoke_should_quit;
     d.window_width  = 320;
     d.window_height = 200;
+#if !JCE_PLATFORM_WEB
+    /* Script/PAK checks need update ticks, not a native window or draw. */
+    d.headless      = true;
+#endif
     return d;
 }
 

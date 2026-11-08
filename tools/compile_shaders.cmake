@@ -25,8 +25,10 @@
 #       OUT_FILES_VAR COMPILED_SHADER_FILES
 #   )
 
+include("${CMAKE_CURRENT_LIST_DIR}/shader_stock_policy.cmake")
+
 function(jce_compile_shaders)
-    cmake_parse_arguments(ARG "REQUIRED"
+    cmake_parse_arguments(ARG "REQUIRED;STOCK"
         "TARGET;SHADER_DIR;VARYING_DEF;OUTPUT_DIR;OUT_FILES_VAR"
         "INCLUDE_DIRS" ${ARGN})
 
@@ -42,6 +44,10 @@ function(jce_compile_shaders)
                 "jce_compile_shaders: ${_req} is required")
         endif()
     endforeach()
+
+    if(ARG_STOCK)
+        jce_shader_stock_policy_identity(_stock_policy _stock_digest)
+    endif()
 
     # ── locate shaderc ────────────────────────────────────────────
     # Priority order:
@@ -281,12 +287,21 @@ function(jce_compile_shaders)
                 continue()
             endif()
 
-            # essl1 (GLES2/WebGL1) is opt-in per-shader via the allowlist.
-            if(_suffix STREQUAL "essl1")
-                if(NOT _name IN_LIST JCE_SHADER_GLES2_ALLOWLIST)
+            # Only built-in stock opts into the declared compatibility subset.
+            # Custom/SDK shader names are never filtered through the catalogue.
+            if(ARG_STOCK)
+                jce_shader_stock_admit(_stock_admitted "${_name}" "${_type}" "${_suffix}")
+                if(NOT _stock_admitted)
                     continue()
                 endif()
-                # Compute shaders cannot exist on GLES2.
+            endif()
+            if(_suffix STREQUAL "essl1")
+                # Preserve the existing full/default GLES2 command policy.
+                # Compatibility stock uses its catalogue; compatibility custom
+                # graphics remain unrestricted rather than inheriting stock names.
+                if(NOT JCE_SHADER_COMPATIBILITY AND NOT _name IN_LIST JCE_SHADER_GLES2_ALLOWLIST)
+                    continue()
+                endif()
                 if(_type STREQUAL "compute")
                     continue()
                 endif()
@@ -310,13 +325,24 @@ function(jce_compile_shaders)
             endif()
 
             set(_out "${ARG_OUTPUT_DIR}/${_name}_${_suffix}.bin")
-            # Bone-palette ceiling for the skinned vertex shaders' u_model[]
-            # array. MUST stay equal to JCE_MAX_BONES in
-            # engine/include/jce/renderer/jce_skinned_mesh.h. 128 mat4 = 512
-            # vec4 fits every targeted vertex uniform budget; the skinned
-            # shaders clamp the joint index to BGFX_CONFIG_MAX_BONES-1.
-            set(_shader_defines
-                --define "BGFX_CONFIG_MAX_BONES=128")
+            # Modern stock retains its existing palette and command identity.
+            # Compatibility shader bodies must select a capability-qualified
+            # palette; 128 mat4 exceeds the GL 2.1 minimum uniform budget.
+            set(_shader_defines "BGFX_CONFIG_MAX_BONES=128")
+            if(JCE_SHADER_COMPATIBILITY AND NOT _type STREQUAL "compute" AND
+               (_suffix STREQUAL "glsl" OR _suffix STREQUAL "essl" OR
+                _suffix STREQUAL "essl1"))
+                string(APPEND _shader_defines ";JCE_SHADER_COMPATIBILITY=1")
+                if(ARG_STOCK AND _suffix STREQUAL "glsl" AND _profile STREQUAL "120")
+                    if(_name STREQUAL "fs_pbr" OR _name STREQUAL "fs_pbr_noshadow")
+                        string(APPEND _shader_defines ";JCE_PBR_GL21_STOCK=1")
+                    elseif(_name STREQUAL "fs_composite")
+                        string(APPEND _shader_defines ";JCE_POSTFX_GL21_STOCK=1")
+                    elseif(_name STREQUAL "fs_sky")
+                        string(APPEND _shader_defines ";JCE_SKY_GL21_STOCK=1")
+                    endif()
+                endif()
+            endif()
 
             # Cache only a verified single shader blob, never a native build tree.
             # The key includes compiler bytes, argv and every declared source input.
@@ -353,7 +379,7 @@ function(jce_compile_shaders)
                         -p "${_profile}"
                         --varyingdef "${_varying}"
                         ${_include_args}
-                        ${_shader_defines}
+                        --define "${_shader_defines}"
                         # -O 3.  Passing NO -O is not the same as -O 0: shaderc
                         # takes a different path entirely, and on HLSL that path
                         # keeps debug information -- fs_pbr is 416168 bytes with

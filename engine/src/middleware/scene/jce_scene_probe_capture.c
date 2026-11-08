@@ -3,9 +3,8 @@
  *                            modal.
  *
  * One face per frame through the ordinary scene renderer and the ordinary
- * offscreen bridge, read back with the blit + bgfx_read_texture pattern the
- * impostor bake proved (jce_impostor.c): the screenshot callback does not
- * deliver for offscreen FBOs, and a blit to a READ_BACK staging texture does.
+ * offscreen bridge. The canonical readback queue owns asynchronous staging
+ * destinations, cancellation and retirement across the backend lifetime.
  */
 
 #include <jce/middleware/scene/jce_scene_probe_capture.h>
@@ -15,9 +14,11 @@
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_render_readback.h>
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
+#include "renderer/jce_render_readback_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 
@@ -33,16 +34,16 @@ static struct {
     CapturePhase          phase;
     int                   face;          /* 0..5 */
     uint32_t              face_size;
-    uint8_t              *faces;         /* 6 * face_size^2 * 4 */
-    uint8_t              *staging_px;    /* one face, RGBA8 or RGBA16F */
-    /* 4 or 8.  The probe component's `hdr` flag decides, and the offscreen
-     * target has to be able to give it: an adapter without RGBA16F render
-     * targets falls back to RGBA8 there, and capturing 8 bytes out of a
-     * 4-byte source would read whatever is past the end. */
+    uint8_t              *faces;
+    size_t                faces_capacity;
+    bool                  requested_hdr;
     uint32_t              bpp;
-    bgfx_texture_handle_t staging;
+    JceRenderFormat       readback_format;
+    JceRenderReadbackQueue *readback;
+    JceRenderReadbackTicket ticket;
+    JceScene             *scene;        /* borrowed identity; never freed here */
+    JceRenderer          *renderer;     /* bound by the first admitted render */
     JceOffscreenTarget   *target;
-    uint32_t              ready_frame;
     jce_vec3              position;
     float                 near_z, far_z;
     char                  path[512];
@@ -53,7 +54,6 @@ static struct {
      * initializers", pointing at the last line rather than the insertion. */
     .status      = JCE_PROBE_CAPTURE_IDLE,
     .phase       = PHASE_RENDER,
-    .staging     = { UINT16_MAX },
     .bpp         = 4u,
     .near_z      = 0.1f,
     .far_z       = 1000.0f,
@@ -99,19 +99,22 @@ bool jce_probe_face_basis(int face, jce_vec3 *out_forward, jce_vec3 *out_up)
 
 static void capture_release(void)
 {
+    if (g_cap.readback) {
+        (void)jce_render_readback_cancel(g_cap.readback, g_cap.ticket);
+        /* No frame pumping here, including scene swaps and unfocused cancel.
+         * The queue retains borrowed CPU storage until ready or backend stop. */
+        jce_render_readback_destroy_deferred(g_cap.readback);
+        g_cap.readback = NULL;
+    }
+    g_cap.ticket = JCE_RENDER_READBACK_INVALID_TICKET;
     if (g_cap.target) {
         jce_offscreen_target_destroy(g_cap.target);
         g_cap.target = NULL;
     }
-    /* NEVER trust a zero-initialised bgfx handle: idx 0 is a VALID handle,
-     * i.e. someone else's texture.  The impostor bake destroyed frame buffers
-     * it never created exactly that way. */
-    if (g_cap.staging.idx != UINT16_MAX) {
-        bgfx_destroy_texture(g_cap.staging);
-        g_cap.staging.idx = UINT16_MAX;
-    }
-    if (g_cap.staging_px) { JCE_FREE(g_cap.staging_px); g_cap.staging_px = NULL; }
     if (g_cap.faces)      { JCE_FREE(g_cap.faces);      g_cap.faces = NULL; }
+    g_cap.faces_capacity = 0;
+    g_cap.scene = NULL;
+    g_cap.renderer = NULL;
 }
 
 bool jce_scene_probe_capture_in_flight(void)
@@ -149,14 +152,15 @@ bool jce_scene_probe_capture_begin(JceScene *scene, JceEntity probe,
 
     capture_release();
 
-    /* HDR when the probe asks for it AND the target can carry it.  Asking
-     * without checking would read past a 4-byte-per-pixel source. */
+    g_cap.requested_hdr = rp->hdr;
     g_cap.bpp = rp->hdr ? 8u : 4u;
 
     const size_t face_bytes = (size_t)face_size * face_size * g_cap.bpp;
-    g_cap.faces      = (uint8_t *)JCE_MALLOC(face_bytes * 6u);
-    g_cap.staging_px = (uint8_t *)JCE_MALLOC(face_bytes);
-    if (!g_cap.faces || !g_cap.staging_px) {
+    /* A LDR output may read an HDR source. One extra 4-byte face lets the
+     * final 8-byte face copy shrink in place without another scratch buffer. */
+    g_cap.faces_capacity = face_bytes * 6u + (rp->hdr ? 0u : face_bytes);
+    g_cap.faces = (uint8_t *)JCE_MALLOC(g_cap.faces_capacity);
+    if (!g_cap.faces) {
         LOG_ERROR(LOG_TAG, "begin failed: out of memory (%u px faces)", face_size);
         capture_release();
         return false;
@@ -173,6 +177,7 @@ bool jce_scene_probe_capture_begin(JceScene *scene, JceEntity probe,
     g_cap.face_size = face_size;
     g_cap.face      = 0;
     g_cap.phase     = PHASE_RENDER;
+    g_cap.scene     = scene;
     g_cap.status    = JCE_PROBE_CAPTURE_RENDERING;
     snprintf(g_cap.path, sizeof g_cap.path, "%s", out_path_ktx);
 
@@ -187,36 +192,20 @@ bool jce_scene_probe_capture_begin(JceScene *scene, JceEntity probe,
 static bool capture_render_face(JceSceneRenderer *sr, JceScene *scene,
                                 JceRenderer *renderer)
 {
-    if (!renderer) return false;
+    if (!jce_render_readback_deferred_admission(renderer, g_cap.readback)) {
+        LOG_WARN(LOG_TAG, "capture readback admission unavailable");
+        return false;
+    }
+    if (!g_cap.readback) {
+        g_cap.readback = jce_render_readback_create(renderer);
+        if (!g_cap.readback) return false;
+        g_cap.renderer = renderer;
+    }
 
     if (!g_cap.target) {
         g_cap.target = jce_offscreen_target_create(renderer, JCE_VIEW_EDITOR_SCENE);
         if (!g_cap.target) {
             LOG_ERROR(LOG_TAG, "offscreen target creation failed");
-            return false;
-        }
-    }
-    if (g_cap.staging.idx == UINT16_MAX) {
-        /* The staging format must MATCH the offscreen target's, because a
-         * bgfx blit between different formats is undefined -- and matching it
-         * is the whole fix: the scene was already being rendered in RGBA16F
-         * and the HDR was discarded here, one call before it would have been
-         * stored. */
-        if (g_cap.bpp == 8u && !jce_offscreen_target_is_hdr(g_cap.target)) {
-            LOG_WARN(LOG_TAG,
-                     "probe asked for HDR but the offscreen target is RGBA8 on "
-                     "this adapter; capturing LDR");
-            g_cap.bpp = 4u;
-        }
-        g_cap.staging = bgfx_create_texture_2d(
-            (uint16_t)g_cap.face_size, (uint16_t)g_cap.face_size, false, 1,
-            g_cap.bpp == 8u ? BGFX_TEXTURE_FORMAT_RGBA16F
-                            : BGFX_TEXTURE_FORMAT_RGBA8,
-            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK
-                | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-            NULL, 0);
-        if (!BGFX_HANDLE_IS_VALID(g_cap.staging)) {
-            LOG_ERROR(LOG_TAG, "read-back staging texture unavailable");
             return false;
         }
     }
@@ -252,6 +241,18 @@ static bool capture_render_face(JceSceneRenderer *sr, JceScene *scene,
         jce_camera_destroy(cam);
         return false;
     }
+    /* Creation alone has no framebuffer/format yet. Observe only after prepare. */
+    const bool source_hdr = jce_offscreen_target_is_hdr(g_cap.target);
+    const JceRenderFormat source_format = source_hdr ? JCE_RENDER_FORMAT_RGBA16F : JCE_RENDER_FORMAT_RGBA8;
+    if (g_cap.face == 0) {
+        g_cap.readback_format = source_format;
+        g_cap.bpp = g_cap.requested_hdr && source_hdr ? 8u : 4u;
+        if (g_cap.requested_hdr && !source_hdr)
+            LOG_WARN(LOG_TAG, "probe asked for HDR but the prepared target is RGBA8; capturing LDR");
+    } else if (source_format != g_cap.readback_format) {
+        jce_camera_destroy(cam);
+        return false;
+    }
 
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     cfg.draw_skybox      = true;
@@ -260,24 +261,34 @@ static bool capture_render_face(JceSceneRenderer *sr, JceScene *scene,
     cfg.draw_sprites     = false;
     cfg.draw_transparent = true;
     cfg.apply_postfx     = false;   /* a probe stores radiance, not a graded frame */
+    cfg.reduced_pass     = true;    /* keep main-view screen-space history private */
     cfg.viewport_width   = g_cap.face_size;
     cfg.viewport_height  = g_cap.face_size;
     cfg.viewport_id      = 0;
     cfg.scene_frame_buffer = jce_offscreen_target_get_frame_buffer(g_cap.target);
 
-    (void)jce_scene_renderer_render(sr, scene, cam, JCE_VIEW_EDITOR_SCENE,
+    (void)jce_scene_renderer_render_linear(sr, scene, cam, JCE_VIEW_EDITOR_SCENE,
                                     0.0f, &cfg);
     jce_camera_destroy(cam);
 
     const uint16_t color_idx = jce_offscreen_target_get_color_texture(g_cap.target);
     if (color_idx == UINT16_MAX) return false;
-    bgfx_texture_handle_t color = { color_idx };
+    JceRenderReadbackDesc readback = jce_render_readback_desc_default();
+    readback.source = (JceTextureHandle){color_idx};
+    readback.format = g_cap.readback_format;
+    readback.view_id = JCE_VIEW_PROBE_CAPTURE_BLIT;
+    readback.width = readback.height = g_cap.face_size;
+    const bool submitted = jce_render_readback_submit(g_cap.readback, &readback, &g_cap.ticket);
+    if (!submitted) LOG_ERROR(LOG_TAG, "face readback submission rejected: format=%u", (unsigned)readback.format);
+    return submitted;
+}
 
-    bgfx_blit((uint16_t)JCE_VIEW_PROBE_CAPTURE_BLIT, g_cap.staging, 0, 0, 0, 0,
-              color, 0, 0, 0, 0,
-              (uint16_t)g_cap.face_size, (uint16_t)g_cap.face_size, 1);
-    g_cap.ready_frame = bgfx_read_texture(g_cap.staging, g_cap.staging_px, 0, 0);
-    return true;
+static uint8_t capture_ldr_channel(uint16_t half)
+{
+    const float value = jce_half_to_float(half);
+    if (!(value > 0.0f)) return 0; /* NaN, negative values and -Inf. */
+    if (value >= 1.0f) return 255; /* Also +Inf; remaining values are finite. */
+    return (uint8_t)(value * 255.0f + 0.5f);
 }
 
 JceProbeCaptureStatus jce_scene_probe_capture_poll(JceSceneRenderer *sr,
@@ -285,8 +296,9 @@ JceProbeCaptureStatus jce_scene_probe_capture_poll(JceSceneRenderer *sr,
                                                    JceRenderer *renderer)
 {
     if (g_cap.status != JCE_PROBE_CAPTURE_RENDERING) return g_cap.status;
-    if (!sr || !scene || !renderer) {
-        LOG_ERROR(LOG_TAG, "poll without a renderer or scene");
+    if (!sr || !scene || !renderer || scene != g_cap.scene ||
+        (g_cap.renderer && renderer != g_cap.renderer)) {
+        LOG_ERROR(LOG_TAG, "poll lost or changed its scene/renderer owner");
         capture_release();
         g_cap.status = JCE_PROBE_CAPTURE_FAILED;
         return g_cap.status;
@@ -302,16 +314,33 @@ JceProbeCaptureStatus jce_scene_probe_capture_poll(JceSceneRenderer *sr,
         return g_cap.status;
     }
 
-    /* PHASE_READBACK: bgfx promised the pixels are valid once the frame index
-     * reaches ready_frame. */
-    if (jce_renderer_get_frame_index(renderer) < g_cap.ready_frame)
+    const JceRenderReadbackState state = jce_render_readback_poll(g_cap.readback, g_cap.ticket);
+    if (state == JCE_RENDER_READBACK_PENDING)
         return g_cap.status;
-
+    JceRenderReadbackInfo info;
+    uint64_t row_pitch = 0, byte_size = 0;
+    const size_t face_bytes = (size_t)g_cap.face_size * g_cap.face_size * g_cap.bpp;
+    const size_t offset = (size_t)g_cap.face * face_bytes;
+    if (state != JCE_RENDER_READBACK_READY ||
+        !jce_render_readback_layout(g_cap.readback_format, g_cap.face_size, g_cap.face_size, &row_pitch, &byte_size) ||
+        !jce_render_readback_get_info(g_cap.readback, g_cap.ticket, &info) ||
+        info.state != JCE_RENDER_READBACK_READY || info.format != (uint32_t)g_cap.readback_format || info.width != g_cap.face_size ||
+        info.height != g_cap.face_size || info.row_pitch != row_pitch || info.byte_size != byte_size ||
+        offset > g_cap.faces_capacity || byte_size > g_cap.faces_capacity - offset ||
+        !jce_render_readback_copy(g_cap.readback, g_cap.ticket, g_cap.faces + offset, (size_t)byte_size)) {
+        capture_release(); g_cap.status = JCE_PROBE_CAPTURE_FAILED;
+        return g_cap.status;
+    }
+    (void)jce_render_readback_release(g_cap.readback, g_cap.ticket);
+    g_cap.ticket = JCE_RENDER_READBACK_INVALID_TICKET;
+    if (g_cap.bpp == 4u && g_cap.readback_format == JCE_RENDER_FORMAT_RGBA16F)
     {
-        const size_t face_bytes =
-        (size_t)g_cap.face_size * g_cap.face_size * g_cap.bpp;
-        memcpy(g_cap.faces + (size_t)g_cap.face * face_bytes,
-               g_cap.staging_px, face_bytes);
+        uint8_t *face = g_cap.faces + offset;
+        for (size_t channel = 0; channel < face_bytes; ++channel) {
+            uint16_t half;
+            memcpy(&half, face + channel * 2u, sizeof half);
+            face[channel] = capture_ldr_channel(half);
+        }
     }
     g_cap.face++;
 

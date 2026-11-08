@@ -13,6 +13,14 @@
 
 #include "jce_gpu_vendor.h"
 #include "jce_renderer_caps_internal.h"
+#include "jce_renderer_web_api_internal.h"
+#if JCE_PLATFORM_WINDOWS && defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+#include "os/platform/jce_window_adapter_internal.h"
+#if defined(JCE_BGFX_XP_VULKAN) && JCE_BGFX_XP_VULKAN
+extern int jce_xp_bgfx_vulkan_probe(void);
+#endif
+#endif
+static JceRendererWebApiState s_web_api;
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL_cpuinfo.h>   /* SDL_GetNumLogicalCPUCores / SDL_GetSystemRAM */
@@ -45,13 +53,26 @@
 #  if JCE_BGFX_OPENGL_VERSION != 46 || JCE_BGFX_OPENGLES_VERSION != 32
 #    error "current graphics tier must build bgfx for OpenGL 4.6 / GLES 3.2"
 #  endif
+#elif JCE_GRAPHICS_API_TIER_VALUE == 3
+#  if JCE_BGFX_OPENGL_VERSION != 21 || JCE_BGFX_OPENGLES_VERSION != 20
+#    error "compatibility graphics tier must build bgfx for OpenGL 2.1 / GLES 2.0"
+#  endif
 #else
 #  error "invalid JCE_GRAPHICS_API_TIER_VALUE"
 #endif
 
+/* Cached bgfx package ordinals and public C ABI values are distinct. */
+enum {
+    JCE_GFX_PROVIDER_COMPATIBILITY_ORDINAL = 3,
+    JCE_GFX_PROVIDER_TIER_COUNT = JCE_GFX_PROVIDER_COMPATIBILITY_ORDINAL + 1
+};
+#define JCE_GFX_BUILD_TIER ((JceGraphicsApiTier)( \
+    JCE_GRAPHICS_API_TIER_VALUE == JCE_GFX_PROVIDER_COMPATIBILITY_ORDINAL \
+        ? JCE_GRAPHICS_API_TIER_COMPATIBILITY : JCE_GRAPHICS_API_TIER_VALUE))
+
 static JceRendererApiInfo s_api_info = {
     JCE_BACKEND_AUTO,
-    (JceGraphicsApiTier)JCE_GRAPHICS_API_TIER_VALUE,
+    JCE_GFX_BUILD_TIER,
     {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, false, false
 };
 
@@ -123,6 +144,7 @@ const char *jce_graphics_api_tier_name(JceGraphicsApiTier tier)
     case JCE_GRAPHICS_API_TIER_STABLE:  return "stable";
     case JCE_GRAPHICS_API_TIER_MODERN:  return "modern";
     case JCE_GRAPHICS_API_TIER_CURRENT: return "current";
+    case JCE_GRAPHICS_API_TIER_COMPATIBILITY: return "compatibility";
     default:                            return "unknown";
     }
 }
@@ -140,35 +162,40 @@ JceGraphicsApiVersion jce_renderer_api_tier_minimum(
      * seeds the runtime GL_EXTENSIONS scan recovers, and the one thing
      * genuinely lost -- BGFX_CAPS_PRIMITIVE_ID, granted unconditionally at
      * >= 32 -- is consumed nowhere in this tree. */
-    static const JceGraphicsApiVersion gl[JCE_GRAPHICS_API_TIER_COUNT] = {
-        {3, 1, 0}, {4, 3, 0}, {4, 6, 0}
+    static const JceGraphicsApiVersion gl[JCE_GFX_PROVIDER_TIER_COUNT] = {
+        {3, 1, 0}, {4, 3, 0}, {4, 6, 0}, {2, 1, 0}
     };
-    static const JceGraphicsApiVersion gles[JCE_GRAPHICS_API_TIER_COUNT] = {
-        {3, 0, 0}, {3, 1, 0}, {3, 2, 0}
+    static const JceGraphicsApiVersion gles[JCE_GFX_PROVIDER_TIER_COUNT] = {
+        {3, 0, 0}, {3, 1, 0}, {3, 2, 0}, {2, 0, 0}
     };
-    static const JceGraphicsApiVersion vk[JCE_GRAPHICS_API_TIER_COUNT] = {
-        {1, 0, 0}, {1, 2, 0}, {1, 4, 0}
+    static const JceGraphicsApiVersion vk[JCE_GFX_PROVIDER_TIER_COUNT] = {
+        {1, 0, 0}, {1, 2, 0}, {1, 4, 0}, {1, 0, 0}
     };
 
-    if ((int)tier < 0 || tier >= JCE_GRAPHICS_API_TIER_COUNT)
+    unsigned row = (unsigned)tier;
+    if (tier == JCE_GRAPHICS_API_TIER_COMPATIBILITY)
+        row = JCE_GFX_PROVIDER_COMPATIBILITY_ORDINAL;
+    else if (row >= JCE_GRAPHICS_API_TIER_COUNT)
         return s_api_version(0, 0, 0);
     if (backend == JCE_BACKEND_OPENGL)
-        return gl[tier];
+        return gl[row];
     if (backend == JCE_BACKEND_OPENGLES)
-        return gles[tier];
+        return gles[row];
     if (backend == JCE_BACKEND_VULKAN)
-        return vk[tier];
+        return vk[row];
     return s_api_version(0, 0, 0);
 }
 
 JceRendererApiInfo jce_renderer_get_api_info(void)
 {
+    (void)jce_renderer_caps_api_web_context_current();
     return s_api_info;
 }
 
 const char *jce_renderer_running_backend_name(void)
 {
     static char buf[48];
+    (void)jce_renderer_caps_api_web_context_current();
     const char *base = bgfx_get_renderer_name(bgfx_get_renderer_type());
 
     /* Only rewrite when we actually observed a version.  Inventing one from
@@ -200,10 +227,11 @@ const char *jce_renderer_running_backend_name(void)
 
 void jce_renderer_caps_api_reset(void)
 {
+    memset(&s_web_api, 0, sizeof(s_web_api));
+    jce_webgl_context_cache_reset_internal();
     memset(&s_api_info, 0, sizeof(s_api_info));
     s_api_info.backend = JCE_BACKEND_AUTO;
-    s_api_info.build_tier =
-        (JceGraphicsApiTier)JCE_GRAPHICS_API_TIER_VALUE;
+    s_api_info.build_tier = JCE_GFX_BUILD_TIER;
 }
 
 void jce_renderer_caps_api_begin_attempt(JceRendererBackend backend)
@@ -806,6 +834,40 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
     return n;
 }
 
+#if JCE_PLATFORM_WINDOWS && defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+static bool xp_backend_meets_host_requirements(bgfx_renderer_type_t type)
+{
+    switch (type) {
+#if defined(JCE_BGFX_XP_D3D12) && JCE_BGFX_XP_D3D12
+    case BGFX_RENDERER_TYPE_DIRECT3D12:
+        return jce_window_legacy_d3d12_available();
+#endif
+#if defined(JCE_BGFX_XP_D3D11) && JCE_BGFX_XP_D3D11
+    case BGFX_RENDERER_TYPE_DIRECT3D11:
+        return jce_window_legacy_d3d11_available();
+#endif
+#if defined(JCE_BGFX_XP_VULKAN) && JCE_BGFX_XP_VULKAN
+    case BGFX_RENDERER_TYPE_VULKAN:
+        return jce_xp_bgfx_vulkan_probe() != 0;
+#endif
+    case BGFX_RENDERER_TYPE_OPENGL:
+    case BGFX_RENDERER_TYPE_NOOP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool jce_renderer_caps_xp_backend_available(bgfx_renderer_type_t type)
+{
+    bgfx_renderer_type_t supported[BGFX_RENDERER_TYPE_COUNT];
+    const uint8_t count = bgfx_get_supported_renderers(BGFX_RENDERER_TYPE_COUNT, supported);
+    for (uint8_t i = 0; i < count; ++i)
+        if (supported[i] == type) return xp_backend_meets_host_requirements(type);
+    return false;
+}
+#endif
+
 int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max)
 {
     bgfx_renderer_type_t supported[BGFX_RENDERER_TYPE_COUNT];
@@ -828,6 +890,9 @@ int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max)
             enum JceRendererBackend b = s_from_bgfx(supported[i]);
             if (b == JCE_BACKEND_AUTO) continue;
             if (b != pref[p]) continue;
+#if JCE_PLATFORM_WINDOWS && defined(JCE_WINXP_LEGACY) && JCE_WINXP_LEGACY
+            if (!xp_backend_meets_host_requirements(supported[i])) continue;
+#endif
             if ((int)b < (int)(sizeof(seen)/sizeof(seen[0])) && seen[(int)b]) continue;
             tmp[count++] = b;
             if ((int)b < (int)(sizeof(seen)/sizeof(seen[0]))) seen[(int)b] = true;
@@ -850,6 +915,7 @@ static bgfx_texture_format_t vfetch_bgfx_format(JceGpuVertexFetchFormat fmt)
 {
     switch (fmt) {
     case JCE_GPU_VFETCH_FMT_R32F:    return BGFX_TEXTURE_FORMAT_R32F;
+    case JCE_GPU_VFETCH_FMT_RGBA16F: return BGFX_TEXTURE_FORMAT_RGBA16F;
     case JCE_GPU_VFETCH_FMT_RGBA32F:
     default:                         return BGFX_TEXTURE_FORMAT_RGBA32F;
     }
@@ -889,7 +955,27 @@ bool jce_gpu_vertex_fetch_usable(JceGpuVertexFetchFormat fmt)
 #if JCE_PLATFORM_WEB
         return false;
 #else
-        return true;
+        /* GL 2.1 / GLES 2.0 do not guarantee vertex texture units. An
+         * unpopulated backend field cannot upgrade that policy to YES. */
+        return JCE_GFX_BUILD_TIER != JCE_GRAPHICS_API_TIER_COMPATIBILITY;
 #endif
     }
+}
+
+
+bool jce_renderer_caps_api_admit_web_context(void)
+{
+#if JCE_PLATFORM_WEB
+    return jce_renderer_web_api_admit(&s_web_api, jce_webgl_context_snapshot_internal);
+#else
+    return true;
+#endif
+}
+bool jce_renderer_caps_api_web_context_current(void)
+{
+#if JCE_PLATFORM_WEB
+    if (s_api_info.backend == JCE_BACKEND_OPENGLES)
+        return jce_renderer_web_api_current(&s_web_api, jce_webgl_context_snapshot_internal);
+#endif
+    return true;
 }

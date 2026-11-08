@@ -28,7 +28,7 @@
  * (`ok`) rather than made with a NULL argument the host would have to
  * interpret.
  *
- * 108 entry points plus 3 meta (nativeApiVersion / nativeOpen / nativeClose).
+ * 109 entry points plus 3 meta (nativeApiVersion / nativeOpen / nativeClose).
  */
 
 #include <jni.h>
@@ -2133,4 +2133,21 @@ JNIEXPORT jboolean JNICALL Java_com_jce_script_JceScript_nStatFlush(
     (void)cls;
     ret = (jboolean)jce_script_api_stat_flush(jce_java_api(api));
     return ret;
+}
+
+
+/* jce.get_viewport_size -> jce_script_api_get_viewport_size (void_out_array) */
+JNIEXPORT void JNICALL Java_com_jce_script_JceScript_nGetViewportSize(
+    JNIEnv *env, jclass cls, jlong api, jfloatArray j_outFloat)
+{
+    float out_wh[2];
+    jfloat outFloat[2];
+
+    (void)cls;
+    memset(out_wh, 0, sizeof out_wh);
+    jce_script_api_get_viewport_size(jce_java_api(api), out_wh);
+    outFloat[0] = (jfloat)out_wh[0];
+    outFloat[1] = (jfloat)out_wh[1];
+    if (j_outFloat)
+        (*env)->SetFloatArrayRegion(env, j_outFloat, 0, 2, outFloat);
 }

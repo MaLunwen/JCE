@@ -118,13 +118,159 @@ static void test_report_resets_the_window(void)
     TEST_ASSERT_NULL(strstr(buf, kNames[0]));
 }
 
+static double snapshot_ms(const char *name)
+{
+    for (int i = 0; i < jce_perf_phase_count(); ++i) {
+        const char *slot_name = NULL;
+        double ms = 0.0;
+        if (jce_perf_phase_peek_frame(i, &slot_name, &ms) &&
+            slot_name && strcmp(slot_name, name) == 0)
+            return ms;
+    }
+    TEST_FAIL_MESSAGE("expected phase was not registered");
+    return -1.0;
+}
+
+static void drain_window_and_pending_frame(void)
+{
+    char buf[OUT_LEN];
+    jce_perf_phase_report(buf, sizeof buf);
+    jce_perf_phase_frame_tick();
+}
+
+static void test_initial_snapshot_remains_unavailable_without_samples(void)
+{
+    char buf[OUT_LEN];
+    TEST_ASSERT_FALSE(jce_perf_phase_frame_has_data());
+    jce_perf_phase_frame_tick();
+    jce_perf_phase_report(buf, sizeof buf);
+    jce_perf_phase_report_average(buf, sizeof buf, 120u);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_FALSE(jce_perf_phase_frame_has_data());
+}
+
+static void test_sampled_zero_snapshot_is_available_after_tick(void)
+{
+    char buf[OUT_LEN];
+    TEST_ASSERT_FALSE(jce_perf_phase_frame_has_data());
+    jce_perf_phase_add(kNames[0], 0.0);
+    jce_perf_phase_report(buf, sizeof buf);
+    jce_perf_phase_report_average(buf, sizeof buf, 120u);
+    TEST_ASSERT_FALSE(jce_perf_phase_frame_has_data());
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, snapshot_ms(kNames[0]));
+    TEST_ASSERT_TRUE(jce_perf_phase_frame_has_data());
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, snapshot_ms(kNames[0]));
+    TEST_ASSERT_TRUE(jce_perf_phase_frame_has_data());
+}
+
+static void test_report_boundary_preserves_frame_snapshot(void)
+{
+    char buf[OUT_LEN];
+    drain_window_and_pending_frame();
+
+    /* Model the engine's end-of-frame report followed by the next tick.
+     * Two full windows also reject duplicate carry into the next average. */
+    for (uint32_t frame = 1u; frame <= 240u; ++frame) {
+        jce_perf_phase_add(kNames[0], 1.0);
+        jce_perf_phase_add(kNames[1], 2.0);
+        if (frame % 120u == 0u) {
+            jce_perf_phase_report_average(buf, sizeof buf, 120u);
+            TEST_ASSERT_NOT_NULL(strstr(buf, "phase_name_a_00=1.00"));
+            TEST_ASSERT_NOT_NULL(strstr(buf, "phase_name_a_01=2.00"));
+        }
+        jce_perf_phase_frame_tick();
+        TEST_ASSERT_EQUAL_DOUBLE(1.0, snapshot_ms(kNames[0]));
+        TEST_ASSERT_EQUAL_DOUBLE(2.0, snapshot_ms(kNames[1]));
+        TEST_ASSERT_TRUE(jce_perf_phase_frame_has_data());
+        jce_perf_phase_frame_tick();
+        TEST_ASSERT_EQUAL_DOUBLE(1.0, snapshot_ms(kNames[0]));
+        TEST_ASSERT_EQUAL_DOUBLE(2.0, snapshot_ms(kNames[1]));
+    }
+    jce_perf_phase_report(buf, sizeof buf);
+    TEST_ASSERT_EQUAL_STRING("", buf);
+}
+
+static void test_report_keeps_unrotated_frame_samples(void)
+{
+    char buf[OUT_LEN];
+    drain_window_and_pending_frame();
+    jce_perf_phase_add(kNames[0], 0.5);
+    jce_perf_phase_report(buf, sizeof buf);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "phase_name_a_00=0.50"));
+    jce_perf_phase_add(kNames[0], 0.25);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(0.75, snapshot_ms(kNames[0]));
+    jce_perf_phase_report(buf, sizeof buf);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "phase_name_a_00=0.25"));
+    jce_perf_phase_report(buf, sizeof buf);
+    TEST_ASSERT_EQUAL_STRING("", buf);
+}
+
+static void test_report_after_tick_keeps_the_completed_snapshot(void)
+{
+    char buf[OUT_LEN];
+    drain_window_and_pending_frame();
+    jce_perf_phase_add(kNames[0], 3.0);
+    jce_perf_phase_frame_tick();
+    jce_perf_phase_report_average(buf, sizeof buf, 3u);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "phase_name_a_00=1.00"));
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(3.0, snapshot_ms(kNames[0]));
+    jce_perf_phase_add(kNames[0], 4.0);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(4.0, snapshot_ms(kNames[0]));
+    jce_perf_phase_report(buf, sizeof buf);
+    TEST_ASSERT_NOT_NULL(strstr(buf, "phase_name_a_00=4.00"));
+}
+
+static void test_report_keeps_all_registered_frame_phases(void)
+{
+    char buf[OUT_LEN];
+    drain_window_and_pending_frame();
+    for (int i = 0; i < JCE_PERF_PHASE_MAX_SLOTS; ++i)
+        jce_perf_phase_add(kNames[i], 0.25 + (double)i);
+    jce_perf_phase_report_average(buf, sizeof buf, 120u);
+    jce_perf_phase_frame_tick();
+    for (int i = 0; i < JCE_PERF_PHASE_MAX_SLOTS; ++i)
+        TEST_ASSERT_EQUAL_DOUBLE(0.25 + (double)i, snapshot_ms(kNames[i]));
+    jce_perf_phase_frame_tick();
+    for (int i = 0; i < JCE_PERF_PHASE_MAX_SLOTS; ++i)
+        TEST_ASSERT_EQUAL_DOUBLE(0.25 + (double)i, snapshot_ms(kNames[i]));
+    jce_perf_phase_report(buf, sizeof buf);
+    TEST_ASSERT_EQUAL_STRING("", buf);
+}
+
+static void test_new_zero_frame_replaces_previous_nonzero_snapshot(void)
+{
+    drain_window_and_pending_frame();
+    jce_perf_phase_add(kNames[0], 7.0);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(7.0, snapshot_ms(kNames[0]));
+    jce_perf_phase_add(kNames[0], 0.0);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, snapshot_ms(kNames[0]));
+    TEST_ASSERT_TRUE(jce_perf_phase_frame_has_data());
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, snapshot_ms(kNames[0]));
+    TEST_ASSERT_TRUE(jce_perf_phase_frame_has_data());
+}
+
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(test_initial_snapshot_remains_unavailable_without_samples);
+    RUN_TEST(test_sampled_zero_snapshot_is_available_after_tick);
     RUN_TEST(test_full_table_does_not_overrun_the_caller_buffer);
     RUN_TEST(test_tiny_buffer_does_not_overrun);
     RUN_TEST(test_zero_slots_are_left_out_so_real_ones_fit);
     RUN_TEST(test_average_scaling_decides_what_counts_as_zero);
     RUN_TEST(test_report_resets_the_window);
+    RUN_TEST(test_report_boundary_preserves_frame_snapshot);
+    RUN_TEST(test_report_keeps_unrotated_frame_samples);
+    RUN_TEST(test_report_after_tick_keeps_the_completed_snapshot);
+    RUN_TEST(test_report_keeps_all_registered_frame_phases);
+    RUN_TEST(test_new_zero_frame_replaces_previous_nonzero_snapshot);
     return UNITY_END();
 }

@@ -596,11 +596,15 @@ internal static unsafe partial class Interop
         internal static extern byte jce_script_api_stat_flush(
             IntPtr api);
         [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void jce_script_api_get_viewport_size(
+            IntPtr api,
+            float* outWh);
+        [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void jce_script_api_json_free(IntPtr api, IntPtr owned);
     }
 }
 
-/// <summary>The engine, as a C# script sees it. 108 calls, generated from the same manifest the other five languages read.</summary>
+/// <summary>The engine, as a C# script sees it. 109 calls, generated from the same manifest the other five languages read.</summary>
 public static unsafe class Jce
 {
     private static IntPtr _api;
@@ -948,7 +952,7 @@ public static unsafe class Jce
         }
 
         /// <summary>
-        /// Viewport-local logical pixel x, y, width, height; zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime.
+        /// Viewport-local Canvas pixel x, y, width, height (native drawable or Editor GameView FBO after render_scale); zero dimensions indicate unavailable input. The sample is frame-transient and shared by Editor Game View and standalone runtime.
         /// </summary>
 
         public static (float, float, float, float) GetPointerPosition()
@@ -1523,5 +1527,16 @@ public static unsafe class Jce
         public static bool StatFlush()
         {
             return Interop.Fn.jce_script_api_stat_flush(_api) != 0;
+        }
+
+        /// <summary>
+        /// Host presentation width and height in Canvas pixels (native drawable or Editor GameView FBO after render_scale), independent of pointer availability, focus or hover. Persistent until the host replaces or clears it; unavailable or absent sized-host callbacks return zero, zero.
+        /// </summary>
+
+        public static (float, float) GetViewportSize()
+        {
+            float* o = stackalloc float[2];
+            Interop.Fn.jce_script_api_get_viewport_size(_api, o);
+            return (o[0], o[1]);
         }
 }

@@ -15,6 +15,7 @@
  */
 
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_trace.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_archive_writer.h>
 #include <jce/resource/jce_asset.h>
@@ -60,6 +61,7 @@ static JceAssetManager *make_manager(void)
 void setUp(void)    { make_pak(); }
 void tearDown(void)
 {
+    jce_trace_set_enabled(false);
     if (g_pak) { jce_pak_close(g_pak); g_pak = NULL; }
     if (g_pak_blob) { jce_free(g_pak_blob); g_pak_blob = NULL; }
 }
@@ -217,6 +219,53 @@ static void test_reload_outcomes_are_distinguishable(void)
             TEST_ASSERT_NOT_EQUAL_INT(vals[i], vals[j]);
 }
 
+static void test_real_sync_asset_load_trace_retains_ready_and_failed_outcomes(void)
+{
+    jce_trace_set_enabled(true);
+    jce_trace_reset();
+    JceAssetManager *mgr = make_manager();
+    JceAssetLoadParams params = JCE_ASSET_LOAD_DEFAULT;
+    params.sync = true;
+    JceAssetHandle good = jce_asset_acquire(mgr, "placeholder.txt", JCE_ASSET_RAW, &params);
+    TEST_ASSERT_EQUAL_INT(JCE_ASSET_STATE_READY, jce_asset_state(mgr, good));
+    TEST_ASSERT_EQUAL_MEMORY("X", jce_asset_data(mgr, good), 1);
+    JceAssetHandle bad = jce_asset_acquire(mgr, "absent.txt", JCE_ASSET_RAW, &params);
+    TEST_ASSERT_EQUAL_INT(JCE_ASSET_STATE_FAILED, jce_asset_state(mgr, bad));
+    jce_asset_release(mgr, good);
+    jce_asset_release(mgr, bad);
+    jce_asset_manager_destroy(mgr);
+    JceTraceCursor cursor;
+    JceTraceEvent events[256];
+    jce_trace_cursor_init(&cursor);
+    uint32_t count = jce_trace_read(&cursor, events, 256), i;
+    bool ready = false, failed = false;
+    for (i = 0; i < count; ++i) {
+        if (events[i].type != JCE_TRACE_EVENT_TASK_END ||
+            strcmp(events[i].name, "asset.load_sync") != 0) continue;
+        ready |= events[i].value_u32[0] == JCE_TRACE_TASK_SUCCEEDED;
+        failed |= events[i].value_u32[0] == JCE_TRACE_TASK_FAILED;
+    }
+    TEST_ASSERT_TRUE(ready);
+    TEST_ASSERT_TRUE(failed);
+    TEST_ASSERT_EQUAL_UINT64(0, jce_trace_task_current_id());
+}
+
+static void test_disabled_sync_load_keeps_actual_payload_without_trace_events(void)
+{
+    jce_trace_set_enabled(false);
+    jce_trace_reset();
+    JceAssetManager *mgr = make_manager();
+    JceAssetLoadParams params = JCE_ASSET_LOAD_DEFAULT;
+    params.sync = true;
+    JceAssetHandle good = jce_asset_acquire(mgr, "placeholder.txt", JCE_ASSET_RAW, &params);
+    TEST_ASSERT_EQUAL_MEMORY("X", jce_asset_data(mgr, good), 1);
+    jce_asset_release(mgr, good);
+    jce_asset_manager_destroy(mgr);
+    JceTraceStats stats;
+    jce_trace_get_stats(&stats);
+    TEST_ASSERT_EQUAL_UINT64(0, stats.recorded_events);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -227,5 +276,7 @@ int main(void)
     RUN_TEST(test_reload_rejects_bad_handle_as_unloaded);
     RUN_TEST(test_reload_of_never_loaded_slot_is_not_ready);
     RUN_TEST(test_reload_outcomes_are_distinguishable);
+    RUN_TEST(test_real_sync_asset_load_trace_retains_ready_and_failed_outcomes);
+    RUN_TEST(test_disabled_sync_load_keeps_actual_payload_without_trace_events);
     return UNITY_END();
 }

@@ -1,0 +1,1742 @@
+{
+  "schema": 1,
+  "reference": {
+    "repository": "https://github.com/Casmo/tower-defense",
+    "commit": "784129a685627a18f3d3f8fa594208000d9313e8"
+  },
+  "font": {
+    "schema": 1,
+    "provider": "Pillow bundled default",
+    "pillow_version": "12.3.0",
+    "family": [
+      "Aileron",
+      "Regular"
+    ],
+    "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f",
+    "font_bytes": 12676,
+    "license": "No Rights Reserved",
+    "source": "https://dotcolon.net/fonts/aileron/",
+    "scope": "Rasterized UI images only; no font software is redistributed",
+    "original_typography": "Deliberately replaced by redistributable default typography; original captures remain reference evidence"
+  },
+  "entries": [
+    {
+      "path": "resources/licenses/Casmo-MIT.txt",
+      "bytes": 1073,
+      "sha256": "e2ac78714c6988662df08906ece56a3489ca0fa7787be4f511d494e764602b3a",
+      "kind": "license-notice",
+      "source": "LICENSE",
+      "source_sha256": "b0726f052c1a0cafcc61afdb0fe426c6440a97bf3bf9e23605b0d0fbb60cf901",
+      "transform": "CRLF to LF only"
+    },
+    {
+      "path": "resources/licenses/ui-font-provenance.json",
+      "bytes": 538,
+      "sha256": "ae554936987b64640a75d0e66488b37ac0d81e7f78a6e923229d12b0b1aaa1e3",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/materials/classic.mat.json",
+      "bytes": 91,
+      "sha256": "784cacdc05ca1a183c7277b93a874d17edcea4c9c7a61c868d5841beeb08de66",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/materials/unlit.mat.json",
+      "bytes": 94,
+      "sha256": "f25b13fbbe6201c0cc7ca5f87e9e6e968b66f50ec0803751c7e9837488fd7e67",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/models/ghost.glb",
+      "bytes": 13736,
+      "sha256": "76dc4bafdc2059c78ebde52f740d94d34e1291c0ab4434ff885defdd5d4d6994",
+      "kind": "converted-model",
+      "source": "assets/enemies/ghost.obj",
+      "source_sha256": "d79f64d4c5e4a455bdadaf27223cf9a5bb56d90f655c36ff157dc45509840b72",
+      "transform": "jce_cook --geometry-only",
+      "object_policy": "whole object",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/models/ground.glb",
+      "bytes": 1764,
+      "sha256": "e4075fa6b8ed44792890af166a0da4bc1ea826d2c0a39b6299d9a22ae0002188",
+      "kind": "reconstructed-geometry",
+      "producer": "tools/author_ground.py",
+      "parameters": "ground-reference.json",
+      "parameters_sha256": "c934e80fbf438c2860b2fb7f82236c1be24135901283bb1f5237868433f604d9",
+      "basis": "Pinned original Three.js BoxGeometry after normal recomputation"
+    },
+    {
+      "path": "resources/models/tower-01.glb",
+      "bytes": 421680,
+      "sha256": "dae3639e11c91d30140d53dbccf0cc3a2e5f8ac02a8e867f9d5f415945b64fe8",
+      "kind": "converted-model",
+      "source": "assets/towers/tower-01.obj",
+      "source_sha256": "3bbce440e64cf8b62fe37739c5cf48a03f913847ff4790f1b672ce24c906183c",
+      "transform": "jce_cook --geometry-only",
+      "object_policy": "whole object",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/models/tower-02.glb",
+      "bytes": 116752,
+      "sha256": "d6e694e27cd44b217ae1460d9a28b29fe423cbe33a42591e12274561a3318628",
+      "kind": "converted-model",
+      "source": "assets/towers/tower-02.obj",
+      "source_sha256": "31f675d15fc1aa2823f48488936ecef7e7121c55145b7a4b90445118284dc354",
+      "transform": "jce_cook --geometry-only",
+      "object_policy": "first OBJ object",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/models/tower-03.glb",
+      "bytes": 922320,
+      "sha256": "010522b7642ab8317dba6ce394980afa0d92213fcd572dbd946cb5100fea31c3",
+      "kind": "converted-model",
+      "source": "assets/towers/tower-03.obj",
+      "source_sha256": "6d514773beefb2138861f7991e1b8a1004f09e71d6c057e23163ad8d5829c6ba",
+      "transform": "jce_cook --geometry-only",
+      "object_policy": "whole object",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/models/ufo.glb",
+      "bytes": 69388,
+      "sha256": "4f99bb22424c5913ae6ea6b362ac2546eaad1c12398fefd27f518a5d36c10466",
+      "kind": "converted-model",
+      "source": "assets/enemies/ufo.obj",
+      "source_sha256": "2707186f406b9ae46d5e6782083732016f37d6c80ca552d09e1c3a86ce979ef9",
+      "transform": "jce_cook --geometry-only",
+      "object_policy": "whole object",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/prefabs/blood.prefab.json",
+      "bytes": 1087,
+      "sha256": "b863d5f8c3f05b3d29d427431a6fb5c42547266c9463ae248727412c918f3964",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/bullet-0.prefab.json",
+      "bytes": 845,
+      "sha256": "81014fe80264e5d9e7391f6e67c7fff9ceab283cdf818cf128b5753316bb03cf",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/bullet-1.prefab.json",
+      "bytes": 845,
+      "sha256": "bbac9531ba44f88977f94f93004a6fe453c9b56d7fe00ef688f51bbe0d20538c",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/enemy-0.prefab.json",
+      "bytes": 1073,
+      "sha256": "86a7405642212d63b8c7d863fa8162cc9e60e8e7a733b918d2e0a9e8a155bc4e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/enemy-1.prefab.json",
+      "bytes": 1076,
+      "sha256": "854c7b71f3aed2a60e7715ebf481561ec2a74800dd0a5a4a56c037c8d20982ef",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/tower-0.prefab.json",
+      "bytes": 1227,
+      "sha256": "a43f52c6d77c1f124f652b759a3af6bbceae106331189d683bbd389061485a72",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/tower-1.prefab.json",
+      "bytes": 1222,
+      "sha256": "18ecd7a764c1ee695bfa3e0833c64f8e40f259405d21fc809013acdff0b79048",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/prefabs/tower-2.prefab.json",
+      "bytes": 1227,
+      "sha256": "8171aa2b6921eb8ae5f7b9b6172aea2a5d0f116ed3d8ff82633158b1ac41a7dc",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/scenes/td_lab.scene.json",
+      "bytes": 195601,
+      "sha256": "e0b57936be8c8f0d0f6d477e7e4d491c6b3fac22abd8ff76ab477708724dc0b2",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/scripts/TdController.jcec",
+      "bytes": 64,
+      "sha256": "20c9005c94a3d60be34464f7781e7446c8af8862b2d310a0be79f1095b5de816",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/scripts/TdController.jcec.deps.json",
+      "bytes": 2554,
+      "sha256": "b9ae0557754ceebf53ada9b182d17ca079d2f8f492668c77c8067dc2ca3b6218",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/Settings/RenderPipeline.rp.json",
+      "bytes": 542,
+      "sha256": "6963bbe7b9c01f5393373bfd52c01d54b0b7562c1a96384400e747a383db75f4",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/background.jpg",
+      "bytes": 95307,
+      "sha256": "9584ea262be06e114806cace7822b86922100e9be8e5e74003688c8180905880",
+      "kind": "original-image",
+      "source": "assets/ui/background.jpg",
+      "source_sha256": "9584ea262be06e114806cace7822b86922100e9be8e5e74003688c8180905880",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/background.jpg.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/blood-128.png",
+      "bytes": 103280,
+      "sha256": "d24ea3ef46a6c76e3ec2c730b10a71fb921c8ec85f48747de9807ffaf4a19663",
+      "kind": "original-image",
+      "source": "assets/enemies/blood-128.png",
+      "source_sha256": "d24ea3ef46a6c76e3ec2c730b10a71fb921c8ec85f48747de9807ffaf4a19663",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/blood-128.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/bullet-01.png",
+      "bytes": 2004,
+      "sha256": "b7b57aef3ffd31abdf1e9ba1769b66e21c8931d13db49a590b2933472e079064",
+      "kind": "original-image",
+      "source": "assets/towers/bullet-01.png",
+      "source_sha256": "b7b57aef3ffd31abdf1e9ba1769b66e21c8931d13db49a590b2933472e079064",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/bullet-01.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/bullet-02.png",
+      "bytes": 506,
+      "sha256": "9ca334e93fd75f726b82d5c2c94e2c456c1cd516797ba65ac395faf684643236",
+      "kind": "original-image",
+      "source": "assets/towers/bullet-02.png",
+      "source_sha256": "9ca334e93fd75f726b82d5c2c94e2c456c1cd516797ba65ac395faf684643236",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/bullet-02.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/creampaper.png",
+      "bytes": 12618,
+      "sha256": "a38fb8795d4e5ae427d7d11929441838e4e059d241ecef317f2cd1072a5e61e2",
+      "kind": "original-image",
+      "source": "assets/ui/creampaper.png",
+      "source_sha256": "a38fb8795d4e5ae427d7d11929441838e4e059d241ecef317f2cd1072a5e61e2",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/creampaper.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/cursor-active.png",
+      "bytes": 501,
+      "sha256": "ae01d12d9018a97930f76465bbda47893bbffe662753bc857e1b8ef744f5b22e",
+      "kind": "original-image",
+      "source": "assets/ui/cursor-active.png",
+      "source_sha256": "ae01d12d9018a97930f76465bbda47893bbffe662753bc857e1b8ef744f5b22e",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/cursor-active.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/cursor-click.png",
+      "bytes": 804,
+      "sha256": "527aa8bd39b01f0a90512b055fd603faf6abc33f6545da4a56016bf460074c66",
+      "kind": "original-image",
+      "source": "assets/ui/cursor-click.png",
+      "source_sha256": "527aa8bd39b01f0a90512b055fd603faf6abc33f6545da4a56016bf460074c66",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/cursor-click.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/cursor-default.png",
+      "bytes": 501,
+      "sha256": "ea68fafd79067dae134528224db1836500404bb1d545fa2e13c2725873df8059",
+      "kind": "original-image",
+      "source": "assets/ui/cursor-default.png",
+      "source_sha256": "ea68fafd79067dae134528224db1836500404bb1d545fa2e13c2725873df8059",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/cursor-default.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/default.png",
+      "bytes": 77815,
+      "sha256": "39245980eb78652896b45eb3a64282afd384a3362e394e6d6f34f8d54005b60d",
+      "kind": "original-image",
+      "source": "assets/towers/default.png",
+      "source_sha256": "39245980eb78652896b45eb3a64282afd384a3362e394e6d6f34f8d54005b60d",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/default.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/ghost.png",
+      "bytes": 252675,
+      "sha256": "f7acad2f4025698496b007d1ff71d5fbe99ab0f46cc2e069d74df8dbd902d0f8",
+      "kind": "original-image",
+      "source": "assets/enemies/ghost.png",
+      "source_sha256": "f7acad2f4025698496b007d1ff71d5fbe99ab0f46cc2e069d74df8dbd902d0f8",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/ghost.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/grey_wash_wall.png",
+      "bytes": 47433,
+      "sha256": "895d6b598afdcd51b9552654b012e3ef6578d44e3e0efdb59d33024ead80a5a4",
+      "kind": "original-image",
+      "source": "assets/ui/grey_wash_wall.png",
+      "source_sha256": "895d6b598afdcd51b9552654b012e3ef6578d44e3e0efdb59d33024ead80a5a4",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/grey_wash_wall.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/level-01.jpg",
+      "bytes": 761324,
+      "sha256": "e7341cfbc63dcb6498bd54676365944d658680c79e9e626b4ca54c002ab85dce",
+      "kind": "original-image",
+      "source": "assets/levels/level-01.jpg",
+      "source_sha256": "e7341cfbc63dcb6498bd54676365944d658680c79e9e626b4ca54c002ab85dce",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/level-01.jpg.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/level-01_COLOR.png",
+      "bytes": 2820839,
+      "sha256": "8fca366c7a78660aacaee4aa5269a98ff889b6428c55af01ce81f869be469af7",
+      "kind": "original-image",
+      "source": "assets/levels/level-01_COLOR.png",
+      "source_sha256": "8fca366c7a78660aacaee4aa5269a98ff889b6428c55af01ce81f869be469af7",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/level-01_COLOR.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/level-01_NRM.png",
+      "bytes": 2632295,
+      "sha256": "6a244e9742d246525201fb06766f0f9d9dae2c3b20390af055b2bdb3dd08c49c",
+      "kind": "original-image",
+      "source": "assets/levels/level-01_NRM.png",
+      "source_sha256": "6a244e9742d246525201fb06766f0f9d9dae2c3b20390af055b2bdb3dd08c49c",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/level-01_NRM.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/level-01_SPEC.png",
+      "bytes": 1438003,
+      "sha256": "d7109c741a4f41e1f22be035d644683ad1e0787b421fccb42fe55f61e0e76b26",
+      "kind": "original-image",
+      "source": "assets/levels/level-01_SPEC.png",
+      "source_sha256": "d7109c741a4f41e1f22be035d644683ad1e0787b421fccb42fe55f61e0e76b26",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/level-01_SPEC.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/lives.png",
+      "bytes": 258,
+      "sha256": "149294492e3fff0228682f53efbf024ba1eae97bb804e5f290550b5dbcf6cffc",
+      "kind": "original-image",
+      "source": "assets/ui/lives.png",
+      "source_sha256": "149294492e3fff0228682f53efbf024ba1eae97bb804e5f290550b5dbcf6cffc",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/lives.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/points.png",
+      "bytes": 779,
+      "sha256": "4726ffe616abc5fa938eab4c6c9584f433d9d37d51bc3f6a58c23dbe88b8da00",
+      "kind": "original-image",
+      "source": "assets/ui/points.png",
+      "source_sha256": "4726ffe616abc5fa938eab4c6c9584f433d9d37d51bc3f6a58c23dbe88b8da00",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/points.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/resources.png",
+      "bytes": 741,
+      "sha256": "a7665899d097c0644e928f96533bc8d35532ea0e02eae63b8dd8ec4d52ca085e",
+      "kind": "original-image",
+      "source": "assets/ui/resources.png",
+      "source_sha256": "a7665899d097c0644e928f96533bc8d35532ea0e02eae63b8dd8ec4d52ca085e",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/resources.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/smoke-particle.png",
+      "bytes": 15427,
+      "sha256": "e68a4ec53047d154c338bf2897c6d295df2176674e56ed0b41d15f906bdd7f2c",
+      "kind": "original-image",
+      "source": "assets/towers/smoke-particle.png",
+      "source_sha256": "e68a4ec53047d154c338bf2897c6d295df2176674e56ed0b41d15f906bdd7f2c",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/smoke-particle.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/smoke_1_40_128_corrected.png",
+      "bytes": 36396,
+      "sha256": "64aebf91bd3cd15822030b312fdf31e26ce7a021151c3059132314dcec1f7fbb",
+      "kind": "original-image",
+      "source": "assets/towers/smoke_1_40_128_corrected.png",
+      "source_sha256": "64aebf91bd3cd15822030b312fdf31e26ce7a021151c3059132314dcec1f7fbb",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/smoke_1_40_128_corrected.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/tower-01.jpg",
+      "bytes": 52858,
+      "sha256": "01d1afebea038141dfd5dc7bace35403b0481f77d18ef46aa1ab880e490a4e3c",
+      "kind": "original-image",
+      "source": "assets/towers/tower-01.jpg",
+      "source_sha256": "01d1afebea038141dfd5dc7bace35403b0481f77d18ef46aa1ab880e490a4e3c",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/tower-01.jpg.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/tower-01.png",
+      "bytes": 39873,
+      "sha256": "c26a2091a6bdb01db6b07640994863d8abcc1dc9f11cdc24bb842682446d9d25",
+      "kind": "original-image",
+      "source": "assets/towers/tower-01.png",
+      "source_sha256": "c26a2091a6bdb01db6b07640994863d8abcc1dc9f11cdc24bb842682446d9d25",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/tower-01.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/tower-02.jpg",
+      "bytes": 232310,
+      "sha256": "9184489f8439050293f847a76bbf952b18e75a96c54b7323bf352065d2d6f842",
+      "kind": "original-image",
+      "source": "assets/towers/tower-02.jpg",
+      "source_sha256": "9184489f8439050293f847a76bbf952b18e75a96c54b7323bf352065d2d6f842",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/tower-02.jpg.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/tower-02.png",
+      "bytes": 44836,
+      "sha256": "f5e624bf13efbab039531e15c92484c99fc2d132f32f3a37cba081efe4a2f9f7",
+      "kind": "original-image",
+      "source": "assets/towers/tower-02.png",
+      "source_sha256": "f5e624bf13efbab039531e15c92484c99fc2d132f32f3a37cba081efe4a2f9f7",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/tower-02.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/tower-03.jpg",
+      "bytes": 319200,
+      "sha256": "b92fbcc92bf2bc72464e032fc270ef02f9537e6e884dfde858d368c2b59fcd8a",
+      "kind": "original-image",
+      "source": "assets/towers/tower-03.jpg",
+      "source_sha256": "b92fbcc92bf2bc72464e032fc270ef02f9537e6e884dfde858d368c2b59fcd8a",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/tower-03.jpg.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/tower-03.png",
+      "bytes": 45692,
+      "sha256": "801f744c82fafd519df5eda1b093f66a7b62dc9dd81870ee53db8eaac3c846ea",
+      "kind": "original-image",
+      "source": "assets/towers/tower-03.png",
+      "source_sha256": "801f744c82fafd519df5eda1b093f66a7b62dc9dd81870ee53db8eaac3c846ea",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/tower-03.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/ufo-yellow.jpg",
+      "bytes": 32363,
+      "sha256": "6ace345b0c1e1ff8064b8d2ca972376c03655f7619a3136ea3a5b46b79a0fbd5",
+      "kind": "original-image",
+      "source": "assets/enemies/ufo-yellow.jpg",
+      "source_sha256": "6ace345b0c1e1ff8064b8d2ca972376c03655f7619a3136ea3a5b46b79a0fbd5",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/ufo-yellow.jpg.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/wave.png",
+      "bytes": 1694,
+      "sha256": "81c6432363621b9228def62a94f831044c68290bc8ca943759d557aacfa21fa8",
+      "kind": "original-image",
+      "source": "assets/ui/wave.png",
+      "source_sha256": "81c6432363621b9228def62a94f831044c68290bc8ca943759d557aacfa21fa8",
+      "terms": "Casmo MIT"
+    },
+    {
+      "path": "resources/textures/wave.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/textures/white.png",
+      "bytes": 68,
+      "sha256": "7ac2abfce2be8b46dd9826d597d94edeefc1570b4a992622721b90a1850e3ee9",
+      "kind": "generated-texture",
+      "producer": "tools/author_reference_scene.py",
+      "basis": "One opaque white RGBA pixel"
+    },
+    {
+      "path": "resources/textures/white.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/back.png",
+      "bytes": 1346,
+      "sha256": "73650d06978628688b9ae0ac3f22a57a5a81358e248155fff32992d2c955d416",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/back.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/button-blue-small.png",
+      "bytes": 387,
+      "sha256": "4245c97a4f0647ee915e4be780c05541713d78e5c2e11bb4ae413be80852ac29",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/button-blue-small.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/button-blue.png",
+      "bytes": 389,
+      "sha256": "814b0aef9a0f3550f729f4bfb65d4ffa821fb474f8c990e67a333d83c7d87581",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/button-blue.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/button-white.png",
+      "bytes": 398,
+      "sha256": "a3292b88a2ba3c9e69f732b3d5febde8ca3c549552d97265312e9b49b6b87d7c",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/button-white.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/close.png",
+      "bytes": 649,
+      "sha256": "65b630bbbddcf52d18b763c5b643ae93a37088ece854449f698c20d9a07f1efd",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/close.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-0.png",
+      "bytes": 428,
+      "sha256": "57caab7f0bf3b324cc4599fb16f6843de65149372f6d955a4cc58fdead977190",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-0.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-1.png",
+      "bytes": 262,
+      "sha256": "89e6c4c173292bb44695a364e2b2da1332f60055b8a75e2ce7473ff947c922ca",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-1.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-2.png",
+      "bytes": 413,
+      "sha256": "8ee8a5df633bd964d5000759bace8bc6aa9fa0898d1b8198e8de266b07e35291",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-2.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-3.png",
+      "bytes": 466,
+      "sha256": "d0351830b97b6a6a4b24e05a8816d22f9fc7051a643b4b9588ff48898b0f16e8",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-3.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-4.png",
+      "bytes": 403,
+      "sha256": "936e2d88a14197b660e6f740f254362a063b6320e18b37eefacacd417a45fa5b",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-4.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-5.png",
+      "bytes": 460,
+      "sha256": "aeabd0910b53ff4c2b0c14d7ddeebcd711c800f5800a39889acda18efd491184",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-5.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-6.png",
+      "bytes": 490,
+      "sha256": "a80e75c3e55e2df82dd77a6e9d7044eba6c79b0b763603df6522839035ab7266",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-6.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-7.png",
+      "bytes": 320,
+      "sha256": "9e838541bff0156f2a2a5c6ccf7cb9c81b746c2a8ccc31afc9e6095b7b3edf4e",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-7.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-8.png",
+      "bytes": 482,
+      "sha256": "9a388af97a0f107982ffe46f767567001226822ab7a15527a9ce68bd7f93178d",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-8.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-9.png",
+      "bytes": 483,
+      "sha256": "62afe9432d1247414649d00ef8c5962ef880bed6b0719c1fe91fc4ae4b5c3829",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-9.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-0.png",
+      "bytes": 433,
+      "sha256": "d08bd921bf146ea8907071ed79a1f6c1c4c3e76a71286d09314a0b7c61353acf",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-0.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-1.png",
+      "bytes": 309,
+      "sha256": "0d9361cf46e41021e714b6acb3fb217bf6f597904c60f1ed4e18b3a713bec0b3",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-1.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-2.png",
+      "bytes": 434,
+      "sha256": "6c97371428b52b9e8922a8c4e9119f42607b73147f423e58d7fca9b59aa43a85",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-2.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-3.png",
+      "bytes": 492,
+      "sha256": "78598dff1980290d5a9a92c65076fa76fa72e631d7fcfb37ca8dd9ed0aaf8818",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-3.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-4.png",
+      "bytes": 397,
+      "sha256": "41b907ec49f62da6da2f42ab741940a1ee01933a3d2b5ae14c6f3a3090ddb740",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-4.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-5.png",
+      "bytes": 454,
+      "sha256": "d56259ef656fc08da1fe7869871df0f0d3f192e35258afb48426df0431ae78d7",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-5.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-6.png",
+      "bytes": 499,
+      "sha256": "295f8ffa3b5455af2ca7c4b0463fa2eeca7bf204e221c763b374aa4cbbd5607b",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-6.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-7.png",
+      "bytes": 339,
+      "sha256": "c8bfa7b429f5053aa96688689b77b53814e4dcbaf976ee5a20a12e73968dde95",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-7.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-8.png",
+      "bytes": 504,
+      "sha256": "90c445a0a4b3b779fff4a7f0f55da2eca9b9fc859a4f8a4d6685d63102041a82",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-8.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cost-red-9.png",
+      "bytes": 499,
+      "sha256": "2cb0287524f178871f785190b3b60d58f37983b348e6e5e4e7c22a7d896d27d2",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cost-red-9.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/credit-line.png",
+      "bytes": 9039,
+      "sha256": "456c21b64745733ace747cbdbd3a933a909254237167759cde078752346fe8f2",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/credit-line.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/credits-title.png",
+      "bytes": 1942,
+      "sha256": "9e8eba3d9312f91bf5837b12aee7382e85e417558ea15e77827094629726f918",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/credits-title.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/credits.png",
+      "bytes": 840,
+      "sha256": "446bc78b28a69e845ca5fa8bf816db736b8877aa6acb2c94d948b4114fb824ca",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/credits.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/cross.png",
+      "bytes": 582,
+      "sha256": "bf9dc024287ea09dd176653030d37b5ca206d43df828dd8a4e8b5cb5194a31fd",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/cross.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/designer.png",
+      "bytes": 3001,
+      "sha256": "e5735b66ce855c87382472fca75f23df1e2d85563c9614bb3bd7d67167399ab9",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/designer.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-0.png",
+      "bytes": 387,
+      "sha256": "0cc06ecd67f1d77d890c246f83e58804920c8426c660da3739527cfcafbe8224",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-0.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-1.png",
+      "bytes": 236,
+      "sha256": "8a3b0b1797a57afd661d1e397379e568fab605f272a7e00443c7ea786dc0d6f8",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-1.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-2.png",
+      "bytes": 377,
+      "sha256": "0c3a462b5bd0f9ab7d8e7c907d7997aa02b36d042073f19518c7f4473fa8eee9",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-2.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-3.png",
+      "bytes": 407,
+      "sha256": "37c801995225f24ed7db82747c0439d1260baf9365846a7b601e99a0978a24d1",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-3.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-4.png",
+      "bytes": 351,
+      "sha256": "08e0ae2a610d1c64888190fb24ee32af249581426455bf9eff284800421ef4fb",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-4.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-5.png",
+      "bytes": 400,
+      "sha256": "a01d61a31cc8e2351afe0bd7a9b8cd9c60a04172cee1871a86edaa07a6f6e92e",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-5.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-6.png",
+      "bytes": 436,
+      "sha256": "91b8ffdf00504828782c68db4cb3989ac060169449d0927783fef6fc04229e56",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-6.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-7.png",
+      "bytes": 289,
+      "sha256": "6493aa20be70c497f34be525fa4f0a226cbdb915d21824833f40a1764aabc1b8",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-7.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-8.png",
+      "bytes": 433,
+      "sha256": "4f5c777c03e686bf252f75965752a3e2820d8f69281ea65e4576550652d18d95",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-8.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/digit-9.png",
+      "bytes": 425,
+      "sha256": "c4519636a7d1102aee8a9bd8a4af386e460676645d275199e4189c4f41494f90",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/digit-9.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/frame.png",
+      "bytes": 401,
+      "sha256": "13c1f9a3b64dc9c26d2ec4a4d0444a3d1d2f37593af412cfddaf416845e914b5",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/frame.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/level-line.png",
+      "bytes": 6574,
+      "sha256": "f3c83363d5aaab682c2a639c1883e58975a9e2f669d523b798d34d8a4b7696d8",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/level-line.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/level.png",
+      "bytes": 1321,
+      "sha256": "d14d00ccd76a70a908f39a36ba6505bd4ed82cc882fd5725b30b279641cde219",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/level.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/mathieu.png",
+      "bytes": 4692,
+      "sha256": "5d6ff18371e499280e53d4c0a5c4c658f8d2d865424aa8433744657cd0bde19e",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/mathieu.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/modal.png",
+      "bytes": 2075,
+      "sha256": "79469d68adbfaaa2f7f0261d11d81ce27c9a8dc3a00747a0c173cd03c58469a3",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/modal.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/play.png",
+      "bytes": 713,
+      "sha256": "4c59f49d5585f6e432d69b78f3815a2dfbb9198e73486295c2e11bedf1fdc2d6",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/play.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/pracalic.png",
+      "bytes": 8826,
+      "sha256": "75d94cbae4f36e338b1bc0855c1ab9f6e50fd19b6677ea741fdefd3b075b2893",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/pracalic.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/programmer.png",
+      "bytes": 3420,
+      "sha256": "986ee23986f4fd8e5e22dcce0b8c3c3e0b9c94ff742dc6ee8eec1e79cbb4fedb",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/programmer.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/slash.png",
+      "bytes": 222,
+      "sha256": "51c6a995a4aa74ec0f34e2a99f7c8f44a1b2c9f647aa62d22429710f26c13ebe",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/slash.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/thanks.png",
+      "bytes": 2809,
+      "sha256": "b7d2b07c1437db03b57e1dfabdc84429c9bcbdcb4f40a6b43f86fc60a07bf9dd",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/thanks.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/timothy.png",
+      "bytes": 2342,
+      "sha256": "f63a942afcb6516492ec8bbd0c43f9be98ce1736075f4644df5348de9c042472",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/timothy.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/title.png",
+      "bytes": 4762,
+      "sha256": "97da522274e53824e89e3f0d582fd4a43bf8162a54eca15f38b14a5ca3bdda52",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/title.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    },
+    {
+      "path": "resources/ui/wave.png",
+      "bytes": 1383,
+      "sha256": "9fabb8fc41a66e61cd60559677895c5214e4b0f54ad1e835f0709834285875d5",
+      "kind": "generated-ui",
+      "producer": "tools/author_ui.py",
+      "terms": "First-party artwork; default-font glyphs No Rights Reserved",
+      "font_sha256": "69853909b940023570964e29cffe30da95aea8de3627736b5cd15ab30143169f"
+    },
+    {
+      "path": "resources/ui/wave.png.import.json",
+      "bytes": 24,
+      "sha256": "bc68cc0338f9bdf7cab366fc0e8ddf7400f5315ccb8dafbde2b68e9abe3f001e",
+      "kind": "authored-metadata",
+      "terms": "First-party project data; imported artwork retains its separate notice"
+    }
+  ],
+  "excluded": [
+    {
+      "source": ".gitignore",
+      "sha256": "7407928e1bb249e1a319bc6508b1cddbbb65dd4b2309f2c9c68209741827b072",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "assets/ui/css/application.css",
+      "sha256": "bffc5a125d14b81168bb8828865d5c712fabf30d2da4d87dd2a18dfdb0171288",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "assets/ui/css/bootstrap.min.css",
+      "sha256": "6ec3bcbd3f64983af02ccee8d89db154fdd5e7a6e5d489a4a0fb580989b96e0b",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "assets/ui/fonts/DISTGRG_-webfont.eot",
+      "sha256": "21cdb34f3603296c503f8d837e6a80a24b3900cac5c9dd813bd9d9641e53c549",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "assets/ui/fonts/DISTGRG_-webfont.svg",
+      "sha256": "e8b671580701a6444fc0cd49709c0afeb5eef4de3f74c3893312b80ae35b4956",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "assets/ui/fonts/DISTGRG_-webfont.ttf",
+      "sha256": "69225dc51402eeae430a2a0a2244dc670be7f86ef78d5931baa906be82195bc9",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "assets/ui/fonts/DISTGRG_-webfont.woff",
+      "sha256": "734e5686809173703e0d4722f3d9a6b9b748ce9d13f9dfa520e9d7c2b047e0b0",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "CONTRIBUTE.md",
+      "sha256": "b36a5b2f94dfd6dd020c0082124a40fd247d3f54cbe6de2a4a92d5b9aceb082e",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "index.html",
+      "sha256": "526f743c200c833813360218b4b55f73325adb340d66f340c21b6c63bca72c88",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/application.js",
+      "sha256": "7e13515d74c29a5d80d84821a3d32d0885c0798076ad5ec6199bbf0f89a87344",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/dom.js",
+      "sha256": "3bbf811685c3ec572bdac2a7ebf36bd183473eafd9c5d5a7d6f5f87753357464",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/OBJLoader.js",
+      "sha256": "9778543bdebc4cb756c637c3c6a89dd366e8d280332c239bfa1cd61b7e10e0f0",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/OrbitControls.js",
+      "sha256": "3000c57a9f66671235bfd5a2977760c05300f4af3c5f782c93f265a939d96bc6",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/three.min.js",
+      "sha256": "001a95a1a78acaa18df28c6ef164da95aff50b8fd2298a2fdf85761bea0a4395",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/three.textureanimator.js",
+      "sha256": "11c65a546e20c131bf2bce1032b19067fd31f338881d285b81fcda6b5de43f09",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/tween.js",
+      "sha256": "0be297303d1aba31f2b99c93406cc481ffb9ec5ad8a67937e10dcc6e317ce9f5",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/lib/webgl.tools.js",
+      "sha256": "16731f252c126dca5bc5591ba5ad241fa4f0d022b635a0bcd28d89f5a5175688",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Decoration.Blood.js",
+      "sha256": "d926f0f392f732a3705fd89416155d558a6fef7234f876c3822cf531377d10c0",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Decoration.js",
+      "sha256": "d19c0a447444351bceeb35b8c90894f5d30d07cc908e88a8392ff1514c207881",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Decoration.SimpleSmoke.js",
+      "sha256": "9f63f49f5cad0914fb5b36532b9712a08033d925916b9c0138850cccb11a43f3",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Decoration.Smoke.js",
+      "sha256": "80d89c287ae25887860a6c9552ca659d60d8758e3ee31b9c7bb074c7403f7adc",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Decoration.Void.js",
+      "sha256": "3a0d576b630971c5da0803ea81bbbddf7e0880568a6f377a51ed31c7092cf2b1",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Element.js",
+      "sha256": "fff67aba1e3978cd277f38f5f42104fb43677fec963a7fae85b9c4f22a9c4bc1",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/TowerDefense.Ui.js",
+      "sha256": "caf3646a1f1a63b61afe14f3fb7f1ba27434c548d5feddec36209944706a6b68",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Core/Worker.PathFinder.js",
+      "sha256": "a4eb89a8ad0b0a96eb8d6edf9bafa779e9ea0f2ff4a604a448356f18b564014a",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Enemies/TowerDefense.BasicEnemy.js",
+      "sha256": "21f1c4d01ee7ec7238354a4f06d7ee234555fea3612bfb8366f0c19a53fa9bb7",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Enemies/TowerDefense.DummyEnemy.js",
+      "sha256": "2487edbfce9f6e62320ff5309720ce788413e30ede86cd491c14855c9d1bb4d9",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Enemies/TowerDefense.Enemy.js",
+      "sha256": "e505a6b6170190861b9234e7055b867a8dcb37f5679b9fc927c9a72205f2217f",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Enemies/TowerDefense.UfoEnemy.js",
+      "sha256": "c758b29a8e43eca5c7506a5cab19d553da813e78ed176e71c5e565d6ba4c55e0",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Levels/TowerDefense.Level.js",
+      "sha256": "8cc03a4343884e5f02b997f63e988baa2fcc840b1b4abe3c23d148476e366818",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Levels/TowerDefense.Level1.js",
+      "sha256": "1671b43fdd727374a88ad93c8b57f7d0a7506954ba1e46689ccc58870043824c",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Tiles/TowerDefense.BasicTile.js",
+      "sha256": "ddc12d6be171bfaba4c52965e5583aac82d56d22029d4fd244e311b92e4c42b0",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Tiles/TowerDefense.DecoTile.js",
+      "sha256": "55790c33a9035a03a08453ac78adaee1e251428ec5839fec2b734922b9540de8",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Tiles/TowerDefense.EndTile.js",
+      "sha256": "7ef5f073ec73896ca466e187eb566ed1493898cd5b8ed6aadb161268fed60255",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Tiles/TowerDefense.StartTile.js",
+      "sha256": "48531391512d499d9e518828ec44d29fbdc7531860f0cb6721315bd9c61a1e1b",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Tiles/TowerDefense.Tile.js",
+      "sha256": "a86885143acfca5906e17678fb3ffdd08c721a3673dbf085e41c814330195e53",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/TowerDefense.js",
+      "sha256": "ce356140d93c887c9fac5d7af3d5654b63dee8e58314ccce1602197b2af467c6",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.AdvancedTower.js",
+      "sha256": "350fabc2bbb2b1342f77e8f83dcaaf67a1111820e1008beb42ba19fbfee79362",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.BadAssTower.js",
+      "sha256": "b92bc5417f8dda4992380e671efae7b905f60e0e20d71cb24a98a8a4b0cc2436",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.BasicTower.js",
+      "sha256": "4aacf9f1add9f2da6283a7d25acaebb46dbcd6ef2af844b77bc1d812fa9f7528",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.Bullet.js",
+      "sha256": "daa526b6e478434e66639c1f401673b76d19541971a707cebac0c3dc304e150c",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.CannonBullet.js",
+      "sha256": "822253e9ba144e59dc22a27e53041da7d91fda655f30beab9cd1a454130b87eb",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.RocketBullet.js",
+      "sha256": "b5a3c9a30e40bc9a4b5fca53df888467628d6d8328006964dc98628cc04f1512",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "js/TowerDefense/Towers/TowerDefense.Tower.js",
+      "sha256": "b2a61f6f4145d172e516c48e4bf1a729ff051be8ce718e1a9870e3cfb4efe9c8",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    },
+    {
+      "source": "README.md",
+      "sha256": "a12f304976d5151c0b0c98848eb417c22b49d4430a051d0785510e27f10866db",
+      "scope": "Reference-only original browser/runtime/font software; not shipped"
+    }
+  ],
+  "scope": "Selected file identity and declared provenance; not a blanket legal determination or visual/performance certification"
+}

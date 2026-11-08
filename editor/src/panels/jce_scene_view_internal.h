@@ -50,6 +50,10 @@ struct SceneViewCtx {
     bool        viewport_active;
     bool        viewport_left_clicked;
     bool        viewport_right_clicked;
+    bool        navigation_hovered;
+    bool        navigation_active;
+    bool        axis_left_clicked;
+    bool        cube_left_clicked;
 };
 
 /* ── Selection box state ─────────────────────────────────────────── */
@@ -117,10 +121,13 @@ uint32_t create_default_scene_entity(const char *name,
 
 /* ── Functions from jce_scene_view_cube.cpp ───────────────────────── */
 
+/* Submit navigation items before the full viewport item. ImGui owns pointer
+ * capture/drag/release; the overlays never read an unowned global click. */
+void register_scene_viewport_input(SceneViewCtx *ctx, bool show_axis);
 int draw_axis_indicator(ImDrawList *dl, ImVec2 origin, ImVec2 size,
-                        const float *view16);
+                        const float *view16, bool left_clicked);
 int draw_view_cube(ImDrawList *dl, ImVec2 origin, ImVec2 size,
-                   const float *view16);
+                   const float *view16, bool left_clicked);
 
 /* ── Functions from jce_scene_view_gizmo.cpp ─────────────────────── */
 

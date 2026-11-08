@@ -41,8 +41,8 @@ static void test_cross_entity_refs_remap_on_load(void)
     JceScene *s1 = jce_scene_create();
     TEST_ASSERT_NOT_NULL(s1);
 
-    /* Churn ids in the source scene so they differ from the fresh destination
-     * scene — a coincidental id match would otherwise mask a missing remap. */
+    /* Exercise source generations. Reusing one slot does not guarantee that
+     * the later fresh target differs from a fresh destination's second id. */
     for (int i = 0; i < 8; i++) {
         JceEntity tmp = jce_scene_create_entity(s1, "churn");
         jce_scene_destroy_entity(s1, tmp);
@@ -69,6 +69,13 @@ static void test_cross_entity_refs_remap_on_load(void)
 
     JceScene *s2 = jce_scene_create();
     TEST_ASSERT_NOT_NULL(s2);
+    /* Load appends to an existing scene. Keep its first two slots occupied so
+     * both full and 32-bit source target ids must change, independently of
+     * the save traversal order. A verbatim ref would select existing-target. */
+    JceEntity existing_cam = jce_scene_create_entity(s2, "existing-cam");
+    JceEntity existing_target = jce_scene_create_entity(s2, "existing-target");
+    TEST_ASSERT_NOT_EQUAL(0, existing_cam);
+    TEST_ASSERT_NOT_EQUAL(0, existing_target);
     TEST_ASSERT_TRUE(jce_scene_load_json(s2, root) > 0);
     jce_json_free(root);
 
@@ -79,6 +86,9 @@ static void test_cross_entity_refs_remap_on_load(void)
     /* The reloaded ids must actually differ from the source ids, or the test
      * could not distinguish a remap from a verbatim copy. */
     TEST_ASSERT_TRUE(b2 != b);
+    TEST_ASSERT_TRUE((uint32_t)b2 != (uint32_t)b);
+    TEST_ASSERT_EQUAL_UINT64(existing_cam, find_named(s2, "existing-cam"));
+    TEST_ASSERT_EQUAL_UINT64(existing_target, find_named(s2, "existing-target"));
 
     JceVirtualCameraComponent *vc2 = jce_scene_get_virtual_camera(s2, a2);
     TEST_ASSERT_NOT_NULL(vc2);

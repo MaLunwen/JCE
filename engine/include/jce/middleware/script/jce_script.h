@@ -176,6 +176,7 @@ typedef struct JceScriptHost {
     float (*action_axis)(void *user, const char *name);
     /* Raw pointer input for scene-authored orbit/strategy controls.  Button
      * numbers are 1-based (1 = left).  Deltas/wheel are per-frame values. */
+    /* Canvas pixel displacement; native host converts window points once. */
     void  (*pointer_delta)(void *user, float out_xy[2]);
     float (*pointer_wheel)(void *user);
     bool  (*pointer_button)(void *user, int button);
@@ -808,7 +809,8 @@ typedef struct JceScriptHost {
                          const float dir[3], float max_dist,
                          uint32_t layer_mask, bool hit_triggers,
                          JceScriptEntity *out, int max);
-    /* Viewport-local pointer x/y and viewport width/height, in logical pixels.
+    /* Viewport-local pointer x/y and viewport width/height, in Canvas pixels
+     * (native drawable; Editor GameView FBO after render_scale).
      * Zero dimensions mean unavailable or input owned by another viewport.
      * Main-thread, borrowed frame sample; appended for sized-host compatibility. */
     void (*pointer_position)(void *user, float out_xywh[4]);
@@ -827,6 +829,11 @@ typedef struct JceScriptHost {
     bool (*stat_set)(void *user, const char *id, double value);
     int (*stat_get)(void *user, const char *id, double fallback);
     bool (*stat_flush)(void *user);
+    /* APPENDED. Host-owned Canvas pixel width/height, independent of pointer
+     * availability/focus. Persistent until the host replaces or clears it;
+     * zero dimensions mean unavailable. Same units as Canvas/pointer_position.
+     * Main-thread; absent sized-host callbacks return two zeros. */
+    void (*viewport_size)(void *user, float out_wh[2]);
 } JceScriptHost;
 
 typedef struct JceScript JceScript;

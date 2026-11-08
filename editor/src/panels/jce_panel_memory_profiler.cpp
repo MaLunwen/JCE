@@ -4,7 +4,7 @@
  *   Top strip:     process RSS / committed + mimalloc reserved / committed
  *   Tag table:     per-tag current / peak / live count / totals (sortable,
  *                  rows highlighted red when current > 64 MB)
- *   Baseline bar:  total tagged current vs 512 MB device-class baseline
+ *   Baseline bar:  process RSS vs 512 MiB process target; tags are partial
  *   Buttons:       Reset Peaks · Snapshot (writes a timestamped JSON)
  *   Refresh combo: 0.1 / 0.5 / 1 / 5 s (default 0.5 s)
  *
@@ -16,13 +16,14 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_ui_state.h"
+#include "ui/jce_editor_colors.h"
+#include "jce_panel_memory_snapshot.h"
 
 #include <jce/tools/jce_imgui.hpp>
 
 #include <cstdio>
 #include <cstring>
 #include <cfloat>
-#include <ctime>
 
 extern "C" {
 #include <jce/os/core/jce_mem_profile.h>
@@ -32,26 +33,17 @@ extern "C" {
 
 namespace {
 
-constexpr uint64_t kBaselineBytes = 512ull * 1024ull * 1024ull;
+constexpr uint64_t kBaselineBytes = JCE_EDITOR_MEMORY_TARGET_BYTES;
 constexpr uint64_t kHotTagBytes   =  64ull * 1024ull * 1024ull;
 constexpr const char *LOG_TAG     = "MemProfiler";
 
-struct TagRow {
-    int             tag;
-    const char     *name;
-    JceMemTagStats  s;
-};
-
-struct PanelState {
-    double             last_refresh = -1.0;
-    float              refresh_rate = 0.5f;
-    JceProcessMemStats proc{};
-    TagRow             rows[JCE_MEM_TAG_COUNT_MAX];
-    int                row_count = 0;
-    uint64_t           total_cur = 0;
-    uint64_t           total_peak = 0;
-    char               snapshot_msg[160] = {0};
-    double             snapshot_msg_time = -1.0;
+using TagRow = JceEditorMemoryTagRow;
+struct PanelState : JceEditorMemorySnapshot {
+    double last_refresh=-1.0;
+    float refresh_rate=0.5f;
+    char snapshot_path[1024]={0};
+    bool snapshot_written=false;
+    double snapshot_msg_time=-1.0;
 };
 
 PanelState &state()
@@ -67,7 +59,8 @@ float bytes_to_mb(uint64_t b)
 
 void refresh(PanelState &st)
 {
-    jce_mem_profile_get_process_stats(&st.proc);
+    st.proc={};
+    st.process_valid=jce_mem_profile_get_process_stats(&st.proc);
     st.row_count = 0;
     for (int i = 0; i < JCE_MEM_TAG_COUNT_MAX; ++i) {
         JceMemTagStats s;
@@ -78,7 +71,8 @@ void refresh(PanelState &st)
         st.rows[st.row_count].s    = s;
         st.row_count++;
     }
-    jce_mem_profile_get_total(&st.total_cur, &st.total_peak);
+    jce_mem_profile_get_aggregate_totals(&st.total_cur, &st.total_peak);
+    jce_mem_profile_get_total(nullptr, &st.tag_peak_sum);
 }
 
 void apply_sort(PanelState &st, ImGuiTableSortSpecs *specs)
@@ -120,80 +114,19 @@ void apply_sort(PanelState &st, ImGuiTableSortSpecs *specs)
 
 void write_snapshot(PanelState &st)
 {
-    char path[160];
-    time_t now = std::time(nullptr);
-    struct tm tm_local{};
-#ifdef _MSC_VER
-    localtime_s(&tm_local, &now);
-#else
-    /* localtime_r unavailable on some embedded toolchains; localtime is
-     * thread-unsafe but acceptable for a one-shot editor button. */
-    struct tm *p = std::localtime(&now);
-    if (p) tm_local = *p;
-#endif
-    std::snprintf(path, sizeof(path),
-                  "mem_snapshot_%04d%02d%02d_%02d%02d%02d.json",
-                  tm_local.tm_year + 1900, tm_local.tm_mon + 1,
-                  tm_local.tm_mday, tm_local.tm_hour,
-                  tm_local.tm_min, tm_local.tm_sec);
-
-    /* Build the JSON in a stack buffer; cap per-row ~120 bytes, plus
-     * preamble. 64 rows * 120 + 512 ~= 8 KB. */
-    char   body[12000];
-    size_t off = 0;
-    int n = std::snprintf(body + off, sizeof(body) - off,
-                          "{\n  \"process\": {\n"
-                          "    \"rss_bytes\": %llu,\n"
-                          "    \"committed_bytes\": %llu,\n"
-                          "    \"mimalloc_reserved_bytes\": %llu,\n"
-                          "    \"mimalloc_committed_bytes\": %llu\n"
-                          "  },\n  \"tags\": [\n",
-                          (unsigned long long)st.proc.process_rss_bytes,
-                          (unsigned long long)st.proc.process_committed_bytes,
-                          (unsigned long long)st.proc.mimalloc_reserved_bytes,
-                          (unsigned long long)st.proc.mimalloc_committed_bytes);
-    if (n > 0) off += (size_t)n;
-
-    for (int i = 0; i < st.row_count && off < sizeof(body) - 256; ++i) {
-        const TagRow &r = st.rows[i];
-        size_t rem = sizeof(body) - off;
-        n = std::snprintf(body + off, rem,
-                          "    {\"name\":\"%s\",\"current\":%llu,"
-                          "\"peak\":%llu,\"live\":%u,"
-                          "\"total_alloc\":%llu,\"total_count\":%u}%s\n",
-                          r.name,
-                          (unsigned long long)r.s.current_bytes,
-                          (unsigned long long)r.s.peak_bytes,
-                          r.s.live_alloc_count,
-                          (unsigned long long)r.s.total_bytes_allocated,
-                          r.s.total_alloc_count,
-                          (i + 1 < st.row_count) ? "," : "");
-        /* Clamp on truncation: blindly adding the would-have length walked
-         * off past the stack buffer (then sizeof-off underflowed). */
-        if (n <= 0 || (size_t)n >= rem) break;
-        off += (size_t)n;
-    }
-    if (off >= sizeof(body)) off = sizeof(body) - 1;
-    n = std::snprintf(body + off, sizeof(body) - off, "  ]\n}\n");
-    if (n > 0 && (size_t)n < sizeof(body) - off) off += (size_t)n;
-
-    bool ok = jce_fs_host_write_all(path, body, (uint64_t)off);
-    if (ok) {
-        std::snprintf(st.snapshot_msg, sizeof(st.snapshot_msg),
-                      "snapshot -> %s", path);
-        LOG_INFO(LOG_TAG, "memory snapshot written: %s (%zu bytes)",
-                 path, (size_t)off);
-    } else {
-        std::snprintf(st.snapshot_msg, sizeof(st.snapshot_msg),
-                      "snapshot FAILED (%s)", path);
-        LOG_WARN(LOG_TAG, "memory snapshot write failed: %s", path);
-    }
-    st.snapshot_msg_time = ImGui::GetTime();
+    refresh(st); /* Snapshot the current observation, including availability. */
+    const auto result=jce_editor_memory_snapshot_publish(st,st.snapshot_path,sizeof st.snapshot_path);
+    st.snapshot_written=result==JceEditorMemorySnapshotResult::Written;
+    if (st.snapshot_written)
+        LOG_INFO(LOG_TAG,"complete memory snapshot written: %s",st.snapshot_path);
+    else
+        LOG_WARN(LOG_TAG,"memory snapshot failed: result=%d path=%s",static_cast<int>(result),st.snapshot_path);
+    st.snapshot_msg_time=ImGui::GetTime();
 }
 
 void format_mb(char *out, size_t cap, uint64_t bytes)
 {
-    std::snprintf(out, cap, "%.2f MB", bytes_to_mb(bytes));
+    std::snprintf(out, cap, "%.2f MiB", bytes_to_mb(bytes));
 }
 
 } // namespace
@@ -235,7 +168,8 @@ extern "C" void jce_editor_panel_memory_profiler_content(void)
         if (st.snapshot_msg_time > 0.0
             && ImGui::GetTime() - st.snapshot_msg_time < 4.0) {
             ImGui::SameLine();
-            ImGui::TextDisabled("%s", st.snapshot_msg);
+            ImGui::TextDisabled("%s: %s",jce_editor_i18n(st.snapshot_written?
+                "memoryProfiler.snapshotWritten":"memoryProfiler.snapshotFailed"),st.snapshot_path);
         }
     }
 
@@ -252,40 +186,51 @@ extern "C" void jce_editor_panel_memory_profiler_content(void)
     char buf[64];
     ImGui::TextUnformatted(jce_editor_i18n("memoryProfiler.process"));
     ImGui::Indent();
-    format_mb(buf, sizeof(buf), st.proc.process_rss_bytes);
+    if (st.process_valid && st.proc.process_rss_bytes)
+        format_mb(buf,sizeof buf,st.proc.process_rss_bytes);
+    else std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("memoryProfiler.unavailable"));
     ImGui::Text("%s: %s",
                 jce_editor_i18n("memoryProfiler.processRss"), buf);
-    format_mb(buf, sizeof(buf), st.proc.process_committed_bytes);
+    if (st.process_valid && st.proc.process_committed_bytes)
+        format_mb(buf,sizeof buf,st.proc.process_committed_bytes);
+    else std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("memoryProfiler.unavailable"));
     ImGui::Text("%s: %s",
                 jce_editor_i18n("memoryProfiler.processCommitted"), buf);
-    format_mb(buf, sizeof(buf), st.proc.mimalloc_reserved_bytes);
+    if (st.process_valid && st.proc.mimalloc_reserved_bytes)
+        format_mb(buf, sizeof(buf), st.proc.mimalloc_reserved_bytes);
+    else
+        std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("memoryProfiler.unavailable"));
     ImGui::Text("%s: %s",
                 jce_editor_i18n("memoryProfiler.mimallocReserved"), buf);
-    format_mb(buf, sizeof(buf), st.proc.mimalloc_committed_bytes);
+    if (st.process_valid && st.proc.mimalloc_committed_bytes)
+        format_mb(buf, sizeof(buf), st.proc.mimalloc_committed_bytes);
+    else
+        std::snprintf(buf,sizeof buf,"%s",jce_editor_i18n("memoryProfiler.unavailable"));
     ImGui::Text("%s: %s",
                 jce_editor_i18n("memoryProfiler.mimallocCommitted"), buf);
     ImGui::Unindent();
 
     ImGui::Separator();
 
-    /* Baseline bar (tagged total vs 512 MB). */
+    /* This target has process RSS scope. Voluntary tags are not device usage. */
     {
-        const float fraction = (float)((double)st.total_cur
-                                       / (double)kBaselineBytes);
-        const float clamped  = fraction > 1.0f ? 1.0f : fraction;
-        char ov[96];
-        std::snprintf(ov, sizeof(ov), "%.2f / 512.00 MB  (%.0f%%)",
-                      bytes_to_mb(st.total_cur), fraction * 100.0f);
-        ImVec4 col = (fraction > 1.0f)
-                         ? ImVec4(0.85f, 0.20f, 0.20f, 1.0f)
-                         : (fraction > 0.75f)
-                               ? ImVec4(0.85f, 0.65f, 0.10f, 1.0f)
-                               : ImVec4(0.30f, 0.65f, 0.30f, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
-        ImGui::ProgressBar(clamped, ImVec2(-FLT_MIN, 0), ov);
-        ImGui::PopStyleColor();
-        ImGui::TextDisabled("%s",
-                            jce_editor_i18n("memoryProfiler.baselineMarker"));
+        const uint64_t rss=jce_editor_memory_budget_rss(st);
+        if (rss) {
+            const float fraction=static_cast<float>(static_cast<double>(rss)/static_cast<double>(kBaselineBytes));
+            char overlay[128];
+            std::snprintf(overlay,sizeof overlay,jce_editor_i18n("memoryProfiler.processTargetFormat"),
+                bytes_to_mb(rss),fraction*100.0f);
+            ImVec4 color=ImGui::GetStyleColorVec4(ImGuiCol_PlotHistogram);
+            if (fraction>1) color=JCE_COLOR_TEXT_ERROR;
+            else if (fraction>.75f) color=JCE_COLOR_TEXT_WARNING;
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram,color);
+            ImGui::ProgressBar(fraction>1?1:fraction,ImVec2(-FLT_MIN,0),overlay);
+            ImGui::PopStyleColor();
+        } else ImGui::TextDisabled("%s",jce_editor_i18n("memoryProfiler.processTargetUnavailable"));
+        ImGui::TextDisabled("%s",jce_editor_i18n("memoryProfiler.baselineMarker"));
+        ImGui::Text("%s: %.2f MiB",jce_editor_i18n("memoryProfiler.taggedPartial"),bytes_to_mb(st.total_cur));
+        if (st.row_count==0)
+            ImGui::TextDisabled("%s",jce_editor_i18n("memoryProfiler.noTaggedRows"));
     }
 
     ImGui::Separator();

@@ -56,7 +56,7 @@ static JceAssetLoadParams sanitize_load_params(const JceAssetLoadParams *params)
     clean.texture_sampler_mode = params->texture_sampler_mode;
     clean.font_size = params->font_size;
     clean.sync = params->sync;
-    /* Persist only POD values. Callers provide transient codepoint buffers. */
+    /* Drop borrowed arrays here; FONT acquisition installs its own copy. */
     clean.font_codepoints = NULL;
     clean.font_codepoint_count = 0;
     return clean;
@@ -96,10 +96,19 @@ static uint64_t hash_asset_key(const char *path, JceAssetType type,
     suffix.type = (uint32_t)type;
     suffix.sampler = (params) ? params->texture_sampler_mode : 0;
     suffix.font_size = (params) ? params->font_size : 0.0f;
+    if (type == JCE_ASSET_FONT && !(suffix.font_size > 0.0f))
+        suffix.font_size = 24.0f;
 
     /* Two-step: canonical path identity, then mix with suffix. */
     uint64_t h1 = jce_archive_hash_path(path);
     uint64_t h2 = XXH3_64bits(&suffix, sizeof(suffix));
+    if (type == JCE_ASSET_FONT && params && params->font_codepoints &&
+        params->font_codepoint_count > 0) {
+        const size_t count = (size_t)params->font_codepoint_count;
+        if (count <= SIZE_MAX / sizeof(uint32_t))
+            h2 ^= XXH3_64bits(params->font_codepoints,
+                             count * sizeof(uint32_t));
+    }
     /* Combine using a simple mix. */
     return h1 ^ (h2 * 0x9E3779B97F4A7C15ULL);
 }
@@ -186,7 +195,13 @@ static void free_slot(JceAssetManager *mgr, uint16_t index)
     size_t memory_bytes = slot->memory_bytes;
 
     destroy_slot_payload(mgr, slot);
+    if (slot->type == JCE_ASSET_FONT)
+        JCE_FREE((void *)slot->load_params.font_codepoints);
 
+    LOG_DEBUG(LOG_TAG, "asset phase=release key=%016llx handle=%u:%u type=%u path=%s",
+              (unsigned long long)slot->path_hash, (unsigned)index,
+              (unsigned)slot->generation, (unsigned)slot->type,
+              slot->path ? slot->path : "<unknown>");
     if (slot->path) {
         JCE_FREE(slot->path);
         slot->path = NULL;
@@ -255,7 +270,12 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
                                  JceAssetType type,
                                  const JceAssetLoadParams *params)
 {
-    if (!mgr || !asset_path) return JCE_ASSET_HANDLE_INVALID;
+    if (!mgr || !asset_path || !asset_path[0]) return JCE_ASSET_HANDLE_INVALID;
+    if ((uint32_t)type >= JCE_ASSET_TYPE_COUNT) {
+        LOG_ERROR(LOG_TAG, "asset phase=acquire reason=unsupported_type type=%u path=%s",
+                  (unsigned)type, asset_path);
+        return JCE_ASSET_HANDLE_INVALID;
+    }
 
     uint64_t h = hash_asset_key(asset_path, type, params);
 
@@ -291,12 +311,36 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
     slot->data       = NULL;
     slot->memory_bytes = 0;
     slot->load_params = sanitize_load_params(params);
+    if (type == JCE_ASSET_FONT && params && params->font_codepoints &&
+        params->font_codepoint_count > 0) {
+        size_t count = (size_t)params->font_codepoint_count;
+        uint32_t *owned = count <= SIZE_MAX / sizeof(*owned)
+            ? JCE_MALLOC(count * sizeof(*owned)) : NULL;
+        if (!owned) {
+            LOG_ERROR(LOG_TAG, "asset phase=acquire reason=codepoint_allocation "
+                      "handle=%u:%u type=%u path=%s count=%d",
+                      (unsigned)idx, (unsigned)slot->generation, (unsigned)type,
+                      asset_path, params->font_codepoint_count);
+            JCE_FREE(slot->path);
+            slot->path = NULL;
+            slot->path_hash = 0;
+            JCE_SLOT_REF_SET(slot, 0);
+            mgr->free_list[mgr->free_count++] = idx;
+            return JCE_ASSET_HANDLE_INVALID;
+        }
+        memcpy(owned, params->font_codepoints, count * sizeof(*owned));
+        slot->load_params.font_codepoints = owned;
+        slot->load_params.font_codepoint_count = params->font_codepoint_count;
+    }
 
     /* Register in hash map. */
     uint16_t inserted = jce_registry_insert(&mgr->registry, h, idx);
     if (inserted == UINT16_MAX) {
         LOG_ERROR(LOG_TAG, "asset acquire failed: registry insert failed (%s)",
                   asset_path);
+        if (slot->type == JCE_ASSET_FONT)
+            JCE_FREE((void *)slot->load_params.font_codepoints);
+        slot->load_params.font_codepoints = NULL;
         JCE_FREE(slot->path);
         slot->path = NULL;
         slot->path_hash = 0;
@@ -315,6 +359,9 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
         JceAssetSlot *existing_slot = &mgr->slots[inserted];
         JCE_SLOT_REF_INC(existing_slot);
 
+        if (slot->type == JCE_ASSET_FONT)
+            JCE_FREE((void *)slot->load_params.font_codepoints);
+        slot->load_params.font_codepoints = NULL;
         JCE_FREE(slot->path);
         slot->path = NULL;
         slot->path_hash = 0;
@@ -330,6 +377,9 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
     }
 
     JceAssetHandle handle = { idx, slot->generation };
+    LOG_DEBUG(LOG_TAG, "asset phase=acquire key=%016llx handle=%u:%u type=%u path=%s",
+              (unsigned long long)h, (unsigned)idx, (unsigned)slot->generation,
+              (unsigned)type, slot->path);
 
     /* Decide sync vs async. */
     bool sync = !params || params->sync || !mgr->pool;
@@ -341,15 +391,17 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
         sync = true;
 
     if (sync) {
-        load_slot_sync(mgr, slot, asset_path, type, params);
+        load_slot_sync(mgr, slot, asset_path, type, &slot->load_params);
 
         if (JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY) {
             mgr->total_loaded++;
             mgr->total_memory += slot->memory_bytes;
         } else {
             mgr->failed_loads++;
-            fire_asset_error(mgr, slot, idx, JCE_ASSET_ERR_INTERNAL,
-                             "sync load returned non-READY state");
+            fire_asset_error(mgr, slot, idx,
+                             jce_pak_find(mgr->pak, asset_path)
+                                 ? JCE_ASSET_ERR_INTERNAL : JCE_ASSET_ERR_NOT_FOUND,
+                             "sync loader did not produce a ready payload");
         }
     } else {
         /* Submit to async pool. */
@@ -430,8 +482,6 @@ JceAssetState jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
 
     JceAssetLoadParams params = slot->load_params;
     params.sync = true;
-    params.font_codepoints = NULL;
-    params.font_codepoint_count = 0;
 
     JceAssetSlot staged;
     memset(&staged, 0, sizeof(staged));
@@ -442,7 +492,9 @@ JceAssetState jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
         destroy_slot_payload(mgr, &staged);
         mgr->failed_loads++;
         fire_asset_error(mgr, slot, (uint16_t)handle.index,
-                         JCE_ASSET_ERR_INTERNAL, "reload failed");
+                         jce_pak_find(mgr->pak, slot->path)
+                             ? JCE_ASSET_ERR_INTERNAL : JCE_ASSET_ERR_NOT_FOUND,
+                         "reload failed; previous payload retained");
         LOG_WARN(LOG_TAG, "reload failed, keeping previous asset data: %s",
                  slot->path);
         /* The previous payload is untouched and still usable — this is a
@@ -705,7 +757,15 @@ static void fire_asset_error(JceAssetManager *mgr,
                              JceAssetErrorCode code,
                              const char *detail)
 {
-    if (!mgr || !mgr->error_fn) return;
+    if (!mgr) return;
+    LOG_ERROR(LOG_TAG, "asset phase=load_failed key=%016llx handle=%u:%u "
+              "type=%u code=%u path=%s detail=%s",
+              (unsigned long long)(slot ? slot->path_hash : 0),
+              (unsigned)slot_index, (unsigned)(slot ? slot->generation : 0),
+              (unsigned)(slot ? slot->type : JCE_ASSET_RAW), (unsigned)code,
+              slot && slot->path ? slot->path : "<unknown>",
+              detail ? detail : "<unknown>");
+    if (!mgr->error_fn) return;
     JceAssetErrorInfo info;
     info.handle.index      = slot_index;
     info.handle.generation = slot ? slot->generation : 0;

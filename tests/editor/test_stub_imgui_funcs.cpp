@@ -14,6 +14,9 @@ namespace ImGui {
 static ImGuiKeyChord g_pressed_chord = ImGuiKey_None;
 static ImGuiKey      g_pressed_key   = ImGuiKey_None;
 static int           g_frame_count   = 1;
+static ImGuiIO       g_io;
+
+ImGuiIO &GetIO() { return g_io; }
 
 const char *GetKeyName(ImGuiKey key)
 {
@@ -30,6 +33,8 @@ const char *GetKeyName(ImGuiKey key)
         case ImGuiKey_S:        std::strcpy(slot, "S");        break;
         case ImGuiKey_Z:        std::strcpy(slot, "Z");        break;
         case ImGuiKey_F2:       std::strcpy(slot, "F2");       break;
+        case ImGuiKey_Comma:    std::strcpy(slot, ",");        break;
+        case ImGuiKey_Period:   std::strcpy(slot, ".");        break;
         case ImGuiKey_Backspace: std::strcpy(slot, "Backspace"); break;
         case ImGuiKey_Delete:   std::strcpy(slot, "Delete");   break;
         case ImGuiKey_Pause:    std::strcpy(slot, "Pause");    break;

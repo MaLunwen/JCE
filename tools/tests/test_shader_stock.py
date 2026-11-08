@@ -1,5 +1,6 @@
 """Current-build shader provenance and safe retirement controls."""
 import json
+import copy
 from pathlib import Path
 import sys
 import tempfile
@@ -61,6 +62,22 @@ class ShaderStockTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.stage()
 
+    def test_opaque_inspection_cannot_recover_names_from_a_source_ledger(self):
+        self.stage()
+        previous_manifest = (self.out / 'manifest.json').read_bytes()
+        previous_shader = (self.out / 'vs_pbr_dx11.bin').read_bytes()
+        opaque = dict(self.entries[0], path=None)
+        self.bom.write_text(json.dumps({
+            'schema': 'jce.pakbom.v1', 'sources_verified': True,
+            'header': {'has_debug_paths': False},
+            'entries': [opaque],
+            'sources': [{'path': self.entries[0]['path']}],
+        }), encoding='utf-8')
+        with self.assertRaises(ValueError):
+            stage_stock(self.bom, self.source, self.out, ['dx11'])
+        self.assertEqual((self.out / 'manifest.json').read_bytes(), previous_manifest)
+        self.assertEqual((self.out / 'vs_pbr_dx11.bin').read_bytes(), previous_shader)
+
     def test_stock_hash_and_size_tamper(self):
         self.stage()
         binary = self.out / 'vs_pbr_dx11.bin'
@@ -102,6 +119,81 @@ class ShaderStockTests(unittest.TestCase):
         from tools.assets.shader_stock import inside
         with self.assertRaises(ValueError):
             inside(self.source, '../../escape.bin')
+
+
+
+class ShaderStockProfileTests(unittest.TestCase):
+    def setUp(self):
+        from tools.shadergen import gen_shader_variants
+        self.gen = gen_shader_variants
+        self.manifest = self.gen.load()
+
+    def test_full_cooker_stays_unrestricted_and_all_original_cells_remain(self):
+        full = self.gen.stock_profiles(self.manifest)["profiles"]["full"]
+        self.assertTrue(full["cook"]["unrestricted"])
+        self.assertEqual(full["cook"]["vertex"], [])
+        self.assertEqual(full["cook"]["fragment"], [])
+        self.assertEqual(len(full["pbr_cells"]), 24)
+        self.assertEqual(len({(p["vertex"], p["fragment"]) for p in full["pbr_cells"]}), 18)
+        self.assertEqual([p["member"] for p in full["stock_pairs"]], [
+            "color", "textured", "text_sdf", "mesh", "pbr_toon",
+            "outline_skinned", "shadow", "shadow_inst", "shadow_skinned", "terrain"])
+
+    def test_compatibility_requests_only_static_base_and_no_shadow(self):
+        profile = self.gen.stock_profiles(self.manifest)["profiles"]["compatibility"]
+        self.assertEqual([(p["variant_name"], p["key"], p["fragment"])
+                          for p in profile["pbr_cells"]],
+                         [("pbr", 0, "pbr"), ("pbr", 2, "pbr_noshadow")])
+        self.assertEqual([p["member"] for p in profile["stock_pairs"]],
+                         ["color", "textured", "text_sdf", "mesh", "shadow"])
+        cook = profile["cook"]
+        self.assertFalse(cook["unrestricted"])
+        self.assertEqual(cook["compute"], [])
+        self.assertEqual(cook["vertex"], sorted(set(cook["vertex"])))
+        self.assertEqual(cook["fragment"], sorted(set(cook["fragment"])))
+        self.assertIn("vs_imgui", cook["vertex"])
+        self.assertIn("fs_pbr_noshadow", cook["fragment"])
+        self.assertIn("fs_present", cook["fragment"])
+        self.assertIn("fs_reveal_dissolve", cook["fragment"])
+        self.assertTrue({"vs_water", "vs_foliage", "vs_foliage_shadow",
+                         "vs_particle", "vs_particle_expanded"}.issubset(cook["vertex"]))
+        self.assertTrue({"fs_water", "fs_foliage", "fs_foliage_shadow",
+                         "fs_particle"}.issubset(cook["fragment"]))
+        forbidden = ("inst", "skinned", "fwdplus", "terrain", "toon", "outline")
+        self.assertFalse(any(any(part in stem for part in forbidden)
+                             for stem in cook["vertex"] + cook["fragment"]))
+        sources = {p.stem for p in (ROOT / "engine/shaders").rglob("*.sc")}
+        self.assertFalse(set(cook["vertex"] + cook["fragment"]) - sources)
+
+    def test_compatibility_selection_cannot_change_modern_generated_shaders(self):
+        before = self.gen.wanted(self.manifest)
+        altered = copy.deepcopy(self.manifest)
+        altered["stock_profiles"][1]["pbr_cells"].pop()
+        after = self.gen.wanted(altered)
+        changed_outputs = {ROOT / altered["stock_profile_table_out"],
+                           ROOT / altered["stock_profile_catalog_out"]}
+        self.assertTrue(all(before[path] == after[path]
+                            for path in before if path not in changed_outputs))
+        self.assertNotEqual(before[ROOT / altered["stock_profile_table_out"]],
+                            after[ROOT / altered["stock_profile_table_out"]])
+
+    def test_invalid_profile_addresses_and_selectors_are_rejected(self):
+        mutations = [
+            lambda m: m["stock_programs"][0].update(vertex="../outside"),
+            lambda m: m["stock_programs"].append(m["stock_programs"][0].copy()),
+            lambda m: m["stock_profiles"][1].update(stock_members=["absent"]),
+            lambda m: m["stock_profiles"][1]["pbr_cells"][0].update(variant="missing"),
+            lambda m: m["stock_profiles"][1]["pbr_cells"][0].update(keywords=["missing"]),
+            lambda m: m["stock_profiles"][1]["pbr_cells"].append(
+                m["stock_profiles"][1]["pbr_cells"][0].copy()),
+            lambda m: m["stock_profiles"][1].update(cook_unrestricted=1),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                altered = copy.deepcopy(self.manifest)
+                mutate(altered)
+                with self.assertRaises(ValueError):
+                    self.gen.wanted(altered)
 
 
 if __name__ == '__main__':

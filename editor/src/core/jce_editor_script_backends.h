@@ -32,13 +32,20 @@ void jce_editor_register_script_backends(void);
  * run by the JCE_SCRIPT_CPP_MODULES environment variable).
  *
  * Pass NULL or "" when a project closes — that unloads and loads nothing.
+ * Native modules run from an exclusively created same-directory image; the
+ * declared path remains their identity and can be rebuilt while code is live.
+ * A refused unload retains the image. Successful unload permits deletion;
+ * failed deletion is retained for retry. Normal Editor shutdown calls this
+ * after state shutdown has released its script instances. Copy failure never
+ * falls back to loading the mutable original file.
  *
  * Never fails the caller.  Each module that cannot be loaded is reported with
  * WHICH of the four distinguishable states it is in (absent / the OS refused
  * to map it / it is not a JCE script module / it was refused after loading),
  * because they have four different fixes and none of them is "unknown
  * language".  Safe to call with no project, with a project that declares no
- * modules, and repeatedly with the same root. */
+ * modules, and repeatedly with the same root. Image-copy and cleanup refusals
+ * have separate diagnostics. */
 void jce_editor_script_modules_reload(const char *project_root);
 
 /* RELOAD THE NATIVE MODULES THE OPEN PROJECT ALREADY HAS LOADED.

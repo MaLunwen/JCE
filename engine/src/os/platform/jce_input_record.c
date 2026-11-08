@@ -48,6 +48,7 @@
 #include <jce/os/core/jce_profiler.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_input_internal.h"
 
 #include <string.h>
 
@@ -449,6 +450,7 @@ bool jce_input_replay_tick(JceInputRecorder *r, JceInput *input)
 {
     JceInputFrame f;
 
+    jce_input_clear_snapshot_replayed(input);
     if (!r || !input || r->mode != JIRC_MODE_REPLAY) return false;
     JCE_PROFILE_ZONE_N("Input::ReplayTick");
 
@@ -471,7 +473,7 @@ bool jce_input_replay_tick(JceInputRecorder *r, JceInput *input)
         memcpy(&f, (const uint8_t *)r->data + r->pos, sizeof(f));
     }
 
-    if (!jce_input_apply(input, &f)) { JCE_PROFILE_ZONE_END; return false; }
+    if (!jce_input_apply_replayed(input, &f)) { JCE_PROFILE_ZONE_END; return false; }
     r->pos += (uint64_t)r->stride;
     r->frame_count++;
     JCE_PROFILE_ZONE_END;

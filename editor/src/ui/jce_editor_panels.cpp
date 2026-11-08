@@ -16,6 +16,7 @@
 #include "core/jce_editor_alloc.h"
 #include "jce_editor_colors.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_lan_discovery.h"
 #include "core/jce_editor_defaults.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
@@ -229,6 +230,9 @@ bool jce_editor_console_entry_get(int display_idx, JceConsoleEntry *out)
 
 void jce_editor_panels_init(void)
 {
+    /* Every lifecycle starts from defaults, including specialized slots that
+       have no explicit assignment below. Persisted bits are applied afterwards. */
+    memset(s_visible, 0, sizeof(s_visible));
     s_visible[JCE_PANEL_HIERARCHY]   = true;
     s_visible[JCE_PANEL_INSPECTOR]   = true;
     s_visible[JCE_PANEL_CONSOLE]     = true;
@@ -286,6 +290,7 @@ void jce_editor_panels_init(void)
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
+    jce_editor_panel_console_init();
 
     /* Restore persisted locale + theme (locale restore is load-bearing:
      * skipping it boots the editor in the default language). */
@@ -319,8 +324,12 @@ void jce_editor_panels_init(void)
 
 void jce_editor_panels_shutdown(void)
 {
+    jce_editor_lan_discovery_shutdown();
+    jce_editor_panel_bundle_browser_shutdown();
+    jce_editor_panel_test_runner_shutdown();
     jce_hierarchy_storage_shutdown();
     jce_file_viewer_shutdown();
+    jce_editor_panel_console_shutdown();
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -479,6 +488,7 @@ void jce_editor_about_dialog(bool *p_open)
     static bool s_show_tpl = false;
     static bool s_sha_loaded = false;
     static char s_sha[96];   /* "<64 hex>  jce_editor.exe\n" comfortably fits */
+    static char s_executable_path[128 * 1024];
 
     if (!s_sha_loaded) {
         s_sha_loaded = true;
@@ -512,6 +522,10 @@ void jce_editor_about_dialog(bool *p_open)
 
     const char *popup_id = "###AboutDialog";
     if (*p_open && !ImGui::IsPopupOpen(popup_id)) {
+        /* Refresh on opening, not on every UI frame. The public host API
+         * returns a complete UTF-8 filename or fails without truncation. */
+        if (!jce_fs_host_get_executable_path(s_executable_path, sizeof(s_executable_path)))
+            s_executable_path[0] = '\0';
         ImGui::OpenPopup(popup_id);
     }
 
@@ -593,6 +607,15 @@ void jce_editor_about_dialog(bool *p_open)
     ImGui::BeginChild("##about_scroll",
                       ImVec2(0.0f, ImGui::GetContentRegionAvail().y - bottom_reserve),
                       false, ImGuiWindowFlags_None);
+    ImGui::TextUnformatted(jce_editor_i18n("viewer.path"));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!s_executable_path[0]);
+    if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.copyPath")))
+        ImGui::SetClipboardText(s_executable_path);
+    ImGui::EndDisabled();
+    ImGui::TextWrapped("%s", s_executable_path[0] ? s_executable_path
+        : jce_editor_i18n("preferences.rendering.notAvailable"));
+    ImGui::Spacing();
     ImGui::TextWrapped("%s", jce_editor_i18n("about.description"));
     ImGui::Spacing();
     ImGui::TextWrapped("%s", jce_editor_i18n("about.platforms"));

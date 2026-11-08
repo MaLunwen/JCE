@@ -153,6 +153,16 @@ jce_add_unit_test(test_jce_scene_particles_state
     SOURCES test_jce_scene_particles_state.c
     LINK    jce_core jce_scene jce_resource jce_renderer)
 
+jce_add_unit_test(test_jce_sr_particle_expanded
+    SOURCES test_jce_sr_particle_expanded.c
+    LINK bgfx::bgfx
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+if(MSVC)
+    # The standalone fixture includes bx through bgfx's C99 API.
+    target_compile_options(test_jce_sr_particle_expanded PRIVATE
+        /Zc:preprocessor /Zc:__cplusplus)
+endif()
+
 # jce_scene_async registers with the player loop, which lives in jce_application.
 jce_add_unit_test(test_jce_scene_async_progress
     SOURCES test_jce_scene_async_progress.c
@@ -193,6 +203,7 @@ jce_add_unit_test(test_jce_scene_renderer_view_order
             "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_scene_renderer_view_order.c")
 target_include_directories(test_jce_scene_renderer_view_order PRIVATE
     "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+include("${CMAKE_CURRENT_SOURCE_DIR}/scene_renderer_view_order_controls.cmake")
 
 # Scene-scoped string interning. The pointers it hands out live inside
 # components that flecs memcpys between tables, so stability across growth is a
@@ -269,7 +280,8 @@ jce_add_unit_test(test_jce_csm_splits
 # that ripples, and all four show up as energy GROWING.
 jce_add_unit_test(test_jce_water_ripple
     SOURCES test_jce_water_ripple.c
-    LINK    jce_core jce_scene)
+    LINK    jce_core jce_scene
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
 
 # Water: the disturbance layer's SEAMS -- scene ownership, and the term the
 # buoyancy pass adds. The solver's own tests cannot see either.
@@ -394,6 +406,8 @@ jce_add_unit_test(test_jce_sequencer_easing_events
 jce_add_unit_test(test_jce_comp_set_partial
     SOURCES test_jce_comp_set_partial.c
     LINK    jce_core jce_scene jce_resource)
+include(comp_set_patch_controls.cmake)
+include(point_light_cull_write_controls.cmake)
 
 # The reservation table must equal what the view-order builder actually names.
 # A compile-time gate is only as strong as the table it consults, and the table
@@ -561,6 +575,11 @@ target_include_directories(test_jce_horizon PRIVATE
 jce_add_unit_test(test_jce_water_field
     SOURCES test_jce_water_field.c
             "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_field.c"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_foam.c"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_shore_step.c"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_shore_state.c"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_shore_foam_step.c"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_shore_boundary.c"
             "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water.c"
             "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_fft.c"
             "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ocean_spectrum.c"
@@ -775,6 +794,9 @@ jce_add_unit_test(test_jce_camera_clear_mode
 jce_add_unit_test(test_jce_rprobe_bake_resolution
     SOURCES test_jce_rprobe_bake_resolution.c
     LINK    JCE)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rprobe-bake-resolution")
+set_tests_properties(test_jce_rprobe_bake_resolution PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rprobe-bake-resolution")
 
 # GrassField.cast_shadow: which blades reach the depth pass, as counts and
 # ranges -- the run set IS the submit decision.
@@ -945,3 +967,804 @@ target_include_directories(test_jce_sr_anim_storage PRIVATE
 jce_add_unit_test(test_jce_scene_rotation_roundtrip
     SOURCES test_jce_scene_rotation_roundtrip.c
     LINK jce_core jce_scene jce_resource)
+
+# Production depth-target ownership and real Noop allocation/lifetime controls.
+jce_add_unit_test(test_jce_shadow_target_lifecycle
+    SOURCES test_jce_shadow_target_lifecycle.c
+    LINK jce_core jce_scene jce_resource jce_renderer)
+target_include_directories(test_jce_shadow_target_lifecycle PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src")
+# The fixture consumes private JceSceneRenderer state and actual Noop stats.
+# Keep bgfx headers/linkage private, matching other scene-owner controls.
+target_link_libraries(test_jce_shadow_target_lifecycle PRIVATE bgfx::bgfx)
+if(MSVC)
+    target_compile_options(test_jce_shadow_target_lifecycle PRIVATE /Zc:preprocessor)
+endif()
+
+# Production foliage resident-root ownership through a first-party C99 provider seam.
+jce_add_unit_test(test_jce_foliage_buffer_lifecycle
+    SOURCES test_jce_foliage_buffer_lifecycle.c
+    ${PROJECT_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_foliage_buffer.c
+    LINK jce_core)
+target_include_directories(test_jce_foliage_buffer_lifecycle PRIVATE
+    ${PROJECT_SOURCE_DIR}/engine/src)
+
+# Current-frame static scatter identity and failed preparation cache admission.
+jce_add_unit_test(test_jce_foliage_shadow_key
+    SOURCES test_jce_foliage_shadow_key.c
+    ${PROJECT_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_foliage_shadow_key.c
+    ${PROJECT_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_foliage_buffer.c
+    ${PROJECT_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_foliage_identity.c
+    LINK jce_core)
+target_include_directories(test_jce_foliage_shadow_key PRIVATE
+    ${PROJECT_SOURCE_DIR}/engine/src)
+
+# Exact private scene Forward+ owner: lazy admission, mode edges and OOM retry.
+jce_add_unit_test(test_jce_forwardplus_storage_lifecycle
+    SOURCES test_jce_forwardplus_storage_lifecycle.c
+    ${PROJECT_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_forwardplus_storage.c
+    LINK jce_core jce_renderer)
+target_include_directories(test_jce_forwardplus_storage_lifecycle PRIVATE
+    ${PROJECT_SOURCE_DIR}/engine/src)
+
+# Actual cooked foliage owner plus real VFS; CPU only, no GPU/window.
+jce_add_unit_test(test_jce_sr_foliage_cooked_vfs
+    SOURCES test_jce_sr_foliage_cooked_vfs.c
+    LINK JCE
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+target_link_libraries(test_jce_sr_foliage_cooked_vfs PRIVATE bgfx::bgfx)
+if(MSVC)
+    target_compile_options(test_jce_sr_foliage_cooked_vfs PRIVATE /Zc:preprocessor)
+endif()
+
+# Exact canvas font-cache owner with counted ports; no core allocator duplicate.
+jce_add_unit_test(test_jce_ui_font_cache
+    SOURCES test_jce_ui_font_cache.c
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas_font_cache.c"
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene"
+        "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Production text-fit math; CPU bounds controls do not certify font pixels.
+jce_add_unit_test(test_jce_ui_text_fit
+    SOURCES test_jce_ui_text_fit.c
+    LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+
+# Exact text submission owner with counted ports; no rasterized GPU evidence.
+jce_add_unit_test(test_jce_ui_text_draw
+    SOURCES test_jce_ui_text_draw.c
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas_text.c"
+    LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+
+# Exact resource epoch/flat-fallback/cache owners; real core with font ports.
+jce_add_unit_test(test_jce_ui_font_resources
+    SOURCES test_jce_ui_font_resources.c
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas_resources.c"
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas_font_cache.c"
+    LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene"
+        "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Compiled runtime contrast: remove only the actual default Symbols leaf.
+# It uses the same strict fixture and exact cache owner, not a mirrored chain.
+file(READ "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas_resources.c"
+    _ui_symbols_owner)
+string(REGEX MATCHALL "if [(]s_uc[.]system_symbols\\[0\\] &&"
+    _ui_symbols_wires "${_ui_symbols_owner}")
+list(LENGTH _ui_symbols_wires _ui_symbols_wire_count)
+if(NOT _ui_symbols_wire_count EQUAL 1)
+    message(FATAL_ERROR "UI Symbols control requires one real fallback leaf wire")
+endif()
+string(REPLACE "if (s_uc.system_symbols[0] &&" "if (false &&"
+    _ui_symbols_mutant "${_ui_symbols_owner}")
+if(_ui_symbols_mutant STREQUAL _ui_symbols_owner)
+    message(FATAL_ERROR "UI Symbols control did not remove the real fallback wire")
+endif()
+set(_ui_symbols_mutant_path
+    "${CMAKE_CURRENT_BINARY_DIR}/jce_ui_canvas_resources_old_symbols.c")
+jce_test_write_if_changed("${_ui_symbols_mutant_path}" "${_ui_symbols_mutant}")
+jce_add_unit_test(test_jce_ui_font_resources_old_symbols
+    KIND contract
+    SOURCES test_jce_ui_font_resources.c
+        "${_ui_symbols_mutant_path}"
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas_font_cache.c"
+    LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene"
+        "${CMAKE_SOURCE_DIR}/engine/src")
+set_tests_properties(test_jce_ui_font_resources_old_symbols PROPERTIES WILL_FAIL TRUE)
+unset(_ui_symbols_owner)
+unset(_ui_symbols_wires)
+unset(_ui_symbols_wire_count)
+unset(_ui_symbols_mutant)
+unset(_ui_symbols_mutant_path)
+
+# Exact grass content/foliage-buffer owners with counted ports; CPU only.
+jce_add_unit_test(test_jce_grass_shadow_content
+    SOURCES test_jce_grass_shadow_content.c
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_grass_shadow_content.c"
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_foliage_buffer.c"
+    LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Real procedural terrain -> conversion owner CPU controls; no GPU evidence.
+jce_add_unit_test(test_jce_sr_terrain_vertices
+    SOURCES test_jce_sr_terrain_vertices.c
+    LINK JCE
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+target_link_libraries(test_jce_sr_terrain_vertices PRIVATE bgfx::bgfx)
+if(MSVC)
+    target_compile_options(test_jce_sr_terrain_vertices PRIVATE /Zc:preprocessor)
+endif()
+
+# Production grass CPU admission receipts; no renderer or GPU device.
+jce_add_unit_test(test_jce_grass_colour_submit
+    SOURCES test_jce_grass_colour_submit.c LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+include("${CMAKE_CURRENT_SOURCE_DIR}/grass_early_gate_controls.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/grass_mask_batch_controls.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/colour_special_phase_controls.cmake")
+
+# Exact cluster transient preparation; counted CPU ports, no bgfx/GPU claim.
+jce_add_unit_test(test_jce_fcluster_submit
+    SOURCES test_jce_fcluster_submit.c LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+set(_fcluster_header "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_fcluster_submit_internal.h")
+file(READ "${_fcluster_header}" _fcluster_owner)
+string(REGEX MATCHALL "if \\(allocation.count < count\\)" _fcluster_short_guards "${_fcluster_owner}")
+list(LENGTH _fcluster_short_guards _fcluster_short_guard_count)
+if(NOT _fcluster_short_guard_count EQUAL 1)
+    message(FATAL_ERROR "Foliage cluster mutation requires its unique actual allocation guard")
+endif()
+string(REPLACE "if (allocation.count < count)" "if (false)" _fcluster_old_unchecked "${_fcluster_owner}")
+if(_fcluster_old_unchecked STREQUAL _fcluster_owner)
+    message(FATAL_ERROR "Foliage cluster mutation did not change its owner")
+endif()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fcluster-mutation")
+set(_fcluster_old_header "${CMAKE_CURRENT_BINARY_DIR}/fcluster-mutation/jce_sr_fcluster_submit_old_unchecked.h")
+unset(_fcluster_previous_header)
+if(EXISTS "${_fcluster_old_header}")
+    file(READ "${_fcluster_old_header}" _fcluster_previous_header)
+endif()
+if(NOT _fcluster_previous_header STREQUAL _fcluster_old_unchecked)
+    file(WRITE "${_fcluster_old_header}" "${_fcluster_old_unchecked}")
+endif()
+jce_add_unit_test(test_jce_fcluster_submit_old_unchecked KIND contract
+    SOURCES test_jce_fcluster_submit.c LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+target_compile_definitions(test_jce_fcluster_submit_old_unchecked PRIVATE
+    JCE_FCLUSTER_SUBMIT_HEADER="${_fcluster_old_header}")
+set_tests_properties(test_jce_fcluster_submit_old_unchecked PROPERTIES WILL_FAIL TRUE)
+
+# Real bounded model diagnostics consume private slots and the shared core trace.
+set(_model_diagnostics_owner_path
+    "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_model_diagnostics.c")
+file(READ "${_model_diagnostics_owner_path}" _model_diagnostics_owner)
+file(READ "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_scene_renderer.c"
+    _model_diagnostics_renderer)
+string(FIND "${_model_diagnostics_renderer}" "void jce_scene_renderer_destroy(JceSceneRenderer *sr)"
+    _model_destroy_start)
+string(FIND "${_model_diagnostics_renderer}" "    /* The GPU blendshape module's program"
+    _model_destroy_end)
+if(_model_destroy_start LESS 0 OR _model_destroy_end LESS _model_destroy_start)
+    message(FATAL_ERROR "Model diagnostics needs the actual renderer destroy prefix")
+endif()
+math(EXPR _model_destroy_length "${_model_destroy_end} - ${_model_destroy_start}")
+string(SUBSTRING "${_model_diagnostics_renderer}" ${_model_destroy_start} ${_model_destroy_length}
+    _model_diagnostics_destroy)
+string(REPLACE "jce_scene_renderer_destroy(" "jce_model_diagnostics_test_destroy_prefix("
+    _model_diagnostics_destroy "${_model_diagnostics_destroy}")
+string(APPEND _model_diagnostics_destroy "}\n")
+foreach(_model_diagnostics_variant IN ITEMS normal old_repeat_warning old_reset old_repeat_trace missing_reset_flush missing_destroy_flush)
+    set(_model_diagnostics_mutant "${_model_diagnostics_owner}")
+    set(_model_diagnostics_destroy_mutant "${_model_diagnostics_destroy}")
+    if(NOT _model_diagnostics_variant STREQUAL "normal")
+        set(_model_diagnostics_mutation _model_diagnostics_mutant)
+        if(_model_diagnostics_variant STREQUAL "old_repeat_warning")
+            set(_model_diagnostics_needle "const bool first = !(sr->model_cache_reported_reasons & bit);")
+            set(_model_diagnostics_replacement "const bool first = true;")
+        elseif(_model_diagnostics_variant STREQUAL "old_reset")
+            set(_model_diagnostics_needle "sr->model_cache_reported_reasons = 0;")
+            set(_model_diagnostics_replacement "/* old reset omitted diagnostic rearm */")
+        elseif(_model_diagnostics_variant STREQUAL "old_repeat_trace")
+            set(_model_diagnostics_needle "const bool first_detail = trace_ready && !(sr->model_diagnostics.detailed_reasons & bit);")
+            set(_model_diagnostics_replacement "const bool first_detail = trace_ready;")
+        elseif(_model_diagnostics_variant STREQUAL "missing_reset_flush")
+            set(_model_diagnostics_needle "(void)sr_model_cache_diagnostics_flush(sr, SR_MODEL_DIAGNOSTICS_RESET);")
+            set(_model_diagnostics_replacement "/* Former reset omitted its final diagnostic flush. */")
+        else()
+            set(_model_diagnostics_mutation _model_diagnostics_destroy_mutant)
+            set(_model_diagnostics_needle "if (!sr_model_cache_diagnostics_flush(sr, SR_MODEL_DIAGNOSTICS_DESTROY))")
+            set(_model_diagnostics_replacement "if (false)")
+        endif()
+        string(REPLACE "${_model_diagnostics_needle}" "" _model_diagnostics_without
+            "${${_model_diagnostics_mutation}}")
+        string(LENGTH "${${_model_diagnostics_mutation}}" _model_diagnostics_before_length)
+        string(LENGTH "${_model_diagnostics_without}" _model_diagnostics_without_length)
+        string(LENGTH "${_model_diagnostics_needle}" _model_diagnostics_needle_length)
+        math(EXPR _model_diagnostics_removed
+            "${_model_diagnostics_before_length} - ${_model_diagnostics_without_length}")
+        if(NOT _model_diagnostics_removed EQUAL _model_diagnostics_needle_length)
+            message(FATAL_ERROR "Model diagnostics control requires exactly one actual wire")
+        endif()
+        string(REPLACE "${_model_diagnostics_needle}" "${_model_diagnostics_replacement}"
+            ${_model_diagnostics_mutation} "${${_model_diagnostics_mutation}}")
+        set(_model_diagnostics_target
+            "test_jce_model_cache_diagnostics_${_model_diagnostics_variant}")
+        set(_model_diagnostics_kind contract)
+    else()
+        set(_model_diagnostics_target test_jce_model_cache_diagnostics)
+        set(_model_diagnostics_kind unit)
+    endif()
+    # Count the actual occupancy reads in the complete production owner.
+    # This typed CPU observation port does not replace any cache behavior.
+    set(_model_slot_read "const SrModelCache *entry = sr->model_cache[i];")
+    string(REPLACE "${_model_slot_read}" "" _model_without_slot_read "${_model_diagnostics_mutant}")
+    string(LENGTH "${_model_diagnostics_mutant}" _model_before_slot_read_length)
+    string(LENGTH "${_model_without_slot_read}" _model_without_slot_read_length)
+    string(LENGTH "${_model_slot_read}" _model_slot_read_length)
+    math(EXPR _model_removed_slot_read "${_model_before_slot_read_length} - ${_model_without_slot_read_length}")
+    if(NOT _model_removed_slot_read EQUAL _model_slot_read_length)
+        message(FATAL_ERROR "Model diagnostics requires one actual occupancy read")
+    endif()
+    string(REPLACE "${_model_slot_read}"
+        "extern void jce_test_model_slot_scanned(void); jce_test_model_slot_scanned(); ${_model_slot_read}"
+        _model_diagnostics_mutant "${_model_diagnostics_mutant}")
+    set(_model_diagnostics_source
+        "${CMAKE_CURRENT_BINARY_DIR}/model_diagnostics_${_model_diagnostics_variant}.c")
+    jce_test_write_if_changed("${_model_diagnostics_source}" "${_model_diagnostics_mutant}")
+    set(_model_diagnostics_destroy_path
+        "${CMAKE_CURRENT_BINARY_DIR}/model_diagnostics_destroy_${_model_diagnostics_variant}.inc")
+    jce_test_write_if_changed("${_model_diagnostics_destroy_path}" "${_model_diagnostics_destroy_mutant}")
+    jce_add_unit_test(${_model_diagnostics_target}
+        KIND ${_model_diagnostics_kind}
+        SOURCES test_jce_model_cache_diagnostics.c "${_model_diagnostics_source}"
+        LINK jce_core)
+    target_include_directories(${_model_diagnostics_target} PRIVATE
+        "${CMAKE_SOURCE_DIR}/engine/src"
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+    target_link_libraries(${_model_diagnostics_target} PRIVATE bgfx::bgfx)
+    target_compile_definitions(${_model_diagnostics_target} PRIVATE
+        "JCE_MODEL_DIAGNOSTICS_DESTROY=\"${_model_diagnostics_destroy_path}\"")
+    if(MSVC)
+        target_compile_options(${_model_diagnostics_target} PRIVATE /Zc:preprocessor)
+    endif()
+    if(NOT _model_diagnostics_variant STREQUAL "normal")
+        set_tests_properties(${_model_diagnostics_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+
+# Exact camera-prepass MRT owner with counted textures and borrowing FBOs.
+set(_prepass_targets_owner_path
+    "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_prepass_targets.c")
+file(READ "${_prepass_targets_owner_path}" _prepass_targets_owner)
+jce_add_unit_test(test_jce_prepass_target_lifecycle
+    SOURCES test_jce_prepass_target_lifecycle.c "${_prepass_targets_owner_path}"
+    LINK jce_core
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+
+# Both contract variants compile the complete actual owner with the unchanged
+# fixture. Exact length reduction proves one wire, including semicolon needles.
+string(LENGTH "${_prepass_targets_owner}" _prepass_targets_owner_length)
+foreach(_prepass_targets_variant IN ITEMS old_single_slot omitted_albedo_cleanup)
+    if(_prepass_targets_variant STREQUAL "old_single_slot")
+        set(_prepass_targets_needle
+            "if (slot->used && slot->target.request.view_base == request->view_base)")
+        set(_prepass_targets_replacement "if (slot->used)")
+    else()
+        set(_prepass_targets_needle
+            "provider->destroy_texture(target->albedo, provider->user);")
+        set(_prepass_targets_replacement "(void)provider;")
+    endif()
+    string(REPLACE "${_prepass_targets_needle}" ""
+        _prepass_targets_without_wire "${_prepass_targets_owner}")
+    string(LENGTH "${_prepass_targets_without_wire}" _prepass_targets_without_length)
+    string(LENGTH "${_prepass_targets_needle}" _prepass_targets_needle_length)
+    math(EXPR _prepass_targets_removed_length
+        "${_prepass_targets_owner_length} - ${_prepass_targets_without_length}")
+    if(NOT _prepass_targets_removed_length EQUAL _prepass_targets_needle_length)
+        message(FATAL_ERROR "Prepass target ${_prepass_targets_variant} requires one exact actual owner wire")
+    endif()
+    string(REPLACE "${_prepass_targets_needle}" "${_prepass_targets_replacement}"
+        _prepass_targets_mutant "${_prepass_targets_owner}")
+    if(_prepass_targets_mutant STREQUAL _prepass_targets_owner)
+        message(FATAL_ERROR "Prepass target ${_prepass_targets_variant} did not change its actual owner")
+    endif()
+    set(_prepass_targets_mutant_path
+        "${CMAKE_CURRENT_BINARY_DIR}/jce_sr_prepass_targets_${_prepass_targets_variant}.c")
+    unset(_prepass_targets_previous)
+    if(EXISTS "${_prepass_targets_mutant_path}")
+        file(READ "${_prepass_targets_mutant_path}" _prepass_targets_previous)
+    endif()
+    if(NOT _prepass_targets_previous STREQUAL _prepass_targets_mutant)
+        file(WRITE "${_prepass_targets_mutant_path}" "${_prepass_targets_mutant}")
+    endif()
+    set(_prepass_targets_target
+        "test_jce_prepass_target_lifecycle_${_prepass_targets_variant}")
+    jce_add_unit_test(${_prepass_targets_target} KIND contract
+        SOURCES test_jce_prepass_target_lifecycle.c "${_prepass_targets_mutant_path}"
+        LINK jce_core
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+    set_tests_properties(${_prepass_targets_target} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+unset(_prepass_targets_owner_path)
+unset(_prepass_targets_owner)
+unset(_prepass_targets_owner_length)
+unset(_prepass_targets_variant)
+unset(_prepass_targets_needle)
+unset(_prepass_targets_replacement)
+unset(_prepass_targets_without_wire)
+unset(_prepass_targets_without_length)
+unset(_prepass_targets_needle_length)
+unset(_prepass_targets_removed_length)
+unset(_prepass_targets_mutant)
+unset(_prepass_targets_mutant_path)
+unset(_prepass_targets_previous)
+unset(_prepass_targets_target)
+
+
+# Actual resource-preparation body, its complete async upload polls and legacy
+# render/reset admission prefixes. Counted ports use the real private layout.
+# They certify bounded owner behavior, not full render passes or GPU completion.
+set(_srp_path "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_scene_renderer.c")
+set(_srp_reset_path "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_environment.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_srp_path}" "${_srp_reset_path}")
+file(READ "${_srp_path}" _srp_source)
+file(READ "${_srp_reset_path}" _srp_reset_source)
+function(_jce_srp_slice SOURCE_VARIABLE START END OUTPUT_VARIABLE)
+    string(FIND "${${SOURCE_VARIABLE}}" "${START}" _start)
+    string(FIND "${${SOURCE_VARIABLE}}" "${END}" _end)
+    if(_start LESS 0 OR _end LESS_EQUAL _start)
+        message(FATAL_ERROR "Resource preparation requires its exact production body boundaries")
+    endif()
+    math(EXPR _length "${_end} - ${_start}")
+    string(SUBSTRING "${${SOURCE_VARIABLE}}" ${_start} ${_length} _slice)
+    set(${OUTPUT_VARIABLE} "${_slice}" PARENT_SCOPE)
+endfunction()
+_jce_srp_slice(_srp_source "struct SrTexJob {" "static JceAsyncRunResult sr_tex_worker(" _srp_tex_job)
+_jce_srp_slice(_srp_source "static void sr_tex_job_destroy(" "/* sr_resolve_texture /" _srp_tex_poll)
+_jce_srp_slice(_srp_source "struct SrModelJob {" "static JceAsyncRunResult sr_model_worker(" _srp_model_job)
+_jce_srp_slice(_srp_source "static void sr_model_job_destroy(" "static uint32_t sr_path_hash(" _srp_model_poll)
+# Resource preparation ends before the separate linear-render wrapper. Keeping
+# that wrapper here would define its public symbol and pull the full renderer
+# TU through its ordinary-render call; scene_linear_controls owns that wrapper.
+_jce_srp_slice(_srp_source "/* Observe each newly terminal job once" "uint16_t jce_scene_renderer_render_linear(" _srp_prepare)
+set(_srp_owner "${_srp_tex_job}\n${_srp_model_job}\n${_srp_tex_poll}\n${_srp_model_poll}\n${_srp_prepare}")
+_jce_srp_slice(_srp_source "uint16_t jce_scene_renderer_render(" "    sr_nodraw_refresh_registry(scene" _srp_prefix)
+string(REPLACE "jce_scene_renderer_render(" "jce_srp_test_render_prefix(" _srp_prefix "${_srp_prefix}")
+string(APPEND _srp_prefix "    (void)_t0_sr;\n    return view_id_base;\n}\n")
+_jce_srp_slice(_srp_reset_source "void jce_scene_renderer_reset_entity_caches(" "    sr_release_prepass_targets(sr, SR_PREPASS_TARGET_RESET);" _srp_reset)
+string(REPLACE "jce_scene_renderer_reset_entity_caches(" "jce_srp_test_reset_prefix(" _srp_reset "${_srp_reset}")
+string(APPEND _srp_reset "}\n")
+set(_srp_ports
+    jce_texture_upload_cpu=jce_srp_test_texture_upload_cpu
+    jce_texture_cpu_free=jce_srp_test_texture_cpu_free
+    jce_model_upload_gltf_cpu=jce_srp_test_model_upload_gltf_cpu
+    jce_model_gltf_cpu_free=jce_srp_test_model_gltf_cpu_free
+    jce_model_gpu_bytes=jce_srp_test_model_gpu_bytes
+    jce_texture_set_streaming_uploads=jce_srp_test_streaming_uploads
+    jce_async_task_is_terminal=jce_srp_test_task_is_terminal
+    jce_async_task_state=jce_srp_test_task_state
+    jce_async_task_release=jce_srp_test_task_release
+    jce_renderer_get_submitted_payload_stats=jce_srp_test_payload_stats
+    jce_renderer_get_frame_index=jce_srp_test_frame_index
+    jce_renderer_frame_admission_current_internal=jce_srp_test_frame_admission
+    sr_model_cache_failure_hash=jce_srp_test_model_failure
+    sr_model_cache_diagnostics_bind=jce_srp_test_model_diagnostics_bind
+    jce_scene_renderer_prepare_resources=jce_srp_test_prepare_resources)
+foreach(_srp_variant IN ITEMS current missing_round_guard missing_admission missing_render_fallback missing_diagnostic_bind)
+    set(_srp_variant_owner "${_srp_owner}")
+    set(_srp_variant_prefix "${_srp_prefix}")
+    set(_srp_kind unit)
+    if(NOT _srp_variant STREQUAL "current")
+        set(_srp_kind contract)
+        if(_srp_variant STREQUAL "missing_round_guard")
+            set(_srp_needle "    const bool reuse = sr->resource_prepared_valid && !arrived && !video_pending &&")
+            set(_srp_replacement "    const bool reuse = false && sr->resource_prepared_valid && !arrived && !video_pending &&")
+            set(_srp_mutation _srp_variant_owner)
+        elseif(_srp_variant STREQUAL "missing_admission")
+            set(_srp_needle "        jce_renderer_frame_admission_current_internal(sr->renderer) &&")
+            set(_srp_replacement "        true && /* Former missing device/context admission. */")
+            set(_srp_mutation _srp_variant_owner)
+        elseif(_srp_variant STREQUAL "missing_diagnostic_bind")
+            set(_srp_needle "    sr_model_cache_diagnostics_bind(sr, scene, facts.context_generation, facts.frame_index);")
+            set(_srp_replacement "    /* Missing real scene/context diagnostics admission. */")
+            set(_srp_mutation _srp_variant_owner)
+        else()
+            set(_srp_needle "    if (!jce_scene_renderer_prepare_resources(sr, scene)) return view_id_base;")
+            set(_srp_replacement "    (void)scene; /* Missing legacy resource-prepare fallback. */")
+            set(_srp_mutation _srp_variant_prefix)
+        endif()
+        string(REPLACE "${_srp_needle}" "" _srp_without "${${_srp_mutation}}")
+        string(LENGTH "${${_srp_mutation}}" _srp_before_length)
+        string(LENGTH "${_srp_without}" _srp_without_length)
+        string(LENGTH "${_srp_needle}" _srp_needle_length)
+        math(EXPR _srp_removed "${_srp_before_length} - ${_srp_without_length}")
+        if(NOT _srp_removed EQUAL _srp_needle_length)
+            message(FATAL_ERROR "Resource preparation ${_srp_variant} requires exactly one actual owner wire")
+        endif()
+        string(REPLACE "${_srp_needle}" "${_srp_replacement}" ${_srp_mutation} "${${_srp_mutation}}")
+    endif()
+    set(_srp_generated "${CMAKE_CURRENT_BINARY_DIR}/jce_srp_${_srp_variant}.inc")
+    set(_srp_prefix_path "${CMAKE_CURRENT_BINARY_DIR}/jce_srp_render_${_srp_variant}.inc")
+    set(_srp_reset_generated "${CMAKE_CURRENT_BINARY_DIR}/jce_srp_reset.inc")
+    foreach(_srp_output IN ITEMS owner prefix reset)
+        if(_srp_output STREQUAL "owner")
+            set(_srp_output_path "${_srp_generated}")
+            set(_srp_output_text "${_srp_variant_owner}")
+        elseif(_srp_output STREQUAL "prefix")
+            set(_srp_output_path "${_srp_prefix_path}")
+            set(_srp_output_text "${_srp_variant_prefix}")
+        else()
+            set(_srp_output_path "${_srp_reset_generated}")
+            set(_srp_output_text "${_srp_reset}")
+        endif()
+        unset(_srp_previous)
+        if(EXISTS "${_srp_output_path}")
+            file(READ "${_srp_output_path}" _srp_previous)
+        endif()
+        if(NOT _srp_previous STREQUAL _srp_output_text)
+            file(WRITE "${_srp_output_path}" "${_srp_output_text}")
+        endif()
+    endforeach()
+    if(_srp_variant STREQUAL "current")
+        set(_srp_target test_jce_scene_resource_prepare)
+        set(_srp_current_owner "${_srp_generated}")
+    else()
+        set(_srp_target "test_jce_scene_resource_prepare_${_srp_variant}")
+    endif()
+    jce_add_unit_test(${_srp_target} KIND ${_srp_kind}
+        SOURCES test_jce_scene_resource_prepare.c
+        LINK jce_core jce_scene jce_resource jce_renderer bgfx::bgfx flecs::flecs_static
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+    target_compile_definitions(${_srp_target} PRIVATE ${_srp_ports}
+        jce_scene_video_prepare_pending=jce_srp_test_video_pending
+        jce_scene_video_prepare_render=jce_srp_test_video_prepare
+        "JCE_SRP_OWNER=\"${_srp_generated}\""
+        "JCE_SRP_RENDER_PREFIX=\"${_srp_prefix_path}\""
+        "JCE_SRP_RESET_PREFIX=\"${_srp_reset_generated}\"")
+    if(MSVC)
+        target_compile_options(${_srp_target} PRIVATE /Zc:preprocessor)
+    endif()
+    if(NOT _srp_variant STREQUAL "current")
+        set_tests_properties(${_srp_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+
+# Complete scene-video owner, real public ECS lifecycle, counted CPU ports.
+# The generated renderer admission prefix comes from its exact production body;
+# later passes/backend work are deliberately outside this CPU control.
+set(_scene_video_owner_path "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_scene_video.c")
+file(READ "${_scene_video_owner_path}" _scene_video_owner)
+file(READ "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_scene_renderer.c" _scene_video_renderer)
+string(FIND "${_scene_video_renderer}" "uint16_t jce_scene_renderer_render(" _scene_video_render_start)
+string(FIND "${_scene_video_renderer}" "    sr_nodraw_refresh_registry(scene" _scene_video_render_end)
+if(_scene_video_render_start LESS 0 OR _scene_video_render_end LESS _scene_video_render_start)
+    message(FATAL_ERROR "Scene video requires the exact real renderer admission prefix")
+endif()
+math(EXPR _scene_video_render_length "${_scene_video_render_end} - ${_scene_video_render_start}")
+string(SUBSTRING "${_scene_video_renderer}" ${_scene_video_render_start} ${_scene_video_render_length}
+    _scene_video_render_prefix)
+string(REPLACE "jce_scene_renderer_render(" "jce_sv_test_render_prefix("
+    _scene_video_render_prefix "${_scene_video_render_prefix}")
+string(APPEND _scene_video_render_prefix "    (void)_t0_sr;\n    return view_id_base;\n}\n")
+set(_scene_video_ports
+    jce_video_load_memory=jce_sv_test_video_load_memory
+    jce_video_unload=jce_sv_test_video_unload
+    jce_video_set_loop=jce_sv_test_video_set_loop
+    jce_video_has_ended=jce_sv_test_video_has_ended
+    jce_video_advance=jce_sv_test_video_advance
+    jce_video_get_frame_counter=jce_sv_test_video_get_frame_counter
+    jce_video_get_frame_rgba=jce_sv_test_video_get_frame_rgba
+    jce_texture_from_rgba=jce_sv_test_texture_from_rgba
+    jce_texture_update_rgba_ref=jce_sv_test_texture_update_rgba_ref
+    jce_texture_destroy=jce_sv_test_texture_destroy
+    jce_fs_host_read_all=jce_sv_test_read_bytes)
+foreach(_scene_video_variant IN ITEMS current old_cpu_upload old_playing_gate old_failed_counter missing_render_wire)
+    set(_scene_video_source "${_scene_video_owner}")
+    set(_scene_video_prefix "${_scene_video_render_prefix}")
+    set(_scene_video_kind unit)
+    if(NOT _scene_video_variant STREQUAL "current")
+        set(_scene_video_kind contract)
+        if(_scene_video_variant STREQUAL "old_cpu_upload")
+            set(_scene_video_needle "    ++ctx->advances;")
+            set(_scene_video_replacement "    ++ctx->advances;\n    sv_upload_latest_frame(c);")
+        elseif(_scene_video_variant STREQUAL "old_playing_gate")
+            set(_scene_video_needle "    /* A stopped one-shot may own the last newly published frame. */\n    sv_upload_latest_frame(c);")
+            set(_scene_video_replacement "    /* Former transport gate loses a final published frame. */\n    if (c->playing) sv_upload_latest_frame(c);")
+        elseif(_scene_video_variant STREQUAL "old_failed_counter")
+            set(_scene_video_needle "    if (accepted) c->uploaded_counter = counter;")
+            set(_scene_video_replacement "    c->uploaded_counter = counter;")
+        else()
+            set(_scene_video_needle "    if (!jce_scene_renderer_prepare_resources(sr, scene)) return view_id_base;")
+            set(_scene_video_replacement "    (void)scene;")
+        endif()
+        if(_scene_video_variant STREQUAL "missing_render_wire")
+            set(_scene_video_before "${_scene_video_prefix}")
+        else()
+            set(_scene_video_before "${_scene_video_source}")
+        endif()
+        string(REPLACE "${_scene_video_needle}" "" _scene_video_without "${_scene_video_before}")
+        string(LENGTH "${_scene_video_before}" _scene_video_before_length)
+        string(LENGTH "${_scene_video_without}" _scene_video_without_length)
+        string(LENGTH "${_scene_video_needle}" _scene_video_needle_length)
+        math(EXPR _scene_video_removed "${_scene_video_before_length} - ${_scene_video_without_length}")
+        if(NOT _scene_video_removed EQUAL _scene_video_needle_length)
+            message(FATAL_ERROR "Scene video ${_scene_video_variant} requires one exact owner wire")
+        endif()
+        string(REPLACE "${_scene_video_needle}" "${_scene_video_replacement}"
+            _scene_video_after "${_scene_video_before}")
+        if(_scene_video_variant STREQUAL "missing_render_wire")
+            set(_scene_video_prefix "${_scene_video_after}")
+        else()
+            set(_scene_video_source "${_scene_video_after}")
+        endif()
+    endif()
+    set(_scene_video_generated "${CMAKE_CURRENT_BINARY_DIR}/jce_scene_video_${_scene_video_variant}.c")
+    set(_scene_video_prefix_path "${CMAKE_CURRENT_BINARY_DIR}/jce_scene_video_render_${_scene_video_variant}.inc")
+    foreach(_scene_video_output IN ITEMS source prefix)
+        if(_scene_video_output STREQUAL "source")
+            set(_scene_video_output_path "${_scene_video_generated}")
+            set(_scene_video_output_text "${_scene_video_source}")
+        else()
+            set(_scene_video_output_path "${_scene_video_prefix_path}")
+            set(_scene_video_output_text "${_scene_video_prefix}")
+        endif()
+        unset(_scene_video_previous)
+        if(EXISTS "${_scene_video_output_path}")
+            file(READ "${_scene_video_output_path}" _scene_video_previous)
+        endif()
+        if(NOT _scene_video_previous STREQUAL _scene_video_output_text)
+            file(WRITE "${_scene_video_output_path}" "${_scene_video_output_text}")
+        endif()
+    endforeach()
+    if(_scene_video_variant STREQUAL "current")
+        set(_scene_video_target test_jce_scene_video_phases)
+    else()
+        set(_scene_video_target "test_jce_scene_video_phases_${_scene_video_variant}")
+    endif()
+    jce_add_unit_test(${_scene_video_target} KIND ${_scene_video_kind}
+        SOURCES test_jce_scene_video_phases.c "${_scene_video_generated}"
+        LINK jce_core jce_scene jce_resource jce_renderer bgfx::bgfx flecs::flecs_static
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+    target_compile_definitions(${_scene_video_target} PRIVATE ${_scene_video_ports}
+        ${_srp_ports} "JCE_SRP_OWNER=\"${_srp_current_owner}\""
+        "JCE_SCENE_VIDEO_RENDER_PREFIX=\"${_scene_video_prefix_path}\"")
+    if(MSVC)
+        target_compile_options(${_scene_video_target} PRIVATE /Zc:preprocessor)
+    endif()
+    if(NOT _scene_video_variant STREQUAL "current")
+        set_tests_properties(${_scene_video_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+foreach(_scene_video_variable IN ITEMS owner_path owner renderer render_start render_end render_length
+    render_prefix ports variant source prefix kind needle replacement before without before_length
+    without_length needle_length removed after generated prefix_path output output_path output_text previous target)
+    unset(_scene_video_${_scene_video_variable})
+endforeach()
+unset(_scene_video_variable)
+
+foreach(_srp_variable IN ITEMS path reset_path source reset_source tex_job tex_poll model_job model_poll
+    prepare owner prefix reset ports variant variant_owner variant_prefix kind needle replacement
+    mutation without before_length without_length needle_length removed generated prefix_path
+    reset_generated output output_path output_text previous target current_owner)
+    unset(_srp_${_srp_variable})
+endforeach()
+unset(_srp_variable)
+
+# Real SceneJson round-trip and full headless Canvas layout/topmost consumption.
+# Seven real public Scene/Canvas consumption groups; no GPU/pixel claim.
+jce_add_unit_test(test_jce_ui_restore_order KIND integration
+    SOURCES test_jce_ui_restore_order.c
+    LINK jce_scene jce_resource jce_ui jce_renderer jce_core)
+
+# Ordinary negatives use complete current owners with only former order wires.
+# Full real ECS, serialization, persistent headless Canvas and unchanged tests.
+set(_ui_restore_canvas_path "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_ui_canvas.c")
+set(_ui_restore_serial_path "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_scene_components_json.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${_ui_restore_canvas_path}" "${_ui_restore_serial_path}")
+file(READ "${_ui_restore_canvas_path}" _ui_restore_canvas)
+file(READ "${_ui_restore_serial_path}" _ui_restore_serial)
+function(_jce_ui_restore_replace_once SOURCE_VARIABLE NEEDLE REPLACEMENT)
+    set(_before "${${SOURCE_VARIABLE}}")
+    string(REPLACE "${NEEDLE}" "" _without "${_before}")
+    string(LENGTH "${_before}" _before_length)
+    string(LENGTH "${_without}" _without_length)
+    string(LENGTH "${NEEDLE}" _needle_length)
+    math(EXPR _removed "${_before_length} - ${_without_length}")
+    if(NOT _removed EQUAL _needle_length)
+        message(FATAL_ERROR "UI restore-order control requires exactly one real owner wire")
+    endif()
+    string(REPLACE "${NEEDLE}" "${REPLACEMENT}" _after "${_before}")
+    set(${SOURCE_VARIABLE} "${_after}" PARENT_SCOPE)
+endfunction()
+
+set(_ui_restore_old_canvas "${_ui_restore_canvas}")
+_jce_ui_restore_replace_once(_ui_restore_old_canvas
+    "#define LOG_TAG \"ui_canvas\""
+    "static int uc_compare_entity_order(const void *left, const void *right)\n{\n    const JceEntity a = *(const JceEntity *)left;\n    const JceEntity b = *(const JceEntity *)right;\n    return (a > b) - (a < b);\n}\n\n#define LOG_TAG \"ui_canvas\"")
+_jce_ui_restore_replace_once(_ui_restore_old_canvas
+    "    if (!jce_scene_internal_sort_entities(s, kids, (size_t)n)) {\n        if (heap) JCE_FREE(heap);\n        return;\n    }"
+    "    qsort(kids, (size_t)n, sizeof(*kids), uc_compare_entity_order);")
+_jce_ui_restore_replace_once(_ui_restore_old_canvas
+    "    if (!jce_scene_internal_sort_entities(s, cl->list, (size_t)cl->count)) return false;\n" "")
+_jce_ui_restore_replace_once(_ui_restore_old_canvas
+    "            if (cso <= kso) break; /* Stable ties retain authored canvas order. */"
+    "            if (cso < kso || (cso == kso && cl->list[j] <= key)) break;")
+
+set(_ui_restore_old_serial "${_ui_restore_serial}")
+_jce_ui_restore_replace_once(_ui_restore_old_serial
+    "        if (!jce_scene_internal_each_authored((JceScene *)scene, ser_entity_cb, &ctx)) {\n            cJSON_Delete(root); return NULL;\n        }"
+    "        jce_scene_each_entity((JceScene *)scene, ser_entity_cb, &ctx);")
+foreach(_ui_restore_variant IN ITEMS old_handle_order old_unordered_save)
+    if(_ui_restore_variant STREQUAL "old_handle_order")
+        set(_ui_restore_owner "${_ui_restore_old_canvas}")
+    else()
+        set(_ui_restore_owner "${_ui_restore_old_serial}")
+    endif()
+    set(_ui_restore_path "${CMAKE_CURRENT_BINARY_DIR}/jce_ui_restore_${_ui_restore_variant}.c")
+    unset(_ui_restore_previous)
+    if(EXISTS "${_ui_restore_path}")
+        file(READ "${_ui_restore_path}" _ui_restore_previous)
+    endif()
+    if(NOT _ui_restore_previous STREQUAL _ui_restore_owner)
+        file(WRITE "${_ui_restore_path}" "${_ui_restore_owner}")
+    endif()
+    set(_ui_restore_target "test_jce_ui_restore_order_${_ui_restore_variant}")
+    jce_add_unit_test(${_ui_restore_target} KIND contract
+        SOURCES test_jce_ui_restore_order.c "${_ui_restore_path}"
+        LINK jce_scene jce_resource jce_ui jce_renderer jce_core
+            bgfx::bgfx cjson::cjson sdl::sdl
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+            "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+    if(MSVC)
+        target_compile_options(${_ui_restore_target} PRIVATE /Zc:preprocessor)
+    endif()
+    set_tests_properties(${_ui_restore_target} PROPERTIES WILL_FAIL TRUE)
+endforeach()
+foreach(_ui_restore_variable IN ITEMS canvas_path serial_path canvas serial old_canvas old_serial
+    variant owner path previous target)
+    unset(_ui_restore_${_ui_restore_variable})
+endforeach()
+unset(_ui_restore_variable)
+
+# Complete actual skinned-animation owner, real Scene/clip/player math and typed
+# model/IO/thread ports. Both views use the production generation guard; the
+# owner gathers the complete short animator snapshot before all six pose passes.
+set(_anim_mv_path "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_sr_anim.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_anim_mv_path}")
+file(READ "${_anim_mv_path}" _anim_mv_source)
+function(_jce_anim_mv_replace_once SOURCE_VARIABLE NEEDLE REPLACEMENT)
+    set(_before "${${SOURCE_VARIABLE}}")
+    string(REPLACE "${NEEDLE}" "" _without "${_before}")
+    string(LENGTH "${_before}" _before_length)
+    string(LENGTH "${_without}" _without_length)
+    string(LENGTH "${NEEDLE}" _needle_length)
+    math(EXPR _removed "${_before_length} - ${_without_length}")
+    if(NOT _removed EQUAL _needle_length)
+        message(FATAL_ERROR "Multiview animation control requires exactly one actual owner wire")
+    endif()
+    string(REPLACE "${NEEDLE}" "${REPLACEMENT}" _after "${_before}")
+    set(${SOURCE_VARIABLE} "${_after}" PARENT_SCOPE)
+endfunction()
+foreach(_anim_mv_variant IN ITEMS current old_first_view_selection old_frame_stamp)
+    set(_anim_mv_owner "${_anim_mv_source}")
+    set(_anim_mv_kind integration)
+    if(_anim_mv_variant STREQUAL "old_first_view_selection")
+        _jce_anim_mv_replace_once(_anim_mv_owner
+            "    list = &scene_animators;"
+            "    /* Former first-view focus-cull membership remains the only list. */")
+        set(_anim_mv_kind contract)
+    elseif(_anim_mv_variant STREQUAL "old_frame_stamp")
+        _jce_anim_mv_replace_once(_anim_mv_owner
+            "    if (sr->velocity_frame_driven) sr->skin_anim_gen = sr->vel_frame_gen;\n" "")
+        _jce_anim_mv_replace_once(_anim_mv_owner
+            "        if (sr->skin_anim_gen == sr->vel_frame_gen && sr->anim_storage_scene == scene) return;"
+            "        if (sr->skin_anim_gen == sr->vel_frame_gen && sr->anim_storage_scene == scene) return;\n        sr->skin_anim_gen = sr->vel_frame_gen; /* Former stamp before fallible reserve. */")
+        set(_anim_mv_kind contract)
+    endif()
+    # Include the real private header before overriding the realloc port; a
+    # compile-definition macro before CRT/owner headers can rename declarations.
+    set(_anim_mv_generated "${CMAKE_CURRENT_BINARY_DIR}/jce_sr_anim_mv_${_anim_mv_variant}.c")
+    set(_anim_mv_text "#include \"jce_sr_internal.h\"\nextern void *jce_mv_realloc(void *, size_t);\n#undef JCE_REALLOC\n#define JCE_REALLOC(pointer, bytes) jce_mv_realloc((pointer), (bytes))\n${_anim_mv_owner}")
+    unset(_anim_mv_previous)
+    if(EXISTS "${_anim_mv_generated}")
+        file(READ "${_anim_mv_generated}" _anim_mv_previous)
+    endif()
+    if(NOT _anim_mv_previous STREQUAL _anim_mv_text)
+        file(WRITE "${_anim_mv_generated}" "${_anim_mv_text}")
+    endif()
+    if(_anim_mv_variant STREQUAL "current")
+        set(_anim_mv_target test_jce_scene_anim_multiview)
+    else()
+        set(_anim_mv_target "test_jce_scene_anim_multiview_${_anim_mv_variant}")
+    endif()
+    jce_add_unit_test(${_anim_mv_target} KIND ${_anim_mv_kind}
+        SOURCES test_jce_scene_anim_multiview.c "${_anim_mv_generated}"
+        LINK JCE bgfx::bgfx flecs::flecs_static
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+    target_compile_definitions(${_anim_mv_target} PRIVATE
+        sr_get_model=jce_mv_get_model
+        jce_model_get_skeleton=jce_mv_model_skeleton
+        jce_model_anim_count=jce_mv_model_anim_count
+        jce_model_get_anim=jce_mv_model_anim
+        jce_json_parse_file=jce_mv_parse_file
+        jce_thread_pool_shared=jce_mv_thread_pool_shared
+        sr_sample_morph_track=jce_mv_sample_morph_track
+        sr_deform_morph_prims=jce_mv_deform_morph_prims)
+    if(MSVC)
+        target_compile_options(${_anim_mv_target} PRIVATE /Zc:preprocessor)
+    endif()
+    if(NOT _anim_mv_variant STREQUAL "current")
+        set_tests_properties(${_anim_mv_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()
+foreach(_anim_mv_variable IN ITEMS path source variant owner kind generated text previous target)
+    unset(_anim_mv_${_anim_mv_variable})
+endforeach()
+unset(_anim_mv_variable)
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/probe_capture_lifetime_controls.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/prepass_clear_controls.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/velocity_world_history_controls.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/shadow_cache_owner_controls.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/sky_admission_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/grass_colour_binding_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/colour_pass_seed_controls.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/fcluster_colour_binding_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/water_colour_binding_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/ssgi_lifetime_controls.cmake")
+
+jce_add_unit_test(test_jce_water_spectrum_authoring
+    SOURCES test_jce_water_spectrum_authoring.c
+    LINK jce_core jce_scene jce_resource)
+
+jce_add_unit_test(test_jce_water_gradient
+    SOURCES test_jce_water_gradient.c LINK jce_core)
+target_include_directories(test_jce_water_gradient PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+jce_add_unit_test(test_jce_water_gradient_gpu
+    SOURCES test_jce_water_gradient_gpu.c
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_gradient_gpu.c"
+    LINK jce_core)
+target_include_directories(test_jce_water_gradient_gpu PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene"
+    "$<TARGET_PROPERTY:bgfx::bgfx,INTERFACE_INCLUDE_DIRECTORIES>")
+if(MSVC)
+    target_compile_options(test_jce_water_gradient_gpu PRIVATE /Zc:preprocessor)
+endif()
+
+# Temporal foam is scene-owned; GPU ports validate resources without a device.
+jce_add_unit_test(test_jce_water_nearshore
+    SOURCES test_jce_water_nearshore.c LINK jce_core jce_scene jce_resource)
+target_include_directories(test_jce_water_nearshore PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+
+jce_add_unit_test(test_jce_water_foam
+    SOURCES test_jce_water_foam.c LINK jce_core jce_scene jce_resource)
+target_include_directories(test_jce_water_foam PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")
+jce_add_unit_test(test_jce_water_foam_gpu
+    SOURCES test_jce_water_foam_gpu.c
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene/jce_water_foam_gpu.c"
+    LINK jce_core)
+target_include_directories(test_jce_water_foam_gpu PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene"
+    "$<TARGET_PROPERTY:bgfx::bgfx,INTERFACE_INCLUDE_DIRECTORIES>")
+if(MSVC)
+    target_compile_options(test_jce_water_foam_gpu PRIVATE /Zc:preprocessor)
+endif()
+
+jce_add_unit_test(test_jce_terrain_surface
+    SOURCES test_jce_terrain_surface.c LINK jce_core jce_scene jce_resource)
+target_include_directories(test_jce_terrain_surface PRIVATE
+    "${CMAKE_SOURCE_DIR}/engine/src/middleware/scene")

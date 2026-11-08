@@ -11,6 +11,11 @@
 # never the umbrella jce_engine — keeps tests as focused as the module.   #
 # ====================================================================== #
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JceGeneratedFixture.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JceTestMetadata.cmake")
+jce_register_test_directory()
+cmake_language(DEFER CALL jce_assert_test_metadata)
+
 # Vendored Unity (single static lib, reused by every test).
 jce_vendor_source(unity JCE_UNITY_SOURCE_DIR)
 add_library(jce_unity STATIC "${JCE_UNITY_SOURCE_DIR}/src/unity.c")
@@ -93,8 +98,11 @@ endfunction()
 # failure.  Building with no target instead builds the editor and every
 # vendored codec -- half an hour on a hosted runner for a suite that links
 # jce_core and jce_platform.  This target is the dependency closure of the
-# suite and nothing else.  CI builds it; see .github/workflows/ci.yml.
+# suite and nothing else. Source-domain aggregates retain the same registration
+# and explicit provider inputs, without building other domains. CI builds all;
+# see .github/workflows/ci.yml.
 add_custom_target(jce_tests)
+jce_create_test_domain_targets()
 
 # ---------------------------------------------------------------- #
 #  jce_test_suite_skipped(<suite> <detail>)                         #
@@ -135,7 +143,8 @@ endfunction()
 # with a test-only stub.  A C test that needs a private header is the normal
 # case for seam tests, not an exception.
 function(jce_add_unit_test NAME)
-    cmake_parse_arguments(ARG "" "" "SOURCES;LINK;INCLUDES" ${ARGN})
+    jce_register_test_directory()
+    cmake_parse_arguments(ARG "" "KIND" "SOURCES;LINK;INCLUDES" ${ARGN})
 
     add_executable(${NAME} ${ARG_SOURCES})
     set_target_properties(${NAME} PROPERTIES
@@ -149,18 +158,22 @@ function(jce_add_unit_test NAME)
     target_include_directories(${NAME} PRIVATE
         "${CMAKE_SOURCE_DIR}/engine/include")
 
-    add_dependencies(jce_tests ${NAME})
+    jce_test_build_dependencies(${NAME})
 
     add_test(NAME ${NAME} COMMAND ${NAME})
     set_tests_properties(${NAME} PROPERTIES
         TIMEOUT 60
         LABELS  "unit"
         ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
+    if(NOT ARG_KIND)
+        set(ARG_KIND unit)
+    endif()
+    jce_set_test_kind("${NAME}" "${ARG_KIND}")
     set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV ${NAME})
 endfunction()
 
 # Vendored doctest (single header; one .cpp picks up DOCTEST_CONFIG_IMPLEMENT
-# from inside each test, so no shared static lib).  Editor-only.
+# from inside each test, so no shared static lib). Domains follow source ownership.
 add_library(jce_doctest INTERFACE)
 jce_vendor_source(doctest JCE_DOCTEST_SOURCE_DIR)
 add_dependencies(jce_doctest jce_vendor_verify_doctest)
@@ -174,7 +187,8 @@ target_include_directories(jce_doctest SYSTEM INTERFACE "${JCE_DOCTEST_SOURCE_DI
 # shadow engine/editor headers with test-only stubs (e.g. a minimal
 # ImGui shim to break the dependency on the full Tools layer).
 function(jce_add_cxx_test NAME)
-    cmake_parse_arguments(ARG "" "" "SOURCES;LINK;INCLUDES" ${ARGN})
+    jce_register_test_directory()
+    cmake_parse_arguments(ARG "" "KIND" "SOURCES;LINK;INCLUDES" ${ARGN})
 
     add_executable(${NAME} ${ARG_SOURCES})
     set_target_properties(${NAME} PROPERTIES
@@ -192,13 +206,17 @@ function(jce_add_cxx_test NAME)
         target_compile_options(${NAME} PRIVATE /wd4267 /wd4244)
     endif()
 
-    add_dependencies(jce_tests ${NAME})
+    jce_test_build_dependencies(${NAME})
 
     add_test(NAME ${NAME} COMMAND ${NAME})
     set_tests_properties(${NAME} PROPERTIES
         TIMEOUT 60
-        LABELS  "unit;cxx;editor"
+        LABELS  "unit;cxx"
         ENVIRONMENT "${JCE_TEST_ENVIRONMENT}")
+    if(NOT ARG_KIND)
+        set(ARG_KIND unit)
+    endif()
+    jce_set_test_kind("${NAME}" "${ARG_KIND}")
     set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV ${NAME})
 endfunction()
 
@@ -213,13 +231,25 @@ add_subdirectory(middleware/net)
 add_subdirectory(middleware/world)
 add_subdirectory(middleware/save)
 add_subdirectory(middleware/llm)
-if(JCE_ENABLE_AI_DISPATCH)
+# The optional engine-domain suite is unavailable with an explicit cause;
+# absence is never implied by the number of configured/passing tests.
+if(NOT JCE_ENABLE_AI_DISPATCH)
+    jce_test_suite_skipped("ai-dispatch"
+        "engine domain: JCE_ENABLE_AI_DISPATCH=OFF disables the optional private AI dispatch suite")
+elseif(NOT EXISTS "${CMAKE_SOURCE_DIR}/private/tests/ai_dispatch/CMakeLists.txt")
+    jce_test_suite_skipped("ai-dispatch"
+        "engine domain: JCE_ENABLE_AI_DISPATCH=ON but private/tests/ai_dispatch/CMakeLists.txt is missing")
+elseif(NOT TARGET jce_ai_dispatch)
+    jce_test_suite_skipped("ai-dispatch"
+        "engine domain: JCE_ENABLE_AI_DISPATCH=ON but the production jce_ai_dispatch target is unavailable")
+else()
     add_subdirectory("${CMAKE_SOURCE_DIR}/private/tests/ai_dispatch"
                      "${CMAKE_BINARY_DIR}/private/tests/ai_dispatch")
 endif()
 add_subdirectory(middleware/animation)
 add_subdirectory(middleware/audio)
 add_subdirectory(middleware/video)
+add_subdirectory(middleware/ui)
 add_subdirectory(middleware/ai)
 add_subdirectory(middleware/physics)
 add_subdirectory(middleware/script)
@@ -252,6 +282,9 @@ if(NOT (JCE_PLATFORM_ANDROID OR JCE_PLATFORM_IOS
         OR JCE_PLATFORM_WEB OR JCE_BUILD_JNI))
     add_subdirectory(editor)
 endif()
+
+# Installed-SDK consumers are independent configure/build/run integrations.
+add_subdirectory(consumers)
 
 # Project-specific assertions are owned by the consumer.
 if(EXISTS "${CMAKE_SOURCE_DIR}/examples/caged_kingdom/tests/CMakeLists.txt")

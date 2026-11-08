@@ -7,14 +7,49 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_thread.h>
+/* Consume this exact production owner once, exposing its private FT/blob
+ * state to this native fixture. The linked archive does not compile a second
+ * copy here; every public text symbol is supplied by this translation unit. */
+#include "renderer/jce_text.c"
 
 static hb_font_t *font;
+static JceFont *native_fonts[3];
+static JceRenderer *native_renderer;
+static JceAtomicI32 *native_fatals;
+static void observe_native_fatal(const JceLogRecord *record, void *user)
+{
+    if (record->level == JCE_LOG_LEVEL_ERROR &&
+        strcmp(record->tag, "jce_renderer") == 0 &&
+        strncmp(record->message, "bgfx fatal:", 11) == 0)
+        jce_atomic_i32_add((JceAtomicI32 *)user, 1);
+}
+static uint16_t native_texture_count(void)
+{
+    for (unsigned i=0; i<6; ++i) bgfx_frame(false);
+    return bgfx_get_stats()->numTextures;
+}
 void setUp(void) {}
 void tearDown(void)
 {
     jce_text_shape_shutdown();
     if (font) hb_font_destroy(font);
     font = NULL;
+    for (unsigned i=0; i<3; ++i) {
+        if (native_fonts[i]) jce_font_close(native_fonts[i]);
+        native_fonts[i] = NULL;
+    }
+    jce_text_shutdown();
+    if (native_renderer) jce_renderer_destroy(native_renderer);
+    native_renderer = NULL;
+    if (native_fatals) {
+        int32_t observed = jce_atomic_i32_load(native_fatals);
+        jce_log_set_sink(NULL, NULL);
+        jce_atomic_i32_destroy(native_fatals); native_fatals = NULL;
+        TEST_ASSERT_EQUAL_INT32_MESSAGE(0, observed, "actual Noop fatal observed");
+    }
 }
 static uint8_t slot(void *ctx, uint32_t cp)
 {
@@ -94,9 +129,63 @@ static void test_real_arabic_joining_and_latin_order(void)
     compare_run("\xd8\xa8\xd8\xaa\xd8\xac", true, distinct_arabic, 3, true);
     printf("REAL_FONT_ORACLE joining=observed rtl=observed latin=observed cache=observed\n");
 }
+/* Licensed stock bytes are mandatory input, independent of the optional
+ * host Arabic font above. Real FT/HB and Noop command delivery establish
+ * independent face behavior and byte/texture lifecycle, never GPU pixels. */
+static void test_actual_ft_noop_shared_blob_independent_faces_and_reopen(void)
+{
+    native_fatals = jce_atomic_i32_create(0);
+    TEST_ASSERT_NOT_NULL(native_fatals);
+    jce_log_set_sink(observe_native_fatal, native_fatals);
+    native_renderer = jce_renderer_create_headless();
+    TEST_ASSERT_NOT_NULL(native_renderer);
+    const uint16_t baseline = native_texture_count();
+    native_fonts[0] = jce_font_open_file_ex(JCE_TEST_FONT_PATH, 14, NULL, 0);
+    native_fonts[1] = jce_font_open_file_ex(JCE_TEST_FONT_PATH, 28, NULL, 0);
+    JceFont *a = native_fonts[0], *b = native_fonts[1];
+    TEST_ASSERT_NOT_NULL(a); TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_NOT_EQUAL(a, b);
+    TEST_ASSERT_NOT_EQUAL(a->ft_face, b->ft_face);
+    TEST_ASSERT_NOT_EQUAL(a->hb_font, b->hb_font);
+    TEST_ASSERT_EQUAL_PTR(a->font_data, b->font_data);
+    TEST_ASSERT_EQUAL_PTR(a->font_data->data, a->ft_face->stream->base);
+    TEST_ASSERT_EQUAL_PTR(b->font_data->data, b->ft_face->stream->base);
+    TEST_ASSERT_EQUAL_UINT64(2, s_text.references);
+    TEST_ASSERT_EQUAL_UINT64(a->font_data->size, s_text.unique_bytes);
+    const uint64_t first_identity = a->font_data->serial;
+    FT_UInt glyph = FT_Get_Char_Index(a->ft_face, 'A');
+    TEST_ASSERT_NOT_EQUAL(0, glyph);
+    TEST_ASSERT_EQUAL_INT(0, FT_Load_Glyph(a->ft_face, glyph, FT_LOAD_DEFAULT));
+    const FT_Pos first_advance = a->ft_face->glyph->advance.x;
+    TEST_ASSERT_EQUAL_INT(0, FT_Load_Glyph(b->ft_face, glyph, FT_LOAD_DEFAULT));
+    TEST_ASSERT_GREATER_THAN_INT64(first_advance, b->ft_face->glyph->advance.x);
+    TEST_ASSERT_EQUAL_INT(0, FT_Load_Glyph(a->ft_face, glyph, FT_LOAD_DEFAULT));
+    TEST_ASSERT_EQUAL_INT64(first_advance, a->ft_face->glyph->advance.x);
+    TEST_ASSERT_EQUAL_UINT16(baseline+2, native_texture_count());
+    jce_font_close(native_fonts[0]); native_fonts[0] = NULL;
+    TEST_ASSERT_EQUAL_UINT64(1, b->font_data->refs);
+    TEST_ASSERT_EQUAL_INT(0, FT_Load_Glyph(b->ft_face, glyph, FT_LOAD_DEFAULT));
+    TEST_ASSERT_GREATER_THAN_INT64(first_advance, b->ft_face->glyph->advance.x);
+    TEST_ASSERT_EQUAL_UINT16(baseline+1, native_texture_count());
+    jce_font_close(native_fonts[1]); native_fonts[1] = NULL;
+    TEST_ASSERT_NULL(s_text.blobs);
+    TEST_ASSERT_EQUAL_UINT64(0, s_text.references);
+    TEST_ASSERT_EQUAL_UINT64(0, s_text.unique_bytes);
+    TEST_ASSERT_EQUAL_UINT16(baseline, native_texture_count());
+    jce_text_shutdown();
+    native_fonts[2] = jce_font_open_file_ex(JCE_TEST_FONT_PATH, 14, NULL, 0);
+    TEST_ASSERT_NOT_NULL(native_fonts[2]);
+    TEST_ASSERT_GREATER_THAN_UINT64(first_identity, native_fonts[2]->font_data->serial);
+    TEST_ASSERT_NOT_EQUAL(0, FT_Get_Char_Index(native_fonts[2]->ft_face, 'A'));
+    jce_font_close(native_fonts[2]); native_fonts[2] = NULL;
+    TEST_ASSERT_NULL(s_text.blobs);
+    TEST_ASSERT_EQUAL_UINT16(baseline, native_texture_count());
+    puts("ACTUAL_FT_NOOP_BLOB independent_faces=observed shared_raw_bytes=observed glyph_metrics=observed close_reopen=observed texture_baseline=restored");
+}
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_real_arabic_joining_and_latin_order);
+    RUN_TEST(test_actual_ft_noop_shared_blob_independent_faces_and_reopen);
     return UNITY_END();
 }

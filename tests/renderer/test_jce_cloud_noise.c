@@ -370,8 +370,10 @@ static void test_detail_erosion_spares_the_core(void)
 
     for (k = 0; k < GRID; ++k) {
         const float z = ((float)k / (float)GRID) * solid.period_z;
-        for (j = 0; j < GRID; ++j) {
-            const float h = 0.15f + 0.35f * ((float)j / (float)GRID);
+        for (j = 0; j < GRID * 2; ++j) {
+            /* Exercise both edges of the full height envelope, independent
+             * of a particular cumulus preset's former thin altitude band. */
+            const float h = ((float)j + 0.5f) / (float)(GRID * 2);
             for (i = 0; i < GRID; ++i) {
                 const float x = ((float)i / (float)GRID) * solid.period_x;
                 const float y = h * solid.period_y;
@@ -396,6 +398,43 @@ static void test_detail_erosion_spares_the_core(void)
     /* Both halves of the invariant must actually have been exercised. */
     TEST_ASSERT_TRUE(core_samples > 0);
     TEST_ASSERT_TRUE(eroded_samples > 0);
+}
+
+static void test_curl_bake_matches_prepared_density_and_wraps(void)
+{
+    enum { nx = 8, ny = 6, nz = 8 };
+    JceCloudNoiseParams legacy, curled;
+    float base[nx * ny * nz], warped[nx * ny * nz];
+    jce_cloud_noise_params_default(&legacy);
+    curled = legacy;
+    curled.curl_metres = 96.0f;
+    TEST_ASSERT_TRUE(jce_cloud_noise_bake(&legacy, base, nx, ny, nz));
+    TEST_ASSERT_TRUE(jce_cloud_noise_bake(&curled, warped, nx, ny, nz));
+
+    JceCloudNoiseParams prepared;
+    jce_cloud_noise_params_sanitize(&curled, &prepared);
+    unsigned different = 0;
+    for (unsigned z = 0; z < nz; ++z) {
+        for (unsigned y = 0; y < ny; ++y) {
+            for (unsigned x = 0; x < nx; ++x) {
+                const float xx = ((x + 0.5f) / nx) * curled.period_x;
+                const float zz = ((z + 0.5f) / nz) * curled.period_z;
+                const float h = (y + 0.5f) / ny;
+                const float yy = h * curled.period_y;
+                const unsigned i = (z * ny + y) * nx + x;
+                const float expected = jce_cloud_density_weather_prepared(&prepared, xx, yy, zz, h);
+                TEST_ASSERT_EQUAL_FLOAT(expected, warped[i]);
+                TEST_ASSERT_FLOAT_WITHIN(1e-5f, expected,
+                    jce_cloud_density_weather_prepared(&prepared,
+                        xx - curled.period_x, yy, zz + curled.period_z, h));
+                if (fabsf(warped[i] - base[i]) > 1e-4f) ++different;
+            }
+        }
+    }
+    TEST_ASSERT_TRUE(different > 8);
+    curled.curl_metres = 0.0f;
+    TEST_ASSERT_TRUE(jce_cloud_noise_bake(&curled, warped, nx, ny, nz));
+    TEST_ASSERT_EQUAL_MEMORY(base, warped, sizeof base);
 }
 
 /* ── 10. caller weather maps, including hostile ones ────────────────────── */
@@ -742,11 +781,159 @@ static void test_march_steps_scale_with_tier(void)
     TEST_ASSERT_EQUAL_UINT32(low, jce_cloud_march_steps(99));
 }
 
+/* The height envelope may be held fixed while changing the physical
+ * layer period. At the same world Y the underlying density noise must not
+ * flatten/stretch: only its independently supplied height envelope can. */
+static void test_density_noise_uses_world_metres(void)
+{
+    JceCloudNoiseParams a, b;
+    jce_cloud_noise_params_default(&a);
+    b = a;
+    b.period_y = a.period_y * 2.0f;
+    for (int i = 0; i < 40; ++i) {
+        const float x = 63.0f + (float)i * 97.0f;
+        const float z = 29.0f + (float)((i * 11) % 40) * 93.0f;
+        const float y = 113.0f + (float)(i % 7) * 71.0f;
+        const float da = jce_cloud_density(&a, x, y, z, 0.35f, 1.0f, 0.5f);
+        const float db = jce_cloud_density(&b, x, y, z, 0.35f, 1.0f, 0.5f);
+        TEST_ASSERT_FLOAT_WITHIN(2e-5f, da, db);
+    }
+}
+
+static void test_split_density_matches_canonical_and_preserves_detail(void)
+{
+    JceCloudNoiseParams p;
+    jce_cloud_noise_params_default(&p);
+    p.period_y = 800.0f;
+    p.weather_coverage_bias = 0.1f;
+    p.curl_metres = 0.0f;
+    float shape[8u * 4u * 8u * 2u];
+    TEST_ASSERT_TRUE(jce_cloud_shape_bake_atlas_controlled(&p, shape, 8, 4, 8, 4, NULL, NULL));
+    unsigned positive = 0;
+    for (unsigned z = 0; z < 8; ++z) for (unsigned y = 0; y < 4; ++y) for (unsigned x = 0; x < 8; ++x) {
+        const float xx = (x + 0.5f) * 512.0f, yy = (y + 0.5f) * 200.0f, zz = (z + 0.5f) * 512.0f;
+        const unsigned index = ((z / 4u * 4u + y) * 32u + z % 4u * 8u + x) * 2u;
+        const float detail = jce_cloud_detail_sample_prepared(&p, xx, yy, zz);
+        const float combined = jce_cloud_density_combine(shape[index], detail, shape[index + 1], p.detail_strength);
+        const float actual = jce_cloud_density_weather_prepared(&p, xx, yy, zz, yy / 800.0f);
+        TEST_ASSERT_FLOAT_WITHIN(2e-6f, actual, combined);
+        positive += combined > 0.01f;
+    }
+    TEST_ASSERT_GREATER_THAN_UINT(16, positive);
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.6f, jce_cloud_density_combine(0.3f, 1.0f, 2.0f, 0.95f));
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.0f, jce_cloud_density_combine(0.0f, 0.0f, 2.0f, 0.95f));
+}
+
+static void test_detail_erosion_retains_feature_centres(void)
+{
+    /* The texture stores 1-F1: its value is one at a Worley feature centre
+     * and decreases towards a cell wall. Erosion must retain the centre,
+     * rather than hollowing it out into a sheet around that wall. */
+    const float shape = 0.10f;
+    const float strength = 0.55f;
+    TEST_ASSERT_FLOAT_WITHIN(1e-6f, shape,
+        jce_cloud_density_combine(shape, 1.0f, 1.0f, strength));
+    TEST_ASSERT_EQUAL_FLOAT(0.0f,
+        jce_cloud_density_combine(shape, 0.0f, 1.0f, strength));
+    float previous = shape;
+    for (unsigned i = 0; i <= 10; ++i) {
+        const float radius = (float)i * 0.10f;
+        const float density = jce_cloud_density_combine(shape, 1.0f - radius, 1.0f, strength);
+        TEST_ASSERT_TRUE(density <= previous + 1e-6f);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.60f,
+            jce_cloud_density_combine(0.30f, 1.0f - radius, 2.0f, strength));
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, shape,
+            jce_cloud_density_combine(shape, 1.0f - radius, 1.0f, 0.0f));
+        previous = density;
+    }
+}
+
+static void test_detail_volume_is_periodic_and_independent_of_weather(void)
+{
+    JceCloudNoiseParams a, b;
+    jce_cloud_noise_params_default(&a);
+    b = a;
+    b.weather_coverage_bias = 0.7f;
+    b.period_y = 1700.0f;
+    b.curl_metres = 230.0f;
+    b.detail_strength = 0.1f;
+    float first[8u * 8u * 8u], second[8u * 8u * 8u];
+    TEST_ASSERT_TRUE(jce_cloud_detail_bake_atlas_controlled(&a, first, 8, 4, NULL, NULL));
+    TEST_ASSERT_TRUE(jce_cloud_detail_bake_atlas_controlled(&b, second, 8, 4, NULL, NULL));
+    TEST_ASSERT_EQUAL_MEMORY(first, second, sizeof(first));
+    for (unsigned i = 0; i < 31; ++i) {
+        const float x = i * 11.3f - 100.0f, y = i * 7.9f, z = i * 13.1f;
+        const float d = jce_cloud_detail_sample_prepared(&a, x, y, z);
+        TEST_ASSERT_FLOAT_WITHIN(3e-6f, d, jce_cloud_detail_sample_prepared(&a, x + 512.0f, y, z));
+        TEST_ASSERT_FLOAT_WITHIN(3e-6f, d, jce_cloud_detail_sample_prepared(&a, x, y + 512.0f, z));
+        TEST_ASSERT_FLOAT_WITHIN(3e-6f, d, jce_cloud_detail_sample_prepared(&a, x, y, z + 512.0f));
+    }
+    TEST_ASSERT_FALSE(jce_cloud_detail_bake_atlas_controlled(&a, NULL, 8, 4, NULL, NULL));
+    TEST_ASSERT_FALSE(jce_cloud_shape_bake_atlas_controlled(&a, first, 0, 8, 8, 4, NULL, NULL));
+}
+
+static void test_detail_contrast_keeps_neutral_and_cell_endpoints(void)
+{
+    /* Independent expected erosion: shape .14 => edge .44, strength .55.
+     * Raw 1-F1 values .6/.5/.4 become wall strengths .25/.5/.75. */
+    const float input[3] = {0.6f, 0.5f, 0.4f};
+    const float walls[3] = {0.25f, 0.5f, 0.75f};
+    for (unsigned i = 0; i < 3; ++i) {
+        const float erosion = 0.55f * 0.44f * walls[i];
+        const float expected = fmaxf(0.0f, (0.14f - erosion) / (1.0f - erosion));
+        TEST_ASSERT_FLOAT_WITHIN(2e-6f, expected,
+            jce_cloud_density_combine(0.14f, input[i], 1.0f, 0.55f));
+    }
+}
+
+static void test_detail_bands_match_scalar_and_refuse_other_spectra(void)
+{
+    JceCloudNoiseParams p, different;
+    jce_cloud_noise_params_default(&p);
+    uint8_t bands[8u * 8u * 8u * 4u];
+    float scalar[8u * 8u * 8u];
+    TEST_ASSERT_TRUE(jce_cloud_detail_bake_bands_controlled(&p, bands, 8, 4, NULL, NULL));
+    TEST_ASSERT_TRUE(jce_cloud_detail_bake_atlas_controlled(&p, scalar, 8, 4, NULL, NULL));
+    for (unsigned i = 0; i < 8u * 8u * 8u; ++i) {
+        const float f1 = (4.0f * bands[4u * i] + 2.0f * bands[4u * i + 1u] +
+                          bands[4u * i + 2u]) / (7.0f * 255.0f);
+        TEST_ASSERT_EQUAL_UINT8(255u, bands[4u * i + 3u]);
+        TEST_ASSERT_FLOAT_WITHIN(0.5f / 255.0f + 2e-6f, 1.0f - scalar[i], f1);
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.6f,
+            jce_cloud_density_combine(0.3f, 1.0f - f1, 2.0f, 0.95f));
+        TEST_ASSERT_FLOAT_WITHIN(1e-6f, 0.1f,
+            jce_cloud_density_combine(0.1f, 1.0f - f1, 1.0f, 0.0f));
+    }
+    different = p; different.detail_octaves = 4;
+    TEST_ASSERT_FALSE(jce_cloud_detail_bake_bands_controlled(&different, bands, 8, 4, NULL, NULL));
+    different = p; different.detail_freq = 96.0f;
+    TEST_ASSERT_FALSE(jce_cloud_detail_bake_bands_controlled(&different, bands, 8, 4, NULL, NULL));
+    TEST_ASSERT_FALSE(jce_cloud_detail_bake_bands_controlled(&p, NULL, 8, 4, NULL, NULL));
+    TEST_ASSERT_FALSE(jce_cloud_detail_bake_bands_controlled(&p, bands, 0, 4, NULL, NULL));
+}
+
+static void test_extinction_default_is_shared_without_changing_positive_values(void)
+{
+    const float invalid[] = {0.0f, -1.0f, NAN, INFINITY};
+    for (unsigned i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+        TEST_ASSERT_EQUAL_FLOAT(1.0f, jce_cloud_extinction_per_km(invalid[i]));
+    const float positive[] = {0.001f, 1.0f, 4.0f, 12.0f, 100.0f};
+    for (unsigned i = 0; i < sizeof(positive) / sizeof(positive[0]); ++i)
+        TEST_ASSERT_EQUAL_FLOAT(positive[i], jce_cloud_extinction_per_km(positive[i]));
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_defaults_and_null_safety);
+    RUN_TEST(test_extinction_default_is_shared_without_changing_positive_values);
+    RUN_TEST(test_split_density_matches_canonical_and_preserves_detail);
+    RUN_TEST(test_detail_volume_is_periodic_and_independent_of_weather);
+    RUN_TEST(test_detail_erosion_retains_feature_centres);
+    RUN_TEST(test_detail_contrast_keeps_neutral_and_cell_endpoints);
+    RUN_TEST(test_detail_bands_match_scalar_and_refuse_other_spectra);
     RUN_TEST(test_density_is_finite_and_unit_range);
+    RUN_TEST(test_density_noise_uses_world_metres);
     RUN_TEST(test_zero_coverage_is_empty);
     RUN_TEST(test_full_coverage_is_substantially_denser);
     RUN_TEST(test_height_gradient_bands_by_type);
@@ -754,6 +941,7 @@ int main(void)
     RUN_TEST(test_determinism_is_bit_exact);
     RUN_TEST(test_bake_fills_buffer_and_rejects_bad_dims);
     RUN_TEST(test_detail_erosion_spares_the_core);
+    RUN_TEST(test_curl_bake_matches_prepared_density_and_wraps);
     RUN_TEST(test_caller_weather_map_is_used_and_clamped);
     RUN_TEST(test_precipitation_is_consumed);
     RUN_TEST(test_no_rain_is_bit_identical);

@@ -18,9 +18,9 @@
  *     ]
  *   }
  *
- * Execution: spawns the configured executable per case via system();
- * captures combined stdout+stderr to a temp log read back into the UI.
- * Exit code 0 = pass, anything else = fail.
+ * Execution: one non-blocking public process owner polls each selected case;
+ * logs live in the shared profile/build tree. Cancel/timeout/incomplete output
+ * never PASS even when a child exit code is zero.
  *
  * Engine-side test infrastructure is intentionally not added here; the
  * panel is the surface that the user drives whatever native binaries
@@ -29,6 +29,8 @@
 
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_config.h"
+#include "core/jce_editor_test_run.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_colors.h"
 
@@ -38,6 +40,8 @@
 extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_timer.h>
 }
 
 #include <cstdio>
@@ -45,17 +49,19 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 namespace {
 
-enum CaseStatus { CS_PENDING = 0, CS_PASS = 1, CS_FAIL = 2, CS_RUNNING = 3 };
+using CaseStatus = JceEditorTestRunStatus;
 
 struct TestCase {
     std::string name;
     std::string args;
-    CaseStatus  status = CS_PENDING;
+    CaseStatus  status = CaseStatus::Idle;
     double      duration_s = 0.0;
-    std::string log;
+    std::string log, log_path, error;
+    bool        arguments_valid = true;
 };
 
 struct TestSuite {
@@ -71,6 +77,13 @@ static struct {
     std::vector<TestSuite> suites;
     int                  selected_suite = -1;
     int                  selected_case  = -1;
+    JceEditorTestRun      run;
+    std::vector<std::pair<size_t,size_t>> queue;
+    size_t               next = 0;
+    int                  active_suite = -1, active_case = -1;
+    int                  timeout_s = 60;
+    uint64_t             ordinal = 0;
+    std::string          error;
 } s_tr;
 
 static void set_default_dir()
@@ -117,15 +130,8 @@ static bool tr_list_cb(const char *name, bool is_dir, void *user)
             const char *cn = jce_json_get_string(c, "name", "case");
             tc.name = cn ? cn : "case";
             JceJson *args = jce_json_get(c, "args");
-            if (jce_json_is_array(args)) {
-                int an = jce_json_array_size(args);
-                for (int j = 0; j < an; ++j) {
-                    JceJson *a = jce_json_array_at(args, j);
-                    const char *as = a ? jce_json_get_string(a, "", "") : "";
-                    if (j) tc.args += ' ';
-                    tc.args += (as ? as : "");
-                }
-            }
+            tc.arguments_valid = jce_editor_test_run_arguments(args, tc.args, tc.error);
+            if (!tc.arguments_valid) tc.status = CaseStatus::Failed;
             s.cases.push_back(tc);
         }
     }
@@ -145,60 +151,76 @@ static void rescan()
     jce_editor_console_log("[Test Runner] discovered %d suite(s)", (int)s_tr.suites.size());
 }
 
-static void run_case(TestSuite &s, TestCase &tc)
+static bool busy()
 {
-    if (s.exe.empty()) {
-        tc.status = CS_FAIL;
-        tc.log = "(suite has no exe)";
-        return;
-    }
-    char tmp[512]; snprintf(tmp, sizeof(tmp), "_jce_testrun_%p.log", (void *)&tc);
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "\"%s\" %s > \"%s\" 2>&1",
-             s.exe.c_str(), tc.args.c_str(), tmp);
-    tc.status = CS_RUNNING;
-    double t0 = ImGui::GetTime();
-    int rc = std::system(cmd);
-    tc.duration_s = ImGui::GetTime() - t0;
-    tc.status = (rc == 0) ? CS_PASS : CS_FAIL;
-    size_t sz = 0;
-    char *buf = (char *)ed_read_file(tmp, &sz);
-    if (buf) {
-        tc.log.assign(buf, sz);
-        ED_FREE(buf);
-    } else {
-        tc.log = "(no output)";
-    }
-    std::remove(tmp);
-    jce_editor_console_log("[Test] %s/%s -> %s (%.3fs)",
-                           s.name.c_str(), tc.name.c_str(),
-                           rc == 0 ? "PASS" : "FAIL", tc.duration_s);
+    return s_tr.run.process || s_tr.active_suite >= 0 || s_tr.next < s_tr.queue.size();
 }
-
-static void run_all()
+static void queue_suite(int selected)
 {
-    for (auto &s : s_tr.suites)
-        for (auto &c : s.cases) run_case(s, c);
+    if (busy()) return;
+    s_tr.queue.clear(); s_tr.next = 0; s_tr.error.clear();
+    for (size_t si=0; si<s_tr.suites.size(); ++si) {
+        if (selected>=0 && (size_t)selected!=si) continue;
+        for (size_t ci=0; ci<s_tr.suites[si].cases.size(); ++ci)
+            if (s_tr.suites[si].cases[ci].arguments_valid) s_tr.queue.emplace_back(si,ci);
+    }
+}
+static void publish_result()
+{
+    if (s_tr.active_suite<0 || s_tr.run.process) return;
+    TestSuite &suite=s_tr.suites[(size_t)s_tr.active_suite];
+    TestCase &test=suite.cases[(size_t)s_tr.active_case];
+    test.status=s_tr.run.status; test.duration_s=s_tr.run.duration_s;
+    test.log=s_tr.run.output.substr(0,64*1024); test.log_path=s_tr.run.log_path; test.error=s_tr.run.error;
+    if (s_tr.run.output.size()>test.log.size())
+        test.log+="\n[UI preview shortened; complete evidence remains in the log above]\n";
+    jce_editor_console_log_level(test.status==CaseStatus::Passed?JCE_CONSOLE_INFO:JCE_CONSOLE_WARNING,
+        "[Test] %s/%s -> %s (%.3fs), exit=%d, log=%s", suite.name.c_str(),test.name.c_str(),
+        jce_editor_test_run_status_name(test.status),test.duration_s,s_tr.run.exit_code,test.log_path.c_str());
+    s_tr.active_suite=s_tr.active_case=-1;
+}
+static void start_next()
+{
+    if (s_tr.next>=s_tr.queue.size()) return;
+    const auto item=s_tr.queue[s_tr.next++];
+    TestSuite &suite=s_tr.suites[item.first]; TestCase &test=suite.cases[item.second];
+    char directory[1024], path[1024], leaf[96];
+    std::snprintf(leaf,sizeof(leaf),"case-%llu-%llu.log",
+        (unsigned long long)jce_time_ticks_ns(),(unsigned long long)++s_tr.ordinal);
+    if (!jce_editor_dotjce_path("build/editor-test-runs",directory,sizeof(directory)) ||
+        !jce_path_join(path,sizeof(path),directory,leaf)) {
+        s_tr.error="Test start refused: no writable profile/build log destination.";
+        s_tr.queue.clear(); s_tr.next=0; return;
+    }
+    const bool started=jce_editor_test_run_start(s_tr.run,suite.exe.c_str(),test.args.c_str(),
+        nullptr,path,(uint32_t)s_tr.timeout_s*1000u);
+    if (!started && s_tr.run.log_path!=path) {
+        s_tr.error=s_tr.run.error; s_tr.queue.clear(); s_tr.next=0;
+        return; /* Preflight did not replace the previous case result. */
+    }
+    s_tr.active_suite=(int)item.first; s_tr.active_case=(int)item.second;
+    test.status=s_tr.run.status; test.duration_s=0; test.log.clear(); test.error.clear();
+    test.log_path=s_tr.run.log_path;
+}
+static void cancel_queue()
+{
+    s_tr.queue.clear(); s_tr.next=0;
+    jce_editor_test_run_cancel(s_tr.run);
 }
 
 static ImU32 status_color(CaseStatus st)
 {
     switch (st) {
-        case CS_PASS:    return JCE_COL32_STATUS_OK;
-        case CS_FAIL:    return JCE_COL32_STATUS_ERR;
-        case CS_RUNNING: return IM_COL32(220, 200, 80, 255);
+        case CaseStatus::Passed:    return JCE_COL32_STATUS_OK;
+        case CaseStatus::Failed:    return JCE_COL32_STATUS_ERR;
+        case CaseStatus::Running: return IM_COL32(220, 200, 80, 255);
         default:         return IM_COL32(160, 160, 160, 255);
     }
 }
 
-static const char *status_label(CaseStatus st)
+static const char *status_label(CaseStatus status)
 {
-    switch (st) {
-        case CS_PASS:    return "PASS";
-        case CS_FAIL:    return "FAIL";
-        case CS_RUNNING: return "...";
-        default:         return "—";
-    }
+    return jce_editor_test_run_status_name(status);
 }
 
 } /* anonymous namespace */
@@ -207,6 +229,8 @@ extern "C" void jce_editor_panel_test_runner_content(void)
 {
     set_default_dir();
 
+    const bool running=busy();
+    ImGui::BeginDisabled(running);
     ImGui::TextUnformatted(jce_editor_i18n("testRunner.dir"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-260);
@@ -214,7 +238,15 @@ extern "C" void jce_editor_panel_test_runner_content(void)
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("testRunner.rescan"))) rescan();
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("testRunner.runAll"))) run_all();
+    if (ImGui::Button(jce_editor_i18n("testRunner.runAll"))) queue_suite(-1);
+    char timeout_label[96];
+    std::snprintf(timeout_label,sizeof(timeout_label),"%s (s)##test-run-timeout",jce_editor_i18n("ai.provider.timeout"));
+    ImGui::SetNextItemWidth(120);
+    if (ImGui::InputInt(timeout_label,&s_tr.timeout_s))
+        s_tr.timeout_s=std::max(1,std::min(3600,s_tr.timeout_s));
+    ImGui::EndDisabled();
+    if (running && ImGui::Button(jce_editor_i18n("common.cancel"))) cancel_queue();
+    if (!s_tr.error.empty()) ImGui::TextWrapped("%s",s_tr.error.c_str());
 
     ImGui::Separator();
     ImVec2 sz = ImGui::GetContentRegionAvail();
@@ -229,14 +261,14 @@ extern "C" void jce_editor_panel_test_runner_content(void)
             s_tr.selected_case  = -1;
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton(jce_editor_i18n("testRunner.run"))) {
-            for (auto &c : s.cases) run_case(s, c);
-        }
+        ImGui::BeginDisabled(running);
+        if (ImGui::SmallButton(jce_editor_i18n("testRunner.run"))) queue_suite((int)si);
+        ImGui::EndDisabled();
         for (size_t ci = 0; ci < s.cases.size(); ++ci) {
             TestCase &c = s.cases[ci];
             total++;
-            if (c.status == CS_PASS) pass_total++;
-            else if (c.status == CS_FAIL) fail_total++;
+            if (c.status == CaseStatus::Passed) pass_total++;
+            else if (c.status == CaseStatus::Failed || c.status == CaseStatus::Cancelled || c.status == CaseStatus::TimedOut) fail_total++;
             ImGui::PushID((int)ci);
             ImGui::Indent(16);
             char lbl[128]; snprintf(lbl, sizeof(lbl), "  %s", c.name.c_str());
@@ -271,6 +303,8 @@ extern "C" void jce_editor_panel_test_runner_content(void)
         ImGui::Text("%s: %s", jce_editor_i18n("testRunner.case"), c.name.c_str());
         ImGui::Text("%s: %s", jce_editor_i18n("testRunner.args"), c.args.c_str());
         ImGui::Separator();
+        if (!c.log_path.empty()) ImGui::TextWrapped("%s",c.log_path.c_str());
+        if (!c.error.empty()) ImGui::TextWrapped("%s",c.error.c_str());
         ImGui::TextUnformatted(jce_editor_i18n("testRunner.output"));
         ImGui::BeginChild("##trout", ImVec2(0, 0), true);
         ImGui::TextUnformatted(c.log.c_str());
@@ -290,4 +324,21 @@ extern "C" void jce_editor_panel_test_runner(void)
         jce_editor_panel_test_runner_content();
     }
     ImGui::End();
+}
+
+extern "C" void jce_editor_panel_test_runner_tick(void)
+{
+    jce_editor_test_run_poll(s_tr.run);
+    if (s_tr.active_suite>=0 && s_tr.run.process) {
+        TestCase &test=s_tr.suites[(size_t)s_tr.active_suite].cases[(size_t)s_tr.active_case];
+        test.status=s_tr.run.status; test.duration_s=s_tr.run.duration_s;
+    }
+    publish_result();
+    if (!s_tr.run.process && s_tr.active_suite<0) start_next();
+}
+extern "C" void jce_editor_panel_test_runner_shutdown(void)
+{
+    s_tr.queue.clear(); s_tr.next=0;
+    jce_editor_test_run_close(s_tr.run);
+    publish_result();
 }

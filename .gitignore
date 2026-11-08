@@ -5,7 +5,6 @@
 !.github/
 !.gitignore
 !.gitattributes
-!.editorconfig
 **/third_party/
 __pycache__/
 *.py[cod]

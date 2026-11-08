@@ -7,6 +7,8 @@
  */
 
 #include "jce_shader_deferred.h"
+#include "jce_postfx_grade_internal.h"
+#include "jce_renderer_shader_profile_internal.h"
 #include "jce_renderer_bgfx_callback.h"   /* half decode + host frame index */
 #include "os/core/jce_memory.h"      /* JCE_CALLOC / JCE_FREE */
 #include "renderer/jce_view_bands.h"
@@ -50,12 +52,18 @@ struct JcePostFXPipeline {
     bool            enabled[JCE_POSTFX_COUNT];
     JcePostFXParams params;
     bool            shaders_loaded;
+    bool            limited_composite_sampling;
+    bool            composite_limit_reported;
     uint16_t        view_base;  /* First bgfx view ID used by jce_postfx_apply(). */
 
     /* Intermediate framebuffers for ping-pong rendering. */
     bgfx_texture_handle_t    fbo_tex[POSTFX_MAX_FBOS];
     bgfx_frame_buffer_handle_t fbo[POSTFX_MAX_FBOS];
     bool                     fbos_valid;
+    /* Published only for complete pairs, from the allocation arguments. */
+    uint16_t                 fbo_width[POSTFX_MAX_FBOS];
+    uint16_t                 fbo_height[POSTFX_MAX_FBOS];
+    uint32_t                 fbo_format[POSTFX_MAX_FBOS];
 
     /* Shader programs.
      * NOTE: prog_tonemap was removed — fs_composite.sc now handles all
@@ -139,7 +147,7 @@ struct JcePostFXPipeline {
     bgfx_frame_buffer_handle_t taa_history_fb;
     bgfx_texture_handle_t      taa_motion_tex;
     bgfx_frame_buffer_handle_t taa_motion_fb;
-    bool                       taa_fbos_valid;    /* history/motion allocated */
+    bool                       taa_fbos_valid;    /* history allocated; motion is independent */
     bool                       history_valid;     /* a resolve has written history */
     /* EXTERNAL per-object motion-vector texture supplied by the renderer for the
      * frame about to be resolved (the scene renderer's velocity G-buffer).  When
@@ -164,16 +172,9 @@ struct JcePostFXPipeline {
 
     /* Selectable tonemap + 3D-LUT grade + soft bloom (Stage 1a.5). */
     int                    tonemap_op;     /* JcePostFXTonemap; 0=ACES default */
-    bgfx_texture_handle_t  lut_tex;        /* 3D LUT (invalid = no grade) */
-    bgfx_texture_handle_t  dummy_lut3d;    /* 1x1x1 placeholder: parks the
-                                            * SAMPLER3D when no LUT is loaded
-                                            * (WebGL2 rejects dangling samplers) */
-    int                    lut_size;       /* N */
-    float                  lut_strength;   /* 0 = neutral */
+    JcePostFXGrade         grade;          /* Borrowed LUT and owned composite resources. */
     float                  bloom_knee;     /* 0 = hard cutoff (legacy) */
     int                    bloom_quality;  /* 0 = single-mip; >0 = pyramid mips */
-    bgfx_uniform_handle_t  u_gradeParams;  /* x=enabled y=strength z=N w=0 */
-    bgfx_uniform_handle_t  s_texLUT;       /* SAMPLER (stage 2) */
     bgfx_program_handle_t  prog_bloom_down;
     bgfx_program_handle_t  prog_bloom_up;
     /* Bloom mip pyramid (HIGH/ULTRA). Up to 6 half-res-chain mips. */
@@ -317,10 +318,9 @@ static bgfx_texture_format_t postfx_color_format(void)
     return BGFX_TEXTURE_FORMAT_RGBA16F;
 }
 
-/* Allocate one full-res RGBA16F intermediate FBO (color texture + framebuffer).
- * destroyTextures=true so destroying the FB also frees the attached texture —
- * otherwise destroy_fbos() leaks handles, which during ImGui drag-resize
- * exhausts bgfx's texture pool and yields recycled-handle AVs in the driver. */
+/* Each completed FBO retains its attachment reference. Create without an
+ * ownership transfer and retire the caller texture reference on both success
+ * and failure, so validation and handle exhaustion share one rollback path. */
 /* Bloom works at HALF resolution, as it does in every standard engine
  * (Unity's bloom starts at half-res, Unreal downsamples, Godot uses mips).
  * Bloom is a low-frequency effect: a full-resolution blur buffer buys no
@@ -339,17 +339,29 @@ static bool postfx_fbo_is_bloom(int i) { return i == 2 || i == 3; }
 
 static void alloc_one_fbo(JcePostFXPipeline *p, int i)
 {
-    const uint32_t fw = postfx_fbo_is_bloom(i) ? postfx_bloom_w(p) : p->width;
-    const uint32_t fh = postfx_fbo_is_bloom(i) ? postfx_bloom_h(p) : p->height;
-    p->fbo_tex[i] = bgfx_create_texture_2d(
-        (uint16_t)fw, (uint16_t)fh, false, 1,
-        postfx_color_format(),
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        NULL, 0);
+    const uint16_t fw = (uint16_t)(postfx_fbo_is_bloom(i) ? postfx_bloom_w(p) : p->width);
+    const uint16_t fh = (uint16_t)(postfx_fbo_is_bloom(i) ? postfx_bloom_h(p) : p->height);
+    const bgfx_texture_format_t format = postfx_color_format();
+    p->fbo_width[i] = p->fbo_height[i] = 0;
+    p->fbo_format[i] = JCE_POSTFX_OUTPUT_FORMAT_UNKNOWN;
+    if (!fw || !fh) return;
+    bgfx_texture_handle_t texture = bgfx_create_texture_2d(
+        fw, fh, false, 1, format,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+    if (texture.idx == UINT16_MAX) return;
     bgfx_attachment_t at;
     memset(&at, 0, sizeof(at));
-    bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-    p->fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    bgfx_attachment_init(&at, texture, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
+    bgfx_frame_buffer_handle_t framebuffer =
+        bgfx_create_frame_buffer_from_attachment(1, &at, false);
+    bgfx_destroy_texture(texture); /* FBO keeps its own ref only on success. */
+    if (framebuffer.idx == UINT16_MAX) return;
+    p->fbo_tex[i] = texture;
+    p->fbo[i] = framebuffer;
+    p->fbo_width[i] = fw;
+    p->fbo_height[i] = fh;
+    p->fbo_format[i] = format == BGFX_TEXTURE_FORMAT_RGBA16F
+        ? JCE_POSTFX_OUTPUT_FORMAT_RGBA16F : JCE_POSTFX_OUTPUT_FORMAT_RGBA8;
 }
 
 static void create_fbos(JcePostFXPipeline *p)
@@ -363,7 +375,7 @@ static void create_fbos(JcePostFXPipeline *p)
      * LOW-tier case) uses ONE full-res RGBA16F target instead of four
      * (~48MB saved at 1080p). */
     alloc_one_fbo(p, 0);
-    p->fbos_valid = true;
+    p->fbos_valid = p->fbo[0].idx != UINT16_MAX;
 }
 
 /* Lazily allocate a composite ping-pong target (FBO 0 or 1); no-op if present. */
@@ -395,13 +407,13 @@ static bool ensure_bloom_blur_h_fbo(JcePostFXPipeline *p)
 
 static void destroy_fbos(JcePostFXPipeline *p)
 {
-    if (!p->fbos_valid) return;
     for (int i = 0; i < POSTFX_MAX_FBOS; i++) {
-        if (p->fbo[i].idx != UINT16_MAX)
-            bgfx_destroy_frame_buffer(p->fbo[i]);
-        p->fbo[i].idx = UINT16_MAX;
-        /* Textures are owned by the FBs (destroyTextures=true). */
-        p->fbo_tex[i].idx = UINT16_MAX;
+        const bgfx_frame_buffer_handle_t framebuffer = p->fbo[i];
+        p->fbo[i].idx = p->fbo_tex[i].idx = UINT16_MAX;
+        p->fbo_width[i] = p->fbo_height[i] = 0;
+        p->fbo_format[i] = JCE_POSTFX_OUTPUT_FORMAT_UNKNOWN;
+        if (framebuffer.idx != UINT16_MAX)
+            bgfx_destroy_frame_buffer(framebuffer);
     }
     p->fbos_valid = false;
 }
@@ -463,6 +475,46 @@ static void ensure_bloom_mips(JcePostFXPipeline *p, int mip_count)
 
 /* ── TAA persistent FBO helpers ─────────────────────────────────────── */
 
+/* Keep the texture's caller reference on every path. Pinned bgfx transfers
+ * destroyTextures=true after handle allocation (even if that fails), but a
+ * validation failure returns before that transfer. Explicit ownership avoids
+ * guessing which failure occurred. The FBO retains only its attachment ref. */
+static bool create_taa_target(const JcePostFXPipeline *p,
+                              bgfx_texture_handle_t *texture_out,
+                              bgfx_frame_buffer_handle_t *framebuffer_out)
+{
+    bgfx_texture_handle_t texture = bgfx_create_texture_2d(
+        (uint16_t)p->width, (uint16_t)p->height, false, 1,
+        postfx_color_format(),
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
+    if (texture.idx == UINT16_MAX) return false;
+    bgfx_attachment_t at;
+    memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, texture, BGFX_ACCESS_WRITE,
+                         0, 1, 0, BGFX_RESOLVE_NONE);
+    bgfx_frame_buffer_handle_t framebuffer =
+        bgfx_create_frame_buffer_from_attachment(1, &at, false);
+    if (framebuffer.idx == UINT16_MAX) {
+        bgfx_destroy_texture(texture);
+        return false;
+    }
+    *texture_out = texture;
+    *framebuffer_out = framebuffer;
+    return true;
+}
+
+static void destroy_taa_target(bgfx_texture_handle_t *texture,
+                               bgfx_frame_buffer_handle_t *framebuffer)
+{
+    const bgfx_texture_handle_t owned_texture = *texture;
+    const bgfx_frame_buffer_handle_t owned_framebuffer = *framebuffer;
+    texture->idx = framebuffer->idx = UINT16_MAX;
+    if (owned_framebuffer.idx != UINT16_MAX)
+        bgfx_destroy_frame_buffer(owned_framebuffer);
+    if (owned_texture.idx != UINT16_MAX)
+        bgfx_destroy_texture(owned_texture);
+}
+
 /* Allocate the persistent TAA history (RGBA16F, HDR like the scene colour)
  * and motion (RGBA16F; RG would suffice but RGBA16F matches the existing
  * FBO format helper and is universally RT-able) framebuffers at the current
@@ -472,17 +524,7 @@ static void create_taa_fbos(JcePostFXPipeline *p)
 {
     if (p->taa_fbos_valid) return;
 
-    p->taa_history_tex = bgfx_create_texture_2d(
-        (uint16_t)p->width, (uint16_t)p->height, false, 1,
-        postfx_color_format(),
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
-    {
-        bgfx_attachment_t at;
-        memset(&at, 0, sizeof(at));
-        bgfx_attachment_init(&at, p->taa_history_tex, BGFX_ACCESS_WRITE,
-                             0, 1, 0, BGFX_RESOLVE_NONE);
-        p->taa_history_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
-    }
+    if (!create_taa_target(p, &p->taa_history_tex, &p->taa_history_fb)) return;
 
     /* NOTE: the camera-only motion buffer (taa_motion_tex/fb) is NOT allocated
      * here — it is DEAD whenever the renderer supplies an external per-object
@@ -500,29 +542,14 @@ static void create_taa_fbos(JcePostFXPipeline *p)
 static bool ensure_taa_motion_fbo(JcePostFXPipeline *p)
 {
     if (p->taa_motion_fb.idx != UINT16_MAX) return true;
-    p->taa_motion_tex = bgfx_create_texture_2d(
-        (uint16_t)p->width, (uint16_t)p->height, false, 1,
-        postfx_color_format(),
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
-    bgfx_attachment_t at;
-    memset(&at, 0, sizeof(at));
-    bgfx_attachment_init(&at, p->taa_motion_tex, BGFX_ACCESS_WRITE,
-                         0, 1, 0, BGFX_RESOLVE_NONE);
-    p->taa_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
-    return p->taa_motion_fb.idx != UINT16_MAX;
+    return create_taa_target(p, &p->taa_motion_tex, &p->taa_motion_fb);
 }
 
 static void destroy_taa_fbos(JcePostFXPipeline *p)
 {
-    if (!p->taa_fbos_valid) return;
-    if (p->taa_history_fb.idx != UINT16_MAX)
-        bgfx_destroy_frame_buffer(p->taa_history_fb);
-    if (p->taa_motion_fb.idx != UINT16_MAX)
-        bgfx_destroy_frame_buffer(p->taa_motion_fb);
-    p->taa_history_fb.idx  = UINT16_MAX;
-    p->taa_motion_fb.idx   = UINT16_MAX;
-    p->taa_history_tex.idx = UINT16_MAX;  /* owned by the FBs */
-    p->taa_motion_tex.idx  = UINT16_MAX;
+    /* Motion blur can allocate motion without ever allocating TAA history. */
+    destroy_taa_target(&p->taa_history_tex, &p->taa_history_fb);
+    destroy_taa_target(&p->taa_motion_tex, &p->taa_motion_fb);
     p->taa_fbos_valid = false;
     p->history_valid  = false;
 }
@@ -593,9 +620,11 @@ static bool draw_fullscreen(JcePostFXPipeline *p, uint16_t view_id,
 static void ae_destroy_targets(JcePostFXPipeline *p)
 {
     if (p->ae_small_fb.idx != UINT16_MAX) {
-        /* Destroys the attachment too (created with destroyTexture = true). */
         bgfx_destroy_frame_buffer(p->ae_small_fb);
-        p->ae_small_fb.idx  = UINT16_MAX;
+        p->ae_small_fb.idx = UINT16_MAX;
+    }
+    if (p->ae_small_tex.idx != UINT16_MAX) {
+        bgfx_destroy_texture(p->ae_small_tex);
         p->ae_small_tex.idx = UINT16_MAX;
     }
     for (int i = 0; i < AE_RING; ++i) {
@@ -644,7 +673,8 @@ static bool ae_ensure_targets(JcePostFXPipeline *p)
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL, 0);
     if (att.idx == UINT16_MAX) return false;
     p->ae_small_tex = att;
-    p->ae_small_fb  = bgfx_create_frame_buffer_from_handles(1, &att, true);
+    /* Keep the pipeline texture owner even when framebuffer admission fails. */
+    p->ae_small_fb  = bgfx_create_frame_buffer_from_handles(1, &att, false);
     if (p->ae_small_fb.idx == UINT16_MAX) {
         bgfx_destroy_texture(att);
         p->ae_small_tex.idx = UINT16_MAX;
@@ -886,19 +916,9 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
 
     /* Stage-1a.5: tonemap-op / 3D-LUT / soft bloom init. */
     p->tonemap_op    = 0;
-    p->lut_tex.idx   = UINT16_MAX;
-    /* Sentinel-init the OWNED placeholder LUT too: it is the only destroyed
-     * handle omitted from this block (lut_tex above is borrowed, never
-     * destroyed).  bgfx idx==0 is a valid handle — a future early-return
-     * before its creation (line ~553) would make jce_postfx_destroy free
-     * foreign 3D-texture 0. */
-    p->dummy_lut3d.idx = UINT16_MAX;
-    p->lut_size      = 0;
-    p->lut_strength  = 0.0f;
+    p->grade = jce_postfx_grade_empty();
     p->bloom_knee    = 0.0f;
     p->bloom_quality = 0;
-    p->u_gradeParams.idx = UINT16_MAX;
-    p->s_texLUT.idx      = UINT16_MAX;
     p->prog_bloom_down.idx = UINT16_MAX;
     p->prog_bloom_up.idx   = UINT16_MAX;
 
@@ -969,22 +989,13 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_texHistory      = bgfx_create_uniform("s_texHistory",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
     p->u_texMotion       = bgfx_create_uniform("s_texMotion",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
-    /* Stage-1a.5 grade/LUT uniforms. */
-    p->u_gradeParams = bgfx_create_uniform("u_gradeParams", BGFX_UNIFORM_TYPE_VEC4, 1);
-    p->s_texLUT      = bgfx_create_uniform("s_texLUT",      BGFX_UNIFORM_TYPE_SAMPLER, 1);
-
-    /* 1x1x1 neutral placeholder for the 3D-LUT sampler.  When no grade LUT is
-     * loaded, stage 2 used to stay unbound — "safe on all backends" was wrong:
-     * on WebGL2 the dangling SAMPLER3D uniform defaults to texture unit 0,
-     * clashing with s_texColor (2D) there, and ANGLE rejects the ENTIRE
-     * composite draw ("Two textures of different types use the same sampler
-     * location") — the scene never reached the backbuffer (web black-screen). */
-    {
-        uint32_t texel = 0xFFFFFFFFu;
-        const bgfx_memory_t *mem = bgfx_copy(&texel, 4);
-        p->dummy_lut3d = bgfx_create_texture_3d(1, 1, 1, false,
-                                                BGFX_TEXTURE_FORMAT_RGBA8, 0, mem, 0);
-    }
+    const JceRendererApiInfo api = jce_renderer_get_api_info();
+    const bgfx_renderer_type_t backend = bgfx_get_renderer_type();
+    const bool compatibility = jce_renderer_shader_profile_compatibility(&api, backend);
+    p->limited_composite_sampling = compatibility && backend == BGFX_RENDERER_TYPE_OPENGL;
+    const bgfx_caps_t *grade_caps = bgfx_get_caps();
+    jce_postfx_grade_acquire(&p->grade, compatibility,
+        grade_caps && (grade_caps->supported & BGFX_CAPS_TEXTURE_3D) != 0);
 
     /* Say that 1x1 is a placeholder.  Both render paths call
      * jce_postfx_resize() before the first frame, but the bare "created
@@ -1035,10 +1046,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     bgfx_destroy_uniform(pipeline->u_taaPrevViewProj);
     bgfx_destroy_uniform(pipeline->u_texHistory);
     bgfx_destroy_uniform(pipeline->u_texMotion);
-    /* Stage-1a.5 grade uniforms. */
-    if (pipeline->u_gradeParams.idx != UINT16_MAX) bgfx_destroy_uniform(pipeline->u_gradeParams);
-    if (pipeline->s_texLUT.idx      != UINT16_MAX) bgfx_destroy_uniform(pipeline->s_texLUT);
-    if (pipeline->dummy_lut3d.idx   != UINT16_MAX) bgfx_destroy_texture(pipeline->dummy_lut3d);
+    jce_postfx_grade_release(&pipeline->grade);
 
     release_stock_programs(pipeline);
     release_postfx_program(&pipeline->prog_custom);
@@ -1118,7 +1126,7 @@ void jce_postfx_set_motion_blur(JcePostFXPipeline *p, bool enabled,
      * image is being dragged by something that has not happened yet. */
     p->mb_intensity = (intensity > 0.0f) ? intensity : 0.0f;
     if (p->mb_intensity > 4.0f) p->mb_intensity = 4.0f;
-    if (!enabled) p->mb_active = false;
+    if (!enabled || p->limited_composite_sampling) p->mb_active = false;
 }
 
 /* One view-space distance -> the depth value the buffer would hold for it. */
@@ -1149,7 +1157,10 @@ void jce_postfx_set_depth_of_field(JcePostFXPipeline *p, bool enabled,
     p->dof_max_coc = (max_coc > 0.0f) ? max_coc : 0.012f;
     if (p->dof_max_coc > 0.25f) p->dof_max_coc = 0.25f;
     p->dof_valid = false;
-    if (!enabled) { p->dof_active = false; return; }
+    if (!enabled || p->limited_composite_sampling) {
+        p->dof_active = false;
+        return;
+    }
     if (!proj16) return;
 
     if (!(focus_distance > 0.0f)) focus_distance = 1.0f;
@@ -1260,13 +1271,13 @@ int jce_postfx_get_tonemap_op(const JcePostFXPipeline *p) { return p ? p->tonema
 
 void jce_postfx_set_lut(JcePostFXPipeline *p, JceTexture lut, int n, float s) {
     if (!p) return;
-    p->lut_tex.idx = lut.idx; p->lut_size = n;
-    if (s < 0.0f) s = 0.0f; if (s > 1.0f) s = 1.0f; p->lut_strength = s;
+    const bgfx_texture_handle_t borrowed = {lut.idx};
+    jce_postfx_grade_set(&p->grade, borrowed, n, s);
 }
 void jce_postfx_get_lut(const JcePostFXPipeline *p, JceTexture *ol, int *on, float *os) {
-    if (ol) ol->idx = p ? p->lut_tex.idx : UINT16_MAX;
-    if (on) *on = p ? p->lut_size : 0;
-    if (os) *os = p ? p->lut_strength : 0.0f;
+    if (ol) ol->idx = p ? p->grade.borrowed.idx : UINT16_MAX;
+    if (on) *on = p ? p->grade.size : 0;
+    if (os) *os = p ? p->grade.strength : 0.0f;
 }
 void  jce_postfx_set_bloom_knee(JcePostFXPipeline *p, float k) {
     if (!p) return; if (k < 0.0f) k = 0.0f; if (k > 1.0f) k = 1.0f; p->bloom_knee = k;
@@ -1280,6 +1291,11 @@ int jce_postfx_get_bloom_quality(const JcePostFXPipeline *p) { return p ? p->blo
 
 /* ── TAA configuration ─────────────────────────────────────────────── */
 
+bool jce_postfx_taa_supported(void)
+{
+    return postfx_color_format() == BGFX_TEXTURE_FORMAT_RGBA16F;
+}
+
 void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
                         float feedback, float luma_clamp, float motion_clamp)
 {
@@ -1287,7 +1303,7 @@ void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
     /* TAA needs the RGBA16F targets: the motion buffer stores SIGNED NDC
      * deltas, which the RGBA8 fallback (see postfx_color_format) would clamp
      * to [0,1] and smear the resolve.  On such backends TAA stays off. */
-    if (enabled && postfx_color_format() != BGFX_TEXTURE_FORMAT_RGBA16F) {
+    if (enabled && !jce_postfx_taa_supported()) {
         LOG_WARN(LOG_TAG, "TAA requires RGBA16F target support and hdr_color "
                           "enabled; keeping TAA off");
         enabled = false;
@@ -1517,6 +1533,18 @@ static void postfx_log_taa_state(JcePostFXPipeline *pipeline, bool submitted)
                  submitted ? "on" : "off", (unsigned)pipeline->view_base);
 }
 
+static bool postfx_composite_multisampling(JcePostFXPipeline *p)
+{
+    if (!p->limited_composite_sampling)
+        return true;
+    if (!p->composite_limit_reported && (p->mb_enabled || p->dof_enabled)) {
+        LOG_WARN(LOG_TAG, "GL 2.1 stock Composite cannot run motion blur or depth of field. "
+                          "Authored settings are retained.");
+        p->composite_limit_reported = true;
+    }
+    return false;
+}
+
 void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_color,
                       JceTextureHandle scene_depth)
@@ -1546,9 +1574,11 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
        reprojection pass (which needs prog_motion_vec + matrices + depth).  With
        neither motion source available we silently skip TAA (the rest of the
        chain is unaffected). */
+    const bool multisampling = postfx_composite_multisampling(pipeline);
+    const bool mb_requested = multisampling && pipeline->mb_enabled;
     const bool have_ext_motion = (inputs.ext_motion.idx != UINT16_MAX);
     const bool have_cam_motion =
-        (pipeline->taa_enabled || pipeline->mb_enabled) &&
+        (pipeline->taa_enabled || mb_requested) &&
         inputs.have_matrices && jce_gfx_texture_valid(scene_depth) &&
         postfx_program_ready(pipeline->prog_motion_vec);
     const bool taa_run =
@@ -1566,7 +1596,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
      * matrices there is nothing to blur ALONG, and quietly rendering an
      * unblurred frame while the toggle says ON is the exact defect this
      * feature exists to close. */
-    const bool mb_run = pipeline->mb_enabled &&
+    const bool mb_run = mb_requested &&
                         pipeline->mb_intensity > 0.0f &&
                         (have_ext_motion || have_cam_motion);
     bgfx_texture_handle_t mb_motion_tex = { UINT16_MAX };
@@ -1990,8 +2020,8 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
          * merely to be switched on.  pipeline->dof_active records which of
          * those two was missing, so jce_postfx_get_depth_of_field_active()
          * can answer "is it doing anything" rather than "is it on". */
-        const bool c_dof     = pipeline->dof_enabled && pipeline->dof_valid &&
-                               scene_depth.idx != UINT16_MAX;
+        const bool c_dof     = multisampling && pipeline->dof_enabled &&
+                               pipeline->dof_valid && scene_depth.idx != UINT16_MAX;
         const bool any_comp  = c_bloom || c_tonemap || c_chroma || c_vig ||
                                c_gray || c_mblur || c_dof;
 
@@ -2053,24 +2083,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);
             bgfx_set_uniform(pipeline->u_vignetteParams,  vig_p, 1);
 
-            /* Stage-1a.5: 3D-LUT grade + tonemap-op (gated: needs valid handle +
-             * strength > 0 + tonemap on — grade is in LDR space after tonemap). */
-            const bool grade_on = (pipeline->lut_tex.idx != UINT16_MAX) &&
-                                   pipeline->lut_strength > 0.0f && c_tonemap;
-            float grade_p[4] = { grade_on ? 1.0f : 0.0f,
-                                  pipeline->lut_strength,
-                                  (float)(pipeline->lut_size > 0 ? pipeline->lut_size : 1),
-                                  0.0f };
-            bgfx_set_uniform(pipeline->u_gradeParams, grade_p, 1);
-            if (grade_on)
-                bgfx_set_texture(2, pipeline->s_texLUT, pipeline->lut_tex, UINT32_MAX);
-            else
-                /* Grade off: u_gradeParams.x < 0.5 so the shader never SAMPLES
-                 * s_texLUT, but the SAMPLER3D uniform must still be parked on a
-                 * real 3D texture — unbound it dangles at unit 0 next to
-                 * s_texColor (2D) and WebGL2 rejects the whole composite draw. */
-                bgfx_set_texture(2, pipeline->s_texLUT, pipeline->dummy_lut3d,
-                                 UINT32_MAX);
+            jce_postfx_grade_submit(&pipeline->grade, c_tonemap);
 
             ensure_composite_fbo(pipeline, ping);
             POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
@@ -2189,6 +2202,39 @@ JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline)
     return h;
 }
 
+bool jce_postfx_get_output_target(const JcePostFXPipeline *pipeline,
+                                  JcePostFXOutputTarget *target)
+{
+    if (!target || target->struct_size != sizeof(*target) ||
+        target->version != JCE_POSTFX_OUTPUT_TARGET_VERSION) return false;
+    memset(target, 0, sizeof(*target));
+    target->struct_size = sizeof(*target);
+    target->version = JCE_POSTFX_OUTPUT_TARGET_VERSION;
+    target->texture.idx = target->framebuffer = UINT16_MAX;
+    if (!pipeline || pipeline->output_tex.idx == UINT16_MAX) return false;
+    const int slot = pipeline->output_ping;
+    if (slot < 0) {
+        if (pipeline->output_fb.idx != UINT16_MAX) return false;
+        target->kind = JCE_POSTFX_OUTPUT_BORROWED;
+        target->texture.idx = pipeline->output_tex.idx;
+        return true;
+    }
+    if (slot >= POSTFX_MAX_FBOS ||
+        pipeline->output_fb.idx == UINT16_MAX ||
+        pipeline->output_tex.idx != pipeline->fbo_tex[slot].idx ||
+        pipeline->output_fb.idx != pipeline->fbo[slot].idx ||
+        !pipeline->fbo_width[slot] || !pipeline->fbo_height[slot] ||
+        pipeline->fbo_format[slot] == JCE_POSTFX_OUTPUT_FORMAT_UNKNOWN)
+        return false;
+    target->kind = JCE_POSTFX_OUTPUT_OWNED;
+    target->width = pipeline->fbo_width[slot];
+    target->height = pipeline->fbo_height[slot];
+    target->format = pipeline->fbo_format[slot];
+    target->texture.idx = pipeline->output_tex.idx;
+    target->framebuffer = pipeline->output_fb.idx;
+    return true;
+}
+
 void jce_postfx_present(JcePostFXPipeline *pipeline,
                         uint32_t width, uint32_t height)
 {
@@ -2294,7 +2340,8 @@ static bool ensure_tsr_buffers(JcePostFXPipeline *p, uint32_t ow, uint32_t oh)
         if (p->tsr_hist_tex[i].idx == UINT16_MAX) { p->tsr_valid = false; return false; }
         bgfx_attachment_t at; memset(&at, 0, sizeof(at));
         bgfx_attachment_init(&at, p->tsr_hist_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-        p->tsr_hist_fb[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+        /* The pipeline owns TSR textures, even if framebuffer creation fails. */
+        p->tsr_hist_fb[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
         if (p->tsr_hist_fb[i].idx == UINT16_MAX) { p->tsr_valid = false; return false; }
     }
     p->tsr_ow = ow; p->tsr_oh = oh; p->tsr_ping = 0;
@@ -2315,7 +2362,8 @@ static bool ensure_tsr_motion(JcePostFXPipeline *p, uint32_t rw, uint32_t rh)
     if (p->tsr_motion_tex.idx == UINT16_MAX) return false;
     bgfx_attachment_t at; memset(&at, 0, sizeof(at));
     bgfx_attachment_init(&at, p->tsr_motion_tex, BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-    p->tsr_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    /* Borrow the pipeline-owned motion texture. */
+    p->tsr_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, false);
     if (p->tsr_motion_fb.idx == UINT16_MAX) return false;
     p->tsr_mw = rw; p->tsr_mh = rh;
     return true;

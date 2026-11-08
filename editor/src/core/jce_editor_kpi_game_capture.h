@@ -62,7 +62,8 @@ bool jce_editor_kpi_game_capture_global_render_size(
     uint16_t *out_width, uint16_t *out_height);
 void jce_editor_kpi_game_capture_global_note_rendered(void);
 const char *jce_editor_kpi_game_capture_global_due_path(void);
-bool jce_editor_kpi_game_capture_global_mark_submitted(void);
+void jce_editor_kpi_game_capture_global_mark_submitted(
+    uint32_t source_frame, uint32_t submit_frame);
 void jce_editor_kpi_game_capture_global_mark_complete(bool success);
 
 #endif /* JCE_EDITOR_KPI_GAME_CAPTURE_H */

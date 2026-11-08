@@ -28,6 +28,14 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(_WIN32)
+#include <process.h>
+#define TEST_PROCESS_ID() ((unsigned long)_getpid())
+#else
+#include <unistd.h>
+#define TEST_PROCESS_ID() ((unsigned long)getpid())
+#endif
+
 static char g_root[1024];
 static int  g_error_count;
 static int  g_warning_count;
@@ -39,9 +47,12 @@ void setUp(void)
     char base[1024];
 
     (void)jce_fs_host_get_current_dir(base, sizeof(base));
+    /* The same fixture is linked into ordinary old-owner controls. CTest may
+     * run those processes together; function-address bits are not a process
+     * identity and can collide across identically laid-out executable images. */
     snprintf(g_root, sizeof(g_root),
-             "%s/_ut_bundle_pack_%d_%d", base,
-             (int)(uintptr_t)setUp & 0xFFFF, ++counter);
+             "%s/_ut_bundle_pack_%lu_%d", base,
+             TEST_PROCESS_ID(), ++counter);
     (void)jce_fs_host_remove_recursive(g_root);
     TEST_ASSERT_TRUE(jce_fs_host_create_directory(g_root));
     g_error_count = 0;
@@ -1161,6 +1172,11 @@ static void test_shader_alternative_source_and_unknown_required(void)
     JceBundlePackOptions opts;
     init_single_file_opts(&opts, scene, out_dir, scenes);
     opts.resolve_fn = test_shader_fallback; opts.resolve_user = shader;
+    /* A selected project policy must preserve the caller's shader resolver. */
+    char policy[1024];
+    join_path(policy, sizeof(policy), "Settings/RenderPipeline.rp.json");
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(policy, "{}", 2));
+    opts.project_root = g_root;
     TEST_ASSERT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
     uint64_t size = 0; void *data = jce_fs_host_read_all(graph, &size);
     TEST_ASSERT_NOT_NULL(data);
@@ -1171,6 +1187,252 @@ static void test_shader_alternative_source_and_unknown_required(void)
     TEST_ASSERT_TRUE(jce_fs_host_write_all(material, descriptor, (uint64_t)strlen(descriptor)));
     TEST_ASSERT_NOT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
     TEST_ASSERT_TRUE(g_error_count > 0);
+}
+
+static const char k_test_pipeline[] =
+    "{\"$schema\":\"jce.rp.v1\",\"enable_volumetric_fog\":false,"
+    "\"enable_ssao\":false,\"enable_ssr\":false,\"shadow_resolution\":2048,"
+    "\"csm_cascade_count\":3,\"render_scale\":1.0}\n";
+static const char k_test_pipeline_address[] = "settings/render_pipeline.rp.json";
+
+static void assert_pipeline_bytes(const JcePakArchive *pak)
+{
+    const JcePakAsset *asset = jce_pak_find(pak, k_test_pipeline_address);
+    TEST_ASSERT_NOT_NULL_MESSAGE(asset, "authored boot policy missing from actual archive");
+    TEST_ASSERT_EQUAL_UINT64(strlen(k_test_pipeline), asset->original_size);
+    char bytes[512];
+    TEST_ASSERT_EQUAL_size_t(strlen(k_test_pipeline),
+        jce_pak_decompress(asset, bytes, sizeof(bytes)));
+    TEST_ASSERT_EQUAL_MEMORY(k_test_pipeline, bytes, strlen(k_test_pipeline));
+}
+
+static void test_project_pipeline_is_one_canonical_root_and_overlay_readable(void)
+{
+    char scene[1024], out[1024], source[1024], bundle[1024], graph[1024], ignored[1024];
+    join_path(scene, sizeof(scene), "policy.scene");
+    join_path(out, sizeof(out), "out_policy");
+    join_path(source, sizeof(source), "Settings/RenderPipeline.rp.json");
+    join_path(bundle, sizeof(bundle), "out_policy/policy.jbundle");
+    join_path(graph, sizeof(graph), "out_policy/bundle_graph.json");
+    join_path(ignored, sizeof(ignored), "Settings/unrelated-private.json");
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(scene, "{\"entities\":[]}", 15));
+    const char *scenes[] = {scene};
+    JceBundlePackOptions opts;
+    init_single_file_opts(&opts, scene, out, scenes);
+    opts.project_root = g_root;
+    /* Missing policy leaves defaults available; no settings tree is invented. */
+    TEST_ASSERT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+    JcePakArchive *base = jce_pak_open_file(bundle);
+    TEST_ASSERT_NOT_NULL(base);
+    TEST_ASSERT_NULL(jce_pak_find(base, k_test_pipeline_address));
+
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(source, k_test_pipeline, strlen(k_test_pipeline)));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(ignored, "{}", 2));
+    /* Distinct staged assets still take their policy from explicit project_root. */
+    char resources[1024];
+    join_path(resources, sizeof(resources), "staged_resources");
+    TEST_ASSERT_TRUE(jce_fs_host_create_directory(resources));
+    opts.resource_root = resources;
+    join_path(out, sizeof(out), "out_authored");
+    join_path(bundle, sizeof(bundle), "out_authored/policy.jbundle");
+    join_path(graph, sizeof(graph), "out_authored/bundle_graph.json");
+    /* An unrelated editor VFS contains the opposite policy. Explicit project
+     * source must beat it at every probe/hash/cook read, not merely discovery. */
+    char foreign_root[1024], foreign_policy[1024];
+    join_path(foreign_root, sizeof(foreign_root), "foreign_project");
+    join_path(foreign_policy, sizeof(foreign_policy),
+              "foreign_project/settings/render_pipeline.rp.json");
+    const char *foreign = "{\"enable_volumetric_fog\":true}";
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(foreign_policy, foreign, strlen(foreign)));
+    JceFileSystem *fs = jce_fs_create();
+    TEST_ASSERT_NOT_NULL(fs);
+    TEST_ASSERT_TRUE(jce_fs_mount_dir(fs, "", foreign_root));
+    JceFileSystem *previous = jce_fs_get_active();
+    const JceFsActivePolicy previous_policy = jce_fs_get_active_policy();
+    jce_fs_set_active_policy(fs, JCE_FS_ACTIVE_OVERLAY);
+    const int result = jce_bundle_pack_run(&opts, log_sink, NULL);
+    jce_fs_set_active_policy(previous, previous_policy);
+    jce_fs_destroy(fs);
+    TEST_ASSERT_EQUAL_INT(0, result);
+    TEST_ASSERT_EQUAL_INT(0, g_error_count);
+    JcePakArchive *authored = jce_pak_open_file(bundle);
+    TEST_ASSERT_NOT_NULL(authored);
+    assert_pipeline_bytes(authored);
+    TEST_ASSERT_NULL(jce_pak_find(authored, "Settings/RenderPipeline.rp.json"));
+    TEST_ASSERT_NULL(jce_pak_find(authored, "Settings/unrelated-private.json"));
+    /* Same public fallback chain installed by stock runtime before load_pak. */
+    jce_pak_overlay_push(base, authored);
+    assert_pipeline_bytes(base);
+    jce_pak_overlay_remove(base, authored);
+    jce_pak_close(base);
+    jce_pak_close(authored);
+
+    uint64_t size = 0;
+    void *data = jce_fs_host_read_all(graph, &size);
+    TEST_ASSERT_NOT_NULL(data);
+    cJSON *doc = cJSON_ParseWithLength((const char *)data, (size_t)size);
+    TEST_ASSERT_NOT_NULL(doc);
+    const cJSON *assets = cJSON_GetObjectItemCaseSensitive(doc, "assets");
+    TEST_ASSERT_EQUAL_INT(2, cJSON_GetArraySize(assets));
+    const cJSON *entry = find_asset_record(assets, "address", k_test_pipeline_address);
+    TEST_ASSERT_NOT_NULL(entry);
+    char hash[17];
+    snprintf(hash, sizeof(hash), "%016llx",
+        (unsigned long long)XXH3_64bits(k_test_pipeline, strlen(k_test_pipeline)));
+    TEST_ASSERT_EQUAL_STRING(hash,
+        cJSON_GetObjectItemCaseSensitive(entry, "content_id")->valuestring);
+    TEST_ASSERT_NOT_NULL(strstr((const char *)data, "project_settings"));
+    cJSON_Delete(doc);
+    jce_fs_buffer_free(data);
+}
+
+static void test_canonical_pipeline_only_and_equal_source_deduplicate(void)
+{
+    char scene[1024], out[1024], source[1024], canonical[1024], bundle[1024];
+    join_path(scene, sizeof(scene), "policy.scene");
+    join_path(out, sizeof(out), "out_policy");
+    join_path(source, sizeof(source), "Settings/RenderPipeline.rp.json");
+    join_path(canonical, sizeof(canonical), k_test_pipeline_address);
+    join_path(bundle, sizeof(bundle), "out_policy/policy.jbundle");
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(scene, "{\"entities\":[]}", 15));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(canonical, k_test_pipeline, strlen(k_test_pipeline)));
+    const char *scenes[] = {scene};
+    JceBundlePackOptions opts;
+    init_single_file_opts(&opts, scene, out, scenes);
+    for (int authored = 0; authored < 2; ++authored) {
+        if (authored) {
+            opts.project_root = g_root;
+            TEST_ASSERT_TRUE(jce_fs_host_write_all(source, k_test_pipeline, strlen(k_test_pipeline)));
+        }
+        TEST_ASSERT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+        JcePakArchive *pak = jce_pak_open_file(bundle);
+        TEST_ASSERT_NOT_NULL(pak);
+        assert_pipeline_bytes(pak);
+        jce_pak_close(pak);
+    }
+    TEST_ASSERT_EQUAL_INT(0, g_error_count);
+}
+
+static void test_project_pipeline_conflict_refuses_before_publication(void)
+{
+    char scene[1024], out[1024], source[1024], canonical[1024], bundle[1024];
+    join_path(scene, sizeof(scene), "policy.scene");
+    join_path(out, sizeof(out), "out_policy");
+    join_path(source, sizeof(source), "Settings/RenderPipeline.rp.json");
+    join_path(canonical, sizeof(canonical), k_test_pipeline_address);
+    join_path(bundle, sizeof(bundle), "out_policy/policy.jbundle");
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(scene, "{\"entities\":[]}", 15));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(source, k_test_pipeline, strlen(k_test_pipeline)));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(canonical, "{}", 2));
+    const char *scenes[] = {scene};
+    JceBundlePackOptions opts;
+    init_single_file_opts(&opts, scene, out, scenes);
+    opts.project_root = g_root;
+    TEST_ASSERT_NOT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+    TEST_ASSERT_NOT_NULL(strstr(g_last_error, "conflicts with canonical resource"));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_file(bundle));
+}
+
+static void test_present_invalid_project_pipeline_never_falls_back(void)
+{
+    char scene[1024], out[1024], source[1024], canonical[1024], bundle[1024];
+    join_path(scene, sizeof(scene), "policy.scene");
+    join_path(out, sizeof(out), "out_policy");
+    join_path(source, sizeof(source), "Settings/RenderPipeline.rp.json");
+    join_path(canonical, sizeof(canonical), k_test_pipeline_address);
+    join_path(bundle, sizeof(bundle), "out_policy/policy.jbundle");
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(scene, "{\"entities\":[]}", 15));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(canonical, k_test_pipeline, strlen(k_test_pipeline)));
+    const char *scenes[] = {scene};
+    JceBundlePackOptions opts;
+    init_single_file_opts(&opts, scene, out, scenes);
+    opts.project_root = g_root;
+    /* A directory at the declared path is present but not a readable regular file. */
+    TEST_ASSERT_TRUE(jce_fs_host_create_directory(source));
+    TEST_ASSERT_NOT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+    TEST_ASSERT_NOT_NULL(strstr(g_last_error, "not a readable regular file"));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_file(bundle));
+    TEST_ASSERT_TRUE(jce_fs_host_remove_recursive(source));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(source, "[]", 2));
+    TEST_ASSERT_NOT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+    TEST_ASSERT_NOT_NULL(strstr(g_last_error, "must contain a JSON object"));
+    TEST_ASSERT_FALSE(jce_fs_host_exists_file(bundle));
+}
+
+static void test_catalog_threshold_preserves_local_assets_and_shared_boot_policy(void)
+{
+    char scenes[2][1024], source[1024], asset[1024], out[1024], catalog_path[1280];
+    join_path(scenes[0], sizeof(scenes[0]), "first.scene");
+    join_path(scenes[1], sizeof(scenes[1]), "second.scene");
+    join_path(source, sizeof(source), "Settings/RenderPipeline.rp.json");
+    join_path(asset, sizeof(asset), "shared.bin");
+    const char *scene = "{\"entities\":[{\"meshPath\":\"shared.bin\"}]}";
+    const char *payload = "opaque dependency bytes; this test does not render a mesh";
+    for (int i = 0; i < 2; ++i)
+        TEST_ASSERT_TRUE(jce_fs_host_write_all(scenes[i], scene, strlen(scene)));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(source, k_test_pipeline, strlen(k_test_pipeline)));
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(asset, payload, strlen(payload)));
+    const char *selected[] = {scenes[0], scenes[1]};
+    JceBundlePackOptions opts;
+    init_single_file_opts(&opts, scenes[0], out, selected);
+    opts.project_root = g_root;
+    opts.scene_file_count = 2;
+    opts.single_file_mode = false;
+    /* Two references below threshold => two local copies; at threshold => one
+     * shared copy. The global boot policy is shared in both catalog layouts. */
+    for (int threshold = 3; threshold >= 2; --threshold) {
+        snprintf(out, sizeof(out), "%s/out_threshold_%d", g_root, threshold);
+        snprintf(catalog_path, sizeof(catalog_path), "%s/bundle_catalog.json", out);
+        opts.shared_threshold = threshold;
+        TEST_ASSERT_EQUAL_INT(0, jce_bundle_pack_run(&opts, log_sink, NULL));
+        JceFileSystem *fs = jce_fs_create();
+        TEST_ASSERT_NOT_NULL(fs);
+        JceBundleCatalog *catalog = jce_bundle_catalog_open(fs, catalog_path);
+        TEST_ASSERT_NOT_NULL(catalog);
+        TEST_ASSERT_EQUAL_UINT32(3, jce_bundle_catalog_count(catalog));
+        int scene_count = 0, policy_copies = 0, payload_copies = 0;
+        for (uint32_t i = 0; i < jce_bundle_catalog_count(catalog); ++i) {
+            const char *id = jce_bundle_catalog_id_at(catalog, i);
+            const bool is_scene = strcmp(jce_bundle_catalog_kind(catalog, id), "scene") == 0;
+            char bundle[1536];
+            snprintf(bundle, sizeof(bundle), "%s/%s", out, jce_bundle_catalog_file(catalog, id));
+            JcePakArchive *pak = jce_pak_open_file(bundle);
+            TEST_ASSERT_NOT_NULL(pak);
+            const JcePakAsset *raw = jce_pak_find(pak, "shared.bin");
+            const bool expect_payload = threshold == 3 ? is_scene : !is_scene;
+            TEST_ASSERT_EQUAL_INT_MESSAGE(expect_payload, raw != NULL,
+                "shared threshold dropped or misplaced ordinary dependency");
+            if (raw) {
+                char bytes[128];
+                TEST_ASSERT_EQUAL_size_t(strlen(payload), jce_pak_decompress(raw, bytes, sizeof(bytes)));
+                TEST_ASSERT_EQUAL_MEMORY(payload, bytes, strlen(payload));
+                ++payload_copies;
+            }
+            if (is_scene) {
+                ++scene_count;
+                TEST_ASSERT_NULL(jce_pak_find(pak, k_test_pipeline_address));
+                TEST_ASSERT_EQUAL_UINT32(1, jce_bundle_catalog_dep_count(catalog, id));
+                TEST_ASSERT_TRUE(jce_bundle_mount(catalog, id));
+                uint64_t size = 0;
+                void *bytes = jce_fs_read_all(fs, k_test_pipeline_address, &size);
+                TEST_ASSERT_NOT_NULL(bytes);
+                TEST_ASSERT_EQUAL_UINT64(strlen(k_test_pipeline), size);
+                TEST_ASSERT_EQUAL_MEMORY(k_test_pipeline, bytes, (size_t)size);
+                jce_fs_buffer_free(bytes);
+                TEST_ASSERT_TRUE(jce_bundle_unmount(catalog, id));
+            } else {
+                assert_pipeline_bytes(pak);
+                ++policy_copies;
+            }
+            jce_pak_close(pak);
+        }
+        TEST_ASSERT_EQUAL_INT(2, scene_count);
+        TEST_ASSERT_EQUAL_INT(1, policy_copies);
+        TEST_ASSERT_EQUAL_INT(threshold == 3 ? 2 : 1, payload_copies);
+        jce_bundle_catalog_close(catalog);
+        jce_fs_destroy(fs);
+    }
+    TEST_ASSERT_EQUAL_INT(0, g_error_count);
 }
 
 int main(void)
@@ -1193,5 +1455,10 @@ int main(void)
     RUN_TEST(test_pack_env_scenes);
     RUN_TEST(test_always_included_reaches_the_bundle);
     RUN_TEST(test_shader_alternative_source_and_unknown_required);
+    RUN_TEST(test_project_pipeline_is_one_canonical_root_and_overlay_readable);
+    RUN_TEST(test_canonical_pipeline_only_and_equal_source_deduplicate);
+    RUN_TEST(test_project_pipeline_conflict_refuses_before_publication);
+    RUN_TEST(test_present_invalid_project_pipeline_never_falls_back);
+    RUN_TEST(test_catalog_threshold_preserves_local_assets_and_shared_boot_policy);
     return UNITY_END();
 }

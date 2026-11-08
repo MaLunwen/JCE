@@ -136,7 +136,7 @@ static bool sb_write_group(const JceStaticBatchInstance *inst,
         memcpy(in[i].world, inst[idx[i]].world, sizeof in[i].world);
     }
 
-    JceMeshMergeResult merged;
+    JceMeshMergeResult merged = {0};
     JceMeshMergeSpan  *spans = (JceMeshMergeSpan *)
         JCE_MALLOC((size_t)n * sizeof *spans);
     const bool ok_merge = spans && jce_mesh_merge_spans(in, n, &merged, spans);
@@ -147,6 +147,7 @@ static bool sb_write_group(const JceStaticBatchInstance *inst,
     const int pn = snprintf(path, sizeof path, "%s/%s_%u.glb",
                             out_dir_host, name_prefix, group_index);
     if (pn <= 0 || (size_t)pn >= sizeof path) {
+        JCE_FREE(spans);
         jce_mesh_merge_free(&merged);
         LOG_ERROR(LOG_TAG, "output path too long for group %u", group_index);
         return false;

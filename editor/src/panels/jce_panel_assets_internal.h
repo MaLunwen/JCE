@@ -103,6 +103,8 @@ extern AssetBrowserState s_assets;
 std::string normalized_path_string(const std::string &p);
 void        ensure_assets_init(void);
 void        refresh_entries(void);
+/* Explicit resource refresh is completed by the asset-index owner. */
+void        request_asset_resource_refresh(void);
 void        navigate_asset_directory(const std::string &path, bool clear_search);
 bool        asset_browser_can_use_root(const std::string &path);
 bool        set_asset_browser_simulated_root(const std::string &path);

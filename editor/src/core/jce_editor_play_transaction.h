@@ -31,4 +31,11 @@ bool jce_editor_play_create(bool &valid, Create create, Teardown teardown,
     jce_editor_play_restore(valid, restore, discard);
     return false;
 }
+/* Host exit reuses Stop before releasing its borrowed view/scene services. */
+template<class Stop, class Shutdown>
+void jce_editor_exit_after_play(bool play_active, Stop stop, Shutdown shutdown)
+{
+    if (play_active) stop();
+    shutdown();
+}
 #endif

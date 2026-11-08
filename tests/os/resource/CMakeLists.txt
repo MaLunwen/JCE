@@ -22,6 +22,7 @@ jce_add_unit_test(test_jce_bundle_pack
     SOURCES test_jce_bundle_pack.c
     LINK    jce_core jce_resource)
 target_include_directories(test_jce_bundle_pack PRIVATE "${CMAKE_SOURCE_DIR}/engine/src")
+include(bundle_partition_controls.cmake)
 if(TARGET cjson::cjson)
     target_link_libraries(test_jce_bundle_pack PRIVATE cjson::cjson)
 endif()
@@ -32,6 +33,63 @@ jce_add_unit_test(test_jce_bundle_loader
 if(TARGET xxHash::xxhash)
     target_link_libraries(test_jce_bundle_loader PRIVATE xxHash::xxhash)
 endif()
+
+# Actual public Bundle/Pak/VFS same-handle admission, including legacy provider
+# restoration and opaque custom providers. This is not a custom-decoder sandbox.
+jce_add_unit_test(test_jce_bundle_inspection_mount
+    SOURCES test_jce_bundle_inspection_mount.c
+    LINK jce_core jce_resource)
+target_compile_definitions(test_jce_bundle_inspection_mount PRIVATE
+    JCE_BUNDLE_INSPECTION_FIXTURE_NAMESPACE="test_jce_bundle_inspection_mount")
+
+# Single-owner mutations retain the exact unchanged fixture and actual library
+# dependencies. A configure-time byte delta checks the exact number of wires;
+# CTest WILL_FAIL still requires inspection of normal Unity assertion exits.
+function(_jce_bundle_inspection_negative NAME OWNER WIRE REPLACEMENT COUNT)
+    set(_owner "${CMAKE_SOURCE_DIR}/${OWNER}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_owner}")
+    file(READ "${_owner}" _source)
+    string(REPLACE "${WIRE}" "${REPLACEMENT}" _mutant "${_source}")
+    string(LENGTH "${_source}" _before)
+    string(LENGTH "${_mutant}" _after)
+    string(LENGTH "${WIRE}" _wire_size)
+    string(LENGTH "${REPLACEMENT}" _replacement_size)
+    math(EXPR _actual "${_before} - ${_after}")
+    math(EXPR _expected "(${_wire_size} - ${_replacement_size}) * ${COUNT}")
+    if(_expected EQUAL 0 OR NOT _actual EQUAL _expected)
+        message(FATAL_ERROR "Expected exactly ${COUNT} actual admission wire(s) for ${NAME}")
+    endif()
+    set(_file "${CMAKE_CURRENT_BINARY_DIR}/${NAME}_owner.c")
+    jce_test_write_if_changed("${_file}" "${_mutant}")
+    get_filename_component(_owner_dir "${_owner}" DIRECTORY)
+    jce_add_unit_test(${NAME}
+        KIND contract
+        SOURCES test_jce_bundle_inspection_mount.c "${_file}"
+        LINK jce_core jce_resource sdl::sdl physfs-static cjson::cjson xxHash::xxhash
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${_owner_dir}")
+    target_compile_definitions(${NAME} PRIVATE JCE_BUNDLE_INSPECTION_FIXTURE_NAMESPACE="${NAME}")
+    set_tests_properties(${NAME} PROPERTIES WILL_FAIL TRUE)
+endfunction()
+_jce_bundle_inspection_negative(test_jce_bundle_inspection_missing_mark
+    "engine/src/resource/jce_bundle_loader.c"
+    "if (inspection_only) jce_pak_mark_inspection_only_internal(pak);"
+    "(void)inspection_only;" 1)
+_jce_bundle_inspection_negative(test_jce_bundle_inspection_missing_mount_guard
+    "engine/src/os/core/jce_filesystem.c"
+    "if (s_pak_service.current_mount_allowed && !s_pak_service.current_mount_allowed(pak)) return false;"
+    "/* old mount admission */" 2)
+_jce_bundle_inspection_negative(test_jce_bundle_inspection_missing_fallback_guard
+    "engine/src/resource/jce_pak_loader.c"
+    "if (!pak_mount_allowed(base) || !pak_mount_allowed(layer)) return;"
+    "/* old fallback admission */" 1)
+_jce_bundle_inspection_negative(test_jce_bundle_inspection_missing_no_provider_guard
+    "engine/src/os/core/jce_filesystem.c"
+    "if (!s_pak_service.current_provider) return false;"
+    "/* old unregistered provider admission */" 2)
+_jce_bundle_inspection_negative(test_jce_bundle_inspection_missing_shared_tail_guard
+    "engine/src/resource/jce_pak_loader.c"
+    "if (tail == layer_tail) return;"
+    "/* old tail join */" 1)
 
 jce_add_unit_test(test_jce_archive
     SOURCES test_jce_archive.c
@@ -84,6 +142,145 @@ target_include_directories(test_jce_cook_incremental PRIVATE
     "${CMAKE_SOURCE_DIR}/tools")
 if(TARGET xxHash::xxhash)
     target_link_libraries(test_jce_cook_incremental PRIVATE xxHash::xxhash)
+endif()
+
+# Actual Web/mobile texture outputs and legacy-cache migration. Compile each
+# complete legacy/CLI owner once and reuse it across the unchanged assertions.
+# This is CPU decode/cook/archive evidence, never renderer or browser acceptance.
+if(TARGET jce_tool_cli_io)
+    set(_cook_fixture_dir "${CMAKE_CURRENT_BINARY_DIR}/cook-platform-owners")
+    set(_cook_resource_dir "${CMAKE_SOURCE_DIR}/engine/src/resource")
+    file(MAKE_DIRECTORY "${_cook_fixture_dir}/legacy" "${_cook_fixture_dir}/old-web")
+    foreach(_cook_owner jce_asset_cooker.c jce_bundle_pack_cook.c jce_bundle_pack.c jce_cook_policy.h)
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+            "${_cook_resource_dir}/${_cook_owner}")
+    endforeach()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/tools/jce_cook.c")
+    file(READ "${_cook_resource_dir}/jce_cook_policy.h" _cook_policy)
+    file(READ "${_cook_resource_dir}/jce_asset_cooker.c" _cook_asset)
+    file(READ "${_cook_resource_dir}/jce_bundle_pack_cook.c" _cook_bundle_asset)
+    file(READ "${_cook_resource_dir}/jce_bundle_pack.c" _cook_bundle)
+    file(READ "${CMAKE_SOURCE_DIR}/tools/jce_cook.c" _cook_cli)
+    # FIND/REVERSE count the single full wire, even for same-byte-length salts;
+    # REGEX MATCHALL/list counting would split C statements on semicolons.
+    function(_jce_cook_exact_mutation INPUT WIRE REPLACEMENT OUT)
+        string(FIND "${INPUT}" "${WIRE}" _first)
+        string(FIND "${INPUT}" "${WIRE}" _last REVERSE)
+        if(_first LESS 0 OR NOT _first EQUAL _last)
+            message(FATAL_ERROR "Expected one actual cook wire: ${WIRE}")
+        endif()
+        string(REPLACE "${WIRE}" "${REPLACEMENT}" _changed "${INPUT}")
+        if("${_changed}" STREQUAL "${INPUT}")
+            message(FATAL_ERROR "Actual cook wire mutation was not applied")
+        endif()
+        set(${OUT} "${_changed}" PARENT_SCOPE)
+    endfunction()
+    _jce_cook_exact_mutation("${_cook_policy}"
+        "case JCE_COOK_PLATFORM_WEB:\n        return JCEASSET_TEXFMT_RGBA8;"
+        "case JCE_COOK_PLATFORM_WEB:\n        return JCEASSET_TEXFMT_ASTC_4x4;" _cook_old_policy)
+    _jce_cook_exact_mutation("${_cook_bundle}" "uint32_t writer_revision = 4u;"
+        "uint32_t writer_revision = 3u;" _cook_old_bundle_salt)
+    _jce_cook_exact_mutation("${_cook_cli}" "uint8_t sv = 3u;"
+        "uint8_t sv = 2u;" _cook_old_cli_salt)
+    # Copied whole CLI owners need the same private include expressed relative
+    # to the inherited src root; this rebases only its source-location spelling.
+    string(REPLACE "../engine/src/resource/jce_audio_import_settings.h"
+        "resource/jce_audio_import_settings.h" _cook_old_cli_salt "${_cook_old_cli_salt}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/legacy/jce_cook_policy.h" "${_cook_old_policy}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/old-web/jce_cook_policy.h" "${_cook_old_policy}")
+    set(_cook_legacy_names [=[#define jce_cook_texture jce_legacy_cook_texture
+#define jce_cook_audio jce_legacy_cook_audio
+#define jce_cook_raw jce_legacy_cook_raw
+#define jce_cook_file jce_legacy_cook_file
+#define jce_cook_result_free jce_legacy_cook_result_free
+#define jce_cook_write jce_legacy_cook_write
+#define jce_cook_detect_type jce_legacy_cook_detect_type
+]=])
+    set(_cook_legacy_bundle_names [=[#define jce_bundle_pack_run jce_legacy_bundle_pack_run
+#define jce_bundle_pack_diff jce_legacy_bundle_pack_diff
+#define jce_bundle_cook_asset jce_legacy_bundle_cook_asset
+#define jce_bundle_cook_jobs_range jce_legacy_bundle_cook_jobs_range
+#define pack_log_info jce_legacy_pack_log_info
+#define read_asset jce_legacy_read_asset
+#define ends_with_ci jce_legacy_ends_with_ci
+]=])
+    # MSVC stdio supplies inline printf definitions: process its actual header
+    # before redirecting call sites, never rename the CRT declaration/body.
+    set(_cook_stdout_port [=[#include <stdio.h>
+int jce_test_cook_platform_printf(const char *format, ...);
+#define printf jce_test_cook_platform_printf
+]=])
+    jce_test_write_if_changed("${_cook_fixture_dir}/cli.c"
+        "${_cook_stdout_port}#include \"${CMAKE_SOURCE_DIR}/tools/jce_cook.c\"\n")
+    jce_test_write_if_changed("${_cook_fixture_dir}/legacy/asset.c" "${_cook_legacy_names}${_cook_asset}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/legacy/bundle_asset.c"
+        "${_cook_legacy_names}${_cook_legacy_bundle_names}${_cook_bundle_asset}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/legacy/bundle.c"
+        "${_cook_legacy_bundle_names}${_cook_old_bundle_salt}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/legacy/cli.c"
+        "${_cook_stdout_port}#define jce_tool_main jce_legacy_cook_tool_main\n${_cook_legacy_names}${_cook_old_cli_salt}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/old-web/asset.c" "${_cook_asset}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/old-web/bundle_asset.c" "${_cook_bundle_asset}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/old_cli_salt.c" "${_cook_stdout_port}${_cook_old_cli_salt}")
+    jce_test_write_if_changed("${_cook_fixture_dir}/old_bundle_salt.c" "${_cook_old_bundle_salt}")
+    function(_jce_cook_cpu_owner NAME)
+        add_library(${NAME} OBJECT ${ARGN})
+        set_target_properties(${NAME} PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED YES C_EXTENSIONS OFF)
+        target_include_directories(${NAME} PRIVATE
+            "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/engine/src/resource"
+            "${CMAKE_SOURCE_DIR}/tools")
+        target_link_libraries(${NAME} PRIVATE jce_resource sdl::sdl miniaudio::miniaudio
+            cgltf::cgltf cjson::cjson xxHash::xxhash)
+        target_compile_definitions(${NAME} PRIVATE JCE_BUILDING_ENGINE=1)
+    endfunction()
+    _jce_cook_cpu_owner(jce_test_cook_platform_helpers
+        "${CMAKE_SOURCE_DIR}/tools/jce_cook_atlas.c" "${CMAKE_SOURCE_DIR}/tools/jce_cook_catalog.c")
+    _jce_cook_cpu_owner(jce_test_cook_platform_cli "${_cook_fixture_dir}/cli.c")
+    _jce_cook_cpu_owner(jce_test_cook_platform_legacy
+        "${_cook_fixture_dir}/legacy/asset.c" "${_cook_fixture_dir}/legacy/bundle_asset.c"
+        "${_cook_fixture_dir}/legacy/bundle.c" "${_cook_fixture_dir}/legacy/cli.c")
+    _jce_cook_cpu_owner(jce_test_cook_platform_old_web
+        "${_cook_fixture_dir}/old-web/asset.c" "${_cook_fixture_dir}/old-web/bundle_asset.c")
+    _jce_cook_cpu_owner(jce_test_cook_platform_old_cli_salt "${_cook_fixture_dir}/old_cli_salt.c")
+    _jce_cook_cpu_owner(jce_test_cook_platform_old_bundle_salt "${_cook_fixture_dir}/old_bundle_salt.c")
+    function(_jce_cook_output_fixture NAME KIND)
+        jce_add_unit_test(${NAME} KIND ${KIND}
+            SOURCES test_jce_cook_platform_outputs.c
+                $<TARGET_OBJECTS:jce_test_cook_platform_helpers>
+                $<TARGET_OBJECTS:jce_test_cook_platform_legacy> ${ARGN}
+            LINK jce_core jce_resource jce_physics jce_platform jce_tool_cli_io
+            INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/tools")
+        target_compile_definitions(${NAME} PRIVATE JCE_COOK_PLATFORM_FIXTURE_NAMESPACE="${NAME}")
+    endfunction()
+    _jce_cook_output_fixture(test_jce_cook_platform_outputs integration
+        $<TARGET_OBJECTS:jce_test_cook_platform_cli>)
+    _jce_cook_output_fixture(test_jce_cook_platform_old_web_default contract
+        $<TARGET_OBJECTS:jce_test_cook_platform_cli> $<TARGET_OBJECTS:jce_test_cook_platform_old_web>)
+    _jce_cook_output_fixture(test_jce_cook_platform_old_cli_salt contract
+        $<TARGET_OBJECTS:jce_test_cook_platform_old_cli_salt>)
+    _jce_cook_output_fixture(test_jce_cook_platform_old_bundle_salt contract
+        $<TARGET_OBJECTS:jce_test_cook_platform_cli> $<TARGET_OBJECTS:jce_test_cook_platform_old_bundle_salt>)
+    set_tests_properties(test_jce_cook_platform_old_web_default
+        test_jce_cook_platform_old_cli_salt test_jce_cook_platform_old_bundle_salt
+        PROPERTIES WILL_FAIL TRUE)
+    unset(_cook_fixture_dir)
+    unset(_cook_resource_dir)
+    unset(_cook_owner)
+    unset(_cook_policy)
+    unset(_cook_asset)
+    unset(_cook_bundle_asset)
+    unset(_cook_bundle)
+    unset(_cook_cli)
+    unset(_cook_old_policy)
+    unset(_cook_old_bundle_salt)
+    unset(_cook_old_cli_salt)
+    unset(_cook_stdout_port)
+    unset(_cook_legacy_names)
+    unset(_cook_legacy_bundle_names)
+else()
+    jce_test_suite_skipped("engine/cook-platform-outputs"
+        "actual host CLI I/O target unavailable; CPU product controls are not registered")
 endif()
 
 # REF-007 (dedup audit) — the asset manager's registry key must share the
@@ -240,7 +437,7 @@ if(_csn_have_cook AND _csn_have_pak)
     # by hand here (same as tests/scripting/java's differential runner).
     set_tests_properties(cook_script_names_setup PROPERTIES
         TIMEOUT        300
-        LABELS         "unit"
+        LABELS         "unit" JCE_TEST_KIND integration
         FIXTURES_SETUP cook_script_names
         ENVIRONMENT    "${JCE_TEST_ENVIRONMENT}")
     set_property(GLOBAL APPEND PROPERTY JCE_TESTS_WITH_ENV
@@ -274,7 +471,7 @@ if(_csn_have_cook AND _csn_have_pak)
                 "cook trap gate: ${_csn_tool} is IMPORTED (host tool from "
                 "another build) — not added to the jce_tests closure")
         else()
-            add_dependencies(jce_tests ${_csn_tool})
+            jce_test_build_dependencies(${_csn_tool})
         endif()
     endforeach()
     unset(_csn_imported)
@@ -339,3 +536,274 @@ target_include_directories(test_jce_audio_import_settings PRIVATE
 jce_add_unit_test(test_jce_curve
     SOURCES test_jce_curve.c
     LINK    jce_core jce_resource)
+
+# Real asset manager/loaders with counted font/audio/allocation ports; no GPU/device.
+jce_add_unit_test(test_jce_asset_font_params
+    SOURCES test_jce_asset_font_params.c
+        "${CMAKE_SOURCE_DIR}/engine/src/resource/jce_asset_loaders.c"
+    LINK jce_core jce_resource
+    INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/stubs"
+        "${CMAKE_SOURCE_DIR}/engine/src")
+# Scope counted audio ports to the fixture and its exact loader TU. The linked
+# real audio archive retains its public symbols and all manager/VFS owners.
+target_compile_definitions(test_jce_asset_font_params PRIVATE
+    jce_audio_load=jce_test_resource_audio_load
+    jce_audio_load_pcm=jce_test_resource_audio_load_pcm
+    jce_audio_unload=jce_test_resource_audio_unload)
+if(TARGET xxHash::xxhash)
+    target_link_libraries(test_jce_asset_font_params PRIVATE xxHash::xxhash)
+endif()
+# The exact private loader header uses SDL atomic declarations. Keep these
+# compile includes local to the fixture; core/SDK public includes remain clean.
+if(TARGET SDL3::Headers)
+    target_link_libraries(test_jce_asset_font_params PRIVATE SDL3::Headers)
+else()
+    set(_asset_font_sdl_headers "")
+    foreach(_asset_font_sdl_target SDL3::SDL3 sdl::sdl)
+        if(TARGET ${_asset_font_sdl_target})
+            get_target_property(_asset_font_sdl_headers ${_asset_font_sdl_target}
+                INTERFACE_INCLUDE_DIRECTORIES)
+            if(_asset_font_sdl_headers)
+                break()
+            endif()
+        endif()
+    endforeach()
+    if(NOT _asset_font_sdl_headers)
+        message(FATAL_ERROR "asset font fixture requires the configured SDL header interface")
+    endif()
+    target_include_directories(test_jce_asset_font_params SYSTEM PRIVATE
+        ${_asset_font_sdl_headers})
+    unset(_asset_font_sdl_headers)
+    unset(_asset_font_sdl_target)
+endif()
+
+# Exact host pack-tool TU with real public Bundle/Archive owners, never bootstrap.
+# CPU closure/provenance/integrity controls do not certify a relocated application.
+if(TARGET jce_tool_cli_io)
+    jce_add_unit_test(test_jce_pak_selected_archive
+        KIND integration
+        SOURCES test_jce_pak_selected_archive.c
+            "${CMAKE_SOURCE_DIR}/tools/jce_pak.c"
+        LINK jce_core jce_resource jce_platform jce_tool_cli_io
+            cjson::cjson xxHash::xxhash zstd::libzstd_static
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src"
+            "${CMAKE_SOURCE_DIR}/tools")
+    target_compile_definitions(test_jce_pak_selected_archive PRIVATE
+        JCE_PAK_SELECTED_FIXTURE_BASE="${CMAKE_CURRENT_BINARY_DIR}/selected-archive-fixtures")
+
+    # Compile the actual tool with only the verified report-address wire removed.
+    # Count its semicolon-free signature; CMake lists split C statements at ';'.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/tools/jce_pak.c")
+    file(READ "${CMAKE_SOURCE_DIR}/tools/jce_pak.c" _pak_bom_source)
+    string(REGEX MATCHALL [[p = sources\[s\]\.rel_path]]
+        _pak_bom_name_wires "${_pak_bom_source}")
+    list(LENGTH _pak_bom_name_wires _pak_bom_name_wire_count)
+    if(NOT _pak_bom_name_wire_count EQUAL 1)
+        message(FATAL_ERROR "Expected one actual verified pack BOM address wire")
+    endif()
+    string(REPLACE "p = sources[s].rel_path;" "p = NULL;"
+        _pak_bom_mutant "${_pak_bom_source}")
+    if("${_pak_bom_mutant}" STREQUAL "${_pak_bom_source}")
+        message(FATAL_ERROR "Actual pack BOM address mutation was not applied")
+    endif()
+    set(_pak_bom_mutant_file "${CMAKE_CURRENT_BINARY_DIR}/jce_pak_missing_bom_source_names.c")
+    jce_test_write_if_changed("${_pak_bom_mutant_file}" "${_pak_bom_mutant}")
+    jce_add_unit_test(test_jce_pak_selected_archive_missing_bom_source_names
+        KIND integration
+        SOURCES test_jce_pak_selected_archive.c "${_pak_bom_mutant_file}"
+        LINK jce_core jce_resource jce_platform jce_tool_cli_io
+            cjson::cjson xxHash::xxhash zstd::libzstd_static
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/tools")
+    target_compile_definitions(test_jce_pak_selected_archive_missing_bom_source_names PRIVATE
+        JCE_PAK_SELECTED_FIXTURE_BASE="${CMAKE_CURRENT_BINARY_DIR}/missing-bom-source-names-fixtures")
+    set_tests_properties(test_jce_pak_selected_archive_missing_bom_source_names
+        PROPERTIES WILL_FAIL TRUE)
+    # Restore only the tool's former host-as-target dispatch. Runtime policy
+    # and unchanged real Bundle/Archive assertions remain independent.
+    set(_pak_target_wire "selected->target = expected_target;")
+    string(REPLACE "${_pak_target_wire}" "selected->target = NULL;"
+        _pak_host_target_mutant "${_pak_bom_source}")
+    string(LENGTH "${_pak_bom_source}" _pak_target_before)
+    string(LENGTH "${_pak_host_target_mutant}" _pak_target_after)
+    string(LENGTH "${_pak_target_wire}" _pak_target_wire_size)
+    string(LENGTH "selected->target = NULL;" _pak_target_old_size)
+    math(EXPR _pak_target_delta "${_pak_target_before} - ${_pak_target_after}")
+    math(EXPR _pak_target_expected "${_pak_target_wire_size} - ${_pak_target_old_size}")
+    if(NOT _pak_target_delta EQUAL _pak_target_expected)
+        message(FATAL_ERROR "Expected exactly one selected target dispatch wire")
+    endif()
+    set(_pak_host_target_file "${CMAKE_CURRENT_BINARY_DIR}/jce_pak_old_host_target.c")
+    jce_test_write_if_changed("${_pak_host_target_file}" "${_pak_host_target_mutant}")
+    jce_add_unit_test(test_jce_pak_selected_archive_old_host_target
+        KIND integration
+        SOURCES test_jce_pak_selected_archive.c "${_pak_host_target_file}"
+        LINK jce_core jce_resource jce_platform jce_tool_cli_io
+            cjson::cjson xxHash::xxhash zstd::libzstd_static
+        INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/tools")
+    target_compile_definitions(test_jce_pak_selected_archive_old_host_target PRIVATE
+        JCE_PAK_SELECTED_FIXTURE_BASE="${CMAKE_CURRENT_BINARY_DIR}/old-host-target-fixtures")
+    set_tests_properties(test_jce_pak_selected_archive_old_host_target PROPERTIES WILL_FAIL TRUE)
+    unset(_pak_target_wire)
+    unset(_pak_host_target_mutant)
+    unset(_pak_target_before)
+    unset(_pak_target_after)
+    unset(_pak_target_wire_size)
+    unset(_pak_target_old_size)
+    unset(_pak_target_delta)
+    unset(_pak_target_expected)
+    unset(_pak_host_target_file)
+    # Each control changes one guard in the complete actual single-entry owner.
+    foreach(_read_variant IN ITEMS missing_read_limit missing_read_crc overwrite_read_output)
+        if(_read_variant STREQUAL "missing_read_limit")
+            set(_read_wire "entry->original_size > 16u * 1024u * 1024u")
+            set(_read_old "0")
+        elseif(_read_variant STREQUAL "missing_read_crc")
+            set(_read_wire "jce_archive_verify_entry(entry, bytes, size);")
+            set(_read_old "1;")
+        else()
+            set(_read_wire "jce_fs_host_write_new(out, bytes, size)")
+            set(_read_old "jce_fs_host_write_all(out, bytes, size)")
+        endif()
+        string(REPLACE "${_read_wire}" "${_read_old}" _read_mutant "${_pak_bom_source}")
+        string(LENGTH "${_pak_bom_source}" _read_before)
+        string(REPLACE "${_read_wire}" "" _read_without "${_pak_bom_source}")
+        string(LENGTH "${_read_without}" _read_after)
+        string(LENGTH "${_read_wire}" _read_wire_size)
+        string(LENGTH "${_read_old}" _read_old_size)
+        math(EXPR _read_delta "${_read_before} - ${_read_after}")
+        if(NOT _read_delta EQUAL _read_wire_size)
+            message(FATAL_ERROR "Expected exactly one actual single-entry ${_read_variant} wire")
+        endif()
+        set(_read_file "${CMAKE_CURRENT_BINARY_DIR}/jce_pak_${_read_variant}.c")
+        jce_test_write_if_changed("${_read_file}" "${_read_mutant}")
+        jce_add_unit_test(test_jce_pak_selected_archive_${_read_variant}
+            KIND integration
+            SOURCES test_jce_pak_selected_archive.c "${_read_file}"
+            LINK jce_core jce_resource jce_platform jce_tool_cli_io
+                cjson::cjson xxHash::xxhash zstd::libzstd_static
+            INCLUDES "${CMAKE_SOURCE_DIR}/engine/src" "${CMAKE_SOURCE_DIR}/tools")
+        target_compile_definitions(test_jce_pak_selected_archive_${_read_variant} PRIVATE
+            JCE_PAK_SELECTED_FIXTURE_BASE="${CMAKE_CURRENT_BINARY_DIR}/${_read_variant}-fixtures")
+        set_tests_properties(test_jce_pak_selected_archive_${_read_variant} PROPERTIES WILL_FAIL TRUE)
+    endforeach()
+    unset(_read_variant)
+    unset(_read_wire)
+    unset(_read_old)
+    unset(_read_mutant)
+    unset(_read_before)
+    unset(_read_after)
+    unset(_read_wire_size)
+    unset(_read_old_size)
+    unset(_read_delta)
+    unset(_read_without)
+    unset(_read_file)
+    unset(_pak_bom_source)
+    unset(_pak_bom_name_wires)
+    unset(_pak_bom_name_wire_count)
+    unset(_pak_bom_mutant)
+    unset(_pak_bom_mutant_file)
+else()
+    jce_test_suite_skipped("engine/pak-selected-archive"
+        "real host CLI I/O object target is unavailable in this configuration")
+endif()
+
+# Explicit native CLI negative for the suffix limit controls in the existing
+# host-tool unittest. Reuse the actual packer's complete source/link recipe.
+# Only the two new refusal guards are removed, leaving the old bounded copy
+# and ignored-overflow behavior intact. Never install this test-only tool.
+if(TARGET jce_pak AND NOT CMAKE_CROSSCOMPILING)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/tools/jce_pak.c")
+    file(READ "${CMAKE_SOURCE_DIR}/tools/jce_pak.c" _pak_suffix_source)
+    set(_pak_suffix_refusal [=[            if (a.exclude_suffix_count >= 16) {
+                fprintf(stderr, "[jce_pak] --exclude-suffix accepts at most 16 values\n");
+                exit(1);
+            }
+            if (strlen(val) >= sizeof(a.exclude_suffixes[0])) {
+                fprintf(stderr, "[jce_pak] --exclude-suffix value is %zu bytes; maximum %zu bytes\n",
+                        strlen(val), sizeof(a.exclude_suffixes[0]) - 1);
+                exit(1);
+            }
+]=])
+    string(REPLACE "${_pak_suffix_refusal}" "" _pak_suffix_mutant "${_pak_suffix_source}")
+    if("${_pak_suffix_mutant}" STREQUAL "${_pak_suffix_source}")
+        message(FATAL_ERROR "Expected actual --exclude-suffix refusal guards")
+    endif()
+    string(LENGTH "${_pak_suffix_source}" _pak_suffix_source_length)
+    string(LENGTH "${_pak_suffix_mutant}" _pak_suffix_mutant_length)
+    string(LENGTH "${_pak_suffix_refusal}" _pak_suffix_refusal_length)
+    math(EXPR _pak_suffix_removed_length "${_pak_suffix_source_length} - ${_pak_suffix_mutant_length}")
+    if(NOT _pak_suffix_removed_length EQUAL _pak_suffix_refusal_length)
+        message(FATAL_ERROR "Expected exactly one actual --exclude-suffix refusal block")
+    endif()
+    set(_pak_suffix_mutant_file "${CMAKE_CURRENT_BINARY_DIR}/jce_pak_old_exclude_suffix_wire.c")
+    file(WRITE "${_pak_suffix_mutant_file}" "${_pak_suffix_mutant}")
+    get_target_property(_pak_suffix_sources jce_pak SOURCES)
+    set(_pak_suffix_owners "${_pak_suffix_sources}")
+    list(FILTER _pak_suffix_owners INCLUDE REGEX "/tools/jce_pak\\.c$")
+    list(LENGTH _pak_suffix_owners _pak_suffix_owner_count)
+    if(NOT _pak_suffix_owner_count EQUAL 1)
+        message(FATAL_ERROR "Expected one actual jce_pak translation unit")
+    endif()
+    list(REMOVE_ITEM _pak_suffix_sources ${_pak_suffix_owners})
+    list(APPEND _pak_suffix_sources "${_pak_suffix_mutant_file}")
+    add_executable(test_jce_pak_old_exclude_suffix_wire EXCLUDE_FROM_ALL ${_pak_suffix_sources})
+    set_property(TARGET test_jce_pak_old_exclude_suffix_wire PROPERTY
+        JCE_PAK_SUFFIX_MUTANT_SOURCE "${_pak_suffix_mutant_file}")
+    # The root admits pristine host-tool headers/dependencies after tests have
+    # configured. Copy the final actual recipe only after that late admission.
+    function(_jce_pak_suffix_inherit_final_recipe)
+        foreach(_property IN ITEMS
+                C_STANDARD C_STANDARD_REQUIRED C_EXTENSIONS MSVC_RUNTIME_LIBRARY
+                INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS
+                LINK_LIBRARIES LINK_OPTIONS LINK_FLAGS)
+            get_target_property(_value jce_pak "${_property}")
+            if(NOT _value STREQUAL "_value-NOTFOUND")
+                set_property(TARGET test_jce_pak_old_exclude_suffix_wire
+                    PROPERTY "${_property}" "${_value}")
+            endif()
+        endforeach()
+        get_target_property(_prerequisites jce_pak MANUALLY_ADDED_DEPENDENCIES)
+        if(_prerequisites)
+            add_dependencies(test_jce_pak_old_exclude_suffix_wire ${_prerequisites})
+        endif()
+        # Source properties are directory-scoped. Preserve their visibility in
+        # the test target's directory, including the relocated complete owner.
+        get_target_property(_sources jce_pak SOURCES)
+        get_target_property(_mutant test_jce_pak_old_exclude_suffix_wire JCE_PAK_SUFFIX_MUTANT_SOURCE)
+        foreach(_source IN LISTS _sources)
+            set(_test_source "${_source}")
+            if(_source STREQUAL "${CMAKE_SOURCE_DIR}/tools/jce_pak.c")
+                set(_test_source "${_mutant}")
+            endif()
+            foreach(_property IN ITEMS
+                    COMPILE_DEFINITIONS INCLUDE_DIRECTORIES COMPILE_OPTIONS
+                    COMPILE_FLAGS LANGUAGE OBJECT_DEPENDS)
+                get_source_file_property(_value "${_source}" TARGET_DIRECTORY jce_pak "${_property}")
+                if(NOT _value STREQUAL "NOTFOUND")
+                    set_source_files_properties("${_test_source}"
+                        TARGET_DIRECTORY test_jce_pak_old_exclude_suffix_wire
+                        PROPERTIES "${_property}" "${_value}")
+                endif()
+            endforeach()
+        endforeach()
+        # Quoted CLI headers normally resolve beside the production source.
+        target_include_directories(test_jce_pak_old_exclude_suffix_wire PRIVATE "${JCE_TOOLS_DIR}")
+    endfunction()
+    cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL _jce_pak_suffix_inherit_final_recipe)
+    set_target_properties(test_jce_pak_old_exclude_suffix_wire PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/host-pak-suffix-controls")
+    jce_configure_test_link_pool(test_jce_pak_old_exclude_suffix_wire)
+    unset(_pak_suffix_source)
+    unset(_pak_suffix_refusal)
+    unset(_pak_suffix_mutant)
+    unset(_pak_suffix_source_length)
+    unset(_pak_suffix_mutant_length)
+    unset(_pak_suffix_refusal_length)
+    unset(_pak_suffix_removed_length)
+    unset(_pak_suffix_mutant_file)
+    unset(_pak_suffix_sources)
+    unset(_pak_suffix_owners)
+    unset(_pak_suffix_owner_count)
+endif()

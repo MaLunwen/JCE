@@ -24,19 +24,28 @@ Run:
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MODULE_PATH = REPO_ROOT / "tools" / "audit" / "check_abi_snapshot.py"
 
 
-def load_module():
+def load_module(source_transform=None):
     spec = importlib.util.spec_from_file_location(
         "jce_check_abi_snapshot", MODULE_PATH)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    if source_transform is None:
+        spec.loader.exec_module(mod)
+    else:
+        source = source_transform(MODULE_PATH.read_text(encoding="utf-8"))
+        exec(compile(source, str(MODULE_PATH), "exec"), mod.__dict__)
     return mod
 
 
@@ -209,6 +218,128 @@ class DiffSeverity(unittest.TestCase):
         d = self.abi.diff_snapshot(before, after)
         self.assertEqual(d["fatal"], 1)
         self.assertEqual(len(d["changed"]), 1)
+
+
+LOCATION_WIRE = '    b_loc = LOCATION_LINE_RE.fullmatch(before)\n    a_loc = LOCATION_LINE_RE.fullmatch(after)\n    if (b_loc is not None and a_loc is not None\n            and b_loc.group("declaration") == a_loc.group("declaration")\n            and b_loc.group("path") != a_loc.group("path")):\n        return "moved", (f"declared in {b_loc.group(\'path\')} -> "\n                         f"{a_loc.group(\'path\')}")\n\n'
+
+
+class HeaderRelocation(unittest.TestCase):
+    """Actual emitter, full diff and CLI; location alone never edits an ABI."""
+
+    FN = "JCE_API uint32_t jce_probe(uint8_t *out, uint32_t cap);\n"
+    FNPTR = "typedef void (*JceProbeFn)(const uint8_t *data, uint32_t size);\n"
+    OPAQUE = "typedef struct JceProbe JceProbe;\n"
+
+    def setUp(self):
+        self.abi = load_module()
+
+    def moved(self, source):
+        before = self.abi.parse_header_text(source, "old/probe.h")
+        after = self.abi.parse_header_text(source, "new/probe.h")
+        self.assertEqual(len(before), 1, before)
+        self.assertEqual(len(after), 1, after)
+        d = self.abi.diff_snapshot(before, after)
+        self.assertEqual(d["fatal"], 0, d)
+        self.assertEqual(len(d["moved"]), 1, d)
+        self.assertEqual(d["drift"], 1, d)  # committed mode still rejects drift
+        self.assertIn("old/probe.h -> new/probe.h", d["moved"][0][1])
+
+    def test_function_relocation_is_moved(self):
+        self.moved(self.FN)
+
+    def test_function_pointer_relocation_is_moved(self):
+        self.moved(self.FNPTR)
+
+    def test_opaque_relocation_is_moved(self):
+        self.moved(self.OPAQUE)
+
+    def test_incompatible_edit_cannot_hide_behind_relocation(self):
+        cases = [
+            (self.FN, self.FN.replace("uint32_t jce_probe", "uint64_t jce_probe")),
+            (self.FN, self.FN.replace("uint32_t cap", "uint64_t cap")),
+            (self.FNPTR, self.FNPTR.replace("uint32_t size", "uint64_t size")),
+            (self.OPAQUE, self.OPAQUE.replace("struct JceProbe", "struct JceOther")),
+            ("typedef enum { A = 0, B } JceEnum;\n",
+             "typedef enum { A = 1, B } JceEnum;\n"),
+            ("typedef struct { uint8_t bytes[4]; int a; } JceRec;\n",
+             "typedef struct { uint8_t bytes[8]; int a; } JceRec;\n"),
+            ("typedef struct { int a; int b; } JceRec;\n",
+             "typedef struct { int b; int a; } JceRec;\n"),
+            ("typedef struct { int a; int b; } JceRec;\n",
+             "typedef struct { int a; int x; int b; } JceRec;\n"),
+            ("typedef struct { int a; int b; } JceRec;\n",
+             "typedef struct { int a; } JceRec;\n"),
+        ]
+        for before, after in cases:
+            with self.subTest(after=after):
+                d = self.abi.diff_snapshot(
+                    self.abi.parse_header_text(before, "old/probe.h"),
+                    self.abi.parse_header_text(after, "new/probe.h"))
+                self.assertEqual(d["fatal"], 1, d)
+                self.assertEqual(len(d["changed"]), 1, d)
+                self.assertEqual(d["moved"], [], d)
+
+    def test_declaration_removal_stays_fatal(self):
+        before = self.abi.parse_header_text(self.FN + self.FNPTR, "old/probe.h")
+        after = self.abi.parse_header_text(self.FNPTR, "new/probe.h")
+        d = self.abi.diff_snapshot(before, after)
+        self.assertEqual(d["removed"], ["fn jce_probe"])
+        self.assertEqual(d["fatal"], 1)
+        self.assertEqual(len(d["moved"]), 1)
+
+    def test_worktree_cli_reports_moves_and_rejects_real_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            baseline = self.abi.parse_header_text(
+                self.FN + self.FNPTR + self.OPAQUE, "old/probe.h")
+            snapshot = root / "baseline.txt"
+            snapshot.write_text("\n".join(baseline) + "\n", encoding="utf-8", newline="\n")
+            header = root / "new" / "probe.h"
+            header.parent.mkdir()
+            source = self.FN + self.FNPTR + self.OPAQUE
+            added = "JCE_API bool jce_added(void);\n"
+            with mock.patch.multiple(self.abi, PUBLIC_ROOT=root, SNAPSHOT=snapshot), \
+                    mock.patch("sys.argv", [str(MODULE_PATH), "--json"]):
+                for source_now, expected_rc, moves, changes in (
+                        (source + added, 0, 3, 0),
+                        (source.replace("uint32_t cap", "uint64_t cap") + added,
+                         1, 2, 1)):
+                    header.write_text(source_now, encoding="utf-8", newline="\n")
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        rc = self.abi.main()
+                    report = json.loads(out.getvalue())
+                    self.assertEqual(rc, expected_rc, report)
+                    self.assertEqual(report["headers"], 1)
+                    self.assertEqual(len(report["moved"]), moves)
+                    self.assertEqual(len(report["changed"]), changes)
+                    self.assertEqual(len(report["added"]), 1)
+                    self.assertEqual(report["removed"], [])
+            self.assertEqual(snapshot.read_text(encoding="utf-8"),
+                             "\n".join(baseline) + "\n")
+
+    def test_omitted_location_wire_fails_ordinary_controls(self):
+        wire = LOCATION_WIRE
+
+        def omit(source):
+            self.assertEqual(source.count(wire), 1)
+            return source.replace(wire, "", 1)
+
+        broken = load_module(omit)
+        suite = unittest.TestSuite()
+        for name in ("test_function_relocation_is_moved",
+                     "test_function_pointer_relocation_is_moved",
+                     "test_opaque_relocation_is_moved"):
+            case = HeaderRelocation(name)
+            case.setUp = lambda case=case: setattr(case, "abi", broken)
+            suite.addTest(case)
+        output = io.StringIO()
+        result = unittest.TextTestRunner(stream=output, verbosity=2).run(suite)
+        self.assertEqual(result.testsRun, 3)
+        self.assertEqual(len(result.failures), 3, output.getvalue())
+        self.assertEqual(result.errors, [], output.getvalue())
+        self.assertEqual(result.skipped, [])
+        self.assertFalse(result.wasSuccessful())
 
 
 class CommittedTreeReader(unittest.TestCase):

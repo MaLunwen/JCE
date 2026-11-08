@@ -117,6 +117,24 @@ JCE_API uint64_t JCE_CALL jce_fs_size(const JceFile *file);
 JCE_API void *JCE_CALL jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
                                        uint64_t *out_size);
 
+/* Explicit archive-only lookup. Unlike ordinary open/read_all, this never
+ * consults global PhysFS directories, the active FS or host fallback. The
+ * first matching PAK entry owns the result; corrupt/oversize data never falls
+ * through to an older archive. Limits apply before allocation/decompression.
+ * out_data=NULL probes metadata only. Otherwise OK returns an owned binary
+ * buffer (with an extra NUL sentinel), released by jce_fs_buffer_free.
+ * Non-OK clears supplied outputs; no match is distinct from failed/overlimit.
+ * max_bytes must be positive and output size must fit size_t plus sentinel. */
+typedef enum JceFsPakReadResult {
+    JCE_FS_PAK_READ_FAILED = 0,
+    JCE_FS_PAK_READ_ABSENT,
+    JCE_FS_PAK_READ_OK,
+    JCE_FS_PAK_READ_OVER_LIMIT
+} JceFsPakReadResult;
+JCE_API JceFsPakReadResult JCE_CALL jce_fs_read_pak_bounded(
+    const JceFileSystem *fs, const char *key, uint64_t max_bytes,
+    void **out_data, uint64_t *out_size);
+
 /* -- Query ---------------------------------------------------------- */
 
 /* Returns true if the virtual path exists in any mounted source. */
@@ -192,6 +210,18 @@ JCE_API bool JCE_CALL jce_fs_host_get_size(const char *path, uint64_t *out_size)
    Returns false if `src` cannot be read or `dst` cannot be written. */
 JCE_API bool JCE_CALL jce_fs_host_copy_file(const char *src, const char *dst);
 
+/* Copy a host file through a bounded 64 KiB buffer to an exclusively created
+   destination, creating missing parent directories. Never replaces an existing
+   file or directory. out_created is required and is cleared before validation;
+   once this call creates dst it stays true even if copying or closing fails.
+   True requires the initially reported source length, terminal EOF and both
+   successful closes. False can retain an owned partial destination: only a
+   caller that observes out_created=true may clean it up. This function never
+   removes a destination. It does not provide a concurrent-source snapshot,
+   compare-and-swap publication or power-loss durability. */
+JCE_API bool JCE_CALL jce_fs_host_copy_file_new(const char *src, const char *dst,
+                                               bool *out_created);
+
 /* Copy a file or a directory tree.  When `src` is a directory, every
    entry under it is copied recursively.  `dst` is the destination
    path (the new location, not its parent).  Existing files are
@@ -226,12 +256,22 @@ JCE_API void *jce_fs_host_read_all(const char *path, uint64_t *out_size);
 JCE_API bool JCE_CALL jce_fs_host_write_all(const char *path,
                            const void *data, uint64_t size);
 
-/* Atomically write an entire buffer to a host-path file: writes to a sibling
-   temp file then renames it over the destination, so an interrupted write
-   (crash / power loss / full disk) can never leave a truncated or empty file.
-   Replaces any existing file.  Creates parent directories.  Returns true on
-   success.  Use this for editable user data (scenes, prefabs, project
-   settings); jce_fs_host_write_all suffices for regenerable build outputs. */
+/* Exclusively create a new host file and write the entire buffer. Atomically
+   refuses an existing file/directory; path-query failure never permits replace.
+   Creates missing parent directories. True requires full write and successful
+   close. Short-write/close failure retains any newly created file as evidence:
+   false does not imply the destination is absent. Never removes or overwrites
+   an existing destination. No power-loss durability guarantee (no fsync). */
+JCE_API bool JCE_CALL jce_fs_host_write_new(const char *path,
+                           const void *data, uint64_t size);
+
+/* Write an entire buffer to a sibling temporary file, close it successfully,
+   then replace the destination by host rename. Write/close/rename failure
+   preserves the old destination. Replaces existing files and creates parents.
+   Returns true on successful publication; no power-loss durability guarantee
+   (no fsync). Callers must serialize writes to the same destination because
+   the current temporary name is shared. Use this for editable scenes/prefabs/
+   settings; write_all suffices for regenerable build outputs. */
 JCE_API bool JCE_CALL jce_fs_host_write_all_atomic(const char *path,
                            const void *data, uint64_t size);
 
@@ -287,9 +327,32 @@ JCE_API JceFsActivePolicy JCE_CALL jce_fs_get_active_policy(void);
  * jce_fs_set_active(); use this only for tests or alternate backends. */
 JCE_API void              JCE_CALL jce_fs_set_active_reader(JceFsReadFn fn);
 
+/* Conservative metadata query for the same source policy as host_read_all.
+ * Relative addresses consult the active reader first; ISOLATED does not fall
+ * back to the host. Absolute paths and a NULL active reader remain host-only.
+ * A custom reader without a presence probe is UNKNOWN, even if a host/PAK
+ * fallback exists. No file is opened/read; PRESENT does not prove readable,
+ * valid contents and ABSENT is not a durable snapshot. Query failures and
+ * nonregular paths are UNKNOWN. API-owner thread, like active-source setters. */
+typedef enum JceFsPresence {
+    JCE_FS_PRESENCE_UNKNOWN = 0,
+    JCE_FS_PRESENCE_ABSENT = 1,
+    JCE_FS_PRESENCE_PRESENT = 2
+} JceFsPresence;
+JCE_API JceFsPresence JCE_CALL jce_fs_probe_read(const char *path);
+
 /* Get the executable's directory (with trailing path separator) into
    `out`.  Returns true on success.  Equivalent to SDL_GetBasePath. */
 JCE_API bool JCE_CALL jce_fs_host_get_base_path(char *out, uint32_t out_size);
+
+/* Get the running executable's absolute, NUL-terminated UTF-8 filename.
+   This queries the OS, independently of the working directory and argv[0];
+   native path separators are retained. Currently supported on Windows and
+   Linux desktop hosts. Other targets, including mobile and Web, return false.
+   Invalid arguments, OS/conversion errors, unsupported targets and insufficient
+   capacity return false without truncation; out[0] is cleared when out is
+   non-NULL and out_size is nonzero. Capacity includes the terminating NUL. */
+JCE_API bool JCE_CALL jce_fs_host_get_executable_path(char *out, uint32_t out_size);
 
 /* Get the process's current working directory (no trailing separator)
    into `out`.  Returns true on success.  Use this rather than the

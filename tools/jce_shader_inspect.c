@@ -158,7 +158,7 @@ static void json_escape(const char *s)
 
 static void print_json(const char *path, const JceShaderReflection *r,
                        const DisasmStats *st, const unsigned char *blob,
-                       int want_code)
+                       int want_code, size_t size, int want_payload)
 {
     printf("{\n  \"file\": \"");
     json_escape(path);
@@ -168,6 +168,14 @@ static void print_json(const char *path, const JceShaderReflection *r,
     printf("  \"hash_in\": %u,\n  \"hash_out\": %u,\n",
            (unsigned)r->hash_in, (unsigned)r->hash_out);
     printf("  \"code_size\": %u,\n", (unsigned)r->code_size);
+    if (want_payload) {
+        printf("  \"container_size\": %zu,\n", size);
+        printf("  \"code_offset\": %u,\n", (unsigned)r->code_offset);
+        printf("  \"payload_hex\": \"");
+        for (uint32_t i = 0; i < r->code_size; i++)
+            printf("%02x", (unsigned)blob[(size_t)r->code_offset + i]);
+        printf("\",\n");
+    }
     printf("  \"code_is_text\": %s,\n", r->code_is_text ? "true" : "false");
     printf("  \"uniform_total\": %u,\n", (unsigned)r->uniform_total);
     printf("  \"uniform_bytes\": %u,\n",
@@ -237,6 +245,7 @@ static int usage(void)
         "\n"
         "  --json              machine-readable output\n"
         "  --code              include the code section (source profiles only)\n"
+        "  --payload-hex       include exact payload bytes (requires --json)\n"
         "  --disasm <file>     a shaderc --disasm listing for instruction counts\n"
         "  --self-test         parse a synthetic blob and a truncated one\n"
         "\n"
@@ -331,10 +340,12 @@ int main(int argc, char **argv)
     const char *disasm_path = NULL;
     int         want_json   = 0;
     int         want_code   = 0;
+    int         want_payload = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--json") == 0)        want_json = 1;
         else if (strcmp(argv[i], "--code") == 0)   want_code = 1;
+        else if (strcmp(argv[i], "--payload-hex") == 0) want_payload = 1;
         else if (strcmp(argv[i], "--self-test") == 0) return self_test();
         else if (strcmp(argv[i], "--disasm") == 0) {
             if (i + 1 >= argc) return usage();
@@ -347,7 +358,7 @@ int main(int argc, char **argv)
             return usage();
         }
     }
-    if (!bin_path) return usage();
+    if (!bin_path || (want_payload && !want_json)) return usage();
 
     size_t         size = 0;
     unsigned char *blob = (unsigned char *)read_all(bin_path, &size);
@@ -380,10 +391,11 @@ int main(int argc, char **argv)
         st.parsed = 1;
     }
 
-    if (want_json) print_json(bin_path, &r, &st, blob, want_code);
+    if (want_json) print_json(bin_path, &r, &st, blob, want_code,
+                              size, want_payload);
     else           print_text(bin_path, &r, &st, blob, want_code);
 
     free(disasm);
     free(blob);
-    return 0;
+    return want_payload && (fflush(stdout) != 0 || ferror(stdout)) ? 1 : 0;
 }

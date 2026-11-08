@@ -245,8 +245,11 @@ typedef struct {
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
 void jce_project_settings_defaults(JceProjectSettings *s);
-/* Select the project-scoped persistence root. NULL/empty restores the
- * no-project fallback; call before loading settings after a project switch. */
+/* Select an already-normalized project-scoped persistence root. A changed
+ * identity retires the cached snapshot; the same root preserves edited values
+ * (Windows ignores case). NULL/empty select the same no-project identity.
+ * This does not load settings or reset live engine state. Explicit load/save
+ * retain their existing CWD fallback when no project is selected. */
 void jce_project_settings_set_root(const char *project_root);
 bool jce_project_settings_load    (JceProjectSettings *out);
 bool jce_project_settings_save    (const JceProjectSettings *s);
@@ -266,9 +269,9 @@ void jce_project_settings_apply   (const JceProjectSettings *s);
  * the settings dialog is confirmed. NULL is a no-op. */
 void jce_project_settings_push_physics_layers(const JceProjectSettings *s);
 
-/* Process-wide cached snapshot — populated by load/apply. Read-only
- * accessor for runtime subsystems that want the current values without
- * hitting disk. Returns NULL until the first load. */
+/* Borrowed snapshot populated by load/save/apply for the selected root.
+ * No disk access. Returns NULL before population and after a root identity
+ * change; a returned pointer is invalidated by the next mutation or switch. */
 const JceProjectSettings *jce_project_settings_current(void);
 
 #ifdef __cplusplus

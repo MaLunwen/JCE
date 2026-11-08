@@ -99,6 +99,8 @@
 
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_input_event.h>
 #include <jce/renderer/jce_renderer.h>   /* jce_renderer_is_headless */
@@ -114,6 +116,18 @@
 #include <stddef.h>
 #include <stdlib.h>   /* getenv — JCE_REQUIRE_WINDOWED_INPUT */
 #include <string.h>
+#include <stdio.h>
+#if JCE_PLATFORM_WINDOWS
+#include <process.h>
+#define BOOT_TEST_PROCESS_ID() ((unsigned long)_getpid())
+#else
+#include <unistd.h>
+#define BOOT_TEST_PROCESS_ID() ((unsigned long)getpid())
+#endif
+
+#ifndef JCE_ENGINE_BOOT_TEST_OUTPUT
+#error "JCE_ENGINE_BOOT_TEST_OUTPUT must name this target's private build output"
+#endif
 
 /* Same stub-PAK contract as test_jce_headless_boot.c: a project with no
  * cooked assets links a 1-byte stub. */
@@ -124,19 +138,65 @@ static bool         s_init_called;
 static JceInput    *s_captured_input;
 static JceRenderer *s_captured_renderer;
 
+/* Each case owns a PID-scoped generated config; never consume or rewrite
+ * the executable directory's remembered backend or another fixture's file. */
+static char s_config_path[1024];
+static uint32_t s_config_marker;
+static bool s_config_selected;
+static unsigned s_config_case;
+static bool s_config_owned;
+
+static void boot_test_config_begin(void)
+{
+    char desired[1024];
+    int length = snprintf(desired, sizeof desired, "%s/boot-%lu-%u.ini",
+        JCE_ENGINE_BOOT_TEST_OUTPUT, BOOT_TEST_PROCESS_ID(), ++s_config_case);
+    TEST_ASSERT_TRUE(length > 0 && (size_t)length < sizeof desired);
+    TEST_ASSERT_TRUE(jce_fs_host_make_unique_path(desired, s_config_path,
+        (uint32_t)sizeof s_config_path));
+    /* PID/case names are disjoint between first-party concurrent launches;
+     * make_unique_path also preserves a stale file after an interrupted run. */
+    /* AppDesc.name overrides window.title, so use the retained public
+     * clear-color field to prove this config actually reached app.init. */
+    s_config_marker = (((uint32_t)BOOT_TEST_PROCESS_ID() & 0xffffu) << 16) |
+        ((s_config_case & 0xffu) << 8) | 0xffu;
+    char config[256];
+    length = snprintf(config, sizeof config,
+        "[renderer]\nbackend=auto\nclear_color=%08X\n", (unsigned)s_config_marker);
+    TEST_ASSERT_TRUE(length > 0 && (size_t)length < sizeof config);
+    s_config_selected = false;
+    s_config_owned = true;
+    TEST_ASSERT_TRUE(jce_fs_host_write_all(s_config_path, config, (uint64_t)length));
+    jce_engine_set_config_path(s_config_path);
+}
+
+static void boot_test_config_end(void)
+{
+    const bool selected = !s_init_called || s_config_selected;
+    jce_engine_set_config_path(NULL);
+    bool removed = !s_config_owned || jce_fs_host_remove_file(s_config_path);
+    s_config_owned = false;
+    s_config_path[0] = '\0';
+    TEST_ASSERT_TRUE_MESSAGE(removed, "this case's owned config was not removed");
+    TEST_ASSERT_TRUE_MESSAGE(selected, "app.init did not consume this case's owned Auto config");
+}
+
 void setUp(void)
 {
     s_init_called       = false;
     s_captured_input    = NULL;
     s_captured_renderer = NULL;
+    boot_test_config_begin();
 }
 
-void tearDown(void) {}
+void tearDown(void) { boot_test_config_end(); }
 
 static bool eib_init(const JceServices *svc, void *user_data)
 {
     (void)user_data;
     s_init_called       = true;
+    s_config_selected = svc && svc->config &&
+        svc->config->clear_color == s_config_marker;
     s_captured_input    = svc->input;
     /* Captured so a NULL input can be ATTRIBUTED rather than excused: only the
      * headless renderer legitimately implies e->input == NULL. */

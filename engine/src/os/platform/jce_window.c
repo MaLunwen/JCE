@@ -3,6 +3,7 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_env.h>
 #include <jce/os/platform/jce_window.h>
 
 #include "jce_window_internal.h"
@@ -10,6 +11,7 @@
 
 #include <SDL3/SDL_metal.h>
 #include <string.h>
+#include <math.h>
 
 /* Verify JCE_WINDOW_* flags match SDL_WINDOW_* at compile time (C99-safe). */
 #define JCE_SASSERT(cond, tag) typedef char jce_sa_##tag[(cond) ? 1 : -1]
@@ -19,6 +21,8 @@ JCE_SASSERT(JCE_WINDOW_MAXIMIZED == SDL_WINDOW_MAXIMIZED, win_mx);
 JCE_SASSERT(JCE_WINDOW_BORDERLESS == SDL_WINDOW_BORDERLESS, win_bl);
 JCE_SASSERT(JCE_WINDOW_HIDDEN == SDL_WINDOW_HIDDEN, win_hd);
 JCE_SASSERT(JCE_WINDOW_OPENGL == SDL_WINDOW_OPENGL, win_gl);
+JCE_SASSERT(JCE_WINDOW_NOT_FOCUSABLE == SDL_WINDOW_NOT_FOCUSABLE, win_nf);
+JCE_SASSERT(JCE_WINDOW_INPUT_FOCUS == SDL_WINDOW_INPUT_FOCUS, win_if);
 #undef JCE_SASSERT
 
 #define LOG_TAG "jce_window"
@@ -36,7 +40,20 @@ struct JceWindow {
     int         logical_h;
     uint32_t    pixel_w;
     uint32_t    pixel_h;
+    uint32_t    point_w;
+    uint32_t    point_h;
 };
+
+/* SDL point size is actual event space, not configured logical layout. */
+static void window_cache_point_size(JceWindow *win)
+{
+    int w = 0, h = 0;
+    win->point_w = win->point_h = 0;
+    if (win->sdl_win && SDL_GetWindowSize(win->sdl_win, &w, &h) && w > 0 && h > 0) {
+        win->point_w = (uint32_t)w;
+        win->point_h = (uint32_t)h;
+    }
+}
 
 JceWindow *jce_window_create(const JceWindowConfig *cfg)
 {
@@ -47,6 +64,12 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     win->logical_h = cfg->logical_h;
 
     uint64_t flags = cfg->flags;
+#if JCE_PLATFORM_WEB
+    /* SDL3 RESIZABLE alone does not resize a canvas with the document.
+     * Let the existing SDL Web owner publish size/resize events. */
+    if (cfg->flags & JCE_WINDOW_RESIZABLE)
+        flags |= SDL_WINDOW_FILL_DOCUMENT;
+#endif
 #if defined(__APPLE__)
     /* Ensure Apple windows are Metal-capable for bgfx initialization. */
     flags |= SDL_WINDOW_METAL;
@@ -66,6 +89,7 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     SDL_GetWindowSizeInPixels(win->sdl_win, &pw, &ph);
     win->pixel_w = (uint32_t)pw;
     win->pixel_h = (uint32_t)ph;
+    window_cache_point_size(win);
 
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     /* On iOS use a 1:1 logical size to match device drawable pixels. */
@@ -92,10 +116,30 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     }
 #endif
 
-    LOG_INFO(LOG_TAG, "window created (%ux%u logical, %ux%u pixels)",
-             win->logical_w, win->logical_h, win->pixel_w, win->pixel_h);
+    /* Explicit performance observation survives DIST INFO stripping. The
+     * usual window bootstrap retains its ordinary log policy. */
+    if (jce_env_flag_enabled(SDL_getenv("JCE_PERF_LOG"))) {
+        jce_log_write(JCE_LOG_LEVEL_INFO, LOG_TAG, __FILE__, __LINE__,
+            "window created (%ux%u logical, %ux%u points, %ux%u pixels)",
+            win->logical_w, win->logical_h, win->point_w, win->point_h, win->pixel_w, win->pixel_h);
+    } else {
+        LOG_INFO(LOG_TAG, "window created (%ux%u logical, %ux%u points, %ux%u pixels)",
+                 win->logical_w, win->logical_h, win->point_w, win->point_h, win->pixel_w, win->pixel_h);
+    }
 
     return win;
+}
+
+bool jce_window_get_flags(const JceWindow *win, uint32_t *out_flags)
+{
+    if (!win || !win->sdl_win || !out_flags) return false;
+    const uint32_t supported = JCE_WINDOW_FULLSCREEN | JCE_WINDOW_OPENGL |
+        JCE_WINDOW_HIDDEN | JCE_WINDOW_BORDERLESS | JCE_WINDOW_RESIZABLE |
+        JCE_WINDOW_MINIMIZED | JCE_WINDOW_MAXIMIZED | JCE_WINDOW_HIGH_PIXEL_DENSITY |
+        JCE_WINDOW_NOT_FOCUSABLE | JCE_WINDOW_INPUT_FOCUS;
+    const SDL_WindowFlags observed = SDL_GetWindowFlags(win->sdl_win);
+    *out_flags = (uint32_t)(observed & (uint64_t)supported);
+    return true;
 }
 
 void jce_window_destroy(JceWindow *win)
@@ -118,6 +162,24 @@ void jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h)
 {
     if (w) *w = win ? win->pixel_w : 0;
     if (h) *h = win ? win->pixel_h : 0;
+}
+
+void jce_window_get_point_size(const JceWindow *win, uint32_t *w, uint32_t *h)
+{
+    if (w) *w = win ? win->point_w : 0;
+    if (h) *h = win ? win->point_h : 0;
+}
+
+bool jce_window_point_to_pixels(const JceWindow *win, float x, float y,
+                                float *out_x, float *out_y)
+{
+    if (!win || !out_x || !out_y || !win->point_w || !win->point_h ||
+        !win->pixel_w || !win->pixel_h || !isfinite(x) || !isfinite(y)) return false;
+    const float px = (float)((double)x * win->pixel_w / win->point_w);
+    const float py = (float)((double)y * win->pixel_h / win->point_h);
+    if (!isfinite(px) || !isfinite(py)) return false;
+    *out_x = px; *out_y = py;
+    return true;
 }
 
 void jce_window_get_safe_area(JceWindow *win, int *x, int *y, int *w, int *h)
@@ -229,6 +291,7 @@ void jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h)
     if (!win) return;
     win->pixel_w = w;
     win->pixel_h = h;
+    window_cache_point_size(win);
 #if defined(__APPLE__) && TARGET_OS_IPHONE
     /* Keep logical size in sync with iOS drawable size. */
     win->logical_w = (int)w;

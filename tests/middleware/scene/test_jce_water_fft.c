@@ -274,6 +274,201 @@ static void test_robustness(void)
     jce_water_fft_destroy(f);
 }
 
+static JceWaterFftSpectrumDesc spectrum_desc(uint32_t model)
+{
+    JceWaterFftSpectrumDesc d = {0};
+    d.struct_size = sizeof(d);
+    d.version = JCE_WATER_FFT_SPECTRUM_VERSION;
+    d.model = model;
+    d.seed = 17;
+    d.wind_speed = 10.0f;
+    d.fetch = 100000.0f;
+    d.swell = 0.2f;
+    d.depth = 5.0f;
+    d.directional_blend = 1.0f;
+    return d;
+}
+
+static void test_versioned_spectrum_controls(void)
+{
+    JceWaterFftSpectrumDesc d = spectrum_desc(JCE_WATER_FFT_SPECTRUM_JONSWAP);
+    JceWaterFft *a = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    JceWaterFft *b = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_TRUE(jce_water_fft_use_jonswap(a, 10, 100000, 0.2f, 17));
+    d.struct_size--;
+    TEST_ASSERT_FALSE(jce_water_fft_configure_spectrum(b, &d));
+    d.struct_size++;
+    d.version++;
+    TEST_ASSERT_FALSE(jce_water_fft_configure_spectrum(b, &d));
+    d.version--;
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(b, &d));
+    jce_water_fft_evolve(a, 2.0f);
+    jce_water_fft_evolve(b, 2.0f);
+    const double calibration = 32.0 * 32.0 * sqrt(3.14159265358979323846 / 256.0);
+    for (int i = 0; i < 32 * 32; ++i) {
+        const double expected = jce_water_fft_height_data(a)[i] * calibration;
+        TEST_ASSERT_DOUBLE_WITHIN(1e-6 + fabs(expected) * 1e-6,
+            expected, jce_water_fft_height_data(b)[i]);
+    }
+    /* Before first evolve, opting back into the old API must restore its
+     * original coefficients, not retain the new calibration state. */
+    JceWaterFft *legacy = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    TEST_ASSERT_NOT_NULL(legacy);
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(legacy, &d));
+    TEST_ASSERT_TRUE(jce_water_fft_use_jonswap(legacy, 10, 100000, 0.2f, 17));
+    TEST_ASSERT_TRUE(jce_water_fft_enable_foam(a));
+    TEST_ASSERT_TRUE(jce_water_fft_enable_foam(legacy));
+    jce_water_fft_evolve(legacy, 2.0f);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(a),
+        jce_water_fft_height_data(legacy), 32 * 32 * sizeof(float));
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_foam_data(a),
+        jce_water_fft_foam_data(legacy), 32 * 32 * sizeof(float));
+    jce_water_fft_destroy(legacy);
+    TEST_ASSERT_FALSE(jce_water_fft_configure_spectrum(b, &d));
+    jce_water_fft_destroy(a);
+    jce_water_fft_destroy(b);
+
+    d.model = JCE_WATER_FFT_SPECTRUM_PM;
+    a = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    b = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    TEST_ASSERT_NOT_NULL(a);
+    TEST_ASSERT_NOT_NULL(b);
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(a, &d));
+    d.fetch = 1.0f;
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(b, &d));
+    jce_water_fft_evolve(a, 2.0f);
+    jce_water_fft_evolve(b, 2.0f);
+    TEST_ASSERT_EQUAL_MEMORY(jce_water_fft_height_data(a),
+                             jce_water_fft_height_data(b), 32 * 32 * sizeof(float));
+    jce_water_fft_destroy(b);
+    b = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    TEST_ASSERT_NOT_NULL(b);
+    d.directional_blend = 0.0f;
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(b, &d));
+    jce_water_fft_evolve(b, 2.0f);
+    TEST_ASSERT_TRUE(memcmp(jce_water_fft_height_data(a),
+                            jce_water_fft_height_data(b), 32 * 32 * sizeof(float)) != 0);
+    jce_water_fft_destroy(a);
+    jce_water_fft_destroy(b);
+}
+
+static void test_tma_fft_uses_finite_depth_phase(void)
+{
+    JceWaterFftSpectrumDesc d = spectrum_desc(JCE_WATER_FFT_SPECTRUM_TMA);
+    d.depth = 2.0f;
+    JceWaterFft *f = jce_water_fft_create(32, 128, 10, 1, 0, 0.001f, 17);
+    TEST_ASSERT_NOT_NULL(f);
+    TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(f, &d));
+    const double k = WFFT_TWO_PI / 128.0;
+    const double expected = sqrt((double)f->spectrum.gravity * k * tanh(k * d.depth));
+    /* Storage is centered: (16,16) is DC, (16,17) is the fundamental. */
+    const int fundamental = 16 * 32 + 17;
+    TEST_ASSERT_DOUBLE_WITHIN(1e-10, expected, f->omega[fundamental]);
+    TEST_ASSERT_TRUE(f->omega[fundamental] < sqrt(WFFT_GRAVITY * k));
+    for (int row = 0; row < 32; ++row) for (int col = 0; col < 32; ++col) {
+        const double x = (double)(row - 16), z = (double)(col - 16);
+        const double wave_number = k * sqrt(x*x + z*z);
+        const double reference = sqrt((double)f->spectrum.gravity * wave_number *
+            tanh(wave_number * d.depth));
+        TEST_ASSERT_DOUBLE_WITHIN(1e-10, reference, f->omega[row * 32 + col]);
+    }
+    jce_water_fft_evolve(f, 2.0f);
+    const float *height = jce_water_fft_height_data(f);
+    for (int i = 0; i < 32 * 32; ++i) TEST_ASSERT_TRUE(isfinite(height[i]));
+    jce_water_fft_destroy(f);
+}
+
+/* PM S(omega) is a one-sided height variance density. Independently
+ * integrate its isotropic k-space density over this finite FFT grid. */
+static double pm_grid_variance(int n, double length, double wind)
+{
+    const double pi = 3.14159265358979323846;
+    const double dk = 2.0 * pi / length, g = 9.81;
+    const double wp = (0.877 / 1.026) * g / wind;
+    double sum = 0.0;
+    for (int row = 0; row < n; ++row) for (int col = 0; col < n; ++col) {
+        const double x = (double)(row - n/2), z = (double)(col - n/2);
+        const double k = dk * sqrt(x*x + z*z);
+        if (k == 0.0) continue;
+        const double omega = sqrt(g * k);
+        const double r = wp / omega;
+        const double energy = 0.0081 * g*g / pow(omega, 5.0) * exp(-1.25*r*r*r*r);
+        sum += energy * (0.5 * sqrt(g/k)) / (2.0*pi*k) * dk*dk;
+    }
+    return sum;
+}
+
+static void test_versioned_pm_preserves_physical_energy_across_resolution(void)
+{
+    const int sizes[] = {32, 64, 128};
+    double variances[3], references[3];
+    for (int r = 0; r < 3; ++r) {
+        const int n = sizes[r];
+        double measured = 0.0;
+        JceWaterFftSpectrumDesc d = spectrum_desc(JCE_WATER_FFT_SPECTRUM_PM);
+        d.directional_blend = 0.0f;
+        d.swell = 0.0f;
+        for (unsigned int seed = 1; seed <= 16; ++seed) {
+            d.seed = seed;
+            JceWaterFft *f = jce_water_fft_create(n, 128, 10, 1, 0, 0.001f, seed);
+            TEST_ASSERT_NOT_NULL(f);
+            TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(f, &d));
+            for (int t = 0; t < 4; ++t) {
+                double mean;
+                jce_water_fft_evolve(f, 3.7f * (float)t);
+                measured += field_variance(jce_water_fft_height_data(f), n*n, &mean);
+            }
+            jce_water_fft_destroy(f);
+        }
+        measured /= 64.0;
+        const double expected = pm_grid_variance(n, 128.0, 10.0);
+        printf("PM energy N=%d variance=%g expected=%g Hs=%g\n",
+            n, measured, expected, 4.0 * sqrt(measured));
+        variances[r] = measured;
+        references[r] = expected;
+    }
+    for (int r = 0; r < 3; ++r)
+        TEST_ASSERT_DOUBLE_WITHIN(references[r] * 0.25, references[r], variances[r]);
+}
+
+/* The horizontal map transforms a world-space cell area. Recover its
+ * signed area from the two secants, without assuming a unit FFT grid. */
+static void test_versioned_jacobian_measures_world_area(void)
+{
+    const int sizes[] = {32, 64};
+    const float lengths[] = {128.0f, 32.0f};
+    for (int r = 0; r < 2; ++r) {
+        const int n = sizes[r];
+        const double step = lengths[r] / n;
+        JceWaterFftSpectrumDesc d = spectrum_desc(JCE_WATER_FFT_SPECTRUM_PM);
+        JceWaterFft *f = jce_water_fft_create(n, lengths[r], 10, 1, 0, 0.001f, 17);
+        TEST_ASSERT_NOT_NULL(f);
+        TEST_ASSERT_TRUE(jce_water_fft_configure_spectrum(f, &d));
+        TEST_ASSERT_TRUE(jce_water_fft_enable_foam(f));
+        jce_water_fft_evolve(f, 2.0f);
+        const float *dx = jce_water_fft_disp_x_data(f);
+        const float *dz = jce_water_fft_disp_z_data(f);
+        const float *jac = jce_water_fft_foam_data(f);
+        double worst = 0.0;
+        for (int z = 0; z < n; ++z) for (int x = 0; x < n; ++x) {
+            const int left = z*n + (x+n-1)%n, right = z*n + (x+1)%n;
+            const int down = ((z+n-1)%n)*n+x, up = ((z+1)%n)*n+x;
+            const double ax = 2.0*step + dx[right]-dx[left];
+            const double az = dz[right]-dz[left];
+            const double bx = dx[up]-dx[down];
+            const double bz = 2.0*step + dz[up]-dz[down];
+            const double area_ratio = (ax*bz-az*bx)/(4.0*step*step);
+            const double error = fabs(jac[z*n+x]-area_ratio);
+            if (error > worst) worst = error;
+        }
+        printf("Jacobian world area N=%d spacing=%g max_error=%g\n", n, step, worst);
+        jce_water_fft_destroy(f);
+        TEST_ASSERT_DOUBLE_WITHIN(2e-6, 0.0, worst);
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -284,5 +479,9 @@ int main(void)
     RUN_TEST(test_field_statistics);
     RUN_TEST(test_sample_bilinear);
     RUN_TEST(test_robustness);
+    RUN_TEST(test_versioned_spectrum_controls);
+    RUN_TEST(test_tma_fft_uses_finite_depth_phase);
+    RUN_TEST(test_versioned_pm_preserves_physical_energy_across_resolution);
+    RUN_TEST(test_versioned_jacobian_measures_world_area);
     return UNITY_END();
 }

@@ -72,6 +72,45 @@ void jce_gpu_caps_init(JceGpuCaps *caps)
 /* ── Public GPU frame statistics (jce/renderer/jce_renderer.h) ─────── */
 
 #include <jce/renderer/jce_renderer.h>
+#include "jce_renderer_lifecycle_internal.h"
+
+bool jce_renderer_get_gpu_timing_observation(
+    JceGpuTimingObservation *out, size_t out_size)
+{
+    if (!out || out_size < sizeof(*out)) return false;
+    JceGpuTimingObservation observation;
+    memset(&observation, 0, sizeof(observation));
+    observation.struct_size = (uint32_t)sizeof(observation);
+    observation.version = 1;
+    observation.unavailable_reason = JCE_GPU_TIMING_CONTEXT_UNAVAILABLE;
+    observation.context_available = jce_renderer_gpu_observation_context_internal(
+        &observation.context_generation, &observation.read_host_frame_index);
+    if (observation.context_available) {
+        const bgfx_stats_t *stats = bgfx_get_stats();
+        observation.unavailable_reason = JCE_GPU_TIMING_BACKEND_UNAVAILABLE;
+        if (stats) {
+            observation.backend_available = true;
+            observation.gpu_source_frame = stats->gpuFrameNum;
+            observation.timer_frequency = stats->gpuTimerFreq;
+            observation.raw_begin = stats->gpuTimeBegin;
+            observation.raw_end = stats->gpuTimeEnd;
+            observation.unavailable_reason = JCE_GPU_TIMING_FREQUENCY_UNAVAILABLE;
+            if (observation.timer_frequency > 0) {
+                observation.unavailable_reason = JCE_GPU_TIMING_INTERVAL_UNAVAILABLE;
+                if (observation.raw_begin >= 0 &&
+                    observation.raw_end > observation.raw_begin) {
+                    observation.duration_ms = (double)(observation.raw_end -
+                        observation.raw_begin) * 1000.0 /
+                        (double)observation.timer_frequency;
+                    observation.timer_available = true;
+                    observation.unavailable_reason = JCE_GPU_TIMING_AVAILABLE;
+                }
+            }
+        }
+    }
+    memcpy(out, &observation, sizeof(observation));
+    return true;
+}
 
 static double gpu_ticks_to_ms(int64_t delta, int64_t freq)
 {
@@ -83,6 +122,7 @@ bool jce_renderer_get_gpu_stats(JceGpuStats *out)
 {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
+    if (!jce_renderer_gpu_observation_context_internal(NULL, NULL)) return false;
 
     const bgfx_stats_t *st = bgfx_get_stats();
     if (!st) return false;

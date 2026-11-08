@@ -37,7 +37,7 @@
  *
  * The C ABI in the middle is being exercised too, and by more than its own
  * suite: tests/scripting/c_abi covers ten entry points by hand, and this file
- * drives all 108 of them.
+ * drives all 109 of them.
  */
 
 #include "jce_script_cpp_differential.hpp"
@@ -1298,6 +1298,15 @@ static bool mk_stat_flush(void *user)
     return true;
 }
 
+static void mk_viewport_size(void *user, float out_wh[2])
+{
+    (void)user;
+    jce::diff::trace_add("viewport_size");
+    jce::diff::trace_end();
+    out_wh[0] = 1705.5f;
+    out_wh[1] = 1706.5f;
+}
+
 /* the release member of the owned-string shape.  Traced, because
  * 'the string was released' is a fact about the CALL SEQUENCE and
  * nothing in the result can show it. */
@@ -1426,6 +1435,7 @@ void jce::diff::install_recording_host(JceScriptHost *h)
     h->stat_set = mk_stat_set;
     h->stat_get = mk_stat_get;
     h->stat_flush = mk_stat_flush;
+    h->viewport_size = mk_viewport_size;
     h->json_free = mk_json_free;
 }
 
@@ -2851,6 +2861,18 @@ static void cpp_case_233(Api &api, jce::diff::Slots &s)
         jce::diff::record(s, api.stat_flush());
 }
 
+static void cpp_case_234(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.get_viewport_size());
+}
+
+static void cpp_case_235(Api &api, jce::diff::Slots &s)
+{
+    (void)api; (void)s;
+        jce::diff::record(s, api.get_viewport_size());
+}
+
 struct DiffCase {
     const char       *label;
     jce::diff::MockMode mode;
@@ -3093,6 +3115,8 @@ static const DiffCase g_cases[] = {
     { "stat_get [host says no]", jce::diff::MOCK_FAIL, "jce.stat_get('stat_get_id', 1.5)", cpp_case_231 },
     { "stat_flush", jce::diff::MOCK_OK, "jce.stat_flush()", cpp_case_232 },
     { "stat_flush [host says no]", jce::diff::MOCK_FAIL, "jce.stat_flush()", cpp_case_233 },
+    { "get_viewport_size", jce::diff::MOCK_OK, "jce.get_viewport_size()", cpp_case_234 },
+    { "get_viewport_size [host says no]", jce::diff::MOCK_FAIL, "jce.get_viewport_size()", cpp_case_235 },
 };
 
 #define JCE_DIFF_CASES ((int)(sizeof g_cases / sizeof g_cases[0]))

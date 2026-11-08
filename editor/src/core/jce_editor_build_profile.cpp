@@ -5,6 +5,8 @@
 #include "jce_editor_build_profile.h"
 #include "jce_editor_config.h"
 #include "jce_editor_project_state.h"
+#include "jce_editor_project.h"
+#include "jce_project_build_target.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -48,13 +50,26 @@ extern "C" void jce_editor_build_profile_restore(void)
     JceEditorConfig cfg;
     jce_editor_config_load(&cfg);
 
-    /* Presence probe: build.target is always non-empty once seeded. */
+    /* Presence, including an empty value, distinguishes an existing profile. */
     char probe[8];
     bool seeded = jce_editor_pstate_get_str("build.target", probe, sizeof(probe));
     if (!seeded) {
-        /* First sight of this project: seed the store from the current
-         * (global-default or last-used) profile so the next switch is
-         * authoritative, but leave the live cfg untouched. */
+        /* Ordinary projects must not inherit another project's external
+         * executable, presets or output directory. Existing saved profiles
+         * and the engine-workspace migration retain their explicit values. */
+        if (!jce_editor_project_is_engine_workspace()) {
+            for (const auto &f : kStrFields) f.ptr(&cfg)[0] = '\0';
+            cfg.run_mode = 0;
+            const JceProject *project = jce_editor_project_get();
+            if (project) {
+                snprintf(cfg.game_target_name, sizeof(cfg.game_target_name), "%s",
+                    jce_project_build_initial_target(false, project->target_name,
+                                                     project->name, nullptr));
+            }
+            snprintf(cfg.build_project_root, sizeof(cfg.build_project_root), "%s",
+                     jce_editor_current_project_root());
+            jce_editor_config_save(&cfg);
+        }
         jce_editor_build_profile_snapshot();
         return;
     }

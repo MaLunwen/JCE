@@ -1,0 +1,28 @@
+set(_rp_publish_owner "${CMAKE_SOURCE_DIR}/engine/src/renderer/jce_render_pipeline.c")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_rp_publish_owner}")
+file(READ "${_rp_publish_owner}" _rp_publish_source)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/rp-publish")
+foreach(_case IN ITEMS current missing_publish)
+    set(_source "${_rp_publish_source}")
+    set(_target test_jce_render_pipeline_publish)
+    set(_kind integration)
+    if(_case STREQUAL "missing_publish")
+        string(REPLACE "if (jce_trace_enabled()) {\n        JceTraceScope scope = jce_trace_scope_begin(\"render_pipeline.publish\");"
+            "if (false) {\n        JceTraceScope scope = jce_trace_scope_begin(\"render_pipeline.publish\");"
+            _source "${_source}")
+        if(_source STREQUAL _rp_publish_source)
+            message(FATAL_ERROR "RP publish negative requires the actual publication gate")
+        endif()
+        string(APPEND _target "_${_case}")
+        set(_kind contract)
+    endif()
+    set(_path "${CMAKE_CURRENT_BINARY_DIR}/rp-publish/${_case}.c")
+    jce_test_write_if_changed("${_path}" "${_source}")
+    jce_add_unit_test(${_target} KIND ${_kind}
+        SOURCES test_jce_render_pipeline_publish.c "${_path}"
+        LINK jce_core jce_resource INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+    set_tests_properties(${_target} PROPERTIES ENVIRONMENT "${JCE_TEST_ENVIRONMENT};JCE_RP_FORCE=")
+    if(NOT _case STREQUAL "current")
+        set_tests_properties(${_target} PROPERTIES WILL_FAIL TRUE)
+    endif()
+endforeach()

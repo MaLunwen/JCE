@@ -747,7 +747,7 @@ void draw_asset_breadcrumb_bar(void)
 
             ImGui::SameLine(0.0f, refresh_gap);
             if (ImGui::SmallButton(refresh_label)) {
-                s_assets.needs_refresh = true;
+                request_asset_resource_refresh();
             }
         }
     }

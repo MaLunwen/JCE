@@ -40,10 +40,14 @@ class NativeUnicodeControls(unittest.TestCase):
         cls.root.mkdir(parents=True)
         cls.records = []
         cls.identities = {}
+        cls.executables = {}
         for name in ("jce_pak", "jce_cook", "jce_bin2obj"):
             path = cls.tools/(name+(".exe" if os.name == "nt" else ""))
+            if name == "jce_pak" and os.environ.get("JCE_PAK_SUFFIX_TEST_EXE"):
+                path = Path(os.environ["JCE_PAK_SUFFIX_TEST_EXE"]).resolve()
             if not path.is_file():
                 raise RuntimeError("missing explicit host tool: " + str(path))
+            cls.executables[name] = path
             cls.identities[name] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     @classmethod
@@ -53,8 +57,8 @@ class NativeUnicodeControls(unittest.TestCase):
             indent=2, ensure_ascii=False)+"\n", encoding="utf-8", newline="\n")
         print("Unicode evidence:", cls.root/"result.json", flush=True)
 
-    def run_tool(self, name, *args, success=True):
-        exe = self.tools/(name+(".exe" if os.name == "nt" else ""))
+    def run_tool(self, name, *args, success=True, expected_exit=None):
+        exe = self.executables[name]
         self.assertEqual(hashlib.sha256(exe.read_bytes()).hexdigest(), self.identities[name])
         command = [str(exe), *map(str, args)]
         result = subprocess.run(command, capture_output=True, timeout=120)
@@ -62,12 +66,85 @@ class NativeUnicodeControls(unittest.TestCase):
         for stream in ("stdout", "stderr"):
             (self.root/(str(index)+"."+stream+".log")).write_bytes(getattr(result, stream))
         self.records.append({"command": command, "returncode": result.returncode,
-            "expected_success": success})
-        if success:
+            "expected_success": success, "expected_exit": expected_exit})
+        if expected_exit is not None:
+            self.assertEqual(result.returncode, expected_exit,
+                result.stderr.decode("utf-8", "replace"))
+        elif success:
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         else:
             self.assertNotEqual(result.returncode, 0)
         return result
+
+    def suffix_pack_fixture(self, label, suffixes):
+        directory = self.root/("suffix-"+label)
+        resources = directory/"resources"
+        (resources/"shaders").mkdir(parents=True)
+        for name in ("keep.txt", "shaders/fs_grass_shadow_dx11.bin",
+                     "shaders/case_only_dx11.BIN",
+                     "shaders/prefix"+"x"*27+".bin", "shaders/"+"界"*10+"x"):
+            (resources/name).write_bytes(name.encode("utf-8"))
+        outputs = tuple(directory/name for name in
+            ("packed.pak", "embedded.h", "assets.cmake", "bom.json"))
+        options = ["--resource-dir", resources, "--pak-file", outputs[0],
+            "--header-file", outputs[1], "--manifest-file", outputs[2],
+            "--json", outputs[3], "--quiet"]
+        for suffix in suffixes:
+            options.extend(("--exclude-suffix", suffix))
+        return options, outputs
+
+    def test_pak_exclude_suffix_accepts_boundary_values(self):
+        # The last accepted suffix must apply; ASCII and UTF-8 limits are bytes.
+        cases = (
+            ("ordinary", ["_dx11.bin"], "shaders/fs_grass_shadow_dx11.bin"),
+            ("31-bytes", ["x"*27+".bin"], "shaders/prefix"+"x"*27+".bin"),
+            ("31-utf8-bytes", ["界"*10+"x"], "shaders/"+"界"*10+"x"),
+            ("16-values", [".unused"+str(i) for i in range(15)]+["_dx11.bin"],
+             "shaders/fs_grass_shadow_dx11.bin"),
+            ("empty-value", [""], None),
+        )
+        expected = {"keep.txt", "shaders/fs_grass_shadow_dx11.bin",
+            "shaders/case_only_dx11.bin", "shaders/prefix"+"x"*27+".bin",
+            "shaders/"+"界"*10+"x"}
+        for label, suffixes, excluded in cases:
+            with self.subTest(label=label):
+                options, outputs = self.suffix_pack_fixture(label, suffixes)
+                self.run_tool("jce_pak", *options)
+                bom = json.loads(outputs[3].read_text(encoding="utf-8"))
+                retained = expected-{excluded} if excluded else expected
+                self.assertEqual({entry["path"] for entry in bom["entries"]}, retained)
+                self.assertTrue(bom["sources_verified"])
+                self.assertTrue(bom["totals"]["verify_ran"])
+                self.assertEqual(bom["totals"]["verified_count"], len(retained))
+                self.assertEqual(bom["totals"]["corrupt_count"], 0)
+                self.assertEqual(bom["totals"]["skipped_count"], 0)
+
+    def test_pak_exclude_suffix_rejects_oversize_value(self):
+        for label, suffix in (("32-bytes", "shaders/fs_grass_shadow_dx11.bin"),
+                              ("32-utf8-bytes", "界"*10+"xx")):
+            with self.subTest(label=label):
+                self.assertEqual(len(suffix.encode("utf-8")), 32)
+                options, outputs = self.suffix_pack_fixture(label, [suffix])
+                result = self.run_tool("jce_pak", *options, success=False, expected_exit=1)
+                diagnostic = result.stderr.decode("utf-8", "replace")
+                self.assertIn("--exclude-suffix", diagnostic)
+                self.assertIn("32 bytes", diagnostic)
+                self.assertIn("maximum 31 bytes", diagnostic)
+                for output in outputs:
+                    self.assertFalse(output.exists(), str(output))
+
+    def test_pak_exclude_suffix_rejects_excess_values(self):
+        suffixes = [".unused"+str(i) for i in range(16)]+["fs_grass_shadow_dx11.bin"]
+        options, outputs = self.suffix_pack_fixture("17-values", suffixes)
+        before = {}
+        for output in outputs:
+            output.write_bytes(b"prior output must survive argument refusal")
+            before[output] = (output.read_bytes(), output.stat().st_mtime_ns)
+        result = self.run_tool("jce_pak", *options, success=False, expected_exit=1)
+        self.assertIn("--exclude-suffix accepts at most 16 values",
+            result.stderr.decode("utf-8", "replace"))
+        for output in outputs:
+            self.assertEqual((output.read_bytes(), output.stat().st_mtime_ns), before[output])
 
     def test_cook_pack_inspect_incremental_closed_loop(self):
         project = self.root/"项目 Ω 空格"

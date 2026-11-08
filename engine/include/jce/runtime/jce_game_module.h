@@ -14,10 +14,17 @@
 #define JCE_GAME_MODULE_H
 
 #include <jce/application/jce_app_interface.h>
+#include <jce/middleware/scene/jce_scene.h>
 
 JCE_EXTERN_C_BEGIN
 
 typedef JceAppDesc JceGameModule;
+
+/* Main-thread borrowed scene for the built-in ECS module. The Play/host owner
+ * sets it before callbacks and clears it before destroying the scene. This
+ * does not create, retain, update or destroy a scene; NULL detaches it. */
+JCE_API void jce_game_module_set_active_scene(JceScene *scene);
+JCE_API JceScene *jce_game_module_active_scene(void);
 
 /* Built-in default module: pure ECS tick (scripts / animators / physics).
  * Always present, no game-specific logic.  Returned pointer is static. */

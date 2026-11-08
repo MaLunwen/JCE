@@ -38,6 +38,7 @@
 #define JCE_WATER_FIELD_H
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/middleware/scene/jce_water_fft.h>
 #include <jce/os/core/jce_math.h>
 
 #include <stdbool.h>
@@ -284,6 +285,14 @@ JCE_API void JCE_CALL jce_water_field_set_destroy(JceWaterFieldSet *set);
  * clock.  Returns NULL if the set is full or a rebuild failed to allocate. */
 JCE_API JceWaterField *JCE_CALL jce_water_field_set_acquire(
     JceWaterFieldSet *set, uint64_t key, const JceWaterFieldDesc *desc);
+
+/* Versioned opt-in spectrum. NULL preserves legacy fetch/Phillips behavior.
+ * The descriptor is copied; caller ownership ends when this call returns.
+ * Invalid controls or failed rebuilds return NULL and retain the old field.
+ * Both render and physics callers must use the same configuration. */
+JCE_API JceWaterField *JCE_CALL jce_water_field_set_acquire_spectrum(
+    JceWaterFieldSet *set, uint64_t key, const JceWaterFieldDesc *desc,
+    const JceWaterFftSpectrumDesc *spectrum);
 
 JCE_API JceWaterField *JCE_CALL jce_water_field_set_find(
     const JceWaterFieldSet *set, uint64_t key);

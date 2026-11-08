@@ -213,3 +213,7 @@ jce_add_unit_test(test_jce_audio_reverb_stages
     LINK    jce_core jce_audio jce_resource)
 
 jce_add_unit_test(test_jce_audio_file SOURCES test_jce_audio_file.c LINK jce_core jce_audio)
+
+include("${CMAKE_CURRENT_LIST_DIR}/master_lifecycle_controls.cmake")
+
+include(miniaudio_com_controls.cmake)

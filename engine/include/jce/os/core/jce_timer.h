@@ -1,7 +1,8 @@
 /*
  * jce_timer.h  High-precision frame timer.
  *
- * Uses SDL_GetPerformanceCounter for sub-millisecond accuracy.
+ * Uses the shared high-resolution monotonic clock. Actual resolution is
+ * platform dependent; consecutive readings may be equal.
  * Provides delta time, elapsed time, smoothed FPS and an interpolation
  * alpha.  The engine's fixed-step simulation cadence is owned by
  * JceFixedClock (jce_fixed_clock.h) — this timer does not drive it.
@@ -77,21 +78,23 @@ JCE_API size_t JCE_CALL jce_time_format_utc(int64_t epoch_seconds,
 /* Cross-platform clock primitives                                     */
 /* ================================================================== */
 
-/* High-resolution monotonic counter (wraps SDL_GetPerformanceCounter).
-   Uniform implementation across Windows / macOS / Linux / Android /
-   iOS / Web — prefer this over std::chrono::steady_clock or platform
-   clocks for consistent behavior.                                    */
+/* High-resolution monotonic counter with an unspecified origin. Native
+   hosts use SDL performance time; Web uses Emscripten performance time.
+   Counter units and actual resolution differ: browser privacy controls
+   may coarsen readings, and consecutive readings may be equal. Use the
+   conversion helpers instead of assuming a particular counter unit. */
 JCE_API uint64_t JCE_CALL jce_time_perf_counter(void);
 
-/* Ticks of jce_time_perf_counter() per second (cached). */
+/* Ticks of jce_time_perf_counter() per second; stable for the provider. */
 JCE_API uint64_t JCE_CALL jce_time_perf_freq(void);
 
-/* Milliseconds since some unspecified monotonic origin
-   (wraps SDL_GetTicks).  Suitable for coarse deadlines and timestamps. */
+/* Milliseconds since an unspecified monotonic origin. Suitable for coarse
+   deadlines and timestamps. Native hosts retain SDL ticks; Web derives
+   both tick APIs from the shared performance clock. */
 JCE_API uint64_t JCE_CALL jce_time_ticks_ms(void);
 
-/* Nanoseconds since some unspecified monotonic origin
-   (wraps SDL_GetTicksNS). */
+/* Nanoseconds since an unspecified monotonic origin. Units do not imply
+   nanosecond resolution; consecutive readings may be equal. */
 JCE_API uint64_t JCE_CALL jce_time_ticks_ns(void);
 
 /* Wall-clock seconds since the Unix epoch (UTC).  Wraps the platform

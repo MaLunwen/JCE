@@ -12,6 +12,6 @@ struct JceEditorSceneContentPaths {
 
 JceEditorSceneContentPaths jce_editor_scene_content_paths(
     bool isolated, const char *project_root, const char *source_assets,
-    const char *cooked_assets);
+    const char *cooked_assets, const char *loose_asset_root = nullptr);
 
 #endif

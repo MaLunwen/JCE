@@ -86,8 +86,15 @@ const char *jce_editor_i18n_or(const char *key, const char *fallback);
    The returned pointer is valid for the lifetime of the i18n system. */
 const char *jce_editor_i18n_lookup_locale(JceLocale locale, const char *key);
 
-/* Number of supported locales (fixed compile-time count). Useful for
-   loops that walk every locale, e.g. multi-language search. */
+/* Match a filter against the key leaf, a qualified key including its leaf,
+   the literal fallback, or a label in any installed locale. ASCII case is
+   ignored and UTF-8 text is matched byte-exactly. An empty filter accepts
+   every entry. matched_locale may be NULL; it reports the actual matching
+   label's locale (active first), or INVALID for non-label matches. */
+bool jce_editor_i18n_search_match(const char *key, const char *fallback, const char *query,
+                                 JceLocale *matched_locale);
+
+/* Number of discovered locales. */
 int jce_editor_i18n_locale_count(void);
 
 /* Look up a translated string and append "##id_suffix" for ImGui IDs.

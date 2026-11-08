@@ -67,6 +67,21 @@ static void test_crypto_hmac_sha256_rfc4231(void) {
     TEST_ASSERT_EQUAL_MEMORY(expected, digest, sizeof(digest));
 }
 
+/* RFC 4231 case 6 exercises the moved SHA stream's long-key HMAC path. */
+static void test_crypto_hmac_sha256_long_key_rfc4231(void) {
+    uint8_t key[131], digest[32];
+    static const uint8_t message[] = "Test Using Larger Than Block-Size Key - Hash Key First";
+    static const uint8_t expected[32] = {
+        0x60,0xe4,0x31,0x59,0x1e,0xe0,0xb6,0x7f,
+        0x0d,0x8a,0x26,0xaa,0xcb,0xf5,0xb7,0x7f,
+        0x8e,0x0b,0xc6,0x21,0x37,0x28,0xc5,0x14,
+        0x05,0x46,0x04,0x0f,0x0e,0xe3,0x7f,0x54
+    };
+    memset(key, 0xaa, sizeof key);
+    jce_archive_hmac_sha256(key, sizeof key, message, sizeof message-1, digest);
+    TEST_ASSERT_EQUAL_MEMORY(expected, digest, sizeof digest);
+}
+
 static void test_crypto_chacha20_rfc8439(void) {
     static const uint8_t key[32] = {
         0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
@@ -1533,11 +1548,46 @@ static void test_script_sources_share_the_text_dictionary(void) {
     jce_free(buf);
 }
 
+/* Empty data is still a real byte sequence with a canonical XXH3 identity.
+ * Exercise the actual writer plus the strict public reader; no header patch. */
+static void test_empty_only_roundtrip_strict_integrity(void)
+{
+    bool all_valid = true;
+    for (int variant = 0; variant < 4; ++variant) {
+        JceArchiveWriterConfig cfg = {0};
+        cfg.emit_debug_paths = (variant & 1) != 0;
+        cfg.compress_index = (variant & 2) != 0;
+        JceArchiveWriter *writer = jce_archive_writer_create(&cfg);
+        TEST_ASSERT_NOT_NULL(writer);
+        TEST_ASSERT_TRUE(jce_archive_writer_add(writer, "empty.bin", "", 0));
+        void *bytes = NULL; size_t size = 0;
+        TEST_ASSERT_TRUE(jce_archive_writer_finish(writer, &bytes, &size));
+        jce_archive_writer_destroy(writer);
+        jce_archive_set_verify_on_open(true);
+        JceArchive *archive = jce_archive_open(bytes, size);
+        bool valid = archive != NULL;
+        if (archive) {
+            const JceArchiveEntry *entry = jce_archive_find(archive, "empty.bin");
+            uint8_t out = 0x5a;
+            valid = entry && jce_archive_count(archive) == 1 &&
+                jce_archive_verify_header(archive) == 1 && entry->original_size == 0 &&
+                jce_archive_read(archive, entry, &out, sizeof out) == 0 &&
+                jce_archive_verify_entry(entry, &out, 0) == 1 && out == 0x5a;
+        }
+        jce_archive_close(archive); jce_free(bytes);
+        jce_archive_set_verify_on_open(false);
+        all_valid = all_valid && valid;
+    }
+    TEST_ASSERT_TRUE_MESSAGE(all_valid, "empty-only writer output must pass strict reader integrity in all index/debug modes");
+}
+
 int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_crypto_hmac_sha256_rfc4231);
+    RUN_TEST(test_crypto_hmac_sha256_long_key_rfc4231);
     RUN_TEST(test_crypto_chacha20_rfc8439);
     RUN_TEST(test_roundtrip_stored_and_zstd);
+    RUN_TEST(test_empty_only_roundtrip_strict_integrity);
     RUN_TEST(test_normalization);
     RUN_TEST(test_determinism);
     RUN_TEST(test_corruption_detected);

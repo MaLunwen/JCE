@@ -28,6 +28,8 @@
 
 #include <stdbool.h>
 
+#define UC_DEFAULT_FONT "fonts/Aileron-Regular.ttf"
+
 typedef struct JcePakArchive JcePakArchive;
 
 /* The generation that invalidates every per-canvas resource cache.  Bumped by
@@ -56,6 +58,8 @@ JceFont *uc_open_font_path(const JcePakArchive *pak, const char *p,
 
 /* Attach the configured fallback chain to a freshly opened font.  Calls back
  * into uc_get_font, so the canvas's cache must already hold `f`'s slot. */
-void uc_attach_fallbacks(JceUICanvas *uc, JceFont *f, int px, bool sdf);
+JceFont *uc_get_font_leaf(JceUICanvas *uc, const char *path, int px, bool sdf);
+void uc_attach_fallbacks(JceUICanvas *uc, JceFont *f, const char *primary_path,
+                         int px, bool sdf);
 
 #endif /* JCE_UI_CANVAS_RESOURCES_H */

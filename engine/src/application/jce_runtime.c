@@ -25,10 +25,14 @@
 #include "jce_terrain_collision_stream.h"
 #include <jce/resource/jce_world_streamer.h>  /* shipped-path world streaming */
 #include "jce_rt_internal.h"
+#include "middleware/scene/jce_water_ripple_internal.h"
+#include "jce_runtime_trace_internal.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/scene/jce_water_field.h>
+#include <jce/middleware/scene/jce_scene_water_spectrum.h>
+#include <jce/middleware/scene/jce_scene_water_nearshore.h>
 #include <jce/middleware/scene/jce_water_ripple.h>
 #if defined(JCE_ENABLE_AI_DISPATCH) && JCE_ENABLE_AI_DISPATCH
 #include <jce/middleware/ai_dispatch/jce_ai_dispatch.h>
@@ -1904,7 +1908,6 @@ static void rt_apply_buoyancy(JceRuntime *rt, float fixed_dt)
 	 * evaluated its own Gerstner sum on its own clock -- which disagreed with
 	 * the screen in phase always, and in MODEL entirely whenever the water was
 	 * authored as FFT.  See jce_water_field.h. */
-	JceWaterFieldSet *wfs = jce_scene_water_fields(rt->scene);
 	/* ONE filler, from the scene -- see jce_scene_water_field_desc. The desc
 	 * that used to be written out here was the renderer's twin, and the two
 	 * disagreed: this side never applied the weather's wind multiplier, so in
@@ -1914,24 +1917,11 @@ static void rt_apply_buoyancy(JceRuntime *rt, float fixed_dt)
 	if (!jce_scene_water_field_desc(rt->scene, scan.entity, &wd)) return;
 
 	JceWaterField *field =
-	    jce_water_field_set_acquire(wfs, (uint64_t)scan.entity, &wd);
+	    jce_scene_acquire_water_field(rt->scene, scan.entity);
 
-	/* The DISTURBANCE layer, sized from the same water body this pass already
-	 * picked. Created here and nowhere else: this is the only code that knows
-	 * which body is the active one, and a grid created by a reader would be
-	 * sized by whoever happened to draw first.
-	 *
-	 * Resolution is fixed rather than authored. It is a cost decision, not a
-	 * look decision -- the step is explicit, so the work per simulated second
-	 * goes with the SQUARE of it -- and a field on the component would be a
-	 * knob whose right value nobody could state. 96 over a typical pond gives
-	 * texels of a few tens of centimetres, which is finer than the wake of
-	 * anything that floats.
-	 *
-	 * Depth is left at the uniform default. Real bathymetry from the terrain
-	 * is the next step and belongs with the terrain query, not here; until it
-	 * exists, a flat bed is honest -- waves simply do not refract toward the
-	 * shore yet. */
+	/* The active water body owns this fixed-resolution disturbance layer.
+	 * A render reader can sample it once this path establishes its domain.
+	 * The terrain sampling below replaces uniform depth when available. */
 	JceWaterRipple *ripple;
 	{
 		JceWaterRippleDesc rd = jce_water_ripple_default_desc();
@@ -1941,6 +1931,18 @@ static void rt_apply_buoyancy(JceRuntime *rt, float fixed_dt)
 		rd.center_x        = wd.center_x;
 		rd.center_z        = wd.center_z;
 		rd.default_depth_m = 2.0f;
+		const JceWaterNearshoreComponent *shore =
+		    jce_scene_get_water_nearshore(rt->scene, scan.entity);
+		if (scan.water->ocean && shore) {
+			/* Large render rings reach the horizon. Retain wake resolution
+			 * around the authored surf zone rather than covering that horizon. */
+			const float local_size = fmaxf(2.0f * rd.resolution, 2.0f * shore->extent);
+			if (rd.size_m > local_size) {
+				rd.size_m = local_size;
+				rd.center_x += shore->offset_x;
+				rd.center_z += shore->offset_z;
+			}
+		}
 		ripple = jce_scene_water_ripple(rt->scene, &rd);
 
 		/* BATHYMETRY: the still-water depth at every cell, from the terrain
@@ -2053,14 +2055,17 @@ static void rt_apply_buoyancy(JceRuntime *rt, float fixed_dt)
 		 *
 		 * Outside the grid the accessor returns 0, which is correct rather than
 		 * a fallback: outside it there is no disturbance. */
-		const float water_y = ws.position.y
-		                    + jce_water_ripple_height(ripple, pos.x, pos.z);
+		float surface_y = ws.position.y;
+		float coverage;
+		if (jce_scene_water_nearshore_surface(rt->scene, scan.entity, pos.x, pos.z,
+				ws.position.y, &surface_y, &coverage) && coverage < 0.01f) continue;
+		const float water_y = surface_y + jce_water_ripple_height(ripple, pos.x, pos.z);
 
 		const float submersion = water_y - pos.y;   /* >0 only when below */
 		const jce_vec3 vel = jce_physics_body_get_velocity(rt->physics, be->body);
 
-		/* WAKE. A body moving through water displaces it, and the impulse is
-		 * built entirely from quantities this pass already has -- no new
+		/* WAKE. A body moving through water drives its local vertical velocity.
+		 * Coupling uses quantities this pass already has -- no new
 		 * authored field, because none of them would have a value anyone could
 		 * state.
 		 *
@@ -2104,8 +2109,10 @@ static void rt_apply_buoyancy(JceRuntime *rt, float fixed_dt)
 			 * has a small residual vertical velocity forever, and without it
 			 * every floating object would drive the grid on every tick and the
 			 * pond would never go quiet. */
+			/* Continuous contact uses the executed physics dt. Repeating a full
+			 * one-shot impulse each tick creates unbounded feedback with buoyancy. */
 			if (r > 0.05f && (vel.y < -0.05f || vel.y > 0.05f))
-				jce_water_ripple_impulse(ripple, pos.x, pos.z, r, -vel.y);
+				jce_water_ripple_drive_velocity(ripple, pos.x, pos.z, r, vel.y, fixed_dt);
 		}
 
 		if (submersion <= 0.0f) continue;           /* airborne -> untouched */
@@ -3957,15 +3964,16 @@ static bool rt_select_locale_asset(const JceRuntimeDesc *desc, char out[32])
 	}
 	return false;
 }
-JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_platform_services(
-    const JceRuntimeDesc *desc, struct JcePlatformServices *services)
+JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_options(
+    const JceRuntimeDesc *desc, struct JcePlatformServices *services,
+    const JceRuntimeCreateOptions *options, size_t options_size)
 {
-	if (!desc || !desc->scene) return NULL;
+	JceTraceScope create_trace = rt_trace_begin("runtime.create");
+	if (!desc || !desc->scene) return rt_trace_create_failed(create_trace, 1);
 	JceRuntime *rt = (JceRuntime *)jce_malloc(sizeof *rt);
-	if (!rt) return NULL;
+	if (!rt) return rt_trace_create_failed(create_trace, 2);
 	memset(rt, 0, sizeof *rt);
-
-	rt->platform_services = services;
+	if (!rt_viewport_initialize(rt, services, options, options_size)) { jce_free(rt); return rt_trace_create_failed(create_trace, 3); }
 	rt->scene             = desc->scene;
 	rt->pak               = desc->pak;
 	rt->audio             = desc->audio;
@@ -4140,11 +4148,13 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_platform_services(
 	              "runtime: save snapshot -> registry=%s scene_provider=on saves_dir=%s",
 	              rt->save_registry ? "on" : "off",
 	              rt->saves_dir[0] ? rt->saves_dir : "(none)");
+	jce_trace_scope_end(create_trace, JCE_TRACE_TASK_SUCCEEDED);
 	return rt;
 }
 
 JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 {
+	JceTraceScope destroy_trace = rt ? rt_trace_begin("runtime.destroy") : (JceTraceScope){0};
 	if (rt && rt->world_streamer) {
 		jce_world_streamer_destroy(rt->world_streamer);
 		rt->world_streamer = NULL;
@@ -4230,6 +4240,7 @@ JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 		jce_save_migration_registry_destroy(rt->save_migrations);
 
 	jce_free(rt);
+	jce_trace_scope_end(destroy_trace, JCE_TRACE_TASK_SUCCEEDED);
 }
 
 /* ── Root motion application (FEATURE 3.2) ─────────────────────────────
@@ -4441,6 +4452,7 @@ JCE_API bool JCE_CALL jce_runtime_is_transitioning(const JceRuntime *rt)
 JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 {
 	if (!rt) return;
+	JceTraceScope tick_trace = rt_trace_begin("runtime.tick");
 	if (dt <= 0.0f) dt = 1.0f / 60.0f;
 
 	uint64_t _t0_tick = jce_time_perf_counter();
@@ -4465,6 +4477,7 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * (rt_audio_poll/_3d, no dt) stays real-time. */
 	const float sim_dt = rt->paused ? 0.0f : dt * rt->time_scale;
 
+	JceTraceScope physics_trace = rt_trace_begin("runtime.physics");
 	uint64_t _t0_physics = jce_time_perf_counter();
 	/* Project Settings > Physics > auto simulation == false: the world still
 	 * exists (for manual stepping via the physics API) but the runtime does not
@@ -4698,6 +4711,7 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 		jce_net_replication_tick((JceNetTick)ntick);
 	}
 	jce_perf_phase_add("physics", jce_time_perf_to_ms(_t0_physics, jce_time_perf_counter()));
+	jce_trace_scope_end(physics_trace, JCE_TRACE_TASK_SUCCEEDED);
 
 	/* Floating-origin large-world rebase (opt-in, default OFF).  Runs after the
 	 * physics sync above (so camera + entities + bodies are at their final
@@ -4706,10 +4720,12 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * floating_origin_enabled returns immediately → byte-identical frame path. */
 	rt_apply_floating_origin(rt);
 	{
+		JceTraceScope scene_trace = rt_trace_begin("runtime.scene_update");
 		uint64_t _t0_su = jce_time_perf_counter();
 		if (rt->scene)
 			jce_scene_update(rt->scene, sim_dt);
 		jce_perf_phase_add("scene_update", jce_time_perf_to_ms(_t0_su, jce_time_perf_counter()));
+		jce_trace_scope_end(scene_trace, JCE_TRACE_TASK_SUCCEEDED);
 	}
 	rt_streaming_tick(rt);   /* after scene_update: uses THIS frame's player pos */
 	/* Root motion (FEATURE 3.2): apply the root-joint delta the renderer
@@ -4731,9 +4747,10 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * networked objects + apply owned-object snap corrections.  Runs after
 	 * scene_update (so gameplay-owned transforms are final) and before the
 	 * gameplay/audio bridge below.  No-op without a live session. */
-	if (rt->net_bridged && jce_session_mode() != JCE_SESSION_MODE_NONE)
+	if (rt->net_bridged && jce_session_mode() != JCE_SESSION_MODE_NONE) {
 		jce_net_transform_render_step((double)rt->clock.alpha);
 		jce_net_animator_render_step((double)rt->clock.alpha);
+	}
 	/* Client-side prediction reconcile (runtime-driven so the net layer stays
 	 * prediction-free): pop any authoritative snapshot the net layer stashed
 	 * for the predicted entity and rollback+replay against it, writing the
@@ -4750,27 +4767,31 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	if (rt->scene)
 		jce_scene_sequencer_update(rt->scene, sim_dt);
 	/* VideoPlayer-as-texture: advance every playing clip one frame and
-	 * upload it into its component texture (the scene renderer binds it as
-	 * mesh albedo).  Runs once per runtime step; the editor drives the same
+	 * retain its CPU frame; admitted scene rendering uploads it as
+	 * mesh albedo.  Runs once per runtime step; the editor drives the same
 	 * call when NOT in play mode so Scene View previews video too. */
 	if (rt->scene)
-		jce_scene_video_update(rt->scene, (double)sim_dt, NULL, NULL);
+		jce_scene_video_advance(rt->scene, (double)sim_dt, NULL, NULL);
 	/* Particle emitters: load authored *.particles.json into the scene's
 	 * shared JceParticleSystem, sync emitter origins to entity world
 	 * positions, step the sim, and debug-draw alive particles.  Runs after
 	 * scene_update for the freshest transforms (mirrors video-as-texture). */
 	{
+		JceTraceScope particles_trace = rt_trace_begin("runtime.particles");
 		uint64_t _t0_par = jce_time_perf_counter();
 		if (rt->scene)
 			jce_scene_particles_update(rt->scene, sim_dt);
 		jce_perf_phase_add("particles", jce_time_perf_to_ms(_t0_par, jce_time_perf_counter()));
+		jce_trace_scope_end(particles_trace, JCE_TRACE_TASK_SUCCEEDED);
 	}
 	/* Variable-rate gameplay bridge: trigger overlap, spawn density, weapon
 	 * timers.  Runs after scene_update so it reads the freshest transforms. */
 	{
+		JceTraceScope gameplay_trace = rt_trace_begin("runtime.gameplay");
 		uint64_t _t0_game = jce_time_perf_counter();
 		rt_tick_gameplay(rt, sim_dt);
 		jce_perf_phase_add("gameplay", jce_time_perf_to_ms(_t0_game, jce_time_perf_counter()));
+		jce_trace_scope_end(gameplay_trace, JCE_TRACE_TASK_SUCCEEDED);
 	}
 	/* Physics draw-distance (big-world spawn): spawn deferred small static
 	 * colliders within radius of the player, despawn far ones.  Runs after
@@ -4799,6 +4820,7 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	jce_perf_phase_add("runtime_tick", jce_time_perf_to_ms(_t0_tick, jce_time_perf_counter()));
 
 	rt_input_expire_frame_sample(rt);   /* jce_rt_input.c */
+	jce_trace_scope_end(tick_trace, JCE_TRACE_TASK_SUCCEEDED);
 }
 
 /* ── Time control (Phase 0.2) ─────────────────────────────────────── */
@@ -5293,20 +5315,6 @@ JCE_API bool JCE_CALL jce_runtime_get_player_forward(const JceRuntime *rt,
 	}
 	if (out_fwd) *out_fwd = fwd;
 	return true;
-}
-
-JCE_API void JCE_CALL jce_runtime_pause_audio(JceRuntime *rt)
-{
-	if (!rt || !rt->audio) return;
-	for (int i = 0; i < rt->voice_count; ++i)
-		jce_audio_pause(rt->audio, rt->voices[i].voice);
-}
-
-JCE_API void JCE_CALL jce_runtime_resume_audio(JceRuntime *rt)
-{
-	if (!rt || !rt->audio) return;
-	for (int i = 0; i < rt->voice_count; ++i)
-		jce_audio_resume(rt->audio, rt->voices[i].voice);
 }
 
 JCE_API JcePhysicsWorld *JCE_CALL jce_runtime_physics(const JceRuntime *rt)

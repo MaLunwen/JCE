@@ -22,6 +22,7 @@
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_prefab.h>
+#include <jce/resource/jce_scene_serial.h>
 
 #include "unity.h"
 
@@ -102,6 +103,73 @@ static void test_script_loads_and_runs_through_runtime(void)
 
     jce_runtime_destroy(rt);
     jce_scene_destroy(s);
+}
+
+static void test_parented_trigger_routes_tag_and_remapped_target(void)
+{
+    static const char authored[] =
+        "{\"contract\":{\"name\":\"jce.scene\",\"major\":1,\"minor\":0},"
+        "\"scene\":{\"version\":1,\"entities\":["
+        "{\"id\":100,\"name\":\"GateAnchor\",\"components\":["
+        "{\"type\":\"Transform\",\"posX\":12}]},"
+        "{\"id\":101,\"name\":\"Gate\",\"parentId\":100,\"components\":["
+        "{\"type\":\"Transform\",\"posX\":1},"
+        "{\"type\":\"TriggerVolume\",\"cx\":2,\"hx\":0.5,\"hy\":0.5,\"hz\":0.5,"
+        "\"enabled\":true,\"fireStay\":true,\"tag\":\"west_gate\"},"
+        "{\"type\":\"Script\",\"scriptPath\":\"" SCRIPT_FILE "\",\"params\":["
+        "{\"name\":\"target\",\"kind\":3,\"entity\":4294967398}]}]},"
+        "{\"id\":4294967398,\"name\":\"Beacon\",\"components\":["
+        "{\"type\":\"Transform\"}]},"
+        "{\"id\":103,\"name\":\"Observer\",\"components\":["
+        "{\"type\":\"Transform\",\"posX\":3},"
+        "{\"type\":\"Camera\",\"primary\":true}]}]}}";
+    jce_test_write_file(SCRIPT_FILE,
+        "local M = {}\n"
+        "local function route(self, tag, x)\n"
+        "  assert(tag == 'west_gate', 'trigger tag was not forwarded')\n"
+        "  local kind, _, target = jce.get_param(self.entity, 'target')\n"
+        "  assert(kind == 3 and target and target ~= 0, 'missing entity target')\n"
+        "  jce.set_position(target, x, 0, 0)\n"
+        "end\n"
+        "function M:on_trigger_enter(observer, tag) route(self, tag, 11) end\n"
+        "function M:on_trigger_stay(observer, tag) route(self, tag, 22) end\n"
+        "function M:on_trigger_exit(observer, tag) route(self, tag, 33) end\n"
+        "return M\n");
+
+    JceScene *scene = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(scene);
+    TEST_ASSERT_TRUE(jce_scene_serial_load(scene, authored, sizeof authored - 1));
+    JceEntity gate, beacon, observer;
+    TEST_ASSERT_EQUAL_INT(1, jce_scene_query_by_name(scene, "Gate", &gate, 1));
+    TEST_ASSERT_EQUAL_INT(1, jce_scene_query_by_name(scene, "Beacon", &beacon, 1));
+    TEST_ASSERT_EQUAL_INT(1, jce_scene_query_by_name(scene, "Observer", &observer, 1));
+    TEST_ASSERT_NOT_EQUAL_UINT64(UINT64_C(4294967398), beacon);
+    const JceScriptComponent *script = jce_scene_get_script(scene, gate);
+    TEST_ASSERT_NOT_NULL(script);
+    TEST_ASSERT_EQUAL_INT(1, script->param_count);
+    TEST_ASSERT_EQUAL_UINT64(beacon, script->params[0].entity);
+
+    JceRuntimeDesc desc = {0};
+    desc.scene = scene; /* No physics. The primary camera is the viewer. */
+    JceRuntime *runtime = jce_runtime_create(&desc);
+    TEST_ASSERT_NOT_NULL(runtime);
+    const JceTransform *camera_pose = jce_scene_get_transform(scene, observer);
+    TEST_ASSERT_NOT_NULL(camera_pose);
+    JceTransform pose = *camera_pose;
+    /* Start at the incorrect local-space center. Only world x=15 overlaps. */
+    const struct { float camera_x, beacon_x; } steps[] = {
+        {3, 0}, {15, 11}, {15, 22}, {18, 33}
+    };
+    for (size_t i = 0; i < sizeof steps / sizeof steps[0]; ++i) {
+        pose.position.x = steps[i].camera_x;
+        jce_scene_set_transform(scene, observer, &pose);
+        jce_runtime_step(runtime, 1.0f / 60.0f);
+        const JceTransform *target = jce_scene_get_transform(scene, beacon);
+        TEST_ASSERT_NOT_NULL(target);
+        TEST_ASSERT_EQUAL_FLOAT(steps[i].beacon_x, target->position.x);
+    }
+    jce_runtime_destroy(runtime);
+    jce_scene_destroy(scene);
 }
 
 /* Spawn a dynamic-rigidbody entity (default box collider) at `x` carrying the
@@ -572,6 +640,7 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_script_loads_and_runs_through_runtime);
+    RUN_TEST(test_parented_trigger_routes_tag_and_remapped_target);
     RUN_TEST(test_a_script_drives_a_progress_bar_through_the_real_host);
     RUN_TEST(test_a_script_drives_a_dropdown_through_the_real_host);
     RUN_TEST(test_a_script_drives_an_input_field_through_the_real_host);

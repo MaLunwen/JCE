@@ -7,11 +7,16 @@
 extern "C" struct JceTerrain *jce_terrain_panel_get_terrain(void);
 extern "C" void jce_terrain_panel_set_brush_armed(bool armed);
 extern "C" bool jce_terrain_panel_open_asset(const char *path);
+#include <cfloat>
 #include <vector>
 #include "io/jce_editor_file_util.h"
+#include "jce_editor_foliage_bake_output.h"
+#include "core/jce_editor_project.h"
+#include <jce/os/core/jce_log.h>
 #include <jce/middleware/scene/jce_foliage.h>
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_ui_state.h"
+#include "ui/jce_editor_dnd.h"
 
 extern "C" {
 #include <jce/renderer/jce_renderer_caps.h>    /* compute caps gate (GPU particles) */
@@ -200,7 +205,6 @@ void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv)
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trig.fireStayEvents", "trig"), &tv->fire_stay))
         insp_undo_bool(&tv->fire_stay);
     ImGui::InputText(jce_editor_i18n_id("inspector.trig.tag", "trig"), tv->tag, sizeof tv->tag);
-    insp_unwired_field_badge();   /* fire_stay, tag */
     /* Commit the tag when the field loses focus (click away / select another
      * object) or on Enter — not every frame — so switching objects mid-edit
      * still records + saves the change. */
@@ -597,12 +601,8 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
                                       JCE_ASSET_KIND_DATA))
             ch = true;
         insp_track_edit();
-        /* TRUE TODAY, AND MEANT TO BE DELETED: nothing under engine/src reads
-         * baked_placement_path yet, so this control is inert.  The field is
-         * in-flight work; when its reader lands,
-         * check_authored_path_consumed.py fails on the now-stale exemption in
-         * authored_path_exempt.txt, and this badge goes with that line. */
-        insp_unwired_field_badge();
+        /* The renderer consumes the validated placement through the active
+         * asset owner; a successful write still needs actual render review. */
         if (vs->baked_placement_path[0]) {
             ImGui::SameLine();
             if (ImGui::SmallButton(
@@ -647,24 +647,41 @@ void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs,
             std::vector<unsigned char> blob(jce_foliage_cook_size(n));
             if (jce_foliage_cook(inst.data(), n, fp.seed,
                                  blob.data(), blob.size(), nullptr)) {
+                const JceProject *project = jce_editor_project_get();
                 char rel[256];
-                snprintf(rel, sizeof rel,
-                         "generated/foliage/vegetation_%u_%u.foliage.bin",
-                         (unsigned)entity, vs->seed);
-                char abs_path[512];
-                if (jce_editor_resolve_asset_path(rel, abs_path, sizeof abs_path) &&
-                    jce_fs_host_write_all_atomic(abs_path, blob.data(),
-                                                 (uint64_t)blob.size())) {
+                const char *reason = nullptr;
+                if (jce_editor_foliage_bake_write(
+                        project ? project->project_root : nullptr,
+                        project ? project->source_assets : nullptr,
+                        jce_fs_get_active_policy() == JCE_FS_ACTIVE_ISOLATED,
+                        entity, vs->seed, blob.data(), (uint64_t)blob.size(),
+                        rel, sizeof rel, &reason)) {
                     jce_state_begin_batch_edit();
                     snprintf(vs->baked_placement_path,
                              sizeof vs->baked_placement_path, "%s", rel);
                     jce_state_end_batch_edit();
+                    /* Replacing the same key must invalidate retained roots.
+                     * The shared reset also covers the Game View consumer. */
+                    jce_editor_scene_render_reset_occlusion();
+                    jce_assetdb_rescan();
                     s_baked = (int)n;
+                    LOG_INFO("foliage_bake",
+                        "placement written entity=%llu seed=%u count=%u "
+                        "bytes=%llu asset='%s' status=%s",
+                        (unsigned long long)entity, vs->seed, n,
+                        (unsigned long long)blob.size(), rel, reason);
                 } else {
-                    s_baked = -2;      /* wrote nothing: report, never pretend */
+                    s_baked = -2;
+                    LOG_WARN("foliage_bake",
+                        "placement write rejected entity=%llu seed=%u reason=%s",
+                        (unsigned long long)entity, vs->seed,
+                        reason ? reason : "unknown");
                 }
             } else {
                 s_baked = -2;
+                LOG_WARN("foliage_bake",
+                    "placement encoding failed entity=%llu seed=%u count=%u",
+                    (unsigned long long)entity, vs->seed, n);
             }
         }
 
@@ -717,66 +734,80 @@ void draw_comp_foliage_cluster(JceFoliageClusterComponent *fc)
 void draw_comp_grass_field(JceGrassFieldComponent *g)
 {
     if (!g) return;
-    bool ch = false;
 
     /* --- Scatter --- */
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.density"),
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.density"),
                            &g->density, 0.05f, 0.001f, 10000.0f, "%.3f");
+    insp_track_edit();
 
-    uint32_t seed_step = 1;
     uint32_t seed_min  = 0;
     uint32_t seed_max  = 0xFFFFFFFFu;
-    if (ImGui::DragScalar(jce_editor_i18n("inspector.grassField.seed"),
-                          ImGuiDataType_U32, &g->seed, 1.0f, &seed_min, &seed_max))
-        ch = true;
+    ImGui::DragScalar(jce_editor_i18n("inspector.grassField.seed"),
+                          ImGuiDataType_U32, &g->seed, 1.0f, &seed_min, &seed_max);
+    insp_track_edit();
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("inspector.grassField.reseed"))) {
-        g->seed = g->seed * 1664525u + 1013904223u;
-        ch = true;
+        insp_undo_set(&g->seed, g->seed * 1664525u + 1013904223u);
     }
 
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.areaX"),
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.areaX"),
                            &g->area_x, 0.5f, 0.0f, 100000.0f, "%.1f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.areaZ"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.areaZ"),
                            &g->area_z, 0.5f, 0.0f, 100000.0f, "%.1f");
-    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.grassField.maxSlope"),
+    insp_track_edit();
+    ImGui::SliderFloat(jce_editor_i18n("inspector.grassField.maxSlope"),
                              &g->max_slope_deg, 0.0f, 90.0f, "%.1f");
+    insp_track_edit();
 
     /* --- Blade geometry --- */
     ImGui::Separator();
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.scaleMin"),
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.scaleMin"),
                            &g->scale_min, 0.01f, 0.0f, 100.0f, "%.3f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.scaleMax"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.scaleMax"),
                            &g->scale_max, 0.01f, 0.0f, 100.0f, "%.3f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.bladeHeight"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.bladeHeight"),
                            &g->blade_height, 0.01f, 0.0f, 100.0f, "%.3f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.bladeWidth"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.bladeWidth"),
                            &g->blade_width, 0.001f, 0.0f, 10.0f, "%.4f");
-    ch |= ImGui::SliderInt(jce_editor_i18n("inspector.grassField.cards"),
+    insp_track_edit();
+    ImGui::SliderInt(jce_editor_i18n("inspector.grassField.cards"),
                            &g->cards, 3, 6);
+    insp_track_edit();
 
     /* --- Color --- */
     ImGui::Separator();
-    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.grassField.rootColor"), g->root_color);
-    ch |= ImGui::ColorEdit3(jce_editor_i18n("inspector.grassField.tipColor"),  g->tip_color);
-    ch |= ImGui::SliderFloat(jce_editor_i18n("inspector.grassField.hueJitter"),
+    ImGui::ColorEdit3(jce_editor_i18n("inspector.grassField.rootColor"), g->root_color);
+    insp_track_edit();
+    ImGui::ColorEdit3(jce_editor_i18n("inspector.grassField.tipColor"),  g->tip_color);
+    insp_track_edit();
+    ImGui::SliderFloat(jce_editor_i18n("inspector.grassField.hueJitter"),
                              &g->hue_jitter, 0.0f, 1.0f, "%.3f");
+    insp_track_edit();
 
     /* --- Wind --- */
     ImGui::Separator();
-    ch |= ImGui::DragFloat2(jce_editor_i18n("inspector.grassField.windDir"),
+    ImGui::DragFloat2(jce_editor_i18n("inspector.grassField.windDir"),
                             g->wind_dir, 0.01f, -1.0f, 1.0f, "%.3f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.windSpeed"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.windSpeed"),
                            &g->wind_speed, 0.01f, 0.0f, 100.0f, "%.3f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.windAmplitude"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.windAmplitude"),
                            &g->wind_amplitude, 0.005f, 0.0f, 10.0f, "%.4f");
+    insp_track_edit();
 
     /* --- Fade --- */
     ImGui::Separator();
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeStart"),
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeStart"),
                            &g->fade_start, 1.0f, 0.0f, 100000.0f, "%.1f");
-    ch |= ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeEnd"),
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.grassField.fadeEnd"),
                            &g->fade_end, 1.0f, 0.0f, 100000.0f, "%.1f");
+    insp_track_edit();
 
     /* --- Density mask (paths / ponds read through the grass) ---
      * Serialized + consumed by the renderer (the ES pond scene carves its
@@ -785,17 +816,29 @@ void draw_comp_grass_field(JceGrassFieldComponent *g)
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n_or("inspector.grassField.densityMask",
                                               "Density Mask (G channel gates blades)"));
-    if (jce_draw_path_input_asset("##gf_density_mask", g->density_mask_path,
-                                  sizeof g->density_mask_path,
-                                  JCE_ASSET_KIND_TEXTURE))
-        ch = true;
+    char mask_before[sizeof g->density_mask_path] = {0};
+    JcePathInputOpts mask_opts;
+    mask_opts.asset_kind = JCE_ASSET_KIND_TEXTURE;
+    mask_opts.changed_before = mask_before;
+    mask_opts.changed_before_size = sizeof mask_before;
+    if (jce_draw_path_input("##gf_density_mask", g->density_mask_path,
+                            sizeof g->density_mask_path, JcePathKind::AssetVfs,
+                            &mask_opts)) {
+        char mask_now[sizeof g->density_mask_path];
+        memcpy(mask_now, g->density_mask_path, sizeof mask_now);
+        memcpy(g->density_mask_path, mask_before, sizeof mask_before);
+        INSP_UNDO_SCOPE();
+        memcpy(g->density_mask_path, mask_now, sizeof mask_now);
+    }
     if (g->density_mask_path[0]) {
-        ch |= ImGui::SliderFloat(jce_editor_i18n_id("inspector.grassField.densityThreshold",
+        ImGui::SliderFloat(jce_editor_i18n_id("inspector.grassField.densityThreshold",
                                                     "Mask Threshold"),
                                  &g->density_threshold, 0.0f, 1.0f, "%.2f");
-        ch |= ImGui::DragFloat(jce_editor_i18n_id("inspector.grassField.maskWorldSize",
+        insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.grassField.maskWorldSize",
                                                   "Mask World Size"),
                                &g->mask_world_size, 0.5f, 0.0f, 100000.0f, "%.1f");
+        insp_track_edit();
         ImGui::TextDisabled("%s", jce_editor_i18n_or("inspector.grassField.maskHint",
             "Blades survive where mask.g >= threshold; 0 world size = area rect."));
     }
@@ -808,15 +851,225 @@ void draw_comp_grass_field(JceGrassFieldComponent *g)
          * The BeginDisabled(true), the unwired badge and the "(v1: reserved)"
          * label are all gone together -- a control that works while still
          * wearing three signs saying it does not is the same lie backwards. */
-        ch |= ImGui::Checkbox(jce_editor_i18n("inspector.grassField.castShadow"), &g->cast_shadow);
+        if (ImGui::Checkbox(jce_editor_i18n("inspector.grassField.castShadow"), &g->cast_shadow))
+            insp_undo_bool(&g->cast_shadow);
     }
-    ch |= ImGui::Checkbox(jce_editor_i18n("inspector.grassField.visible"), &g->visible);
+    if (ImGui::Checkbox(jce_editor_i18n("inspector.grassField.visible"), &g->visible))
+        insp_undo_bool(&g->visible);
 
     /* Estimate blade count */
     long est = (long)((double)g->density * (double)g->area_x * (double)g->area_z);
     ImGui::TextDisabled("%s: %ld", jce_editor_i18n("inspector.grassField.estimate"), est);
+}
 
-    if (ch) insp_track_edit();
+void draw_comp_water_caustics(JceWaterCausticsComponent *value)
+{
+    if (!value) return;
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    bool changed = false;
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.causticProjection.offsetX"),
+        &value->offset_x, 0.01f, -10.0f, 10.0f, "%.2f m", clamp);
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.causticProjection.offsetZ"),
+        &value->offset_z, 0.01f, -10.0f, 10.0f, "%.2f m", clamp);
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.causticProjection.fadeDepth"),
+        &value->fade_depth, 0.05f, 0.01f, 1000.0f, "%.2f m", clamp);
+    if (changed) insp_track_edit();
+}
+
+void draw_comp_water_caustic_detail(JceWaterCausticDetailComponent *value)
+{
+    if (!value) return;
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    ImGui::SliderFloat(jce_editor_i18n("inspector.water.causticDetail.secondaryWeight"),
+        &value->secondary_weight, 0.0f, 1.0f, "%.2f", clamp);
+    insp_track_edit();
+
+    float start = value->transition_start_m;
+    if (ImGui::DragFloat(jce_editor_i18n("inspector.water.causticDetail.transitionStartM"),
+            &start, 0.05f, 0.0f, 80.0f, "%.2f m", clamp) && start < value->transition_end_m)
+        value->transition_start_m = start;
+    insp_track_edit();
+
+    float end = value->transition_end_m;
+    if (ImGui::DragFloat(jce_editor_i18n("inspector.water.causticDetail.transitionEndM"),
+            &end, 0.05f, 0.0f, 100.0f, "%.2f m", clamp) && end > value->transition_start_m)
+        value->transition_end_m = end;
+    insp_track_edit();
+
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.causticDetail.tileSizeM"),
+        &value->tile_size_m, 0.05f, 0.0f, 128.0f, "%.2f m", clamp);
+    insp_track_edit();
+
+    ImGui::SliderFloat(jce_editor_i18n("inspector.water.causticDetail.finePeriodRatio"),
+        &value->fine_period_ratio, 0.0f, 0.5f, "%.3f", clamp);
+    insp_track_edit();
+    ImGui::SliderFloat(jce_editor_i18n("inspector.water.causticDetail.fineWeight"),
+        &value->fine_weight, 0.0f, 1.0f, "%.2f", clamp);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.causticDetail.fineFadeDepthM"),
+        &value->fine_fade_depth_m, 0.05f, 0.05f, 100.0f, "%.2f m", clamp);
+    insp_track_edit();
+}
+
+void draw_comp_water_normal_detail(JceScene *scene, JceEntity entity)
+{
+    const JceWaterNormalDetailComponent *value =
+        jce_scene_get_water_normal_detail(scene, entity);
+    if (!value) return;
+    JceWaterNormalDetailComponent edited = *value;
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    const auto apply_edit = [&](bool changed) {
+        // Snapshot the old value on activation; publish a final edit before
+        // deactivation closes history. Track every draw, including idle frames.
+        const bool activated = ImGui::IsItemActivated();
+        if (changed && !activated)
+            jce_scene_set_water_normal_detail(scene, entity, &edited);
+        insp_track_edit();
+        if (changed && activated)
+            jce_scene_set_water_normal_detail(scene, entity, &edited);
+    };
+    // These authored bands are independent: never reorder their frequencies.
+    apply_edit(ImGui::DragFloat(jce_editor_i18n("inspector.water.normalDetail.frequencyLow"),
+        &edited.frequency_low, 0.1f, 0.1f, 64.0f, "%.2f /m", clamp));
+    apply_edit(ImGui::DragFloat(jce_editor_i18n("inspector.water.normalDetail.frequencyHigh"),
+        &edited.frequency_high, 0.1f, 0.1f, 64.0f, "%.2f /m", clamp));
+    apply_edit(ImGui::SliderFloat(jce_editor_i18n("inspector.water.normalDetail.strength"),
+        &edited.strength, 0.0f, 1.0f, "%.3f", clamp));
+}
+
+void draw_comp_water_optics(JceWaterOpticsComponent *value)
+{
+    if (!value) return;
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    ImGui::SliderFloat(jce_editor_i18n("inspector.water.optics.ssrStrength"),
+        &value->ssr_strength, 0.0f, 1.0f, "%.2f", clamp);
+    insp_track_edit();
+    ImGui::SliderFloat(jce_editor_i18n("inspector.water.optics.refractionStrength"),
+        &value->refraction_strength, 0.0f, 1.0f, "%.2f", clamp);
+    insp_track_edit();
+}
+
+void draw_comp_water_motion(JceWaterMotionComponent *value)
+{
+    if (!value) return;
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    bool changed = false;
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.motion.cascadeFraction"),
+        &value->cascade_fraction, 0.0f, 0.95f, "%.2f", clamp);
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.motion.phaseRate"),
+        &value->phase_rate, 0.0f, 4.0f, "%.2f", clamp);
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.motion.horizontalScale"),
+        &value->horizontal_scale, 0.0f, 2.0f, "%.2f", clamp);
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.motion.maxHorizontalDisplacement"),
+        &value->max_horizontal_displacement, 0.05f, 0.0f, 64.0f, "%.2f m", clamp);
+    ImGui::TextWrapped("%s", jce_editor_i18n("inspector.water.motion.note"));
+    if (changed) insp_track_edit();
+}
+
+void draw_comp_water_nearshore(JceScene *scene, JceWaterNearshoreComponent *value)
+{
+    if (!value) return;
+    const char *none = jce_editor_i18n("inspector.water.nearshore.noTerrain");
+    const char *selected_name = value->terrain ? jce_scene_entity_name(scene, value->terrain) : none;
+    if (value->terrain && !jce_scene_has_terrain(scene, value->terrain))
+        selected_name = jce_editor_i18n("inspector.water.nearshore.missingTerrain");
+    if (ImGui::BeginCombo(jce_editor_i18n("inspector.water.nearshore.terrain"),
+                          selected_name ? selected_name : none)) {
+        JceEntity selection = value->terrain;
+        if (ImGui::Selectable(none, selection == 0)) selection = 0;
+        jce_scene_each_entity(scene, [](JceScene *s, JceEntity e, void *ud) {
+            if (!jce_scene_has_terrain(s, e)) return;
+            auto *choice = static_cast<JceEntity *>(ud);
+            const char *name = jce_scene_entity_name(s, e);
+            if (!name || !*name) return;
+            ImGui::PushID(static_cast<int>(e >> 32));
+            ImGui::PushID(static_cast<int>(e & UINT32_MAX));
+            if (ImGui::Selectable(name, *choice == e)) *choice = e;
+            ImGui::PopID();
+            ImGui::PopID();
+        }, &selection);
+        ImGui::EndCombo();
+        insp_undo_set(&value->terrain, selection);
+    }
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.nearshore.offsetX"),
+        &value->offset_x, 0.1f, -FLT_MAX, FLT_MAX, "%.2f m", clamp);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.nearshore.offsetZ"),
+        &value->offset_z, 0.1f, -FLT_MAX, FLT_MAX, "%.2f m", clamp);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.nearshore.extent"),
+        &value->extent, 0.1f, 8.0f, 128.0f, "%.2f m", clamp);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.nearshore.drag"),
+        &value->drag, 0.05f, 0.0f, 20.0f, "%.2f /s", clamp);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.water.nearshore.boundaryAbsorption"),
+        &value->boundary_absorption, 0.1f, 0.0f, 50.0f, "%.2f /s", clamp);
+    insp_track_edit();
+    ImGui::SliderFloat(jce_editor_i18n("inspector.water.nearshore.foamOpacity"),
+        &value->foam_opacity, 0.0f, 1.0f, "%.2f", clamp);
+    insp_track_edit();
+}
+
+void draw_comp_water_crest(JceWaterCrestComponent *value)
+{
+    if (!value) return;
+    const ImGuiSliderFlags clamp = ImGuiSliderFlags_AlwaysClamp;
+    bool changed = false;
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.crest.start"),
+        &value->start_height, 0.01f, 0.0f, 1000.0f, "%.2f m", clamp);
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.crest.range"),
+        &value->height_range, 0.01f, 0.001f, 1000.0f, "%.3f m", clamp);
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.crest.fade"),
+        &value->fade_distance, 1.0f, 0.1f, 100000.0f, "%.1f m", clamp);
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.crest.strength"),
+        &value->strength, 0.0f, 8.0f, "%.2f", clamp);
+    changed |= ImGui::ColorEdit3(jce_editor_i18n("inspector.water.crest.tint"), value->tint);
+    if (changed) insp_track_edit();
+}
+
+void draw_comp_water_foam(JceWaterFoamComponent *value)
+{
+    if (!value) return;
+    bool changed = false;
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.foam.generation"),
+        &value->generation_rate, 0.0f, 100.0f, "%.2f");
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.foam.decay"),
+        &value->decay_rate, 0.0f, 100.0f, "%.2f");
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.foam.threshold"),
+        &value->fold_threshold, -1.0f, 1.0f, "%.2f");
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.foam.opacity"),
+        &value->opacity, 0.0f, 1.0f, "%.2f");
+    changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.foam.scale"),
+        &value->texture_scale, 0.01f, 0.0001f, 1000.0f, "%.4f");
+    ImGui::TextWrapped("%s", jce_editor_i18n("inspector.water.foam.requirement"));
+    if (changed) insp_track_edit();
+}
+
+void draw_comp_water_spectrum(JceWaterSpectrumComponent *value)
+{
+    if (!value) return;
+    bool changed = false;
+    const char *models[] = { "JONSWAP", "Pierson-Moskowitz", "TMA" };
+    int model = (int)value->model - 1;
+    if (ImGui::Combo(jce_editor_i18n("inspector.water.spectrum.model"),
+                     &model, models, 3)) {
+        value->model = (uint32_t)(model + 1);
+        changed = true;
+    }
+    if (value->model == JCE_WATER_FFT_SPECTRUM_TMA)
+        changed |= ImGui::DragFloat(jce_editor_i18n("inspector.water.spectrum.depth"),
+            &value->depth, 0.1f, 0.01f, 10000.0f, "%.2f");
+    changed |= ImGui::SliderFloat(jce_editor_i18n("inspector.water.spectrum.direction"),
+        &value->directional_blend, 0.0f, 1.0f, "%.2f");
+    bool filtering = (value->shading_flags & JCE_WATER_SPECTRUM_FILTER_NORMALS) != 0;
+    if (ImGui::Checkbox(jce_editor_i18n("inspector.water.spectrum.filterNormals"), &filtering)) {
+        value->shading_flags = filtering ? JCE_WATER_SPECTRUM_FILTER_NORMALS : 0u;
+        changed = true;
+    }
+    ImGui::TextWrapped("%s", jce_editor_i18n("inspector.water.spectrum.waterControls"));
+    if (changed) insp_track_edit();
 }
 
 void draw_comp_water(JceWaterComponent *w)
@@ -1397,10 +1650,26 @@ static void draw_script_params(JceScriptComponent *scr)
                 insp_track_edit();
                 break;
             case JCE_SCRIPT_PARAM_ENTITY: {
-                int ent = (int)pm->entity;
-                if (ImGui::DragInt("##vl", &ent, 1.0f, 0, 1 << 30))
-                    pm->entity = (uint64_t)(ent < 0 ? 0 : ent);
+                ImGui::InputScalar("##vl", ImGuiDataType_U64, &pm->entity);
                 insp_track_edit();
+                JceScene *scene = jce_state_get_scene();
+                const bool hovered = ImGui::IsItemHovered();
+                if (scene && ImGui::BeginDragDropTarget()) {
+                    if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(JCE_DND_ENTITY);
+                        payload && payload->DataSize == static_cast<int>(sizeof(uint32_t))) {
+                        uint32_t index;
+                        memcpy(&index, payload->Data, sizeof index);
+                        const JceEntity entity = jce_state_to_ecs_entity(index);
+                        if (jce_scene_entity_alive(scene, entity))
+                            insp_undo_set(&pm->entity, entity);
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                if (scene && hovered && jce_scene_entity_alive(scene, pm->entity)) {
+                    const char *name = jce_scene_entity_name(scene, pm->entity);
+                    if (name && name[0])
+                        ImGui::SetTooltip("%s", name);
+                }
                 break;
             }
             case JCE_SCRIPT_PARAM_NUMBER:

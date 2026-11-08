@@ -210,13 +210,27 @@ typedef enum JceRendererBackend {
  * every GPU below GL 4.3.
  *
  * So the tier is now a support-matrix decision, not a performance one.  Pick a
- * higher one to narrow what you ship to, never to go faster. */
+ * higher one to narrow what you ship to, never to go faster.
+ *
+ * COMPATIBILITY is an explicit additional support policy (GL 2.1 / GLES 2.0),
+ * not a lower quality setting or proof that every renderer feature is available.
+ * Required extensions, shader/resource limits and feature fallbacks still need
+ * their own capability admission. Existing tier values remain unchanged. */
 typedef enum JceGraphicsApiTier {
     JCE_GRAPHICS_API_TIER_STABLE  = 0,
     JCE_GRAPHICS_API_TIER_MODERN  = 1,
     JCE_GRAPHICS_API_TIER_CURRENT = 2,
-    JCE_GRAPHICS_API_TIER_COUNT   = 3
+    JCE_GRAPHICS_API_TIER_COUNT   = 3, /* Legacy dense-range sentinel. */
+    JCE_GRAPHICS_API_TIER_COMPATIBILITY = 4
 } JceGraphicsApiTier;
+
+/* Pure build/profile policy, not a graphics capability or execution claim. */
+static inline bool jce_graphics_api_is_compatibility_gl_es(
+    JceGraphicsApiTier tier, JceRendererBackend backend)
+{
+    return tier == JCE_GRAPHICS_API_TIER_COMPATIBILITY &&
+        (backend == JCE_BACKEND_OPENGL || backend == JCE_BACKEND_OPENGLES);
+}
 
 typedef struct JceGraphicsApiVersion {
     uint16_t major;

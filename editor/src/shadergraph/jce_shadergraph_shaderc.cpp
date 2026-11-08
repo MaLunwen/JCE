@@ -316,9 +316,13 @@ ShadercResult compile_sc(const std::string &sc_path,
     int         exit_code  = -1;
     std::string stderr_buf;
     if (!run_shaderc(shaderc, args, &stderr_buf, &exit_code)) {
-        r.error = stderr_buf.empty()
-                    ? ("failed to spawn shaderc: " + shaderc)
-                    : stderr_buf;
+        if (stderr_buf.empty()) {
+            const char *spawn_error = jce_process_get_last_spawn_error();
+            r.error = "failed to spawn shaderc: " + shaderc;
+            if (spawn_error && spawn_error[0]) r.error += std::string(" (process: ") + spawn_error + ")";
+        } else {
+            r.error = stderr_buf;
+        }
         std::remove(bin_path.c_str());
         return r;
     }

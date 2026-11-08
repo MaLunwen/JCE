@@ -10,6 +10,12 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
     return jce_runtime_create_with_platform_services(desc, NULL);
 }
 
+JCE_API JceRuntime *JCE_CALL jce_runtime_create_with_platform_services(
+    const JceRuntimeDesc *desc, JcePlatformServices *services)
+{
+    return jce_runtime_create_with_options(desc, services, NULL, 0);
+}
+
 void jce_runtime_set_platform_services(JceRuntime *rt, JcePlatformServices *services)
 {
     if (rt) rt->platform_services = services;

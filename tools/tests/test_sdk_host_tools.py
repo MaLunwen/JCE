@@ -21,7 +21,7 @@ class SDKHostToolsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.sdk = Path(self.temp.name) / 'sdk'
         self.names = ('jce_cook', 'jce_pak', 'jce_bin2obj')
-        self.target = {'host': 'windows', 'arch': 'x64'}
+        self.target = {'host': 'windows', 'arch': 'x86_64', 'key': 'windows-x64'}
         self.args = SimpleNamespace(project=self.temp.name, arch='x64', variant='dist')
 
     def populate(self, directory='bin', names=None):
@@ -44,7 +44,9 @@ class SDKHostToolsTests(unittest.TestCase):
         def probe(cmd, **kwargs):
             calls.append(Path(cmd[0]))
             return SimpleNamespace(returncode=1)
-        self.assertNotIn(Path('host-lock'), self.paths(probe))
+        paths = self.paths(probe)
+        self.assertIn(Path(self.temp.name).resolve() / 'build/desktop/windows-x64/dist', paths)
+        self.assertNotIn(Path('host-lock'), paths)
         self.assertEqual(set(calls), {self.sdk / 'bin' / (name + '.exe') for name in self.names})
         self.assertEqual(len(self.args._sdk_host_tools), 3)
 

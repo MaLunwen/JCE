@@ -13,6 +13,7 @@
 
 #include "jce_sr_internal.h"
 #include "jce_sr_anim_retarget.h"
+#include "jce_scene_order_internal.h"
 
 #include <jce/middleware/animation/jce_humanoid.h> /* role map for kind-7 IK goals */
 #include <jce/resource/jce_pak_loader.h>   /* PAK-first anim-SM / avatar-mask */
@@ -24,6 +25,8 @@
 #include <jce/os/core/jce_hashmap.h>
 
 #include <string.h>
+#include <limits.h>
+#include "renderer/jce_skinned_mesh_deform_internal.h"
 
 /* ── FEATURE 3.1 GPU morph deform: per-instance dynamic-VB lifecycle ──
  *
@@ -50,6 +53,7 @@ static void sr_init_morph_vbs(SrAnimInstance *a)
 void sr_free_morph_vbs(SrAnimInstance *a)
 {
     if (!a) return;
+    sr_free_cpu_deform(a);
     for (int i = 0; i < SR_MORPH_PRIM_MAX; i++) {
         if (a->morph_vb[i].idx != UINT16_MAX) {
             bgfx_destroy_dynamic_vertex_buffer(a->morph_vb[i]);
@@ -94,6 +98,9 @@ static void sr_anim_rebind_model(SrAnimInstance *a, JceModel *model)
     a->player      = NULL;
     a->model       = model;
     a->active_clip = -1;
+    a->skin_palette_count = 0;
+    a->prev_skin_palette_count = 0;
+    a->prev_skin_valid = false;
     /* Clip set changed — force the blend tree to rebuild against the new
        model's clips. */
     if (a->blend_tree) {
@@ -968,204 +975,62 @@ static jce_vec3 sr_world_to_model(const jce_mat4 *inv_model, jce_vec3 p)
     return jce_v3(r.x, r.y, r.z);
 }
 
-/* ── Animator sub-list ──────────────────────────────────────────────
- * With >=1 SkeletalAnimator in the scene, SIX passes (clip select, IK,
- * foot IK, full-body IK, morph weights, ragdoll) each walked the FULL
- * collect list probing has_skeletal_animator per entity — 6 x O(150k)
- * flecs probes per viewport per frame on a large world with one character.
- * sr_anim_build_selection runs once per sr_update_skinned_anims: the (tiny)
- * animator id set comes from component iteration, then a single list walk
- * records the indices carrying an animator, in list order.  Membership and
- * order semantics (focus-bounded streaming collect, event dispatch order,
- * instance slot allocation) are preserved exactly, and every pass keeps its
- * own has_/get checks so mid-frame component removal behaves as before.
- * On allocation failure s_asel_valid stays false and the passes fall back
- * to the original full walks. */
-static uint32_t *s_asel_set;      /* open-addressed animator-id set */
-static uint32_t  s_asel_set_cap;  /* power of two, 0 = unallocated */
-static int      *s_asel_idx;      /* collect-list indices with an animator */
-static int       s_asel_idx_cap;
-static int       s_asel_count;
-static bool      s_asel_valid;
+/* The first view's focus-cull list is not the scene's animator population.
+ * Reserve requests and an entity snapshot together on the existing renderer
+ * owner. Six pose passes consume this short, authored-order snapshot, including
+ * actors visible only to later views. No per-frame allocation after growth. */
+typedef struct {
+    EntityList *list;
+    bool overflow;
+} SrAnimSnapshotContext;
 
-/* Memo key: the selection is a pure function of (which renderer, which collect
- * list, which animator entities), so it only has to be rebuilt when one of
- * those changes.  Without this the list walk below runs every frame -- and it
- * is O(entities), not O(animators): the sampler put it at 2.8% of a 200k frame
- * whose animators number in the single digits, streaming 1.6 MB of entity ids
- * to locate a handful.
- *
- * The id sum AND xor are both kept because either alone collides trivially
- * (swap two ids; add one and remove another of equal value). Both are computed
- * inside the animator iteration that already happens, so the key costs
- * O(animators), which is the whole point. */
-/* These are file-scope statics: ONE selection for the whole process.
- *
- * That is safe, and it is worth writing down why, because it looks alarming.
- * Build and use are a single call chain -- sr_anim_build_selection runs once at
- * the top of sr_update_skinned_anims and the IK / morph / ragdoll passes consume
- * s_asel_idx before it returns -- so two renderers cannot interleave a build
- * with another's use.
- *
- * What a second JceSceneRenderer culling the same scene WOULD do is alternate
- * the s_asel_key_sr check and miss every time, falling back to the full
- * O(entities) walk. That is correct output at the old cost, not corruption. If
- * a second viewport ever measures slow here, this is the reason, and the fix is
- * to key the memo per renderer rather than to distrust the answer. */
-static const void *s_asel_key_sr;   /* which renderer owns the cached answer */
-static int         s_asel_key_n;    /* animator count it was built for */
-
-static uint64_t s_asel_cur_sum;
-static uint32_t s_asel_cur_xor;
-
-static void sr_asel_collect_cb(JceScene *s, JceEntity e, void *ud)
+static void sr_anim_snapshot_collect(JceScene *scene, JceEntity entity, void *user)
 {
-    (void)s; (void)ud;
-    uint32_t id = (uint32_t)e;
-    if (id == 0) return;
-    s_asel_cur_sum += id;
-    s_asel_cur_xor ^= id;
-    const uint32_t mask = s_asel_set_cap - 1u;
-    uint32_t h = (id * 2654435761u) & mask;
-    while (s_asel_set[h] && s_asel_set[h] != id) h = (h + 1u) & mask;
-    s_asel_set[h] = id;
+    (void)scene;
+    SrAnimSnapshotContext *ctx = user;
+    if (ctx->list->count >= ctx->list->cap) { ctx->overflow = true; return; }
+    ctx->list->entities[ctx->list->count++] = entity;
 }
 
-static void sr_anim_build_selection(const JceSceneRenderer *sr,
-                                    JceScene *scene, const EntityList *list)
+static bool sr_anim_build_scene_snapshot(JceSceneRenderer *sr, JceScene *scene,
+                                         EntityList *snapshot)
 {
-    const bool was_valid = s_asel_valid;
-    s_asel_valid = false;
-    if (!list) { s_asel_count = 0; return; }
-    const int n = jce_scene_count_skeletal_animators(scene);
-    if (n <= 0 || list->count <= 0) { s_asel_count = 0; s_asel_valid = true; return; }
-
-    uint32_t need = (uint32_t)n * 2u;
-    uint32_t cap = s_asel_set_cap ? s_asel_set_cap : 64u;
-    while (cap < need) cap <<= 1;
-    if (cap != s_asel_set_cap || !s_asel_set) {
-        uint32_t *ns = (uint32_t *)JCE_REALLOC(s_asel_set,
-                                               (size_t)cap * sizeof *ns);
-        if (!ns) return;
-        s_asel_set = ns; s_asel_set_cap = cap;
+    memset(snapshot, 0, sizeof(*snapshot));
+    const int count = jce_scene_count_skeletal_animators(scene);
+    if (count <= 0) return true;
+    if ((uint32_t)count > sr->anim_request_capacity || !sr->anim_requests) {
+        const uint32_t capacity = jce_hashmap_cap_pow2((uint32_t)count, 16u);
+        const size_t stride = sizeof(SrAnimSample) + sizeof(JceEntity);
+        if (capacity < (uint32_t)count || capacity > INT_MAX || capacity > SIZE_MAX / stride) return false;
+        void *next = JCE_REALLOC(sr->anim_requests, (size_t)capacity * stride);
+        if (!next) {
+            LOG_ERROR(LOG_TAG, "animation snapshot allocation failed for %d actors", count);
+            return false;
+        }
+        sr->anim_requests = next;
+        sr->anim_request_capacity = capacity;
     }
-    memset(s_asel_set, 0, (size_t)s_asel_set_cap * sizeof *s_asel_set);
-    s_asel_cur_sum = 0; s_asel_cur_xor = 0;
-    jce_scene_each_skeletal_animator(scene, sr_asel_collect_cb, NULL);
-
-    /* Same renderer, same collect list, same animator set => the indices we
-     * recorded last time are still exactly right. Skip the O(entities) walk.
-     *
-     * A cache that silently returns a stale selection does not crash -- it
-     * freezes animation, which is exactly the kind of defect that ships. So
-     * JCE_ANIM_ASEL_VERIFY=1 rebuilds anyway and compares, in the same shape as
-     * JCE_CULL_VERIFY and JCE_DRAWCMD_VERIFY. */
+    snapshot->entities = (JceEntity *)((SrAnimSample *)sr->anim_requests + sr->anim_request_capacity);
+    snapshot->cap = (int)sr->anim_request_capacity;
+    SrAnimSnapshotContext ctx = {snapshot, false};
+    jce_scene_each_skeletal_animator(scene, sr_anim_snapshot_collect, &ctx);
+    if (ctx.overflow || snapshot->count != count) return false;
+    if (!jce_scene_internal_sort_entities(scene, snapshot->entities, (size_t)snapshot->count))
+        return false;
+    /* The former selection-memo verification switch now validates the exact
+     * snapshot. It never changes membership or enables a culled fallback. */
     static int s_asel_verify = -1;
     if (s_asel_verify < 0) {
-        const char *v = getenv("JCE_ANIM_ASEL_VERIFY");
-        s_asel_verify = (v && v[0] && v[0] != '0') ? 1 : 0;
+        const char *value = getenv("JCE_ANIM_ASEL_VERIFY");
+        s_asel_verify = value && value[0] && value[0] != '0';
     }
-    /* Validate the remembered indices directly instead of trusting a list
-     * generation counter.
-     *
-     * The first version keyed on sr->frame_list_gen, and the verify above
-     * caught it inside 600 frames: the same five animators moved from
-     * [111 118 119 120 121] to [146 153 154 155 156] -- streaming had inserted
-     * 35 entities ahead of them -- while frame_list_gen stayed at 2. That
-     * counter does not identify the list's CONTENTS, and animation would have
-     * frozen silently.
-     *
-     * This instead re-reads the n remembered slots and compares the sum AND xor
-     * of the ids found there against the animator set's own. If the counts
-     * match and both aggregates match, the two multisets are equal: sum alone
-     * misses a swap, xor alone misses a duplicate, together they pin it. Every
-     * remembered slot therefore still holds a distinct animator, n of them, so
-     * the selection is exactly the animator set -- proven per frame in
-     * O(animators), with no dependence on how the list was built. */
-    bool memo_hit = (was_valid && sr && s_asel_key_sr == (const void *)sr &&
-                     s_asel_key_n == n && s_asel_count == n);
-    if (memo_hit) {
-        uint64_t hit_sum = 0; uint32_t hit_xor = 0;
-        for (int k = 0; k < n; k++) {
-            const int idx = s_asel_idx[k];
-            if (idx < 0 || idx >= list->count) { memo_hit = false; break; }
-            const uint32_t id = (uint32_t)list->entities[idx];
-            hit_sum += id; hit_xor ^= id;
-        }
-        if (memo_hit && (hit_sum != s_asel_cur_sum || hit_xor != s_asel_cur_xor))
-            memo_hit = false;
-    }
-    if (memo_hit && !s_asel_verify) {
-        s_asel_valid = true;
-        return;
-    }
-    const int   memo_count = s_asel_count;
-    static int *s_asel_prev;        /* verify-only copy of the memo's answer */
-    static int  s_asel_prev_cap;
-    if (memo_hit && s_asel_verify && memo_count > 0) {
-        if (s_asel_prev_cap < memo_count) {
-            int *np = (int *)JCE_REALLOC(s_asel_prev,
-                                         (size_t)memo_count * sizeof *np);
-            if (np) { s_asel_prev = np; s_asel_prev_cap = memo_count; }
-        }
-        if (s_asel_prev_cap >= memo_count)
-            memcpy(s_asel_prev, s_asel_idx, (size_t)memo_count * sizeof *s_asel_idx);
-    }
-    s_asel_count = 0;
-
-    if (s_asel_idx_cap < n) {
-        int *ni = (int *)JCE_REALLOC(s_asel_idx, (size_t)n * sizeof *ni);
-        if (!ni) return;
-        s_asel_idx = ni; s_asel_idx_cap = n;
-    }
-    const uint32_t mask = s_asel_set_cap - 1u;
-    for (int i = 0; i < list->count; i++) {
-        uint32_t id = (uint32_t)list->entities[i];
-        if (id == 0) continue;
-        uint32_t h = (id * 2654435761u) & mask;
-        while (s_asel_set[h]) {
-            if (s_asel_set[h] == id) {
-                if (s_asel_count >= s_asel_idx_cap) return; /* dup ids: bail */
-                s_asel_idx[s_asel_count++] = i;
-                break;
-            }
-            h = (h + 1u) & mask;
-        }
-    }
-    s_asel_valid = true;
-    if (memo_hit && s_asel_verify) {
-        bool same = (memo_count == s_asel_count);
-        if (same && memo_count > 0 && s_asel_prev_cap >= memo_count)
-            same = memcmp(s_asel_prev, s_asel_idx,
-                          (size_t)memo_count * sizeof *s_asel_idx) == 0;
-        static uint32_t s_vn = 0;
-        if (!same) {
-            char a[160] = {0}, b[160] = {0};
-            int pa = 0, pb = 0;
-            for (int q = 0; q < memo_count && q < 8 && pa < 150; q++)
-                pa += snprintf(a + pa, sizeof a - (size_t)pa, "%d ",
-                               s_asel_prev_cap >= memo_count ? s_asel_prev[q] : -1);
-            for (int q = 0; q < s_asel_count && q < 8 && pb < 150; q++)
-                pb += snprintf(b + pb, sizeof b - (size_t)pb, "%d ", s_asel_idx[q]);
-            LOG_ERROR(LOG_TAG, "ASEL_VERIFY FAILED: memo %d [%s] vs rebuild %d "
-                      "[%s] (listgen=%llu, copied=%d)",
-                      memo_count, a, s_asel_count, b,
-                      (unsigned long long)(sr ? sr->frame_list_gen : 0),
-                      s_asel_prev_cap >= memo_count);
-        }
-        else if ((s_vn++ % 120u) == 0u)
-            LOG_INFO(LOG_TAG, "ASEL_VERIFY ok: %d animator indices match "
-                     "(%d entities walked)", s_asel_count, list->count);
-    }
-    s_asel_key_sr = (const void *)sr;   /* NULL sr => never a hit next time */
-    s_asel_key_n  = n;
+    if (s_asel_verify) for (int i = 0; i < snapshot->count; ++i)
+        if (!jce_scene_has_skeletal_animator(scene, snapshot->entities[i])) return false;
+    return true;
 }
 
-/* k-th selected list index; full walk when selection couldn't be built. */
-static inline int sr_asel_n(const EntityList *list)
-{ return s_asel_valid ? s_asel_count : list->count; }
-static inline int sr_asel_i(int k)
-{ return s_asel_valid ? s_asel_idx[k] : k; }
+static inline int sr_asel_n(const EntityList *list) { return list->count; }
+static inline int sr_asel_i(int index) { return index; }
 
 /* "LeftArm" / "RightArm" / "LeftLeg" / "RightLeg" -> JceHumanoidLimb.
  *
@@ -2015,7 +1880,7 @@ static void sr_apply_ragdoll_override(JceSceneRenderer *sr, JceScene *scene,
 }
 
 static void sr_resolve_morph_weights(JceSceneRenderer *sr, JceScene *scene,
-                                     EntityList *list)
+                                     EntityList *list, bool cpu_skin)
 {
     const int an = sr_asel_n(list);
     for (int k = 0; k < an; k++) {
@@ -2082,7 +1947,7 @@ static void sr_resolve_morph_weights(JceSceneRenderer *sr, JceScene *scene,
 
         /* Run the CPU pre-skin deform into per-instance dynamic VBs (FEATURE
          * 3.1).  Dirty-gated + LOD-guarded inside; no-op when morph_count == 0. */
-        sr_deform_morph_prims(sr, ai);
+        if (!cpu_skin) sr_deform_morph_prims(sr, ai);
     }
 }
 
@@ -2223,33 +2088,26 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
      * already-sampled palette as prev.  Runtime/single-viewport callers that
      * never call begin_velocity_frame keep the original per-render path. */
     if (sr->velocity_frame_driven) {
+        /* Prune publishes scene ownership before a fallible reserve. Invalidate
+         * its old accepted generation before that transition, so an OOM in a
+         * different scene remains retryable within this same velocity round. */
+        if (sr->anim_storage_scene != scene) sr->skin_anim_gen = sr->vel_frame_gen - 1u;
         if (sr->skin_anim_gen == sr->vel_frame_gen && sr->anim_storage_scene == scene) return;
-        sr->skin_anim_gen = sr->vel_frame_gen;
     }
 
     sr_anim_instances_prune(sr, scene);
     if (jce_scene_count_skeletal_animators(scene) == 0 && !sr->anim_storage.count)
         return;
 
-    /* Build the animator sub-list once for this update + the IK/morph/ragdoll
-     * passes below (see sr_anim_build_selection).  A component ADDED mid-frame
-     * by an anim-event callback joins the passes next frame. */
-    sr_anim_build_selection(sr, scene, list);
-
+    /* A callback-added component joins the next velocity generation. Reserve
+     * the whole snapshot before any pose/time mutation; OOM leaves the frame
+     * unstamped so a later view may retry without a partial or double step. */
+    EntityList scene_animators;
+    if (!sr_anim_build_scene_snapshot(sr, scene, &scene_animators)) return;
+    list = &scene_animators;
+    if (sr->velocity_frame_driven) sr->skin_anim_gen = sr->vel_frame_gen;
     const int an = sr_asel_n(list);
-    /* Reserve before creating any requests. Instance payloads are stable,
-     * and the request buffer is never resized while parallel jobs use it. */
-    if ((uint32_t)an > sr->anim_request_capacity) {
-        uint32_t cap = jce_hashmap_cap_pow2((uint32_t)an, 16u);
-        if ((uint64_t)cap * sizeof(SrAnimSample) > SIZE_MAX) return;
-        void *next = JCE_REALLOC(sr->anim_requests, (size_t)cap * sizeof(SrAnimSample));
-        if (!next) {
-            LOG_ERROR(LOG_TAG, "animation request allocation failed for %d actors", an);
-            return;
-        }
-        sr->anim_requests = next;
-        sr->anim_request_capacity = cap;
-    }
+    const bool cpu_skin = jce_skinned_mesh_cpu_skin_required();
     SrAnimSample *reqs = sr->anim_requests;
     for (int k = 0; k < an; k++) {
         const int i = sr_asel_i(k);
@@ -2291,8 +2149,16 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                 float dx = wm.col[3].x - eye.x;
                 float dy = wm.col[3].y - eye.y;
                 float dz = wm.col[3].z - eye.z;
-                if (dx * dx + dy * dy + dz * dz > mid * mid)
-                    continue;                 /* FAR tier -> freeze pose */
+                if (dx * dx + dy * dy + dz * dz > mid * mid) {
+                    if (cpu_skin) {
+                        const uint32_t count = ai->skin_palette_count > JCE_MAX_BONES
+                            ? JCE_MAX_BONES : ai->skin_palette_count;
+                        memcpy(ai->prev_skin_palette, ai->skin_palette,
+                               count * sizeof(jce_mat4));
+                        ai->prev_skin_palette_count = count;
+                    }
+                    continue;
+                }
             }
         }
         /* TAA per-bone motion: snapshot the PRIOR (last-frame) skin palette into
@@ -2305,7 +2171,7 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
            drives the frame: in the editor the FIRST viewport (which may be the
            Scene view with velocity off) must capture prev here, because the Game
            view that wants velocity renders 2nd and reuses these palettes. */
-        if (sr->taa_want_velocity || sr->velocity_frame_driven) {
+        if (sr->taa_want_velocity || sr->velocity_frame_driven || cpu_skin) {
             uint32_t pc = ai->skin_palette_count;
             if (pc > JCE_MAX_BONES) pc = JCE_MAX_BONES;
             if (pc > 0) {
@@ -2879,11 +2745,20 @@ void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
      * track ⊕ authored static JceMorphWeights (FEATURE 3.1 last-mile).  No-op
      * for models without morph targets / entities without authored weights or
      * a track, so legacy playback is byte-identical. */
-    sr_resolve_morph_weights(sr, scene, list);
+    sr_resolve_morph_weights(sr, scene, list, cpu_skin);
 
     /* Pass 6 (serial): apply the runtime-published ragdoll pose ON TOP of the
      * sampled + IK'd palette (ragdoll scene-pass last-mile).  Gated on
      * jce_scene_has_ragdoll_pose -> byte-identical for every non-ragdoll
      * entity.  Applied LAST so a live ragdoll wins over clip + IK. */
     sr_apply_ragdoll_override(sr, scene, list);
+    if (cpu_skin) {
+        for (int k = 0; k < an; ++k) {
+            JceEntity e = list->entities[sr_asel_i(k)];
+            if (entity_enabled(scene, e) &&
+                jce_scene_has_skeletal_animator(scene, e) &&
+                jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SKELETAL_ANIMATOR))
+                sr_deform_cpu_skin_prims(sr_find_anim_instance(sr, e));
+        }
+    }
 }

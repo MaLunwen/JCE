@@ -24,11 +24,14 @@
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_renderer.h>
+#include "jce_renderer_frame_serial_internal.h"
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
+#include "jce_instance_upload.h"
+#include "jce_impostor_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
@@ -36,6 +39,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOG_TAG "impostor"
@@ -243,42 +247,56 @@ void jce_impostor_draw_instanced(JceRenderer *r, uint16_t view_id,
     impostor_gfx_init(r);
     if (g_gfx.prog.idx == UINT16_MAX) return;
 
-    /* Allocate the per-instance buffer: 2 vec4 (32 bytes) per card.
-       i_data0 = (center.xyz, radius); i_data1 = (gridN, tint.rgb). */
-    const uint16_t stride = 32;
-    uint32_t avail = bgfx_get_avail_instance_data_buffer(count, stride);
-    if (avail == 0) return;
-    bgfx_instance_data_buffer_t idb;
-    bgfx_alloc_instance_data_buffer(&idb, avail, stride);
-    float *dst = (float *)idb.data;
-    for (uint32_t i = 0; i < avail; ++i) {
-        const JceImpostorInstance *in = &insts[i];
-        dst[0] = in->center[0]; dst[1] = in->center[1]; dst[2] = in->center[2];
-        dst[3] = in->radius;
-        dst[4] = (float)atlas->meta.grid_n;
-        dst[5] = in->tint[0]; dst[6] = in->tint[1]; dst[7] = in->tint[2];
-        dst += 8;
-    }
-
+    /* Shared renderer admission owns all 32/64/80-byte lanes under one
+       aggregate budget. Pack only the actually admitted cards. */
+    JceInstanceUploadOwner *owner = jce_renderer_instance_upload_owner(r);
+    const uint32_t epoch = jce_renderer_instance_upload_epoch();
+    uint32_t offset = 0;
     /* Sun term uniforms. */
     float ld[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
     if (light_dir) { ld[0] = light_dir[0]; ld[1] = light_dir[1]; ld[2] = light_dir[2]; }
     float lc[4] = { 0.85f, 0.85f, 0.85f, 0.25f };  /* rgb sun, w ambient */
     if (light_color) { lc[0]=light_color[0]; lc[1]=light_color[1]; lc[2]=light_color[2]; lc[3]=light_color[3]; }
-    bgfx_set_uniform(g_gfx.u_lightDir, ld, 1);
-    bgfx_set_uniform(g_gfx.u_lightColor, lc, 1);
-
-    bgfx_texture_handle_t atex = { atlas->atlas.idx };
-    bgfx_set_texture(0, g_gfx.u_atlas, atex, UINT32_MAX);
-
-    bgfx_set_vertex_buffer(0, g_gfx.quad_vb, 0, 4);
-    bgfx_set_index_buffer(g_gfx.quad_ib, 0, 6);
-    bgfx_set_instance_data_buffer(&idb, 0, avail);
-    /* Opaque alpha-tested cards: depth test+write, no blend, no backface cull
-       (the billboard can face either way). */
-    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
-                   BGFX_STATE_WRITE_Z  | BGFX_STATE_DEPTH_TEST_LESS, 0);
-    bgfx_submit(view_id, g_gfx.prog, 0, BGFX_DISCARD_ALL);
+    while (offset < count) {
+        uint32_t requested = count - offset;
+        if (requested > 8192u) requested = 8192u;
+        JceInstanceUpload upload;
+        if (!jce_instance_upload_begin(owner, epoch, requested, 32u, 128u, &upload)) {
+            LOG_WARN(LOG_TAG, "card admission failed: submitted=%u requested=%u remaining=%u",
+                     offset, count, count - offset);
+            break;
+        }
+        const uint32_t accepted = upload.count;
+        float *dst = upload.data;
+        for (uint32_t i = 0; i < accepted; ++i) {
+            const JceImpostorInstance *in = &insts[offset + i];
+            dst[0] = in->center[0]; dst[1] = in->center[1]; dst[2] = in->center[2];
+            dst[3] = in->radius;
+            dst[4] = (float)atlas->meta.grid_n;
+            dst[5] = in->tint[0]; dst[6] = in->tint[1]; dst[7] = in->tint[2];
+            dst += 8;
+        }
+        if (!accepted || !jce_instance_upload_commit(owner, &upload, accepted) ||
+            !jce_instance_upload_bind_encoder(owner, &upload, accepted, NULL)) {
+            jce_instance_upload_discard(owner, &upload);
+            bgfx_discard(BGFX_DISCARD_ALL);
+            LOG_WARN(LOG_TAG, "card upload failed: submitted=%u requested=%u remaining=%u",
+                     offset, count, count - offset);
+            break;
+        }
+        /* Every submit discards state, so each admitted remainder rebinds the
+           same lighting, atlas, quad and opaque alpha-tested card state. */
+        bgfx_set_uniform(g_gfx.u_lightDir, ld, 1);
+        bgfx_set_uniform(g_gfx.u_lightColor, lc, 1);
+        bgfx_texture_handle_t atex = { atlas->atlas.idx };
+        bgfx_set_texture(0, g_gfx.u_atlas, atex, UINT32_MAX);
+        bgfx_set_vertex_buffer(0, g_gfx.quad_vb, 0, 4);
+        bgfx_set_index_buffer(g_gfx.quad_ib, 0, 6);
+        bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+                       BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS, 0);
+        bgfx_submit(view_id, g_gfx.prog, 0, BGFX_DISCARD_ALL);
+        offset += accepted;
+    }
 }
 
 /* ── GPU bake state machine ────────────────────────────────────────── */
@@ -301,11 +319,25 @@ typedef struct {
        this bgfx build).  staging is BLIT_DST|READ_BACK; pixels is the CPU dst. */
     bgfx_texture_handle_t       staging;     /* BLIT_DST | READ_BACK RGBA8 */
     uint8_t  *pixels;        /* RGBA8, atlas_px*atlas_px*4 (read_texture dst) */
+    uint32_t  submit_frame;  /* API frame which may already own the views */
     uint32_t  ready_frame;   /* bgfx frame index after which pixels are valid */
     bool      blit_done;     /* blit + read_texture issued */
+    bool      retiring;      /* CPU destination borrowed until backend join */
 } ImpostorBake;
 
-static ImpostorBake g_bake;
+static ImpostorBake g_bake = {
+    .fbo = {UINT16_MAX}, .color = {UINT16_MAX},
+    .depth = {UINT16_MAX}, .staging = {UINT16_MAX}
+};
+
+static void bake_reset(void)
+{
+    memset(&g_bake, 0, sizeof(g_bake));
+    g_bake.fbo.idx = UINT16_MAX;
+    g_bake.color.idx = UINT16_MAX;
+    g_bake.depth.idx = UINT16_MAX;
+    g_bake.staging.idx = UINT16_MAX;
+}
 
 static void bake_destroy_fbo(void)
 {
@@ -323,7 +355,7 @@ bool jce_impostor_bake_submit(const JceImpostorBakeDesc *desc)
         LOG_WARN(LOG_TAG, "bake submit: missing model/renderer");
         return false;
     }
-    if (g_bake.status == JCE_IMPOSTOR_BAKE_RENDERING ||
+    if (g_bake.retiring || g_bake.status == JCE_IMPOSTOR_BAKE_RENDERING ||
         g_bake.status == JCE_IMPOSTOR_BAKE_READBACK) {
         LOG_WARN(LOG_TAG, "bake rejected: one already in flight");
         return false;
@@ -413,6 +445,7 @@ bool jce_impostor_bake_submit(const JceImpostorBakeDesc *desc)
         return false;
     }
 
+    g_bake.submit_frame = jce_renderer_get_frame_index(desc->renderer);
     g_bake.status = JCE_IMPOSTOR_BAKE_RENDERING;
     LOG_INFO(LOG_TAG, "bake start: grid=%dx%d cell=%d atlas=%dpx r=%.2f",
              gn, gn, g_bake.cell_px, g_bake.atlas_px, g_bake.radius);
@@ -461,6 +494,7 @@ static void bake_render_views(void)
                          (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BASE - 1u),
                          (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BLIT
                                     - JCE_VIEW_IMPOSTOR_BAKE_BASE + 2u));
+
 
     {
         uint16_t cv = (uint16_t)(JCE_VIEW_IMPOSTOR_BAKE_BASE - 1);
@@ -538,11 +572,23 @@ bool jce_impostor_bake_in_flight(void)
 
 JceImpostorBakeStatus jce_impostor_bake_poll(void)
 {
+    if (g_bake.retiring) return g_bake.status;
     switch (g_bake.status) {
     case JCE_IMPOSTOR_BAKE_RENDERING:
-        /* Submit the atlas views + blit-to-staging + bgfx_read_texture THIS
-           frame.  bgfx_read_texture returns the frame index after which the CPU
-           pixels are valid; we poll for it in READBACK. */
+        /* The submit frame may already contain viewport draws. Wait for a new
+         * API frame so its modal viewport gate can give these views to us. */
+        if (!g_bake.desc.renderer) {
+            JCE_FREE(g_bake.pixels);
+            g_bake.pixels = NULL;
+            bake_destroy_fbo();
+            g_bake.status = JCE_IMPOSTOR_BAKE_FAILED;
+            return g_bake.status;
+        }
+        if (jce_renderer_frame_order(jce_renderer_get_frame_index(g_bake.desc.renderer),
+                g_bake.submit_frame) != JCE_RENDERER_FRAME_AFTER)
+            return g_bake.status;
+
+        /* The blit and readback follow the atlas views in this new frame. */
         bake_render_views();
         g_bake.status = JCE_IMPOSTOR_BAKE_READBACK;
         return g_bake.status;
@@ -552,7 +598,7 @@ JceImpostorBakeStatus jce_impostor_bake_poll(void)
            reached the frame bgfx_read_texture promised). */
         if (g_bake.desc.renderer) {
             uint32_t fi = jce_renderer_get_frame_index(g_bake.desc.renderer);
-            if (fi < g_bake.ready_frame) return g_bake.status;
+            if (!jce_renderer_frame_ready(fi,g_bake.ready_frame)) return g_bake.status;
         }
         {
             bool ok = bake_write_atlas_png();
@@ -603,11 +649,21 @@ void jce_impostor_shutdown(void)
      * bgfx's handle refcounts in release ("Destroying already destroyed
      * uniform" with debug asserts) and, layout-dependent, the heap next to
      * bgfx's internal allocations (the benchmark exit-crash: ShaderRef name
-     * freed with a stomped pointer inside bgfx::shutdown).  Gate every
-     * destroy on the module's lazy-init latches. */
-    if (g_bake.fbo.idx != 0 || g_bake.staging.idx != 0 || g_bake.pixels) {
-        bake_destroy_fbo();
-        if (g_bake.pixels) { JCE_FREE(g_bake.pixels); g_bake.pixels = NULL; }
+     * freed with a stomped pointer inside bgfx::shutdown).  The bake now
+     * starts with explicit invalid handles; shared draw resources still use
+     * their lazy-init latch. */
+    /* Explicit invalid sentinels make handle zero a normal owned handle.
+     * Retire textures in command order while bgfx is alive. An issued
+     * read_texture still borrows pixels; neither cancellation nor handle
+     * destruction completes that write. Keep the one existing buffer until
+     * renderer teardown has actually joined the backend. */
+    bake_destroy_fbo();
+    if (g_bake.pixels && g_bake.blit_done) {
+        g_bake.retiring = true;
+        memset(&g_bake.desc, 0, sizeof(g_bake.desc));
+    } else {
+        JCE_FREE(g_bake.pixels);
+        bake_reset();
     }
     if (g_gfx.init_tried) {
         if (BGFX_HANDLE_IS_VALID(g_gfx.quad_vb)) bgfx_destroy_vertex_buffer(g_gfx.quad_vb);
@@ -619,4 +675,14 @@ void jce_impostor_shutdown(void)
     }
     memset(&g_gfx, 0, sizeof g_gfx);
     g_gfx.prog.idx = UINT16_MAX;
+}
+
+void jce_impostor_after_backend_shutdown(void)
+{
+    /* CPU-only: renderer calls this after bgfx_shutdown joins all producers.
+     * No GPU handles are touched after the device has gone away. */
+    if (g_bake.retiring) {
+        JCE_FREE(g_bake.pixels);
+        bake_reset();
+    }
 }

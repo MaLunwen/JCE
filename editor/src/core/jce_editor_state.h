@@ -19,6 +19,7 @@ extern "C" {
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/application/jce_runtime.h>
+#include <jce/runtime/jce_game_module.h>
 #include <jce/resource/jce_streaming.h>   /* JceStreamPreviewMode */
 
 /* ── Edit Mode ─────────────────────────────────────────────────────── */
@@ -318,6 +319,8 @@ void              jce_state_set_live_preview(bool on);
 
 /* Scene loading */
 bool              jce_state_new_default_scene(void);
+/* Project creation selects its default scene without inheriting prior content. */
+bool              jce_state_new_default_scene_for_project(bool is_2d);
 bool              jce_state_load_scene_file(const char *scene_path);
 
 /* Frame-sliced (non-blocking) scene-file open.  For large scenes (entity
@@ -352,10 +355,12 @@ bool              jce_state_load_scene_from_jbundle(const char *jbundle_path);
  * and read-only semantics. */
 bool              jce_state_load_scene_from_catalog(const char *catalog_path,
                                                     const char *bundle_id_or_scene);
-/* Leave read-only Bundle Preview and restore source-project content routing.
- * Idempotent; used by non-file scene transitions such as New Scene and editor
- * shutdown.  Plain scene loaders call it internally. */
-void              jce_state_close_bundle_preview(void);
+/* Stop Play/pending Play, tear down scene streaming, then leave read-only Bundle
+ * Preview and restore source-project content routing/RP. Idempotent; project
+ * switches call before rebinding the outgoing root, even without a next scene.
+ * False retains the Bundle/root when Play authoring restoration is pending.
+ * New Scene and shutdown also use it; plain scene loaders retire internally. */
+bool              jce_state_close_bundle_preview(void);
 bool              jce_state_save_scene_file(const char *scene_path);
 /* Flagged save: JCE_SAVE_AUTOSAVE skips the diagnostic synchronous
  * round-trip re-load and the auto-repack hook (hitch-quality for the
@@ -380,6 +385,13 @@ void          jce_state_stop(void);
 void          jce_state_step(float dt);
 JcePlayState  jce_state_get_play_state(void);
 void          jce_state_play_mode_tick(float dt);
+/* Play owns module callbacks and borrowed services independently of viewport. */
+void jce_editor_play_bind_services(const JceServices *services);
+void jce_editor_play_host_tick(int paused_fps, int background_fps, int preview_fps);
+float jce_editor_play_render_delta(void);
+void jce_editor_play_draw_module(void);
+const JceGameModule *jce_editor_play_get_module(void);
+void jce_editor_play_set_module(const JceGameModule *module);
 
 /* JCE_STRESS_MOVERS=N harness (DOTS-floor L2 soak): record stress-spawned
  * entities and wiggle the first N through the real set_transform path every
@@ -404,6 +416,10 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
 void jce_editor_play_set_pointer_input(float dx, float dy, float wheel,
                                        unsigned int buttons);
 void jce_editor_play_set_pointer_position(float x, float y, float width, float height);
+/* Host layout publication; independent of mouse/focus, may consume one pending
+ * Play request before any Game View draws. Requested extent resolves through
+ * the same pipeline owner as the actual Canvas/FBO. */
+void jce_editor_play_publish_viewport(uint32_t width, uint32_t height);
 void jce_editor_play_set_touch_input(
     const JceRuntimeTouch *touches, int count);
 

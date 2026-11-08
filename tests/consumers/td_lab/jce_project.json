@@ -1,0 +1,19 @@
+{
+  "schema": 3,
+  "name": "Tower Defense",
+  "version": "0.1.0",
+  "target": "TowerDefense",
+  "exe": "TowerDefense.exe",
+  "startup_scene": "scenes/td_lab.scene.json",
+  "source_assets": "resources",
+  "cooked_assets": "resources/_cooked",
+  "script_modules": [
+    "native/build/td_controller.dll"
+  ],
+  "native_script_factories": [
+    "td_module"
+  ],
+  "native_script_refs": {
+    "scripts/tdcontroller.jcec": "scripts/TdController.jcec"
+  }
+}

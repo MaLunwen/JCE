@@ -23,8 +23,9 @@ silently: cookie on vs off moved 335 px at 1/255 (the noise floor is 46 px at
 1/255).  After the bind was corrected: 487,015 px, 44.4%, peak 216/255.
 
 So the rule is: every `JCE_*` macro used in a preprocessor guard under
-`engine/shaders/` must be `#define`d somewhere under `engine/shaders/`, or be
-listed in `shader_axis_exempt.txt` WITH a reason on the same line.  A bare path
+`engine/shaders/` must be defined in shader sources or appended to the stock
+compiler's per-shader define list. An exemption must record a reason on the
+same line in `shader_axis_exempt.txt`. A bare path
 with no reason is ignored, so the exemption file fails closed.
 
 EXIT CODES
@@ -38,6 +39,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SHADERS = ROOT / "engine" / "shaders"
 EXEMPT = Path(__file__).resolve().parent / "shader_axis_exempt.txt"
+COOKER = ROOT / "tools" / "compile_shaders.cmake"
 
 # `#if defined(X)`, `#elif defined(X)`, `#ifdef X`, `#ifndef X`.  Only JCE_*:
 # BGFX_*, and the language/platform macros bgfx itself defines, are not ours.
@@ -45,6 +47,9 @@ GUARD = re.compile(
     r'^\s*#\s*(?:if|elif)\s+.*?defined\s*\(\s*(JCE_[A-Z0-9_]+)\s*\)'
     r'|^\s*#\s*ifn?def\s+(JCE_[A-Z0-9_]+)\b')
 DEFINE = re.compile(r'^\s*#\s*define\s+(JCE_[A-Z0-9_]+)\b')
+COOKER_DEFINE = re.compile(
+    r'^\s*string\(APPEND _shader_defines ";(JCE_[A-Z0-9_]+)=1"\)\s*$',
+    re.MULTILINE)
 
 # Include guards are not feature axes: a name that only ever appears as its own
 # file's `#ifndef X` / `#define X` pair is a header guard, and this checker
@@ -79,7 +84,8 @@ def main() -> int:
         print("check_shader_feature_axes: SKIPPED - no engine/shaders")
         return 0
 
-    used, defined = {}, set()
+    used = {}
+    defined = set(COOKER_DEFINE.findall(COOKER.read_text(encoding="utf-8")))
     for p in sorted(SHADERS.rglob("*")):
         if p.suffix not in (".sc", ".sh"):
             continue
@@ -111,7 +117,8 @@ def main() -> int:
                 print("      " + s)
         print("  A guarded macro nothing defines is code that exists in no "
               "compiled program.  Define it in an entry .sc, delete the guard, "
-              "or add it to tools/lint/shader_axis_exempt.txt WITH the "
+              "pass it from the shader cooker, or add it to "
+              "tools/lint/shader_axis_exempt.txt WITH the "
               "reason and what is missing.")
         return 1
 

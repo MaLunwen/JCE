@@ -15,12 +15,12 @@
  * engine's true total, and a block crossing between them unbalanced
  * whichever counter had seen only one end of its life.
  *
- * The accounting lives HERE rather than in jce_allocator.c because the
- * host tools (jce_pak, jce_cook) link this translation unit without the
- * allocator's SDL-dependent one.
+ * This owner is also compiled directly by host tools. Its counter adapter
+ * needs no SDL/thread service, heap, registration or runtime initialization.
  */
 
 #include "jce_memory.h"
+#include "os/platform/jce_native_atomic_word_internal.h"
 
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_profiler.h>
@@ -33,12 +33,12 @@
 /* ================================================================== */
 
 #if JCE_ALLOC_TRACKING
-/* Native-word counters (no tearing on aligned access; no locks ⇒ APPROXIMATE
- * under concurrent allocation, which is fine for a leak trend). */
-static size_t s_live_bytes, s_live_count, s_peak_bytes;
-static size_t s_total_allocs, s_total_frees;
-static size_t s_bkt_bytes[JCE_ALLOC_TRACK_BUCKETS];
-static size_t s_bkt_count[JCE_ALLOC_TRACK_BUCKETS];
+/* Every shared word is atomic. A multi-word observation is not one globally
+ * consistent instant; native-word wrap and the tracked-heap scope remain. */
+static JceNativeAtomicWord s_live_bytes, s_live_count, s_peak_bytes;
+static JceNativeAtomicWord s_total_allocs, s_total_frees;
+static JceNativeAtomicWord s_bkt_bytes[JCE_ALLOC_TRACK_BUCKETS];
+static JceNativeAtomicWord s_bkt_count[JCE_ALLOC_TRACK_BUCKETS];
 
 static int track_bucket(size_t sz)
 {
@@ -52,19 +52,32 @@ static void track_on_alloc(void *p)
     if (!p) return;
     size_t sz = mi_usable_size(p);
     int b = track_bucket(sz);
-    s_live_bytes += sz; s_live_count += 1; s_total_allocs += 1;
-    s_bkt_bytes[b] += sz; s_bkt_count[b] += 1;
-    if (s_live_bytes > s_peak_bytes) s_peak_bytes = s_live_bytes;
+    size_t live = jce_native_atomic_word_add(&s_live_bytes, sz) + sz;
+    (void)jce_native_atomic_word_add(&s_live_count, 1);
+    (void)jce_native_atomic_word_add(&s_total_allocs, 1);
+    (void)jce_native_atomic_word_add(&s_bkt_bytes[b], sz);
+    (void)jce_native_atomic_word_add(&s_bkt_count[b], 1);
+    size_t peak = jce_native_atomic_word_load(&s_peak_bytes);
+    while (peak < live) {
+        if (jce_native_atomic_word_compare_exchange(&s_peak_bytes, peak, live)) break;
+        peak = jce_native_atomic_word_load(&s_peak_bytes);
+    }
+}
+static void track_on_free_size(size_t sz)
+{
+    int b = track_bucket(sz);
+    (void)jce_native_atomic_word_add(&s_live_bytes, (size_t)0 - sz);
+    (void)jce_native_atomic_word_add(&s_live_count, (size_t)0 - 1);
+    (void)jce_native_atomic_word_add(&s_total_frees, 1);
+    (void)jce_native_atomic_word_add(&s_bkt_bytes[b], (size_t)0 - sz);
+    (void)jce_native_atomic_word_add(&s_bkt_count[b], (size_t)0 - 1);
 }
 static void track_on_free(void *p)   /* call BEFORE mi_free, while p is valid */
 {
-    if (!p) return;
-    size_t sz = mi_usable_size(p);
-    int b = track_bucket(sz);
-    s_live_bytes -= sz; s_live_count -= 1; s_total_frees += 1;
-    s_bkt_bytes[b] -= sz; s_bkt_count[b] -= 1;
+    if (p) track_on_free_size(mi_usable_size(p));
 }
 #else
+#  define track_on_free_size(sz) ((void)(sz))
 #  define track_on_alloc(p) ((void)(p))
 #  define track_on_free(p)  ((void)(p))
 #endif
@@ -73,14 +86,15 @@ static void track_on_free(void *p)   /* call BEFORE mi_free, while p is valid */
  * per allocation, compiled into RELEASE too (unlike the NDEBUG-only tracker
  * above), so JCE_PERF_LOG can surface allocs/frame + KB/frame in a profiling
  * build — making per-frame heap churn measurable (verify-before-fix) instead of
- * reasoned-from-code.  Unlocked ⇒ approximate under concurrent allocation, which
- * is all a per-frame trend needs. */
-static size_t s_pf_allocs, s_pf_alloc_bytes;        /* monotonic since start */
-static size_t s_pf_last_allocs, s_pf_last_bytes;    /* sampled by frame_delta */
+ * reasoned-from-code. Atomic words count concurrent producers without a
+ * process-wide lock; separate reads do not form a globally consistent pair. */
+static JceNativeAtomicWord s_pf_allocs, s_pf_alloc_bytes; /* native-word wrap */
+static size_t s_pf_last_allocs, s_pf_last_bytes; /* single consumer thread */
 
 void jce_alloc_frame_delta(uint64_t *out_allocs, uint64_t *out_bytes)
 {
-    size_t a = s_pf_allocs, b = s_pf_alloc_bytes;
+    size_t a = jce_native_atomic_word_load(&s_pf_allocs);
+    size_t b = jce_native_atomic_word_load(&s_pf_alloc_bytes);
     if (out_allocs) *out_allocs = (uint64_t)(a - s_pf_last_allocs);
     if (out_bytes)  *out_bytes  = (uint64_t)(b - s_pf_last_bytes);
     s_pf_last_allocs = a;
@@ -91,14 +105,14 @@ bool jce_alloc_track_snapshot(JceAllocTrack *out)
 {
     if (!out) return false;
 #if JCE_ALLOC_TRACKING
-    out->live_bytes   = (uint64_t)s_live_bytes;
-    out->live_count   = (uint64_t)s_live_count;
-    out->peak_bytes   = (uint64_t)s_peak_bytes;
-    out->total_allocs = (uint64_t)s_total_allocs;
-    out->total_frees  = (uint64_t)s_total_frees;
+    out->live_bytes   = (uint64_t)jce_native_atomic_word_load(&s_live_bytes);
+    out->live_count   = (uint64_t)jce_native_atomic_word_load(&s_live_count);
+    out->peak_bytes   = (uint64_t)jce_native_atomic_word_load(&s_peak_bytes);
+    out->total_allocs = (uint64_t)jce_native_atomic_word_load(&s_total_allocs);
+    out->total_frees  = (uint64_t)jce_native_atomic_word_load(&s_total_frees);
     for (int i = 0; i < JCE_ALLOC_TRACK_BUCKETS; ++i) {
-        out->bucket_bytes[i] = (uint64_t)s_bkt_bytes[i];
-        out->bucket_count[i] = (uint64_t)s_bkt_count[i];
+        out->bucket_bytes[i] = (uint64_t)jce_native_atomic_word_load(&s_bkt_bytes[i]);
+        out->bucket_count[i] = (uint64_t)jce_native_atomic_word_load(&s_bkt_count[i]);
     }
     return true;
 #else
@@ -115,8 +129,8 @@ void jce__alloc_account_alloc(void *ptr, size_t requested)
 {
     if (!ptr) return;
     track_on_alloc(ptr);
-    s_pf_allocs++;                      /* rank-9 always-on */
-    s_pf_alloc_bytes += requested;
+    (void)jce_native_atomic_word_add(&s_pf_allocs, 1);
+    (void)jce_native_atomic_word_add(&s_pf_alloc_bytes, requested);
     JCE_PROFILE_ALLOC(ptr, requested);
 }
 
@@ -147,9 +161,24 @@ void *jce__calloc_tracked(size_t count, size_t size)
 
 void *jce__realloc_tracked(void *ptr, size_t size)
 {
-    jce__alloc_account_free(ptr);        /* drop old accounting (NULL => no-op) */
+    if (size == 0) {
+        jce__free_tracked(ptr);
+        return NULL;
+    }
+    const uintptr_t old_address = (uintptr_t)ptr;
+#if JCE_ALLOC_TRACKING
+    const size_t old_size = ptr ? mi_usable_size(ptr) : 0;
+#else
+    const size_t old_size = 0;
+#endif
     void *p = mi_realloc(ptr, size);
-    jce__alloc_account_alloc(p, size);   /* add new accounting (NULL => no-op)  */
+    if (!p) return NULL; /* The old block and its accounting remain live. */
+    if (old_address) {
+        /* The old allocation may have moved: never query/dereference it now. */
+        JCE_PROFILE_FREE((void *)old_address);
+        track_on_free_size(old_size);
+    }
+    jce__alloc_account_alloc(p, size);
     return p;
 }
 

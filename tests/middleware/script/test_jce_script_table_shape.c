@@ -15,7 +15,7 @@
  * that generated the bindings proves only that the generator agrees with
  * itself, which is exactly the self-consistency spec 4.4 warns about.
  *
- * 117 entries: 108 generated functions + 8 hand-written functions + json_null.
+ * 118 entries: 109 generated functions + 8 hand-written functions + json_null.
  * This line said 81 long after the list below said 105 -- prose beside a
  * golden list is the one part of the file nothing checks, so re-derive it
  * from the list rather than trusting it.
@@ -48,7 +48,7 @@ void setUp(void)    { g_keys[0] = '\0'; }
 void tearDown(void) {}
 
 static const char *const K_EXPECTED =
-    "117\n"
+    "118\n"
     "anim_set_bool:function\n"
     "anim_set_float:function\n"
     "anim_set_int:function\n"
@@ -87,6 +87,7 @@ static const char *const K_EXPECTED =
     "get_touch:function\n"
     "get_touch_count:function\n"
     "get_velocity:function\n"
+    "get_viewport_size:function\n"
     "get_world_position:function\n"
     "has_component:function\n"
     "is_action_down:function\n"

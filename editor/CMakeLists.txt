@@ -212,6 +212,11 @@ if(MSVC)
 	target_link_libraries(JCE_Editor PRIVATE "${EDITOR_PAK_OBJ_FILE}")
 	set_source_files_properties("${EDITOR_PAK_OBJ_FILE}"
 		PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+elseif(WIN32)
+	# GNU Windows needs COFF-compatible assembly and target symbol decoration.
+	# Reuse the same binary wrapper as public SDK consumers and Bundles.
+	_jce_target_embed_binary(JCE_Editor "${EDITOR_PAK_FILE}" assets_pak_data
+		"${CMAKE_BINARY_DIR}/editor_assets_embed.S")
 else()
 	# GCC / Clang: .incbin ASM wrapper.
 	set(_EDITOR_ASM_EMBED "${CMAKE_BINARY_DIR}/editor_assets_embed.S")
@@ -247,7 +252,7 @@ set_target_properties(JCE_Editor PROPERTIES
 	PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/symbols/$<CONFIG>"
 	COMPILE_PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/symbols/$<CONFIG>")
 
-# Dist builds on Windows: GUI subsystem (no console window).
+# Windows Dist uses the GUI subsystem. Release keeps its console.
 if(WIN32 AND JCE_BUILD_VARIANT STREQUAL "dist")
 	set_target_properties(JCE_Editor PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()

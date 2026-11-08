@@ -6,7 +6,8 @@
  *
  * Layer: Application (Layer 6).
  *
- * STATUS: Architecture stub — API surface defined, implementation pending.
+ * File capture uses the renderer callback and existing PNG writer.
+ * Capture-to-memory remains reserved and is not implemented.
  */
 
 #ifndef JCE_SCREENSHOT_H
@@ -37,7 +38,9 @@ typedef enum {
 
 /* Request a screenshot of the current frame.
  * The capture is deferred: it happens at the end of bgfx_frame(),
- * and is written asynchronously.  Returns false if path is invalid. */
+ * and is written asynchronously. Only PNG is implemented by this utility;
+ * BMP/TGA/invalid formats and BMP-extension paths reject before submission.
+ * Returns false for invalid/busy requests. */
 JCE_API bool jce_screenshot_save(const char *path, JceScreenshotFormat format);
 
 /* ================================================================== */
@@ -52,14 +55,23 @@ typedef void (*JceScreenshotCallback)(const uint8_t *rgba_pixels,
                                        uint32_t width, uint32_t height,
                                        void *userdata);
 
+/* Reserved compatibility entry: currently a no-op; no pixels are captured
+ * and no callback is invoked. Use the implemented file API above. */
 JCE_API void jce_screenshot_capture(JceScreenshotCallback cb, void *userdata);
 
 /* ================================================================== */
 /* Query                                                               */
 /* ================================================================== */
 
-/* Returns true if a screenshot is currently pending. */
+/* Pending includes GPU delivery, encoding and actual file writing.
+ * Main-thread requests share the renderer's one bounded file slot. */
 JCE_API bool jce_screenshot_pending(void);
+/* Non-consuming latest-file result: -1 idle, 0 pending, 1 wrote, 2 failed.
+ * Terminal results remain until the next accepted request. Renderer shutdown
+ * fails unfinished requests and retains completed results. Read the result
+ * before another file consumer submits. Success is the image/file API result,
+ * not durable storage or GPU idle. */
+JCE_API int jce_screenshot_poll(void);
 
 /* ================================================================== */
 /* Deterministic capture schedules                                     */

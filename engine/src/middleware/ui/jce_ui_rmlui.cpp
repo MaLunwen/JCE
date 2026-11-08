@@ -12,6 +12,9 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/platform/jce_host_font.h>
+#include "jce_rml_font_bytes.h"
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/renderer/jce_texture.h>
@@ -26,6 +29,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_alloc.h>
+#include "os/core/jce_trace_scope_internal.h"
 }
 
 #include <cstring>
@@ -242,6 +246,7 @@ public:
         /* Store a COPY: the spans are only valid for the duration of the call. */
         geo->vertices.assign(vertices.data(), vertices.data() + vertices.size());
         geo->indices.assign(indices.data(), indices.data() + indices.size());
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "ui.rml.geometry.compile", (int64_t)vertices.size());
         return reinterpret_cast<Rml::CompiledGeometryHandle>(geo);
     }
 
@@ -419,6 +424,7 @@ public:
         if (!jce_texture_valid(tex)) return 0;
 
         generated_textures_.push_back(tex);
+        jce_trace_counter(JCE_TRACE_CATEGORY_RENDER, "ui.rml.texture.generated", (int64_t)width * height);
         return (Rml::TextureHandle)tex.idx;
     }
 
@@ -492,7 +498,9 @@ struct JceRmlBackend {
 
     /* Font data buffers — must remain alive while RmlUI uses the fonts.
        RmlUI::LoadFontFace(data,...) does NOT copy the data. */
-    std::vector<void *>                 font_data_buffers;
+    JceRmlFontBytes                    font_data_buffers = {};
+    bool default_font_loaded = false;
+    bool default_cjk_loaded = false;
 
     /* Temporary storage so elem_get_text can return a stable c_str(). */
     std::string                         temp_text;
@@ -501,6 +509,9 @@ struct JceRmlBackend {
     bool pointer_down = false;
     uint32_t height = 0;
 };
+
+static bool rml_preload_default_fonts(JceRmlBackend *b);
+static bool s_rml_backend_owned = false;
 
 /* ================================================================== */
 /* Lifecycle                                                           */
@@ -519,6 +530,12 @@ static float compute_dp_ratio(uint32_t h)
 JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
                               JceRenderer *renderer, JcePakArchive *pak)
 {
+    /* The bridge owns one fixed-name global Rml context. Reject a second
+     * owner before replacing borrowed global interfaces/font resources. */
+    if (s_rml_backend_owned) {
+        LOG_ERROR(LOG_TAG, "backend phase=create_rejected reason=active_owner");
+        return nullptr;
+    }
     auto *b = jce_cxx_new<JceRmlBackend>();
     if (!b) {
         LOG_ERROR(LOG_TAG, "failed to allocate JceRmlBackend");
@@ -549,6 +566,9 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
 
     if (!Rml::Initialise()) {
         LOG_ERROR(LOG_TAG, "Rml::Initialise() failed");
+        Rml::SetSystemInterface(nullptr);
+        Rml::SetRenderInterface(nullptr);
+        Rml::SetFileInterface(nullptr);
         jce_cxx_delete(b->file_interface);
         jce_cxx_delete(b->render_interface);
         jce_cxx_delete(b->sys_interface);
@@ -561,6 +581,9 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
     if (!b->context) {
         LOG_ERROR(LOG_TAG, "Rml::CreateContext() failed");
         Rml::Shutdown();
+        Rml::SetSystemInterface(nullptr);
+        Rml::SetRenderInterface(nullptr);
+        Rml::SetFileInterface(nullptr);
         jce_cxx_delete(b->file_interface);
         jce_cxx_delete(b->render_interface);
         jce_cxx_delete(b->sys_interface);
@@ -568,8 +591,10 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
         return nullptr;
     }
 
+    s_rml_backend_owned = true;
     float dp = compute_dp_ratio(height);
     b->context->SetDensityIndependentPixelRatio(dp);
+    b->default_font_loaded = rml_preload_default_fonts(b);
 
     LOG_SUCCESS(LOG_TAG, "RmlUi backend created (%ux%u, dp=%.2f)",
                 width, height, dp);
@@ -594,15 +619,18 @@ void jce_rml_destroy(JceRmlBackend *b)
     Rml::SetSystemInterface(nullptr);
     Rml::SetRenderInterface(nullptr);
     Rml::SetFileInterface(nullptr);
+    s_rml_backend_owned = false;
 
     for (auto *adapter : b->event_adapters)
         jce_cxx_delete(adapter);
     b->event_adapters.clear();
 
     /* Free font data buffers AFTER Rml::Shutdown (FreeType is done). */
-    for (void *buf : b->font_data_buffers)
-        JCE_FREE(buf);
-    b->font_data_buffers.clear();
+    {
+        JceTraceScope trace = jce_trace_scope_begin("ui.rml.font.release");
+        jce_rml_font_bytes_clear(&b->font_data_buffers);
+        jce_trace_scope_end(trace, JCE_TRACE_TASK_SUCCEEDED);
+    }
 
     jce_cxx_delete(b->file_interface);
     jce_cxx_delete(b->render_interface);
@@ -844,56 +872,127 @@ void jce_rml_elem_on(JceRmlBackend *b, uint32_t elem_idx,
 /* Font loading                                                        */
 /* ================================================================== */
 
+/* Internal aliases decouple CSS from physical filenames/family metadata. */
+static const char *RML_DEFAULT_LATIN = "JCE-UI";
+static const char *RML_DEFAULT_CJK = "JCE-UI-CJK";
+static const char *RML_DEFAULT_SYMBOLS = "JCE-UI-Symbols";
+static const uint64_t RML_FONT_MAX_BYTES = 64u * 1024u * 1024u;
+
+struct RmlFontAdmission {
+    const char *family;
+    bool fallback;
+};
+static bool rml_admit_font_span(const void *bytes, size_t size, void *user)
+{
+    const auto *request = static_cast<const RmlFontAdmission *>(user);
+    JceTraceScope trace = jce_trace_scope_begin("ui.rml.font.admit");
+    const bool accepted = Rml::LoadFontFace(
+        Rml::Span<const Rml::byte>(reinterpret_cast<const Rml::byte *>(bytes), size),
+        request->family, Rml::Style::FontStyle::Normal,
+        Rml::Style::FontWeight::Normal, request->fallback);
+    jce_trace_scope_end(trace, accepted ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return accepted;
+}
+static bool rml_retain_font(JceRmlBackend *b, void *data, size_t size,
+                            const char *family, bool fallback,
+                            JceRmlFontReleaseFn release, const char *source)
+{
+    RmlFontAdmission request = {family, fallback};
+    const JceRmlFontBytesResult result = jce_rml_font_bytes_admit(
+        &b->font_data_buffers, data, size, release, rml_admit_font_span, &request);
+    if (result != JCE_RML_FONT_BYTES_OK) {
+        LOG_WARN(LOG_TAG, "font phase=%s source=%s family=%s",
+            result == JCE_RML_FONT_BYTES_REGISTRY_OOM ? "retention_oom" : "face_rejected", source, family);
+        return false;
+    }
+    jce_trace_counter(JCE_TRACE_CATEGORY_CORE, "ui.rml.font.retained", (int64_t)b->font_data_buffers.count);
+    LOG_INFO(LOG_TAG, "font phase=ready source=%s family=%s fallback=%d bytes=%zu retained=%zu",
+             source, family, (int)fallback, size, b->font_data_buffers.count);
+    return true;
+}
+static bool rml_load_pak_face(JceRmlBackend *b, const char *path,
+                             const char *family, bool fallback, const char *source)
+{
+    JceTraceScope trace = jce_trace_scope_begin("ui.rml.font.load");
+    bool loaded = false;
+    do {
+        const JcePakAsset *asset = b->pak ? jce_pak_find(b->pak, path) : nullptr;
+        if (!asset || !asset->original_size || asset->original_size > RML_FONT_MAX_BYTES
+            || asset->original_size > SIZE_MAX) {
+            LOG_WARN(LOG_TAG, "font phase=pak_source_unavailable source=%s family=%s", source, family);
+            break;
+        }
+        const size_t size = (size_t)asset->original_size;
+        void *data = JCE_MALLOC(size);
+        if (!data) { LOG_WARN(LOG_TAG, "font phase=source_oom source=%s family=%s", source, family); break; }
+        if (jce_pak_decompress_ex(b->pak, asset, data, size) != size
+            || !jce_pak_verify(asset, data, size)) {
+            JCE_FREE(data);
+            LOG_WARN(LOG_TAG, "font phase=pak_verify_failed source=%s family=%s", source, family);
+            break;
+        }
+        loaded = rml_retain_font(b, data, size, family, fallback, jce_free, source);
+    } while (false);
+    jce_trace_scope_end(trace, loaded ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return loaded;
+}
+static bool rml_load_system_face(JceRmlBackend *b, JceHostFontRole role,
+                                const char *family, bool fallback, const char *source)
+{
+    JceTraceScope trace = jce_trace_scope_begin("ui.rml.font.system");
+    bool loaded = false;
+    char path[2048];
+    if (jce_host_default_font(role, path, sizeof path)) {
+        uint64_t read = 0, total = 0;
+        void *data = jce_fs_host_read_capped(path, RML_FONT_MAX_BYTES + 1, &read, &total);
+        if (!data || !read || total > RML_FONT_MAX_BYTES || read != total) {
+            jce_fs_buffer_free(data);
+            LOG_WARN(LOG_TAG, "font phase=host_read_failed source=%s family=%s", source, family);
+        } else loaded = rml_retain_font(b, data, (size_t)read, family, fallback,
+                                        jce_fs_buffer_free, source);
+    }
+    jce_trace_scope_end(trace, loaded ? JCE_TRACE_TASK_SUCCEEDED : JCE_TRACE_TASK_FAILED);
+    return loaded;
+}
+static bool rml_preload_default_fonts(JceRmlBackend *b)
+{
+    /* Keep installed roles first. A single stock face covers missing glyphs
+     * when either installed CJK or Symbols cannot be admitted. */
+    const bool latin = rml_load_system_face(b, JCE_HOST_FONT_UI_LATIN,
+        RML_DEFAULT_LATIN, false, "system_latin")
+        || rml_load_pak_face(b, "fonts/Aileron-Regular.ttf",
+                            RML_DEFAULT_LATIN, false, "licensed_stock_latin");
+    b->default_cjk_loaded = rml_load_system_face(b, JCE_HOST_FONT_UI_CJK,
+        RML_DEFAULT_CJK, true, "system_cjk");
+    const bool symbols = rml_load_system_face(b, JCE_HOST_FONT_UI_SYMBOLS,
+        RML_DEFAULT_SYMBOLS, true, "system_symbols");
+    const bool stock_fallback = (!b->default_cjk_loaded || !symbols) &&
+        rml_load_pak_face(b, "fonts/JCE-CJK-Fallback.ttf",
+            b->default_cjk_loaded ? RML_DEFAULT_SYMBOLS : RML_DEFAULT_CJK,
+            true, "licensed_stock_cjk_symbols");
+    b->default_cjk_loaded = b->default_cjk_loaded || stock_fallback;
+    if (!latin) LOG_ERROR(LOG_TAG, "font phase=default_latin_unavailable owner=rml family=JCE-UI");
+    if (!b->default_cjk_loaded)
+        LOG_WARN(LOG_TAG, "font phase=default_cjk_unavailable owner=rml fallback=cjk_omitted");
+    if (!symbols && !stock_fallback)
+        LOG_WARN(LOG_TAG, "font phase=default_symbols_unavailable owner=rml fallback=symbols_omitted");
+    /* Custom project faces may still be explicitly loaded into a context on
+     * a locked-down host without stock/default fonts. Do not replace them. */
+    return latin;
+}
 bool jce_rml_load_font(JceRmlBackend *b, const char *pak_path)
 {
     if (!b || !pak_path || !b->pak) return false;
-
-    const JcePakAsset *asset = jce_pak_find(b->pak, pak_path);
-    if (!asset) {
-        LOG_ERROR(LOG_TAG, "font not found in PAK: %s", pak_path);
-        return false;
-    }
-
-    void *data = JCE_MALLOC((size_t)asset->original_size);
-    if (!data) return false;
-
-    size_t sz = jce_pak_decompress(asset, data, (size_t)asset->original_size);
-    if (sz == 0) {
-        JCE_FREE(data);
-        return false;
-    }
-
-    /* Extract family name from filename (e.g. "fonts/Caveat.ttf" → "Caveat"). */
-    std::string family;
-    {
-        std::string path_str(pak_path);
-        size_t slash = path_str.find_last_of("/\\");
-        size_t dot   = path_str.find_last_of('.');
-        if (slash != std::string::npos)
-            family = path_str.substr(slash + 1,
-                dot != std::string::npos ? dot - slash - 1 : std::string::npos);
-        else
-            family = path_str.substr(0,
-                dot != std::string::npos ? dot : std::string::npos);
-    }
-
-    /* RmlUi 6.x: font data is passed as a Span<const byte>. */
-    bool ok = Rml::LoadFontFace(
-        Rml::Span<const Rml::byte>(
-            reinterpret_cast<const Rml::byte *>(data), (size_t)sz),
-        family, Rml::Style::FontStyle::Normal,
-        Rml::Style::FontWeight::Normal, false);
-
-    if (ok) {
-        /* RmlUI keeps a pointer to the font data — must stay alive. */
-        b->font_data_buffers.push_back(data);
-        LOG_SUCCESS(LOG_TAG, "font loaded: %s (family: %s)", pak_path, family.c_str());
-    } else {
-        JCE_FREE(data);
-        LOG_ERROR(LOG_TAG, "Rml::LoadFontFace failed: %s", pak_path);
-    }
-
-    return ok;
+    /* Keep the explicit project-family contract: filename stem, Normal,
+     * not an automatically selected global fallback. */
+    std::string path(pak_path);
+    const size_t slash = path.find_last_of("/\\");
+    const size_t begin = slash == std::string::npos ? 0 : slash + 1;
+    size_t end = path.find_last_of('.');
+    if (end == std::string::npos || end < begin) end = path.size();
+    const std::string family = path.substr(begin, end - begin);
+    if (family.empty()) return false;
+    return rml_load_pak_face(b, pak_path, family.c_str(), false, "explicit_project");
 }
 
 /* ================================================================== */

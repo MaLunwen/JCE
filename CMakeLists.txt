@@ -38,7 +38,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.13.4 LANGUAGES C)
+project(JCE VERSION 0.14.0 LANGUAGES C)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEDeliveryProfile.cmake")
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
@@ -196,7 +196,7 @@ set(CMAKE_CXX_EXTENSIONS        OFF)
 #   SSE2 baseline on x86, NEON on arm64.
 
 if(JCE_PLATFORM_WINDOWS)
-	add_compile_definitions(_WIN32_WINNT=0x0601 WINVER=0x0601)
+	include(cmake/JCEWindowsTarget.cmake)
 endif()
 
 if(NOT MSVC)
@@ -576,9 +576,27 @@ include("${JCE_TOOLS_DIR}/compile_shaders.cmake")
 # Release/Dist, architectures, parallel CI jobs, and sandbox users never race
 # over one source-tree output or accidentally package another build's stale
 # backend profile.
+# JCE shader stock artifact root: begin
+# Keep restricted stock beside the full root, never beneath it: a later full
+# build must not recursively package a previous compatibility cohort.
+set(JCE_SHADER_STOCK_CATALOG "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/stock_profiles.json")
+include("${CMAKE_CURRENT_SOURCE_DIR}/tools/shader_stock_policy.cmake")
+jce_shader_stock_policy_identity(_jce_stock_profile _jce_stock_sha256)
+set(_jce_stock_directory "engine_assets")
+if(_jce_stock_profile STREQUAL "compatibility")
+	string(SUBSTRING "${_jce_stock_sha256}" 0 32 _jce_stock_prefix)
+	set(_jce_stock_directory "engine_assets-compat-${_jce_stock_prefix}")
+endif()
+set(JCE_SHADER_STOCK_POLICY_NAME "${_jce_stock_profile}" CACHE INTERNAL
+	"Configured built-in stock shader policy" FORCE)
+set(JCE_SHADER_STOCK_POLICY_SHA256 "${_jce_stock_sha256}" CACHE INTERNAL
+	"Configured stock catalogue identity" FORCE)
 set(JCE_ENGINE_ASSET_BUILD_DIR
-	"${CMAKE_CURRENT_BINARY_DIR}/generated/engine_assets")
-set(JCE_SHADER_OUTPUT_DIR "${JCE_ENGINE_ASSET_BUILD_DIR}/shaders")
+	"${CMAKE_CURRENT_BINARY_DIR}/generated/${_jce_stock_directory}" CACHE INTERNAL
+	"Configured stock asset root" FORCE)
+set(JCE_SHADER_OUTPUT_DIR "${JCE_ENGINE_ASSET_BUILD_DIR}/shaders" CACHE INTERNAL
+	"Configured stock shader output" FORCE)
+# JCE shader stock artifact root: end
 
 # ── Per-platform shader profile selection ───────────────────────────
 # Compile (and pak) only the bgfx renderer back-ends that the target
@@ -602,20 +620,37 @@ message(STATUS "JCE shader profiles: ${JCE_SHADER_PROFILES}")
 jce_shader_pak_exclude_flags(JCE_PAK_SHADER_EXCLUDE_FLAGS
 	PROFILES ${JCE_SHADER_PROFILES})
 
+# Exclude retired private shader binaries from compatible reused caches.
+# jce_pak suffixes are bounded to 31 bytes.
+list(APPEND JCE_PAK_SHADER_EXCLUDE_FLAGS
+    --exclude-suffix "point25_diag_dx11.bin"
+    --exclude-suffix "weighted9_diag_dx11.bin"
+    --exclude-suffix "point25_diag_fwdplus_dx11.bin"
+    --exclude-suffix "weighted9_diag_fwdplus_dx11.bin"
+    --exclude-suffix "range64_diag_dx11.bin"
+    --exclude-suffix "range64_diag_fwdplus_dx11.bin"
+    --exclude-suffix "range64_reduce_dx11.bin"
+    --exclude-suffix "range64_combine_dx11.bin")
+
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShaders
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/standard"
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersPBR
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/pbr"
+	INCLUDE_DIRS  "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssr"
+	              "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/standard"
 	VARYING_DEF   "varying_pbr.def.sc"
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_PBR_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersImGui
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/imgui"
 	VARYING_DEF   "varying_imgui.def.sc"
@@ -623,6 +658,7 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_IMGUI_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersPostFX
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/postfx"
 	VARYING_DEF   "varying_postfx.def.sc"
@@ -635,6 +671,7 @@ jce_compile_shaders(
 # fs_<name>), so appending them onto the PostFX file list makes them ride
 # along in every pak aggregation without touching each one.
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersLooks
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/looks"
 	VARYING_DEF   "varying.def.sc"
@@ -643,6 +680,7 @@ jce_compile_shaders(
 list(APPEND COMPILED_POSTFX_SHADER_FILES ${COMPILED_LOOKS_SHADER_FILES})
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersParticles
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/particles"
 	VARYING_DEF   "varying_particles.def.sc"
@@ -650,6 +688,7 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_PARTICLES_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersDecals
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/decals"
 	VARYING_DEF   "varying_decals.def.sc"
@@ -657,6 +696,7 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_DECALS_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersWeather
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/weather"
 	VARYING_DEF   "varying_weather.def.sc"
@@ -664,6 +704,7 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_WEATHER_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersSSAO
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssao"
 	VARYING_DEF   "varying_ssao.def.sc"
@@ -671,6 +712,7 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_SSAO_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersSSR
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssr"
 	VARYING_DEF   "varying_ssr.def.sc"
@@ -678,6 +720,7 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_SSR_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersSSGI
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssgi"
 	VARYING_DEF   "varying_ssgi.def.sc"
@@ -685,9 +728,11 @@ jce_compile_shaders(
 	OUT_FILES_VAR COMPILED_SSGI_SHADER_FILES)
 
 jce_compile_shaders(
+	STOCK
 	TARGET        CompileShadersVolFog
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/volfog"
 	VARYING_DEF   "varying_volfog.def.sc"
+	INCLUDE_DIRS  "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssr"
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_VOLFOG_SHADER_FILES)
 
@@ -748,6 +793,13 @@ if(CMAKE_CROSSCOMPILING)
 else()
 	add_executable(jce_pak
 		"${JCE_TOOLS_DIR}/jce_pak.c"
+        # Selected archives use the actual public Bundle contract loader.
+        # This bounded host closure has no renderer boot or model/audio cooker.
+        "${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_loader.c"
+        "${JCE_ENGINE_SRC_DIR}/resource/jce_pak_loader.c"
+        "${JCE_ENGINE_SRC_DIR}/resource/jce_image_decode.c"
+        "${JCE_ENGINE_SRC_DIR}/renderer/jce_image.c"
+        "${JCE_ENGINE_SRC_DIR}/renderer/jce_stb_image_impl.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_cook.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_writer.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_reader.c"
@@ -777,7 +829,11 @@ else()
 	target_include_directories(jce_pak PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
 		"${JCE_ENGINE_SRC_DIR}")
+	# Host filesystem observation reuses the core trace/timer owner.
+	# Core has no renderer/embedded-archive dependency, so this has no cycle.
 	target_link_libraries(jce_pak PRIVATE
+		jce_core
+        cjson::cjson SDL3_image::SDL3_image
 		mimalloc-static
 		zstd::libzstd_static
 		xxHash::xxhash)
@@ -1154,10 +1210,22 @@ else()
 		list(APPEND _GAME_PAK_RES_FLAGS
 			--resource-dir "${GAME_RUNTIME_METADATA_DIR}")
 	endif()
+	# About reads these exact root notices from the Editor PAK on every platform.
+	# Keep one build-local staging owner; RCDATA is a separate delivery check.
+	set(EDITOR_NOTICE_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_editor_notices")
+	set(EDITOR_NOTICE_SOURCE_FILES
+		"${CMAKE_CURRENT_SOURCE_DIR}/LICENSE" "${TPL_SRC_FILE}")
+	file(MAKE_DIRECTORY "${EDITOR_NOTICE_STAGE_DIR}")
+	foreach(_editor_notice IN LISTS EDITOR_NOTICE_SOURCE_FILES)
+		get_filename_component(_editor_notice_name "${_editor_notice}" NAME)
+		configure_file("${_editor_notice}"
+			"${EDITOR_NOTICE_STAGE_DIR}/${_editor_notice_name}" COPYONLY)
+	endforeach()
 	set(_EDITOR_PAK_RES_FLAGS
 		--resource-dir "${ENGINE_RESOURCE_DIR}"
 		--resource-dir "${ENGINE_UI_DIR}"
-		--resource-dir "${EDITOR_RESOURCE_DIR}")
+		--resource-dir "${EDITOR_RESOURCE_DIR}"
+		--resource-dir "${EDITOR_NOTICE_STAGE_DIR}")
 	set(_GAME_PAK_PREP_COMMANDS
 		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${GAME_ICON_STAGE_DIR}"
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_ICON_STAGE_DIR}"
@@ -1295,6 +1363,9 @@ add_custom_command(
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_EDITOR_PAK_RES_FLAGS}
 	           --exclude-segment raw_assets
+	           # User-authored handwriting is source-only for the default editor.
+	           # Installed Ink Free/system faces and licensed stock fallback own Auto.
+	           --exclude-suffix fonts/JCE.ttf
 	           ${JCE_PAK_SHADER_EXCLUDE_FLAGS}
 	           ${_PAK_LEVEL_FLAGS}
 	           --pak-file      "${EDITOR_PAK_FILE}"
@@ -1305,7 +1376,7 @@ add_custom_command(
 	${_EDITOR_REPORT_CMD}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
-	           ${ENGINE_UI_FILES}
+	           ${ENGINE_UI_FILES} ${EDITOR_NOTICE_SOURCE_FILES}
 	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_SSGI_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 	COMMENT    "Packing editor assets -> ${EDITOR_PAK_FILE}"
 	VERBATIM)
@@ -1352,6 +1423,12 @@ if(JCE_EMBED_ENGINE_SHADERS)
 	set(JCE_ENGSH_BOM_FILE      "${CMAKE_BINARY_DIR}/reports/engine_shaders_bom.json")
 	set(JCE_ENGSH_STAMP_FILE    "${CMAKE_BINARY_DIR}/_engine_shaders_pak.stamp")
 
+	# Public stock remains separate from the encrypted project archive.
+	set(_ENGSH_PATH_FLAGS "")
+	if(JCE_BUILD_VARIANT STREQUAL "dist")
+		list(APPEND _ENGSH_PATH_FLAGS --strip-debug-paths)
+	endif()
+
 	if(Python3_FOUND)
 		set(_ENGSH_REPORT_CMD COMMAND "${Python3_EXECUTABLE}" "${_PAK_REPORT_SCRIPT}"
 			"${JCE_ENGSH_BOM_FILE}"
@@ -1373,6 +1450,7 @@ if(JCE_EMBED_ENGINE_SHADERS)
 		           --exclude-segment raw_assets
 		           ${JCE_PAK_SHADER_EXCLUDE_FLAGS}
 		           ${_PAK_LEVEL_FLAGS}
+		           ${_ENGSH_PATH_FLAGS}
 		           --symbol-prefix jce_engine_shaders_pak
 		           --pak-file      "${JCE_ENGSH_PAK_FILE}"
 		           --header-file   "${JCE_ENGSH_HEADER_FILE}"
@@ -1747,6 +1825,10 @@ if(Python3_FOUND)
 		# i18n files, matching this block's documented contract.
 		# Packing reads these source JSON files: order it after the writer,
 		# rather than scheduling normalization and packing as sibling targets.
+		# Cooking also scans source JSON; it cannot run beside the writer.
+		if(TARGET CookEditorAssets)
+			add_dependencies(CookEditorAssets jce_i18n_auto)
+		endif()
 		if(TARGET PackEditorAssets)
 			add_dependencies(PackEditorAssets jce_i18n_auto)
 		endif()
@@ -1943,8 +2025,8 @@ file(GENERATE OUTPUT "${DEP_LOCS_FILE}" CONTENT "${_dep_locs_content}")
 
 # The engine resolves pristine headers and exports this path only after its
 # subdirectory has configured. Host targets are declared earlier.
-foreach(_host_asset_target jce_cook jce_bundle_pack)
-	if(TARGET ${_host_asset_target})
+foreach(_host_asset_target jce_pak jce_cook jce_bundle_pack)
+	if(TARGET ${_host_asset_target} AND NOT CMAKE_CROSSCOMPILING)
 		target_include_directories(${_host_asset_target} PRIVATE "${JCE_STB_IMAGE_SOURCE_DIR}")
 		add_dependencies(${_host_asset_target} jce_vendor_verify_stb_image)
 	endif()
