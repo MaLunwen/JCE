@@ -66,6 +66,20 @@ scripts/windows/build-editor.bat --xp
 scripts/windows/build-editor.bat --xp --arch x86 --toolchain-root "C:\SDKs\llvm-mingw-xp"
 ```
 
+Use `--variant release` for a Release XP Editor (AAC/H.264/H.265 adapters
+default ON in a fresh cache; `--patented-codecs off` persistently disables
+them in that Release cache). Use `--variant dist` for a distributable
+XP Editor that always compiles those adapters out, regardless of the
+stored preference. `editor --xp` and `xp-editor` honor both selections.
+Windows XP Release and Dist have separate owned build caches and
+candidates (`obj/release` / `release/jce_editor.exe` versus
+`obj/dist` / `dist/jce_editor.exe`); old Dist cache contents are not
+reinterpreted as a Release artifact. Dist keeps its historical
+published file name; Release uses a `-release.exe` suffix.
+These flags select CMake policy; actual XP compatibility and codec
+operation still require compiler and device verification. Distribution
+rights for the enabled codecs require independent legal assessment.
+
 The launcher defaults to x64. It selects the toolchain root from
 `--toolchain-root`, then `JCE_XP_TOOLCHAIN_ROOT`, then the pinned
 LLVM-MinGW-XP distribution beside the repository. It discovers a host
@@ -279,3 +293,34 @@ embedding fixture proves COFF/RC payload and subsystem linkage. Neither
 configures or qualifies the full Editor. Generated logs, inventories, captures
 and receipts belong under ignored `build/validation/`; this document defines
 the reusable policy rather than storing machine-specific acceptance notes.
+
+## Unified native Editor Release/Dist cache layout (v0.14.1)
+
+For native single-executable Editor targets (ordinary Windows x64/x86 and the
+separate LLVM-MinGW-XP x64/x86 lane), each Release/Dist variant owns its own
+CMake tree and Conan-generator output:
+
+    build/desktop/<target>/obj/<variant>/       # CMake + Ninja objects
+    build/desktop/<target>/conan/<variant>/     # Conan generators + toolchain
+    build/desktop/<target>/<variant>/jce_editor.exe
+
+`<variant>` is either `release` or `dist`. The XP target retains its own
+LLVM-MinGW/MSVCRT package store under `build/compat` and never links MSVC host
+libraries into the guest Editor. Host-side generators under `build/host` are
+not deliverables. `dist/editor/` remains the separately verified single-EXE
+package location. No companion DLLs or game-asset directories are introduced.
+
+The variant directories are independent, so a Release opt-out of AAC/H.264/H.265
+cannot carry into Dist and Dist's forced OFF cannot alter Release's cached
+preference. Release defaults ON for a fresh cache and permits explicit OFF;
+Dist always forces OFF. Build/variant selection and codec preference are
+independent inputs; this layout does not change vendor licensing obligations.
+
+Historical trees such as `<target>/obj`, `<target>/conan`,
+`<target>/obj-release`, `<target>/obj/conan` or `<target>-standalone` are NOT
+renamed, deleted, or auto-adopted. A first new build uses the new paths and may
+recompile. Remove historical trees only after separate user-directed review.
+
+The XP `receipt.json`, optional real-time progress and guest compatibility qualification
+remain separate; consistent folder names are NOT evidence of successful builds
+or XP VM execution.

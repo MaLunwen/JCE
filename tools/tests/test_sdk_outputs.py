@@ -142,6 +142,7 @@ class Fixture:
              patch.object(driver, "sync_conan_hooks") as hooks, \
              patch.object(driver, "export_conan_recipes") as recipes, \
              patch.object(driver, "find_vs_install", return_value=None), \
+             patch.object(driver, "find_host_shaderc", return_value=self.root / "shaderc-counted-port.exe"), \
              patch.object(driver, "host_build_profile", return_value="windows-x64"), \
              patch.object(driver, "bgfx_graphics_conan_args", return_value=[]), \
              patch.object(driver, "git_short_sha", return_value="presence-fixture"), \

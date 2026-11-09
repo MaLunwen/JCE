@@ -74,12 +74,18 @@ jobs:
   lint:
     name: lint (structural + style)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # The lint suite executes Conan-backed unit tests and YAML ownership
+      # parsing; install those test prerequisites before the suite.
+      - name: Install lint test prerequisites
+        run: |
+          python -m pip install "conan>=2.0,<3" "PyYAML>=6,<7"
+          conan profile detect --force
       - name: Run all lints
         run: python tools/lint/run_all.py
 
@@ -144,12 +150,6 @@ jobs:
       # to run the suite), so CI must install it or the gate is decorative.
       # Only recipe metadata is needed, so this resolves in seconds and never
       # builds a package.
-      - name: Install Conan (needed by the licence gate)
-        run: |
-          pip install --upgrade pip
-          pip install "conan>=2.0"
-          conan profile detect --force
-
       - name: Architecture audit (deps, ABI boundaries, licences)
         run: python tools/audit/run_architecture_audit.py
 
@@ -199,7 +199,7 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Build the public SDK
-        run: python scripts/jce.py sdk --variant release --no-debug --profiling off --patented-codecs off
+        run: python scripts/jce.py sdk --variant release --no-debug --profiling off
 
   # ---------------------------------------------------------------------------
   # SDK consumer closure — the stub-PAK regression guard.

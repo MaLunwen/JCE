@@ -71,12 +71,14 @@ Use an installed Gradle 8.14.1 and supply SDK/NDK environment settings.
 
 Native single-executable editor builds are the default and owned by standalone.py;
 --standalone remains a compatibility alias. Default executables go under
-build/desktop/<target>/<variant>. New native caches use obj/ and conan/ in
-the same target directory. Reuse a historical <target>-release or
-<target>-standalone cache in place only after bounded
-source/toolchain/compiler/architecture/static-CRT/embedded-policy admission,
-repeated under the same cache lease. Never rename or copy a CMake cache.
-Release/dist configure may reuse the same Release closure while always pinning
+build/desktop/<target>/<variant>. Native embedded-editor caches use
+build/desktop/<target>/obj/<variant> and build/desktop/<target>/conan/<variant> exclusively.
+Never select historical <target>-release or <target>-standalone paths,
+even when their caches are valid; leave them untouched. Do not rename,
+copy or automatically remove a CMake cache. The canonical cache still
+requires source/toolchain/compiler/architecture/static-CRT/embedded-policy
+admission, repeated under the same cache lease.
+Release/dist configure uses distinct static closures while always pinning
 the requested variant; --skip-build requires that exact cached variant and
 shipping flags. A conflicting canonical owner refuses reuse. Explicit authoring
 development uses the target's authoring/ directory. Editor packaging holds the same
@@ -743,3 +745,34 @@ UNOBSERVED effective state. SFTP observations are bounded before/after checks,
 not an atomic exclusion of concurrent path replacement. This does not alter the
 Windows account, system settings or user profile. Focused fake-transport controls
 are tools/tests/test_xp_vm_background.py; they execute no guest application.
+
+## Unified native Editor Release/Dist cache layout (v0.14.1)
+
+For native single-executable Editor targets (ordinary Windows x64/x86 and the
+separate LLVM-MinGW-XP x64/x86 lane), each Release/Dist variant owns its own
+CMake tree and Conan-generator output:
+
+    build/desktop/<target>/obj/<variant>/       # CMake + Ninja objects
+    build/desktop/<target>/conan/<variant>/     # Conan generators + toolchain
+    build/desktop/<target>/<variant>/jce_editor.exe
+
+`<variant>` is either `release` or `dist`. The XP target retains its own
+LLVM-MinGW/MSVCRT package store under `build/compat` and never links MSVC host
+libraries into the guest Editor. Host-side generators under `build/host` are
+not deliverables. `dist/editor/` remains the separately verified single-EXE
+package location. No companion DLLs or game-asset directories are introduced.
+
+The variant directories are independent, so a Release opt-out of AAC/H.264/H.265
+cannot carry into Dist and Dist's forced OFF cannot alter Release's cached
+preference. Release defaults ON for a fresh cache and permits explicit OFF;
+Dist always forces OFF. Build/variant selection and codec preference are
+independent inputs; this layout does not change vendor licensing obligations.
+
+Historical trees such as `<target>/obj`, `<target>/conan`,
+`<target>/obj-release`, `<target>/obj/conan` or `<target>-standalone` are NOT
+renamed, deleted, or auto-adopted. A first new build uses the new paths and may
+recompile. Remove historical trees only after separate user-directed review.
+
+The XP `receipt.json`, optional real-time progress and guest compatibility qualification
+remain separate; consistent folder names are NOT evidence of successful builds
+or XP VM execution.

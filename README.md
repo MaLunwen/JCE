@@ -59,8 +59,11 @@ Editor and application shipments default to one native executable.
 SDK/runtime bundle. Embedded delivery supports Lua, JavaScript, C and C++.
 The editor executable goes to `build/desktop/<target>/<variant>`, with
 `windows-x64` and `windows-x64-xp` as separate target identities. New native
-Release caches use `obj/` and `conan/` under the target directory. Compatible
-historical caches are reused in place under their existing leases.
+Release and Dist use `build/desktop/<target>/obj/<variant>/` build
+trees and `build/desktop/<target>/conan/<variant>/` generator directories.
+The executable is separate at `build/desktop/<target>/<variant>/`.
+Automatic fallback to `<target>-standalone` or `<target>-release`
+cache directories has been retired; they are neither selected nor deleted.
 The direct SDK app builder uses the same target naming under each project's
 `build/desktop/<target>/<variant>`.
 
@@ -92,6 +95,18 @@ and C# are optional authoring/SDK backends in the full language build. They must
 not become external VM dependencies of default shipped applications. SDKs, native project modules,
 project assets and development compilers are supplied separately when needed
 for project development; they do not enlarge the editor executable.
+
+### Codec policy, including Windows XP+
+
+`release` enables AAC/H.264/H.265 adapters by default in a fresh
+build tree, and `--patented-codecs off` keeps a manual Release
+opt-out; `dist` always disables these adapters. The explicit
+LLVM-MinGW-XP x86/x64 editor path and Web Release follow the same
+variant policy (Web codec compilation is not yet qualified).
+The XP Editor uses
+separate Release/Dist caches and artifacts and still requires
+actual XP toolchain/device acceptance. Enabling these adapters
+does not establish patent licensing or distribution rights.
 
 ### AI authoring, and what is actually here
 
@@ -195,7 +210,7 @@ artifacts still require their own relocation and system-dependency validation.
 
 | | |
 | --- | --- |
-| Version | `0.14.0` (authoritative: `CMakeLists.txt`) |
+| Version | `0.14.1` (authoritative: `CMakeLists.txt`) |
 | Engine (C99) | 495 tracked `.c` under `engine/src/` |
 | Editor (C++20) | 236 tracked `.cpp` under `editor/src/`, 110 panels |
 | Public API | 316 headers under `engine/include/jce/`, 24 umbrellas, 4007 `JCE_API` symbols |
@@ -300,7 +315,7 @@ The image loader is a single JCE service. Callers request an image by usage/form
 | AV1 video decode                                                                       | **dav1d 1.5.3**                                      | Video module supplies decoded frames to the renderer                      | A second AV1 software decoder in the same build                                                                         |
 | VP8/VP9 encode/decode                                                                  | **libvpx 1.16.0**                                    | WebM video paths and explicitly supported encode/decode workflows         | Platform-specific VP8/VP9 paths with different behavior unless selected behind the video backend                        |
 | WebM container demux/mux                                                               | **libwebm 1.0.0.31**                                 | Container handling; codec payloads go to dav1d/libvpx/Opus as appropriate | Handwritten EBML/WebM parsing or assuming libwebm itself decodes media                                                  |
-| Patent-sensitive AAC/H.264/H.265 paths                                                 | **Optional JCE codec modules**, disabled in `dist` | Enabled only by explicit CMake switches and license review                | Silent enablement through Conan, automatic fallback to patented codecs, or shipping them in royalty-free `dist` builds |
+| Patent-sensitive AAC/H.264/H.265 paths                                                 | **Optional JCE codec modules**, disabled in `dist` | Release: ON by default, optional explicit OFF; Dist: forced OFF; licensing review required                | Silent enablement through Conan, automatic fallback to patented codecs, or shipping them in royalty-free `dist` builds |
 
 ### Networking and Serialization
 
@@ -503,3 +518,34 @@ Consumer-specific tools and content belong to `examples/<project>/`. Stable
 contracts live in `contracts/`; local plans and delivery notes remain in ignored
 `docs/` and `.docs/`. The public core works without optional private AI workflows.
 See [AGENTS.md](AGENTS.md) and [the JCE skill](skills/jce/SKILL.md).
+
+## Unified native Editor Release/Dist cache layout (v0.14.1)
+
+For native single-executable Editor targets (ordinary Windows x64/x86 and the
+separate LLVM-MinGW-XP x64/x86 lane), each Release/Dist variant owns its own
+CMake tree and Conan-generator output:
+
+    build/desktop/<target>/obj/<variant>/       # CMake + Ninja objects
+    build/desktop/<target>/conan/<variant>/     # Conan generators + toolchain
+    build/desktop/<target>/<variant>/jce_editor.exe
+
+`<variant>` is either `release` or `dist`. The XP target retains its own
+LLVM-MinGW/MSVCRT package store under `build/compat` and never links MSVC host
+libraries into the guest Editor. Host-side generators under `build/host` are
+not deliverables. `dist/editor/` remains the separately verified single-EXE
+package location. No companion DLLs or game-asset directories are introduced.
+
+The variant directories are independent, so a Release opt-out of AAC/H.264/H.265
+cannot carry into Dist and Dist's forced OFF cannot alter Release's cached
+preference. Release defaults ON for a fresh cache and permits explicit OFF;
+Dist always forces OFF. Build/variant selection and codec preference are
+independent inputs; this layout does not change vendor licensing obligations.
+
+Historical trees such as `<target>/obj`, `<target>/conan`,
+`<target>/obj-release`, `<target>/obj/conan` or `<target>-standalone` are NOT
+renamed, deleted, or auto-adopted. A first new build uses the new paths and may
+recompile. Remove historical trees only after separate user-directed review.
+
+The XP `receipt.json`, optional real-time progress and guest compatibility qualification
+remain separate; consistent folder names are NOT evidence of successful builds
+or XP VM execution.

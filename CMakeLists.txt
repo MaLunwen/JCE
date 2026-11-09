@@ -38,7 +38,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.14.0 LANGUAGES C)
+project(JCE VERSION 0.14.1 LANGUAGES C)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEDeliveryProfile.cmake")
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
@@ -514,7 +514,7 @@ endif()
 # JCE_ENABLE_PATENTED_CODECS option (declared in engine/CMakeLists.txt,
 # default ON) records preference and is never mutated. JCE_PATENTED_CODECS_ENABLED
 # is the *effective* switch the build reads — derived from the option, then
-# forced OFF for dist/Web. Switching variants does not lose the user's preference.
+# forced OFF for dist only, for every target. The user preference persists.
 set(JCE_PATENTED_CODECS_ENABLED ON)  # default; flipped below if needed
 if(DEFINED JCE_ENABLE_PATENTED_CODECS AND NOT JCE_ENABLE_PATENTED_CODECS)
 	set(JCE_PATENTED_CODECS_ENABLED OFF)
@@ -525,19 +525,12 @@ if(JCE_BUILD_VARIANT STREQUAL "dist")
 	endif()
 	set(JCE_PATENTED_CODECS_ENABLED OFF)
 endif()
-if(JCE_PLATFORM_WEB)
-	if(JCE_PATENTED_CODECS_ENABLED)
-		message(STATUS "JCE_PLATFORM_WEB forces JCE_ENABLE_PATENTED_CODECS OFF (WASM uses royalty-free codecs only).")
-	endif()
-	set(JCE_PATENTED_CODECS_ENABLED OFF)
-endif()
-
 # Assert the derivation actually held.
 #
 # "dist ships royalty-free, release carries the codecs" is a LICENSING
 # decision, and until now it was only an ordering property of the if()s
-# above: reorder them, add a branch that re-derives the variable, or move the
-# Web check, and a dist build starts shipping AAC/H.264/H.265 with nothing
+# above: reorder them or add a branch that re-derives the variable, and a
+# dist build starts shipping AAC/H.264/H.265 with nothing
 # saying so.  That failure is invisible in every build log and every test —
 # the first person to notice would be a lawyer.
 #
@@ -547,11 +540,6 @@ if(JCE_BUILD_VARIANT STREQUAL "dist" AND JCE_PATENTED_CODECS_ENABLED)
 	message(FATAL_ERROR
 		"dist variant derived JCE_PATENTED_CODECS_ENABLED=ON. The dist build "
 		"must be royalty-free; something above stopped forcing it OFF.")
-endif()
-if(JCE_PLATFORM_WEB AND JCE_PATENTED_CODECS_ENABLED)
-	message(FATAL_ERROR
-		"Web target derived JCE_PATENTED_CODECS_ENABLED=ON. WASM builds must "
-		"use royalty-free codecs only.")
 endif()
 
 if(JCE_BUILD_JNI)

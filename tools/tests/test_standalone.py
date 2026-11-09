@@ -81,13 +81,14 @@ def pe_fixture(imports, delayed=(), *, functions=None, delayed_functions=None,
     return blob
 
 
-def native_cache_fixture(root, target, variant="dist", *, legacy="standalone", **changes):
+def native_cache_fixture(root, target, variant="dist", *, legacy=False, **changes):
     target_root = root / "build/desktop" / target["key"]
+    # JCE_EDITOR_VARIANT_LAYOUT_V4: fixture supports historical caches only when explicitly requested.
     if legacy:
         build = target_root.with_name(target_root.name + "-" + legacy)
         conan = build.with_name(build.name + "-conan")
     else:
-        build, conan = target_root / "obj", target_root / "conan"
+        build, conan = target_root / "obj" / variant, target_root / "conan" / variant
     toolchain = conan / "build/Release/generators/conan_toolchain.cmake"
     toolchain.parent.mkdir(parents=True, exist_ok=True)
     toolchain.write_text('set(CMAKE_MSVC_RUNTIME_LIBRARY "$<$<CONFIG:Release>:MultiThreaded>")\n', encoding="utf-8")
@@ -138,12 +139,12 @@ class CacheCleanSourceProtectionTests(unittest.TestCase):
             driver.export_conan_recipes.assert_not_called()
             driver.run.assert_not_called()
 
-    def test_qualified_legacy_nested_project_refuses_before_either_cache_deletion(self):
+    def test_canonical_nested_project_refuses_before_either_cache_deletion(self):
         for second_root in (False, True):
             with self.subTest(second_root=second_root), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()
                 build, toolchain = native_cache_fixture(root, self.target)
-                source = self.project(build.with_name(build.name + "-conan") if second_root else build)
+                source = self.project(build.parent.parent / "conan" / build.name if second_root else build)
                 self.assert_native_preserves(MODULE, root, source)
                 self.assertTrue((build / "CMakeCache.txt").is_file())
                 self.assertTrue(toolchain.is_file())
@@ -177,7 +178,7 @@ class CacheCleanSourceProtectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "stop after clean"):
                     MODULE._configure(driver, SimpleNamespace(variant="dist", clean=True), self.target, {})
                 self.assertEqual([call.args[0] for call in remove.call_args_list],
-                                 [build, build.with_name(build.name + "-conan")])
+                                 [build, build.parent.parent / "conan" / build.name])
             self.assertFalse(build.exists())
             self.assertFalse(toolchain.exists())
             driver.sync_conan_hooks.assert_called_once_with({})
@@ -209,7 +210,7 @@ class CacheCleanSourceProtectionTests(unittest.TestCase):
                 driver.run.assert_not_called()
             self.assertEqual((source / "src/owned.c").read_bytes(), b"KEEP_USER_SOURCE")
             # Without a marker, exhausted scans still refuse every deletion.
-            conan = build.with_name(build.name + "-conan")
+            conan = build.parent.parent / "conan" / build.name
             for budgets in ({"entry_budget": 1}, {"depth_budget": 0}):
                 with self.subTest(budgets=budgets), self.assertRaisesRegex(ValueError, "budget exhausted"):
                     MODULE.guard_cache_clean((build, conan), root / "build/desktop", **budgets)
@@ -308,26 +309,35 @@ class CacheCleanSourceProtectionTests(unittest.TestCase):
 class NativeCacheSelectionTests(unittest.TestCase):
     target = {"key": "fixture", "host": "windows", "arch": "x86_64", "cross": False}
 
-    def test_new_default_has_no_delivery_category_and_qualified_legacy_reuses_in_place(self):
+    def test_canonical_layout_never_adopts_legacy_objects_or_lease_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             driver = SimpleNamespace(ROOT=root)
             args = SimpleNamespace(variant="dist")
-            fresh = MODULE.native_cache_plan(driver, args, self.target)
-            self.assertEqual(fresh["build"], root / "build/desktop/fixture/obj")
-            self.assertEqual(fresh["conan"], root / "build/desktop/fixture/conan")
-            self.assertFalse(fresh["build"].exists())
-            legacy, _ = native_cache_fixture(root, self.target, variant="release")
-            plan = MODULE.native_cache_plan(driver, args, self.target)
-            self.assertEqual(plan["build"], legacy)
-            self.assertFalse(fresh["build"].exists())
-            with self.assertRaisesRegex(ValueError, "JCE_BUILD_VARIANT"):
+            target_root = root / "build/desktop/fixture"
+            expected = MODULE.native_cache_plan(driver, args, self.target)
+            self.assertEqual(expected["build"], target_root / "obj/dist")
+            self.assertEqual(expected["conan"], target_root / "conan/dist")
+            old_standalone, _ = native_cache_fixture(root, self.target,
+                variant="dist", legacy="standalone")
+            old_release, _ = native_cache_fixture(root, self.target,
+                variant="release", legacy="release")
+            self.assertEqual(MODULE.native_cache_plan(driver, args, self.target), expected)
+            self.assertFalse(expected["build"].exists())
+            with self.assertRaisesRegex(ValueError, "cache is missing"):
                 MODULE.native_cache_plan(driver, args, self.target, exact_variant=True)
+            args._native_cache_plan = {**expected, "build": old_standalone}
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                MODULE.native_cache_plan(driver, args, self.target)
+            del args._native_cache_plan
+            canonical, _ = native_cache_fixture(root, self.target, variant="release")
+            self.assertNotEqual(canonical, expected["build"])
+            self.assertEqual(MODULE.native_cache_plan(driver, args, self.target), expected)
             args.variant = "release"
             self.assertEqual(MODULE.native_cache_plan(driver, args, self.target,
-                             exact_variant=True)["build"], legacy)
-            historical, _ = native_cache_fixture(root, self.target, variant="release", legacy="release")
-            self.assertEqual(MODULE.native_cache_plan(driver, args, self.target)["build"], historical)
+                exact_variant=True)["build"], canonical)
+            self.assertTrue((old_standalone / "CMakeCache.txt").is_file())
+            self.assertTrue((old_release / "CMakeCache.txt").is_file())
 
     def test_foreign_static_runtime_architecture_and_shipping_flags_refuse_reuse(self):
         for field, value in (("JCE_DELIVERY_PROFILE", "authoring"), ("CMAKE_BUILD_TYPE", "Debug"),
@@ -370,14 +380,15 @@ class NativeCacheSelectionTests(unittest.TestCase):
                         plan = MODULE.native_cache_plan(driver, args, self.target, exact_variant=exact_variant)
                         self.assertEqual(plan["build"], build)
 
-    def test_remembered_lease_paths_do_not_switch_when_canonical_cache_appears(self):
+    def test_remembered_lease_paths_stay_canonical_and_revalidate_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
-            legacy, _ = native_cache_fixture(root, self.target)
+            canonical, _ = native_cache_fixture(root, self.target)
             driver, args = SimpleNamespace(ROOT=root), SimpleNamespace(variant="dist")
             args._native_cache_plan = MODULE.native_cache_plan(driver, args, self.target)
-            native_cache_fixture(root, self.target, legacy=False)
-            self.assertEqual(MODULE.native_cache_plan(driver, args, self.target)["build"], legacy)
+            native_cache_fixture(root, self.target, legacy="standalone",
+                                 JCE_ENABLE_PROFILING="ON")
+            self.assertEqual(MODULE.native_cache_plan(driver, args, self.target)["build"], canonical)
             native_cache_fixture(root, self.target, JCE_ENABLE_PROFILING="ON")
             with self.assertRaisesRegex(ValueError, "JCE_ENABLE_PROFILING"):
                 MODULE.native_cache_plan(driver, args, self.target)
@@ -470,7 +481,7 @@ class NativeEditorDispatchTests(unittest.TestCase):
             @contextmanager
             def lease(paths):
                 self.assertIn(build, paths)
-                self.assertIn(build.with_name(build.name + "-conan"), paths)
+                self.assertIn(build.parent.parent / "conan" / build.name, paths)
                 events.append("acquired")
                 native_cache_fixture(root, target, JCE_ENABLE_PROFILING="ON")
                 try:
@@ -634,7 +645,8 @@ class NativeShadercSelectionTests(unittest.TestCase):
         with self.fixture() as fixture:
             inactive = fixture.root / "inactive.exe"
             inactive.write_bytes(b"inactive host tool")
-            native_cache_fixture(fixture.root, fixture.target, JCE_SHADERC_EXECUTABLE=str(inactive))
+            native_cache_fixture(fixture.root, fixture.target, legacy="standalone",
+                                 JCE_SHADERC_EXECUTABLE=str(inactive))
             self.require_cached_compiler(fixture)
 
     def test_empty_or_relative_cache_tool_does_not_select_from_process_cwd(self):
@@ -704,7 +716,11 @@ class NativeStandaloneTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("jce_standalone_bgfx_args", ROOT / "tools/build/jce.py")
         shared = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(shared)
-        driver = SimpleNamespace(ROOT=ROOT, HOST="windows", DRY_RUN=True,
+        # JCE_LAYOUT_V4_2_STANDALONE_FIX: isolate mocked configure from real build/desktop caches.
+        scratch = tempfile.TemporaryDirectory(prefix="jce-layout-v4-2-")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name).resolve()
+        driver = SimpleNamespace(ROOT=root, HOST="windows", DRY_RUN=True,
             host_arch=lambda: "x86_64",
             sync_conan_hooks=Mock(), export_conan_recipes=Mock(),
             find_vs_install=lambda arch: None, host_build_profile=lambda: "windows-x64",
@@ -895,7 +911,11 @@ class NativeStandaloneTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("jce_standalone_recipe_args", ROOT / "tools/build/jce.py")
         shared = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(shared)
-        driver = SimpleNamespace(ROOT=ROOT, HOST="windows", DRY_RUN=True,
+        # JCE_LAYOUT_V4_2_STANDALONE_FIX: isolate mocked configure from real build/desktop caches.
+        scratch = tempfile.TemporaryDirectory(prefix="jce-layout-v4-2-")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name).resolve()
+        driver = SimpleNamespace(ROOT=root, HOST="windows", DRY_RUN=True,
             host_arch=lambda: "x86_64",
                                  sync_conan_hooks=Mock(), export_conan_recipes=Mock(),
                                  find_vs_install=lambda arch: None,
@@ -919,7 +939,7 @@ class NativeStandaloneTests(unittest.TestCase):
             self.assertIn("-DJCE_BUILD_SCRIPT_" + language + "=OFF", commands[1])
         self.assertIn("-DJCE_ENABLE_SDK_INSTALL=OFF", commands[1])
         self.assertIn("-DJCE_BUILD_TESTS=OFF", commands[1])
-        output = ROOT / "build/desktop/windows-x64/dist"
+        output = root / "build/desktop/windows-x64/dist"
         self.assertIn("-DJCE_EDITOR_ARTIFACT_DIR=" + str(output), commands[1])
         self.assertEqual(exe, output / "jce_editor.exe")
         cmake = (ROOT / "editor/CMakeLists.txt").read_text()
@@ -927,14 +947,14 @@ class NativeStandaloneTests(unittest.TestCase):
 
 
 class NativePackageLayoutTests(unittest.TestCase):
-    def test_default_package_build_reuses_legacy_cache_and_writes_canonical_artifact(self):
+    def test_default_package_build_uses_canonical_cache_and_artifact(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             target = dict(NativeCacheSelectionTests.target, profile="windows-x64")
-            build, toolchain = native_cache_fixture(root, target)
+            build, toolchain = native_cache_fixture(root, target, legacy=False)
             (build / "generated/engine_assets/shaders").mkdir(parents=True)
             target_root = root / "build/desktop/fixture"
-            target_root.mkdir()
+            target_root.mkdir(exist_ok=True)
             foreign = target_root / "CMakeCache.txt"
             foreign.write_bytes(b"JCE_DELIVERY_PROFILE:STRING=authoring\n")
             output = target_root / "dist"
@@ -969,7 +989,7 @@ class NativePackageLayoutTests(unittest.TestCase):
             self.assertEqual(exe.read_bytes(), expected)
             self.assertEqual((root / "dist/editor/JCE-editor-fixture.exe").read_bytes(), expected)
             self.assertEqual(foreign.read_bytes(), b"JCE_DELIVERY_PROFILE:STRING=authoring\n")
-            self.assertFalse((target_root / "obj").exists())
+            self.assertTrue((target_root / "obj" / "dist" / "CMakeCache.txt").is_file())
 
     def test_windows_subsystem_policy_follows_variant_in_build_and_package(self):
         base = ROOT / "build/tests"
@@ -1015,7 +1035,7 @@ class NativePackageLayoutTests(unittest.TestCase):
     def test_cached_override_is_authoritative_and_asset_receipt_uses_build_tree(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            build = root / "build/desktop/fixture-standalone"
+            build = root / "build/desktop/fixture/obj/dist"
             old = build / "dist/jce_editor.exe"
             old.parent.mkdir(parents=True)
             old.write_bytes(pe_fixture(["KERNEL32.dll"]))
@@ -1024,7 +1044,7 @@ class NativePackageLayoutTests(unittest.TestCase):
             fresh = output / "jce_editor.exe"
             fresh.write_bytes(pe_fixture(["KERNEL32.dll", "USER32.dll"]))
             target = {"host": "windows", "key": "fixture", "arch": "x86_64"}
-            native_cache_fixture(root, target, JCE_EDITOR_ARTIFACT_DIR=str(output))
+            native_cache_fixture(root, target, legacy=False, JCE_EDITOR_ARTIFACT_DIR=str(output))
             cache = build / "CMakeCache.txt"
             driver = SimpleNamespace(ROOT=root, HOST="windows", DRY_RUN=False,
                 resolve_target=lambda arch: target, msvc_env=lambda selected: {},
@@ -1065,7 +1085,11 @@ class NativePackageLayoutTests(unittest.TestCase):
             fresh.write_bytes(pe_fixture(["KERNEL32.dll", "USER32.dll"]))
             args.skip_build = False
             args.out = str(root / "new variant/editor.exe")
-            native_cache_fixture(root, target, variant="release", JCE_EDITOR_ARTIFACT_DIR=str(output))
+            native_cache_fixture(root, target, variant="release", legacy=False, JCE_EDITOR_ARTIFACT_DIR=str(output))
+            # JCE_LAYOUT_V4_2_STANDALONE_FIX: release and dist have independent CMake caches.
+            native_cache_fixture(root, target, variant="dist", legacy=False, JCE_EDITOR_ARTIFACT_DIR=str(output))
+            self.assertTrue((root / "build/desktop/fixture/obj/release/CMakeCache.txt").is_file())
+            self.assertTrue((root / "build/desktop/fixture/obj/dist/CMakeCache.txt").is_file())
             with patch.object(MODULE, "build_editor", return_value=fresh), \
                  patch.object(MODULE, "verify_assets", return_value={}), \
                  patch.object(MODULE, "verify_notices", return_value={}), \
@@ -1078,7 +1102,7 @@ class NativePackageLayoutTests(unittest.TestCase):
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             root = Path(temporary).resolve()
-            source = root / 'build/desktop/fixture-standalone/dist/jce_editor.exe'
+            source = root / 'build/desktop/fixture/obj/dist/dist/jce_editor.exe'
             source.parent.mkdir(parents=True)
             source.write_bytes(pe_fixture(['KERNEL32.dll']))
             out = root / 'delivery/editor.exe'

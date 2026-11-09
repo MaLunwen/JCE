@@ -388,7 +388,7 @@ class DeclaredBundleAdmission(unittest.TestCase):
         args=SimpleNamespace(project=str(self.project),arch='x64',variant='dist',
             delivery_profile='embedded',standalone=False,target=None,exe=None,registry_proof=None,
             configure_only=configure_only,clean=clean)
-        target=dict(self.target,host=driver.HOST)
+        target=dict(self.target)
         def dispatch(command,**kwargs):
             if command[0]=='cmake':
                 self.commands.append(command)
@@ -398,6 +398,7 @@ class DeclaredBundleAdmission(unittest.TestCase):
                     if after_link:after_link()
             else:self.run_port(command,**kwargs)
         with patch.dict(sys.modules,{driver.__name__:driver}), \
+             patch.object(driver,'HOST','windows'), \
              patch.object(driver,'resolve_target',return_value=target), \
              patch.object(driver,'resolve_sdk',return_value=self.sdk), \
              patch.object(driver,'_confirmed_app_sdk_tools',return_value=self.tools), \

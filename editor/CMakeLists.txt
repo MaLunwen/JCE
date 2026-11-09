@@ -153,7 +153,10 @@ if(TARGET jce_script_java)
 endif()
 
 # Resolve a human-readable OS + arch string for the About dialog.
-if(JCE_PLATFORM_WINDOWS)
+if(JCE_PLATFORM_WINDOWS AND JCE_WINXP_LEGACY)
+    # JCE_XP_ABOUT_PLATFORM_V4_4_1: compiled target, not runtime OS detection.
+    set(_jce_os_str "Windows XP+")
+elseif(JCE_PLATFORM_WINDOWS)
     set(_jce_os_str "Windows")
 elseif(JCE_PLATFORM_MACOS)
     set(_jce_os_str "macOS")

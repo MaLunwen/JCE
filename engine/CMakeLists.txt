@@ -173,7 +173,7 @@ redistribution." ON)
 
 # Effective switch — the rest of this file reads only this. Set by the root
 # CMakeLists.txt before this file runs (default: == JCE_ENABLE_PATENTED_CODECS;
-# dist variant: forced OFF).
+# dist variant: forced OFF on every platform).
 if(NOT DEFINED JCE_PATENTED_CODECS_ENABLED)
 	set(JCE_PATENTED_CODECS_ENABLED ${JCE_ENABLE_PATENTED_CODECS})
 endif()

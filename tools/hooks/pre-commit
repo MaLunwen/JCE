@@ -1,0 +1,5 @@
+#!/bin/sh
+# CMakeLists.txt is the only hand-edited JCE release version.
+# Synchronize precisely the version mirrors in the staged index before the
+# existing commit-msg gate validates the proposed release commit.
+exec python tools/lint/sync_release_mirrors.py --staged

@@ -120,6 +120,11 @@ void JCE_CALL jce_runtime_pause_audio(JceRuntime *) { PROBE_REQUIRE(false); }
 void JCE_CALL jce_runtime_resume_audio(JceRuntime *) { PROBE_REQUIRE(false); }
 int JCE_CALL jce_engine_get_target_fps(void) { return target_fps; }
 void JCE_CALL jce_engine_set_target_fps(int fps) { PROBE_REQUIRE(fps >= 0); target_fps = fps; }
+/* The production host-policy owner now publishes the background-loop
+ * policy through these public ports; keep the compiled seam linked. */
+static bool cpu_run_in_background = false;
+bool JCE_CALL jce_engine_get_run_in_background(void) { return cpu_run_in_background; }
+void JCE_CALL jce_engine_set_run_in_background(bool enabled) { cpu_run_in_background = enabled; }
 JceRenderSettings jce_render_settings_default(void) {
     JceRenderSettings rs = {}; rs.vsync = 1; return rs;
 }

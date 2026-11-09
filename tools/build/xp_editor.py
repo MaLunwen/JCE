@@ -18,6 +18,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import threading
 import time
 import uuid
 
@@ -304,16 +305,159 @@ def _guard_cache(cache, identity):
 
 
 class _Stages:
-    """Every native launch gets bounded retained stdout/stderr and an outcome."""
-    def __init__(self, directory, receipt, runner=None):
-        self.directory, self.receipt = directory, receipt
+    # JCE_XP_PROGRESS_EMBEDDED_V2: real-time tee + heartbeat + receipt.
+    """XP stages: live CMake/Ninja/Conan output, heartbeat and bounded receipts.
+
+    Real subprocesses are streamed via Popen; injected test runners retain the
+    original subprocess.run signature. Conan JSON stdout is kept intact for
+    graph admission, but not dumped to the terminal. No source/cache migration.
+    """
+    def __init__(self, directory, receipt, runner=None, *, heartbeat_seconds=None):
+        # JCE_BUILD_CONSISTENCY_XP_V3: shared heartbeat with jce.py.
+        if heartbeat_seconds is None:
+            try:
+                heartbeat_seconds = float(os.environ.get("JCE_BUILD_PROGRESS_INTERVAL", "12"))
+            except ValueError:
+                heartbeat_seconds = 12
+            if not 0 < heartbeat_seconds <= 3600:
+                heartbeat_seconds = 12
+        if not isinstance(heartbeat_seconds, (float, int)) or isinstance(heartbeat_seconds, bool) or not 0 < heartbeat_seconds <= 3600:
+            raise ValueError("XP heartbeat seconds must be within (0, 3600]")
+        self.directory, self.receipt = Path(directory), receipt
         self.runner = runner or subprocess.run
+        self._real_runner = runner is None
+        self.heartbeat_seconds = heartbeat_seconds
 
     def _log(self, path, contents):
         data = contents if isinstance(contents, bytes) else (contents or "").encode("utf-8", "replace")
         path.write_bytes(data[:LOG_LIMIT])
         return {"path": str(path), "bytes": len(data), "retained_bytes": min(len(data), LOG_LIMIT),
                 "truncated": len(data) > LOG_LIMIT, "sha256": hashlib.sha256(data).hexdigest()}
+
+    def _report_failure(self, label, row, error):
+        print(f"[XP Editor] {label}: FAILED; receipt: {self.directory / 'receipt.json'}", flush=True)
+        for stream in ("stderr", "stdout"):
+            item = row.get(stream, {})
+            if item.get("path"):
+                print(f"[XP Editor] {label}: {stream} log: {item['path']}", flush=True)
+        pattern = re.compile(r"(?:FAILED:|ERROR:|fatal error|error:|undefined reference|ld\.lld:|CMake Error|ninja: build stopped|ConanException|error C\d+)", re.I)
+        for stream in ("stderr", "stdout"):
+            data = getattr(error, stream, None)
+            if data is None and stream == "stdout":
+                data = getattr(error, "output", None)
+            if not data:
+                continue
+            if isinstance(data, bytes):
+                data = data.decode("utf-8", "replace")
+            lines = data.splitlines()
+            selected = [s for s in lines if pattern.search(s)]
+            snippet = "\n".join((selected[-16:] if selected else lines[-12:]))[-6000:]
+            snippet = snippet.encode("ascii", "backslashreplace").decode("ascii")
+            if snippet:
+                print(f"[XP Editor] {label}: {stream} diagnostic:\n{snippet}", flush=True)
+
+    def _run_live(self, row, stem, cwd, env, timeout):
+        # --format=json emits a full Conan graph on stdout. Its bytes are
+        # required by _admit_graph() and must never be filtered/truncated there.
+        cmd = row["argv"]
+        suppress_json = any(a == "--format=json" or a == "--format" and i + 1 < len(cmd) and cmd[i + 1] == "json"
+                            for i, a in enumerate(cmd))
+        output_lock = threading.Lock()
+        output = {}
+        errors = []
+        threads = []
+        stdout_path = self.directory / (stem + ".stdout.log")
+        stderr_path = self.directory / (stem + ".stderr.log")
+        p = None
+        started = time.monotonic_ns()
+        try:
+            p = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            def pump(kind, pipe, path):
+                digest = hashlib.sha256()
+                total = retained = 0
+                chunks = []
+                try:
+                    with path.open("wb") as log:
+                        while True:
+                            data = pipe.readline(65536)
+                            if not data:
+                                break
+                            chunks.append(data)
+                            digest.update(data)
+                            total += len(data)
+                            if retained < LOG_LIMIT:
+                                segment = data[:LOG_LIMIT - retained]
+                                log.write(segment)
+                                retained += len(segment)
+                            if kind == "stdout" and suppress_json:
+                                continue
+                            line = data.decode("utf-8", "replace").rstrip("\r\n")
+                            if line:
+                                with output_lock:
+                                    # ASCII-safe fallback for legacy CMD console codepages.
+                                    try:
+                                        print(f"[XP {kind}][{row['stage']}] {line}", flush=True)
+                                    except UnicodeEncodeError:
+                                        safe = line.encode("ascii", "backslashreplace").decode("ascii")
+                                        print(f"[XP {kind}][{row['stage']}] {safe}", flush=True)
+                except Exception as exc:
+                    errors.append((kind, exc))
+                finally:
+                    output[kind] = {"body": b"".join(chunks),
+                                    "meta": {"path": str(path), "bytes": total,
+                                             "retained_bytes": retained,
+                                             "truncated": total > retained,
+                                             "sha256": digest.hexdigest()}}
+                    pipe.close()
+            for kind, pipe, path in (("stdout", p.stdout, stdout_path),
+                                     ("stderr", p.stderr, stderr_path)):
+                thread = threading.Thread(target=pump, args=(kind, pipe, path),
+                                          name="jce-xp-tee-" + kind, daemon=True)
+                threads.append(thread)
+                thread.start()
+            # wait(timeout) keeps the main thread interruptible and reports
+            # progress even if a child buffers its output without newlines.
+            while True:
+                elapsed = (time.monotonic_ns() - started) / 1_000_000_000
+                remaining = timeout - elapsed
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    p.wait(timeout=min(self.heartbeat_seconds, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    elapsed = int((time.monotonic_ns() - started) / 1_000_000_000)
+                    with output_lock:
+                        print(f"[XP Editor] {row['stage']}: running {elapsed}s; "
+                              f"full logs: {self.directory}", flush=True)
+            for thread in threads:
+                thread.join(timeout=30)
+            if any(t.is_alive() for t in threads):
+                raise RuntimeError("XP stage pipe reader did not finish")
+        finally:
+            if p is not None:
+                if p.poll() is None:
+                    p.kill()
+                p.wait()
+                # Unblock readers in a cancellation path. Drain in healthy path.
+                if any(t.is_alive() for t in threads):
+                    for stream in (p.stdout, p.stderr):
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                    for thread in threads:
+                        thread.join(timeout=2)
+            for kind in ("stdout", "stderr"):
+                if kind in output:
+                    row[kind] = output[kind]["meta"]
+        if errors:
+            raise RuntimeError("XP stage log stream error: " + repr(errors[0]))
+        return subprocess.CompletedProcess(cmd, p.returncode,
+            output["stdout"]["body"].decode("utf-8", "replace"),
+            output["stderr"]["body"].decode("utf-8", "replace"))
 
     def run(self, label, command, cwd, env, *, input_data=None, timeout=7200, accepted_returncodes=(0,)):
         number = len(self.receipt["stages"]) + 1
@@ -325,20 +469,41 @@ class _Stages:
         self.receipt["stages"].append(row)
         self.receipt["active_stage"] = label
         _write(self.directory / "receipt.json", self.receipt)
+        print(f"[XP Editor] BEGIN {label} ({number}); logs: {self.directory}", flush=True)
         print("[XP Editor] " + label + ": " + json.dumps(row["argv"]), flush=True)
         started = time.monotonic_ns()
+        finished = threading.Event()
+
+        def report_port_progress():
+            while not finished.wait(self.heartbeat_seconds):
+                elapsed = int((time.monotonic_ns() - started) / 1_000_000_000)
+                print(f"[XP Editor] {label}: running {elapsed}s; full logs: {self.directory}", flush=True)
+
+        heartbeat = None
+        if not self._real_runner or input_data is not None:
+            # Real subprocess stdin bytes (preflight -E -) and injected test
+            # runners keep subprocess.run semantics. No double heartbeat.
+            heartbeat = threading.Thread(target=report_port_progress,
+                                         name="jce-xp-port-heartbeat", daemon=True)
+            heartbeat.start()
         try:
-            result = self.runner(row["argv"], cwd=str(cwd), env=env, input=input_data,
-                                 text=True, encoding="utf-8", errors="replace",
-                                 capture_output=True, timeout=timeout, check=False,
-                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            row["stdout"] = self._log(self.directory / (stem + ".stdout.log"), result.stdout)
-            row["stderr"] = self._log(self.directory / (stem + ".stderr.log"), result.stderr)
+            if self._real_runner and input_data is None:
+                result = self._run_live(row, stem, cwd, env, timeout)
+            else:
+                result = self.runner(row["argv"], cwd=str(cwd), env=env, input=input_data,
+                                     text=True, encoding="utf-8", errors="replace",
+                                     capture_output=True, timeout=timeout, check=False,
+                                     stdin=subprocess.DEVNULL if input_data is None else None,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if "stdout" not in row:
+                row["stdout"] = self._log(self.directory / (stem + ".stdout.log"), result.stdout)
+                row["stderr"] = self._log(self.directory / (stem + ".stderr.log"), result.stderr)
             row["returncode"] = result.returncode
             if result.returncode not in accepted_returncodes:
                 raise subprocess.CalledProcessError(result.returncode, row["argv"],
                                                     output=result.stdout, stderr=result.stderr)
             row["state"] = "SUCCEEDED"
+            print(f"[XP Editor] END {label}: SUCCEEDED ({(time.monotonic_ns()-started)/1e9:.1f}s)", flush=True)
             return result
         except BaseException as error:
             row["state"] = "FAILED"
@@ -348,11 +513,14 @@ class _Stages:
                 row["stderr"] = self._log(self.directory / (stem + ".stderr.log"),
                                            getattr(error, "stderr", None) or str(error))
             row["error"] = str(error)[:4096]
+            self._report_failure(label, row, error)
             raise
         finally:
+            finished.set()
+            if heartbeat is not None:
+                heartbeat.join(timeout=1)
             row["elapsed_ns"] = str(time.monotonic_ns() - started)
             _write(self.directory / "receipt.json", self.receipt)
-
 
 def _preflight(toolchain_root, arch, stages, repo, env):
     # Load a private instance: recording the existing owner's launches must not
@@ -712,6 +880,72 @@ def _admit_stock_shaders(cache, values, repo):
             "directory": str(directory), "scope": "configured source policy; shader bytes and device execution are separate"}
 
 
+# JCE_XP_CANDIDATE_PROVENANCE_V4_4_1: a previous variant's public EXE
+# is NOT proof of ownership by the current CMake/Conan tree. Keep it intact
+# during configure; if the user explicitly builds, archive unproved bytes only
+# after configuration is admitted and immediately before Ninja can replace it.
+def _archive_unproved_editor_candidate(candidate, cache, run, receipt, abi_digest,
+                                       profile, build_profile, bgfx_bx_debug):
+    candidate = _ordinary(candidate)
+    if not candidate.exists():
+        return None
+    status = candidate.lstat()
+    if not stat.S_ISREG(status.st_mode):
+        raise ValueError("XP Editor candidate must be an ordinary file: " + str(candidate))
+    stamp = cache / "xp-built.json"
+    cmake = cache / "CMakeCache.txt"
+    if stamp.is_file() and cmake.is_file():
+        try:
+            # Require the *whole* producer identity, not merely the same EXE,
+            # CMake cache and ABI. Conan graph, target profile and port hashes
+            # must also match exactly before this candidate can be reused.
+            expected = _built_identity(candidate, cache, abi_digest,
+                profile, build_profile, receipt["platform_port"],
+                receipt["consumer_ports"], bgfx_bx_debug=bgfx_bx_debug)
+            if _read_json(stamp) == expected:
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    backup = _owned_child(run / "preexisting-jce_editor.exe", run)
+    if backup.exists():
+        raise ValueError("XP Editor candidate archive already exists: " + str(backup))
+    original_hash = _sha(candidate)
+    os.replace(candidate, backup)
+    receipt["archived_preexisting_candidate"] = {
+        "original": str(candidate), "backup": str(backup),
+        "sha256": original_hash, "restored_after_failure": False,
+        "reason": "candidate not admitted by full current XP build receipt",
+    }
+    print("[XP Editor] archived prior unproved EXE -> " + str(backup), flush=True)
+    return backup
+
+
+def _restore_archived_editor_candidate(candidate, backup, run, receipt):
+    if backup is None:
+        return
+    entry = receipt["archived_preexisting_candidate"]
+    try:
+        candidate = _ordinary(candidate)
+        if candidate.exists():
+            status = candidate.lstat()
+            if not stat.S_ISREG(status.st_mode):
+                raise ValueError("failed build emitted a non-file candidate")
+            partial = _owned_child(run / "failed-build-jce_editor.exe", run)
+            if partial.exists():
+                raise ValueError("failed-build artifact archive already exists")
+            os.replace(candidate, partial)
+            entry["failed_build_output"] = str(partial)
+        if not backup.is_file() or _sha(backup) != entry["sha256"]:
+            raise ValueError("preexisting candidate archive changed; restore refused")
+        os.replace(backup, candidate)
+        entry["restored_after_failure"] = True
+        print("[XP Editor] restored prior EXE after build failure", flush=True)
+    except (OSError, ValueError) as exc:
+        # Never hide the real build error or silently claim recovery succeeded.
+        entry["restore_error"] = str(exc)[:1024]
+        print("[XP Editor] candidate restoration requires attention: " + str(exc), flush=True)
+
+
 def _configured_executable(cache, candidate, *, allow_legacy=False):
     configuration = cache / "CMakeCache.txt"
     configured = _cache_values(configuration).get("JCE_EDITOR_ARTIFACT_DIR") if configuration.is_file() else None
@@ -727,14 +961,15 @@ def _configured_executable(cache, candidate, *, allow_legacy=False):
     return _owned_child(cache / "dist/jce_editor.exe", cache)
 
 
-def _admit_configured(cache, profile, toolchain_root, arch, *, repo=ROOT):
+def _admit_configured(cache, profile, toolchain_root, arch, *, repo=ROOT,
+                      variant="dist", patented_codecs=None):
     values = _cache_values(cache / "CMakeCache.txt")
     if values.get("MSVC", "FALSE").upper() in ("1", "ON", "TRUE", "YES"):
         raise ValueError("XP Editor cannot use the MSVC ABI")
     expected = {
         "JCE_WINXP_LEGACY": "ON", "JCE_EDITOR_STANDALONE": "ON",
         "JCE_BUILD_EDITOR": "ON", "JCE_ENABLE_SDK_INSTALL": "OFF",
-        "JCE_DELIVERY_PROFILE": "embedded", "JCE_BUILD_VARIANT": "dist",
+        "JCE_DELIVERY_PROFILE": "embedded", "JCE_BUILD_VARIANT": variant,
         "JCE_BUILD_SCRIPT_VM_PYTHON": "OFF", "JCE_BUILD_SCRIPT_CSHARP": "OFF",
         "JCE_BUILD_SCRIPT_JAVA": "OFF", "JCE_ENABLE_AI_DISPATCH": "OFF",
         "JCE_EMBED_ENGINE_SHADERS": "ON", "JCE_BUILD_TESTS": "OFF",
@@ -743,6 +978,13 @@ def _admit_configured(cache, profile, toolchain_root, arch, *, repo=ROOT):
     for name, wanted in expected.items():
         if values.get(name) != wanted:
             raise ValueError("configured Editor capability mismatch: " + name)
+    preference = values.get("JCE_ENABLE_PATENTED_CODECS")
+    if preference not in ("ON", "OFF"):
+        raise ValueError("configured XP patent codec preference is missing or invalid")
+    if (variant == "release" and patented_codecs is not None and
+            preference != patented_codecs.upper()):
+        raise ValueError("configured XP Release patent codec preference differs from request")
+    effective = "OFF" if variant == "dist" else preference
     xp = _module("xp_compat")
     for variable, suffix in (("CMAKE_C_COMPILER", "-clang.exe"),
                              ("CMAKE_CXX_COMPILER", "-clang++.exe")):
@@ -754,6 +996,8 @@ def _admit_configured(cache, profile, toolchain_root, arch, *, repo=ROOT):
             "scripting_execution": "NOT_EXECUTED", "stock_shaders": "configured ON",
             "shader_profiles": list(XP_SHADER_PROFILES),
             "profile_sha256": _sha(profile),
+            "patented_codecs": {"preference": preference, "effective": effective,
+                "evidence": "configured CMake policy, not verified binary/runtime"},
             "stock_shader_policy": _admit_stock_shaders(cache, values, repo)}
 
 
@@ -882,6 +1126,16 @@ def _publish(exe, output, audit):
     os.replace(temporary, output)
 
 
+# JCE_XP_LAYOUT_PROVENANCE_V4_3: canonical Conan identity
+# The build tree is .../<target>/obj/<variant>, NOT the parent of Conan's
+# xp-graph.json and xp-generation.json after the v4 layout change.
+def _xp_conan_identity_root(cache):
+    cache = Path(cache)
+    if cache.parent.name != "obj" or cache.name not in ("release", "dist"):
+        raise ValueError("XP build identity requires obj/<variant> CMake cache")
+    return cache.parent.parent / "conan" / cache.name
+
+
 def _built_identity(exe, cache, abi_digest, profile, build_profile, platform_port=None, consumer_ports=None,
                     *, bgfx_bx_debug="auto"):
     identity = {"abi_sha256": abi_digest, "sha256": _sha(exe),
@@ -889,8 +1143,8 @@ def _built_identity(exe, cache, abi_digest, profile, build_profile, platform_por
             "consumer_headers_sha256": {kind: port["headers_sha256"] for kind, port in
                                         (consumer_ports or {}).items()},
             "cmake_cache_sha256": _sha(cache / "CMakeCache.txt"),
-            "graph_sha256": _sha(cache / "conan/xp-graph.json"),
-            "generation_sha256": _sha(cache / "conan/xp-generation.json"),
+            "graph_sha256": _sha(_xp_conan_identity_root(cache) / "xp-graph.json"),
+            "generation_sha256": _sha(_xp_conan_identity_root(cache) / "xp-generation.json"),
             "target_profile_sha256": _sha(profile), "build_profile_sha256": _sha(build_profile)}
     # Default identity stays compatible with existing admitted caches. Explicit
     # diagnostics must be selected again at audit, never relabeled by omission.
@@ -901,7 +1155,8 @@ def _built_identity(exe, cache, abi_digest, profile, build_profile, platform_por
 
 def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None, base_conan_home=None,
           build_profile=None, shaderc=None, host_pak=None, host_bin2obj=None,
-          export_inventory=None, bgfx_bx_debug="auto", driver=None, runner=None, env=None):
+          export_inventory=None, bgfx_bx_debug="auto", driver=None, runner=None, env=None,
+          variant="dist", patented_codecs=None):
     """Run one explicit phase; only audit may publish the final executable.
 
     Dependencies/configure/build are cumulative and reuse matching generated
@@ -911,6 +1166,13 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
     """
     if type(bgfx_bx_debug) is not str or bgfx_bx_debug not in ("auto", "off", "on"):
         raise ValueError("bgfx BX debug must be auto, off or on")
+    if type(variant) is not str or variant not in ("release", "dist"):
+        raise ValueError("XP Editor variant must be release or dist")
+    if patented_codecs is not None and (type(patented_codecs) is not str or
+            patented_codecs not in ("on", "off")):
+        raise ValueError("XP patented-codecs must be on, off or omitted")
+    if variant == "dist" and patented_codecs is not None:
+        print("[XP Editor] patented-codecs request ignored: Dist always disables AAC/H.264/H.265", flush=True)
     if arch not in ("x86", "x64") or phase not in PHASES:
         raise ValueError("unsupported XP Editor architecture/phase")
     if type(jobs) is not int or not 1 <= jobs <= 256:
@@ -919,13 +1181,19 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
     desktop = repo / "build/desktop"
     compat = repo / "build/compat"
     desktop_target = _owned_child(desktop / ("windows-" + arch + "-xp"), desktop)
-    desktop_cache = _owned_child(desktop_target / "obj", desktop_target)
+    # Preserve the historical Dist cache; keep the Release ABI/product
+    # independently configured so an old forced-OFF cache cannot mask
+    # Release's default-ON preference or relabel a Dist executable.
+    # JCE_EDITOR_VARIANT_LAYOUT_V4: XP paths mirror native embedded Editor by variant.
+    desktop_cache = _owned_child(desktop_target / "obj" / variant, desktop_target)
     legacy_cache = _owned_child(compat / ("windows-" + arch + "-xp-editor-llvm-msvcrt"), compat)
-    candidate = _owned_child(desktop_target / "dist/jce_editor.exe", desktop_target)
-    validation = _owned_child(repo / "build/validation/xp-editor" / arch, repo / "build/validation/xp-editor")
+    candidate = _owned_child(desktop_target / variant / "jce_editor.exe", desktop_target)
+    validation = _owned_child(repo / "build/validation/xp-editor" /
+        (arch if variant == "dist" else arch + "-release"), repo / "build/validation/xp-editor")
     run = validation / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12])
     run.mkdir(parents=True)
     receipt = {"schema": "jce.xp.editor-build.v1", "state": "FAILED", "phase": phase,
+               "variant": variant, "patented_codecs_request": patented_codecs,
                "arch": arch, "cache": str(desktop_cache), "bgfx_bx_debug_request": bgfx_bx_debug,
                "canonical_candidate": str(candidate),
                "stages": [], "active_stage": "prepare",
@@ -933,7 +1201,9 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
     stages = _Stages(run, receipt, runner)
     try:
         lock = _module("cache_lock")
-        output = _owned_child(repo / "dist/editor" / ("JCE-editor-windows-" + arch + "-xp.exe"), repo / "dist/editor")
+        published_name = ("JCE-editor-windows-" + arch + "-xp" +
+            ("-release" if variant == "release" else "") + ".exe")
+        output = _owned_child(repo / "dist/editor" / published_name, repo / "dist/editor")
         caches = (desktop_cache, legacy_cache)
         homes = {path: Path(conan_home).resolve() if conan_home else _default_conan_home(repo, path)
                  for path in caches}
@@ -959,16 +1229,17 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
             identity = {"schema": "jce.xp.editor-cache.v1", "source_root": str(repo),
                         "product": "editor", "delivery": "native-single-exe", "abi": abi,
                         "abi_sha256": abi_digest}
+            if variant == "release":
+                identity["build_variant"] = "release"
             receipt["active_stage"] = "cache-admission"
             cache = desktop_cache
             desktop_owner = _owned_child(desktop_cache / XP_CACHE_OWNER, desktop_cache)
             legacy_owner = _owned_child(legacy_cache / XP_CACHE_OWNER, legacy_cache)
-            if not desktop_owner.exists() and legacy_owner.is_file() and _read_json(legacy_owner) == identity:
-                cache = legacy_cache
+            # JCE_EDITOR_VARIANT_LAYOUT_V4: do not resurrect a mismatched old XP cache.
             receipt["cache"] = str(cache)
             home = homes[cache]
-            if phase in ("configure", "build") and candidate.exists():
-                _configured_executable(cache, candidate)
+            # JCE_XP_CANDIDATE_PROVENANCE_V4_4_1: preexisting public EXE is not ownership evidence.
+            # Verify the cache first; archive only just before actual compilation.
             _guard_cache(cache, identity)
             profile = cache / "xp-host.profile"
             if profile.exists() and profile.read_text(encoding="utf-8") != profile_text:
@@ -997,7 +1268,7 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
                 receipt["native_build_profile"] = {"profile": str(build_profile), "source": "explicit"}
             if not build_profile.is_file():
                 raise ValueError("native build-host Conan profile is missing")
-            dependency_root = cache / "conan"
+            dependency_root = _owned_child(desktop_target / "conan" / variant, desktop_target)
             profile_arguments = _conan_profile_arguments(profile, build_profile, jobs, abi_digest,
                 receipt["platform_port"], receipt["consumer_ports"], tc, bgfx_bx_debug=bgfx_bx_debug)
             command = ["conan", "install", str(repo), *profile_arguments, "--build=missing",
@@ -1067,32 +1338,46 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
                 configure = ["cmake", "-S", str(repo), "-B", str(cache), "-G", "Ninja",
                     "-DCMAKE_TOOLCHAIN_FILE=" + str(generated), "-DCMAKE_BUILD_TYPE=Release",
                     "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON", "-DJCE_XP_TOOLCHAIN_ROOT=" + str(toolchain_root),
-                    "-DJCE_WINXP_LEGACY=ON", "-DJCE_BUILD_VARIANT=dist", "-DJCE_EDITOR_STANDALONE=ON",
+                    "-DJCE_WINXP_LEGACY=ON", f"-DJCE_BUILD_VARIANT={variant}", "-DJCE_EDITOR_STANDALONE=ON",
                     "-DJCE_BUILD_EDITOR=ON", "-DJCE_DELIVERY_PROFILE=embedded", "-DJCE_ENABLE_SDK_INSTALL=OFF",
                     "-DJCE_BUILD_SCRIPT_VM_PYTHON=OFF", "-DJCE_BUILD_SCRIPT_CSHARP=OFF", "-DJCE_BUILD_SCRIPT_JAVA=OFF",
                     "-DJCE_ENABLE_AI_DISPATCH=OFF", "-DJCE_ENABLE_PROFILING=OFF", "-DJCE_ENABLE_RENDERDOC=OFF",
-                    "-DJCE_ENABLE_CPPCHECK=OFF", "-DJCE_BUILD_TESTS=OFF", "-DJCE_ENABLE_PATENTED_CODECS=OFF",
+                    "-DJCE_ENABLE_CPPCHECK=OFF", "-DJCE_BUILD_TESTS=OFF",
+                    # Do not stamp the user preference on every configure:
+                    # fresh Release defaults ON; manual Release OFF persists.
+                    # Dist uses the root CMake effective override OFF.
+                    *(["-DJCE_ENABLE_PATENTED_CODECS=" + patented_codecs.upper()]
+                      if variant == "release" and patented_codecs is not None else []),
                     "-DJCE_EMBED_ENGINE_SHADERS=ON",
                     "-DJCE_SHADER_PROFILES=" + ";".join(XP_SHADER_PROFILES),
                     "-DJCE_EDITOR_ARTIFACT_DIR=" + str(candidate.parent), "-DJCE_EMIT_LINK_MAP=ON",
                     "-DJCE_SHADERC_EXECUTABLE=" + tools["shaderc"],
                     "-DJCE_PAK_EXECUTABLE=" + tools["host-pak"], "-DJCE_BIN2OBJ_EXECUTABLE=" + tools["host-bin2obj"]]
                 stages.run("configure", configure, repo, selected_env)
-                receipt["capabilities"] = _admit_configured(cache, profile, toolchain_root, arch, repo=repo)
+                receipt["capabilities"] = _admit_configured(cache, profile, toolchain_root, arch,
+                    repo=repo, variant=variant, patented_codecs=patented_codecs)
                 if _configured_executable(cache, candidate) != candidate:
                     raise ValueError("configure did not select the desktop XP Editor candidate")
                 receipt["state"] = "CONFIGURED"
                 if phase == "configure":
                     return cache
-                stages.run("build", ["cmake", "--build", str(cache), "--target", "JCE_Editor", "--parallel", str(jobs)],
-                           repo, selected_env)
-                exe = _owned_child(candidate, desktop_target)
-                if not exe.is_file():
-                    raise ValueError("Editor build succeeded without its exact target executable")
-                receipt.update(state="BUILT_STATIC_UNVERIFIED", candidate=str(exe), built_sha256=_sha(exe))
-                receipt["capabilities"]["gui"] = "BUILT_NOT_EXECUTED"
-                _write(cache / "xp-built.json", _built_identity(exe, cache, abi_digest, profile, build_profile,
-                    receipt["platform_port"], receipt["consumer_ports"], bgfx_bx_debug=bgfx_bx_debug))
+                archived_candidate = _archive_unproved_editor_candidate(
+                    candidate, cache, run, receipt, abi_digest,
+                    profile=profile, build_profile=build_profile,
+                    bgfx_bx_debug=bgfx_bx_debug)
+                try:
+                    stages.run("build", ["cmake", "--build", str(cache), "--target", "JCE_Editor", "--parallel", str(jobs)],
+                               repo, selected_env)
+                    exe = _owned_child(candidate, desktop_target)
+                    if not exe.is_file():
+                        raise ValueError("Editor build succeeded without its exact target executable")
+                    receipt.update(state="BUILT_STATIC_UNVERIFIED", candidate=str(exe), built_sha256=_sha(exe))
+                    receipt["capabilities"]["gui"] = "BUILT_NOT_EXECUTED"
+                    _write(cache / "xp-built.json", _built_identity(exe, cache, abi_digest, profile, build_profile,
+                        receipt["platform_port"], receipt["consumer_ports"], bgfx_bx_debug=bgfx_bx_debug))
+                except BaseException:
+                    _restore_archived_editor_candidate(candidate, archived_candidate, run, receipt)
+                    raise
                 return exe
             # Auditing cannot bless an arbitrary/pre-existing executable.
             exe = _configured_executable(cache, candidate, allow_legacy=cache == legacy_cache)
@@ -1101,7 +1386,8 @@ def build(repo, arch, toolchain_root, jobs=1, *, phase="build", conan_home=None,
             if built != _built_identity(exe, cache, abi_digest, profile, build_profile,
                     receipt["platform_port"], receipt["consumer_ports"], bgfx_bx_debug=bgfx_bx_debug):
                 raise ValueError("built Editor identity does not match this admitted cache")
-            receipt["capabilities"] = _admit_configured(cache, profile, toolchain_root, arch, repo=repo)
+            receipt["capabilities"] = _admit_configured(cache, profile, toolchain_root, arch,
+                    repo=repo, variant=variant, patented_codecs=patented_codecs)
             receipt["capabilities"]["gui"] = "BUILT_NOT_EXECUTED"
             receipt["target_packages"] = _admit_graph(graph_path, arch)
             receipt["active_stage"] = "static-audit"
@@ -1134,6 +1420,9 @@ def add_arguments(parser):
     parser.add_argument("--toolchain-root", type=Path, required=True)
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--phase", choices=PHASES, default="build")
+    parser.add_argument("--variant", choices=("release", "dist"), default="release")
+    parser.add_argument("--patented-codecs", choices=("on", "off"), default=None,
+                        help="Release default ON in new cache; explicit OFF persists; Dist always OFF")
     parser.add_argument("--bgfx-bx-debug", choices=("auto", "off", "on"), default="auto",
                         help="upstream BX diagnostics/assertions; auto preserves the build default")
     parser.add_argument("--conan-home", type=Path, help="owned configuration overlay with actual Clang 22 settings")
@@ -1155,7 +1444,8 @@ def main(argv=None):
               conan_home=args.conan_home, base_conan_home=args.base_conan_home,
               build_profile=args.build_profile, shaderc=args.shaderc,
               host_pak=args.host_pak, host_bin2obj=args.host_bin2obj, export_inventory=args.export_inventory,
-              bgfx_bx_debug=args.bgfx_bx_debug)
+              bgfx_bx_debug=args.bgfx_bx_debug, variant=args.variant,
+              patented_codecs=args.patented_codecs)
         return 2 if args.phase == "audit" and result is None else 0
     except (OSError, ValueError, subprocess.SubprocessError, struct.error) as error:
         print("[XP Editor] FAILED: " + str(error), flush=True)

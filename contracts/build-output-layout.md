@@ -3,11 +3,12 @@
 Generated files are local output, never source authority. Unit-test source
 remains under tests/ or tools/tests/; test work and new validation output belong
 under ignored build/. Reuse a compatible build/cache owner before creating a
-new tree. This contract changes prospective defaults, not existing paths.
+new tree. The embedded native Editor uses one canonical cache per target and variant;
+legacy object paths remain untouched but are no longer auto-selected.
 
 | Role | Location and lifetime |
 | --- | --- |
-| Persistent build and dependency caches | Keep existing absolute CMake paths, including `build/desktop/<target-variant>/` and compatible historical cache trees during the default single-executable migration. Keep compatible Conan stores, source pins and shader caches with their current owners. Reuse only when the owner's complete configuration/content identity admits it. |
+| Persistent build and dependency caches | The native embedded-editor default is `build/desktop/<target>/obj/<variant>` (objects) and `build/desktop/<target>/conan/<variant>` (Conan-generated toolchain). Historical `<target>-release` / `<target>-standalone` object trees are not auto-adopted; leave them untouched. Other existing Conan/source caches retain their owners. Reuse only if the full owner identity admits it. |
 | Generated test work | build/tests/ and existing owner-selected build/ children contain fixtures, temporary projects, test logs and test executables. Keep each run scoped to its own work directory; do not duplicate a complete source/build/SDK tree for a trial. |
 | Bounded validation and raw evidence | New Core-5 output defaults to build/validation/benchmark/. Existing unique run/control directories, suite IDs and immutable content-key fixtures remain authoritative. Keep requested sample/time/size budgets, failed controls and availability distinctions; the directory is not a validity claim or an automatic retention service. |
 | Gate diagnostics | The source runner defaults to build/reports/lint-failure.txt and the audit runner to build/reports/architecture-audit-failure.txt. The lint runner retains its existing failure-write/success-clear behavior for its current log only. Audit --log retains its explicit path and write-on-success behavior. |
@@ -52,8 +53,8 @@ Editor executables use build/desktop/<target>/<variant>. New native Release
 objects and Conan generators use obj/ and conan/ under the target. XP uses
 windows-x86-xp or windows-x64-xp, with obj/ separate from the GUI candidate in
 dist/. Direct SDK desktop project builds use their project's matching layout.
-Configure pins the requested release/dist variant. Qualified historical caches
-remain available in place under their existing leases.
+Configure pins the requested release/dist variant. Historical `<target>-release` and `<target>-standalone` native Editor
+object caches are ignored, without moving or deleting them.
 Skip-build requires the exact configured variant, embedded shipping flags and
 configured output location. Foreign source/profile/CRT/compiler closures refuse.
 Windows editor packaging verifies ordinary/delayed PE imports, embedded assets
@@ -73,3 +74,55 @@ follows child symlinks. This is a refusal guard, not an automatic source mover,
 retention sweep, general-purpose source detector or concurrent filesystem lock.
 Keep source projects outside disposable caches in new layouts; preserve existing
 nested projects in place until their owner explicitly approves a migration.
+
+## Unified build entry and progress (v0.14.1)
+
+The documented Windows editor/host-tools/SDK/project/package shims, and the
+Windows Android/Web public batch shims, enter `scripts/jce.py`. Linux and macOS
+editor/host-tools/SDK/project/package shims already enter the same driver.
+`jce.py` reports invocation BEGIN/END and per-command BEGIN/END, exit code,
+elapsed time and a heartbeat (normally every 12 seconds) while retaining live
+stdout/stderr. Set `JCE_BUILD_PROGRESS_INTERVAL` in seconds to adjust it.
+
+The XP Editor has an additional stage recorder (full logs and receipt.json),
+and does not claim static PE analysis is the same as executing on XP guests.
+Web/Android platform-specific build recipes remain in their existing BAT files;
+the new driver subcommands delegate to those recipes rather than duplicating
+Conan/CMake policies. The macOS universal/iOS specialist scripts preserve their
+existing target-specific orchestrators. The unified entry is a presentation
+and exit-code contract, not evidence that every target has passed compilation.
+
+For Windows XP x86/x64, `libhevc` uses an XP-compatible event/critical-section
+condition-variable fallback. Modern Windows retains the existing native CV
+branch. Cross compilation is separate from a target VM execution proof.
+
+## Unified native Editor Release/Dist cache layout (v0.14.1)
+
+For native single-executable Editor targets (ordinary Windows x64/x86 and the
+separate LLVM-MinGW-XP x64/x86 lane), each Release/Dist variant owns its own
+CMake tree and Conan-generator output:
+
+    build/desktop/<target>/obj/<variant>/       # CMake + Ninja objects
+    build/desktop/<target>/conan/<variant>/     # Conan generators + toolchain
+    build/desktop/<target>/<variant>/jce_editor.exe
+
+`<variant>` is either `release` or `dist`. The XP target retains its own
+LLVM-MinGW/MSVCRT package store under `build/compat` and never links MSVC host
+libraries into the guest Editor. Host-side generators under `build/host` are
+not deliverables. `dist/editor/` remains the separately verified single-EXE
+package location. No companion DLLs or game-asset directories are introduced.
+
+The variant directories are independent, so a Release opt-out of AAC/H.264/H.265
+cannot carry into Dist and Dist's forced OFF cannot alter Release's cached
+preference. Release defaults ON for a fresh cache and permits explicit OFF;
+Dist always forces OFF. Build/variant selection and codec preference are
+independent inputs; this layout does not change vendor licensing obligations.
+
+Historical trees such as `<target>/obj`, `<target>/conan`,
+`<target>/obj-release`, `<target>/obj/conan` or `<target>-standalone` are NOT
+renamed, deleted, or auto-adopted. A first new build uses the new paths and may
+recompile. Remove historical trees only after separate user-directed review.
+
+The XP `receipt.json`, optional real-time progress and guest compatibility qualification
+remain separate; consistent folder names are NOT evidence of successful builds
+or XP VM execution.

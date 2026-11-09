@@ -25,9 +25,8 @@ class JCEConan(ConanFile):
     # JCE_ENABLE_PATENTED_CODECS) are intentionally NOT exposed here.
     # They are CMake-only and must be set with -D at configure time:
     #   cmake -DJCE_ENABLE_PATENTED_CODECS=OFF  (default ON; forced OFF
-    #                                            for the dist variant and
-    #                                            for Web — see the root
-    #                                            CMakeLists derivation)
+    #                                            for the dist variant on
+    #                                            every supported target)
     #   cmake -DJCE_BUILD_JNI=ON                (default OFF)
     #
     # The line above used to say the codec option defaults OFF.  It does

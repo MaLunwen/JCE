@@ -156,6 +156,7 @@ class XpCliTests(unittest.TestCase):
                     self.assertEqual(command[command.index("--toolchain-root") + 1], str(selected))
                     self.assertEqual(command[command.index("--arch") + 1], arch)
                     self.assertEqual(command[command.index("--phase") + 1], "build")
+                    self.assertEqual(command[command.index("--variant") + 1], "release")
                     for flag, path in (("--shaderc", shaderc), ("--host-pak", host_tools["jce_pak"]),
                                        ("--host-bin2obj", host_tools["jce_bin2obj"])):
                         self.assertEqual(command[command.index(flag) + 1], str(path))
@@ -163,6 +164,20 @@ class XpCliTests(unittest.TestCase):
                     ensure.assert_called_once_with(driver.os.environ, ("jce_pak", "jce_bin2obj"))
                     lease.assert_called_once_with(driver._host_cache_paths())
                     modern.assert_not_called()
+
+    def test_direct_xp_editor_explicit_variants_and_codec_options(self):
+        driver = module("xp_editor_codec_variants", "tools/build/jce.py")
+        for args, variant, codec in (
+                ([], "release", None),
+                (["--variant", "release", "--patented-codecs", "off"], "release", "off"),
+                (["--variant", "dist", "--patented-codecs", "on"], "dist", "on")):
+            with self.subTest(args=args), patch.object(driver, "_run_xp_tool") as run:
+                driver.main(["xp-editor", "--toolchain-root", "C:/xp-fixture", *args])
+                command = run.call_args.args[1]
+                self.assertEqual(command[command.index("--variant") + 1], variant)
+                self.assertEqual("--patented-codecs" in command, codec is not None)
+                if codec is not None:
+                    self.assertEqual(command[command.index("--patented-codecs") + 1], codec)
 
     def test_editor_xp_shortcut_rejects_incompatible_modes_before_build(self):
         driver = module("xp_editor_shortcut_invalid", "tools/build/jce.py")

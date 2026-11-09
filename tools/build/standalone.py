@@ -346,30 +346,30 @@ def _admit_cache(plan: dict, target: dict, *, exact_variant: bool = False) -> No
 
 
 def native_cache_layout(driver, args, target: dict) -> dict:
-    """Select stable paths without admitting objects an isolated SDK never uses."""
+    """Variant-owned native Editor objects and Conan generators; never adopt legacy paths.
+
+    JCE_EDITOR_VARIANT_LAYOUT_V4. Absolute CMake/Conan generator paths cannot
+    be moved. Both variants use independent static binary closures, while the
+    Editor EXE remains directly under <target>/<variant>/jce_editor[.exe].
+    """
     root = driver.ROOT.resolve()
-    desktop = root / "build/desktop"
-    target_dir = desktop / target["key"]
-    canonical = target_dir / "obj"
-    legacy = (desktop / (target["key"] + "-release"),
-              desktop / (target["key"] + "-standalone"))
-    remembered = getattr(args, "_native_cache_plan", None)
-    build = remembered["build"] if remembered else canonical
-    if not remembered and not canonical.exists():
-        build = next((path for path in legacy if (path / "CMakeCache.txt").is_file()), canonical)
-    if build not in (canonical, *legacy):
-        raise ValueError("native cache owner differs from the requested target/variant")
-    conan = target_dir / "conan" if build == canonical else build.with_name(build.name + "-conan")
+    variant = getattr(args, "variant", None)
+    if variant not in ("release", "dist"):
+        raise ValueError("native embedded Editor requires release or dist")
+    target_dir = root / "build/desktop" / target["key"]
+    build = target_dir / "obj" / variant
+    conan = target_dir / "conan" / variant
     plan = {"source": root, "build": build, "conan": conan,
             "toolchain": conan / "build/Release/generators/conan_toolchain.cmake",
-            "variant": args.variant}
-    if remembered and remembered != plan:
+            "variant": variant}
+    remembered = getattr(args, "_native_cache_plan", None)
+    if remembered is not None and remembered != plan:
         raise ValueError("native cache request identity changed after ownership selection")
     return plan
 
 
 def native_cache_plan(driver, args, target: dict, *, exact_variant: bool = False) -> dict:
-    """Keep admitted legacy absolute paths; new defaults use the Release config."""
+    """Admit canonical objects only; skip-build must match the exact variant."""
     plan = native_cache_layout(driver, args, target)
     _admit_cache(plan, target, exact_variant=exact_variant)
     return plan

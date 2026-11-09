@@ -522,7 +522,8 @@ class NativeGenerationControls(unittest.TestCase):
                 text=True, capture_output=True, timeout=30)
             self.assertEqual(parsed.returncode, 0, parsed.stdout + parsed.stderr)
             self.assertIn("ctest", parsed.stdout.lower())
-            self.assertIn("policy_old_scene)$", parsed.stdout)
+            # Ninja may print CMake regex end anchors as \$ on POSIX.
+            self.assertIn("policy_old_scene)$", parsed.stdout.replace(r"\$", "$"))
 
 
 class RealCliControls(unittest.TestCase):

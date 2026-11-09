@@ -214,10 +214,10 @@ if not re.search(r'JCE_BUILD_VARIANT STREQUAL "dist" AND ' + EFFECTIVE
     fail("dist-forced",
          "CMakeLists.txt lost the assert that dist actually derived the "
          "switch OFF.")
-if not re.search(r"JCE_PLATFORM_WEB AND " + EFFECTIVE
-                 + r"[\s\S]{0,200}?FATAL_ERROR", root_cml):
-    fail("dist-forced",
-         "CMakeLists.txt lost the assert that Web derived the switch OFF.")
+if ("if(JCE_PLATFORM_WEB AND JCE_PATENTED_CODECS_ENABLED)" in root_cml
+        or "JCE_PLATFORM_WEB forces JCE_ENABLE_PATENTED_CODECS OFF" in root_cml
+        or re.search(r"if\(JCE_PLATFORM_WEB\)\s*set\(" + EFFECTIVE + r"\s+OFF", root_cml)):
+    fail("release-default", "Web Release must not silently override the codec preference OFF")
 
 # ── Clause 1, prebuilt SDK: actual per-archive metadata admission ────────
 # VERSION.txt is explanatory; the archive metadata is the variant authority.
@@ -257,6 +257,24 @@ mismatch = cpp_body(admission,
 if (not mismatch or not re.search(r"\breturn\s+false\s*;", cpp_mask(mismatch))
         or not re.search(r"\bset_error\s*\(\s*error\s*\)", cpp_mask(mismatch))):
     fail("dist-forced", "jce_build_manager_start_project_build() lost SDK target/variant rejection")
+
+# JCE_EDITOR_VARIANT_LAYOUT_V4: XP uses variant-specific canonical object paths.
+# XP uses the same Release/Dist policy. A previous XP-only producer hardcoded
+# Dist and disabled codecs even when `editor --xp --variant release` was chosen.
+# Never let this divergence return unnoticed.
+xp_editor = read("tools/build/xp_editor.py")
+if '"-DJCE_BUILD_VARIANT=dist"' in xp_editor:
+    fail("xp-variant", "XP producer forces Dist instead of selecting the requested variant")
+if '"-DJCE_ENABLE_PATENTED_CODECS=OFF"' in xp_editor:
+    fail("xp-variant", "XP producer unconditionally disables patented codecs")
+if ('f"-DJCE_BUILD_VARIANT={variant}"' not in xp_editor
+        or 'desktop_target / "obj" / variant' not in xp_editor
+        or 'patented_codecs.upper()' not in xp_editor
+        or 'if variant == "release" and patented_codecs is not None' not in xp_editor):
+    fail("xp-variant", "XP producer lost Release/Dist and explicit codec preference wiring")
+if ('"JCE_BUILD_VARIANT": variant' not in xp_editor
+        or '"OFF" if variant == "dist" else preference' not in xp_editor):
+    fail("xp-variant", "XP configured product lost variant/effective codec admission")
 
 # ── Report ──────────────────────────────────────────────────────────────
 if failures:

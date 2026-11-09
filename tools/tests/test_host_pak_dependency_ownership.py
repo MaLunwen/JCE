@@ -19,6 +19,15 @@ class HostPakDependencyOwnership(unittest.TestCase):
     def setUpClass(cls):
         cls.rules = gate.build_rules(gate.load_ownership())
 
+    def test_dependency_matrix_builtin_yaml_parser_matches_real_ownership(self):
+        # Offline runs must not require PyYAML to understand block and
+        # wrapped-flow lists in the checked-in ownership matrix.
+        source = (ROOT / 'contracts/dependency-ownership.yml').read_text(encoding='utf-8')
+        fallback = gate.build_rules(gate._mini_yaml_load(source))
+        for capability in ('ecs', 'json', 'image-decode-ldr', 'sdl-portability-substrate'):
+            self.assertEqual(fallback[capability], self.rules[capability], capability)
+        self.assertEqual(gate.check_links(fallback), [])
+
     def test_actual_host_links_and_existing_header_owners_pass(self):
         self.assertEqual(gate.check_links(self.rules), [])
         self.assertIn('jce_pak', self.rules['image-decode-ldr']['link_whitelist'])

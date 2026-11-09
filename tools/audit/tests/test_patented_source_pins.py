@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 GATE = ROOT / "tools/audit/check_patented_codec_gate.py"
 FILES = (
     "CMakePresets.json", "CMakeLists.txt", "tools/build/jce.py",
+    "tools/build/xp_editor.py",
     "engine/CMakeLists.txt", "engine/cmake/JCEVendorSources.cmake",
     "engine/cmake/codec_ports/libhevc/CMakeLists.txt",
     "engine/cmake/codec_ports/openh264/CMakeLists.txt",
@@ -91,8 +92,8 @@ class SourcePinsGateTests(unittest.TestCase):
     def test_dist_effective_codec_switch_still_must_be_forced_off(self):
         name = "CMakeLists.txt"
         self.replace(name,
-                     "\tset(JCE_PATENTED_CODECS_ENABLED OFF)\nendif()\nif(JCE_PLATFORM_WEB)",
-                     "\tset(JCE_PATENTED_CODECS_ENABLED ON)\nendif()\nif(JCE_PLATFORM_WEB)")
+                     "\tset(JCE_PATENTED_CODECS_ENABLED OFF)\nendif()\n\n# Assert",
+                     "\tset(JCE_PATENTED_CODECS_ENABLED ON)\nendif()\n\n# Assert")
         self.gate(reason="CMakeLists.txt no longer forces JCE_PATENTED_CODECS_ENABLED OFF")
 
     def test_missing_acquisition(self):
@@ -124,6 +125,22 @@ class SourcePinsGateTests(unittest.TestCase):
         del pins["sources"]["libhevc"]["sha256"]
         path.write_text(json.dumps(pins))
         self.gate()
+
+    def test_web_release_cannot_be_implicitly_disabled(self):
+        self.replace("CMakeLists.txt", '# Assert the derivation actually held.',
+            'if(JCE_PLATFORM_WEB)\n\tset(JCE_PATENTED_CODECS_ENABLED OFF)\nendif()\n\n# Assert the derivation actually held.')
+        self.gate(reason="Web Release must not silently override")
+
+    def test_xp_cannot_force_dist_when_release_was_requested(self):
+        self.replace("tools/build/xp_editor.py",
+                     'f"-DJCE_BUILD_VARIANT={variant}"', '"-DJCE_BUILD_VARIANT=dist"')
+        self.gate(reason="XP producer forces Dist")
+
+    def test_xp_cannot_force_patented_codecs_off_for_every_build(self):
+        self.replace("tools/build/xp_editor.py",
+                     '"-DJCE_BUILD_TESTS=OFF",',
+                     '"-DJCE_BUILD_TESTS=OFF", "-DJCE_ENABLE_PATENTED_CODECS=OFF",')
+        self.gate(reason="XP producer unconditionally disables patented codecs")
 
     def test_release_default_remains(self):
         path = self.root / "engine/CMakeLists.txt"

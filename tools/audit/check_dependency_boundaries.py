@@ -209,6 +209,8 @@ def _mini_yaml_load(text: str) -> dict:
     cur: dict | None = None
     in_caps = False
     pending_list_key: str | None = None
+    pending_flow_key: str | None = None
+    pending_flow_value = ""
 
     def parse_scalar(v: str):
         v = v.strip()
@@ -227,6 +229,14 @@ def _mini_yaml_load(text: str) -> dict:
             continue
         indent = len(line) - len(line.lstrip())
         stripped = line.strip()
+        if pending_flow_key is not None:
+            pending_flow_value += " " + stripped
+            if "]" in stripped:
+                if cur is None:
+                    raise ValueError("YAML flow list outside capability")
+                cur[pending_flow_key] = parse_scalar(pending_flow_value)
+                pending_flow_key, pending_flow_value = None, ""
+            continue
         if indent == 0:
             in_caps = False
             pending_list_key = None
@@ -239,15 +249,16 @@ def _mini_yaml_load(text: str) -> dict:
             continue
         if not in_caps:
             continue
-        if stripped.startswith("- "):
+        if indent == 2 and stripped.startswith("- "):
             cur = {}
             caps.append(cur)
             pending_list_key = None
             stripped = stripped[2:]
         if cur is None:
             continue
-        if stripped.startswith("- ") or (pending_list_key and not (":" in stripped)):
-            cur.setdefault(pending_list_key or "", []).append(parse_scalar(stripped.lstrip("- ")))
+        if pending_list_key and indent >= 6 and stripped.startswith("- "):
+            cur[pending_list_key].append(parse_scalar(stripped[2:]))
+            continue
             continue
         if ":" in stripped:
             k, _, v = stripped.partition(":")
@@ -258,7 +269,12 @@ def _mini_yaml_load(text: str) -> dict:
                 cur[k] = []
             else:
                 pending_list_key = None
-                cur[k] = parse_scalar(v)
+                if v.startswith("[") and not v.endswith("]"):
+                    pending_flow_key, pending_flow_value = k, v
+                else:
+                    cur[k] = parse_scalar(v)
+    if pending_flow_key is not None:
+        raise ValueError("unterminated YAML flow list: " + pending_flow_key)
     root["capabilities"] = caps
     return root
 

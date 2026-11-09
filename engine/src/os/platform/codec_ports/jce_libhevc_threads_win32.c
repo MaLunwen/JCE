@@ -173,6 +173,129 @@ WORD32 ithread_set_affinity(WORD32 core_id)
 
 /* ── Condition variable ────────────────────────────────────────── */
 
+/* ---- XP+ condition variable compatibility ----
+ * JCE_BUILD_CONSISTENCY_XP_V3: native CONDITION_VARIABLE requires Vista.
+ * The XP branch uses XP-era events/critical sections only, without import
+ * table references to Initialize/Sleep/WakeConditionVariable( CS ).
+ */
+#if defined(JCE_WINXP_LEGACY) || (defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0600)
+#define JCE_LIBHEVC_USE_XP_COND 1
+#else
+#define JCE_LIBHEVC_USE_XP_COND 0
+#endif
+
+#if JCE_LIBHEVC_USE_XP_COND
+
+typedef struct jce_libhevc_xp_waiter {
+    HANDLE event;
+    struct jce_libhevc_xp_waiter *next;
+} jce_libhevc_xp_waiter;
+
+typedef struct {
+    CRITICAL_SECTION guard;
+    jce_libhevc_xp_waiter *first;
+    jce_libhevc_xp_waiter *last;
+} jce_libhevc_xp_cond;
+
+WORD32 ithread_get_cond_struct_size(void)
+{
+    return (WORD32)sizeof(jce_libhevc_xp_cond);
+}
+
+WORD32 ithread_cond_init(void *cond)
+{
+    jce_libhevc_xp_cond *cv = (jce_libhevc_xp_cond *)cond;
+    cv->first = NULL;
+    cv->last = NULL;
+    InitializeCriticalSection(&cv->guard);
+    return 0;
+}
+
+WORD32 ithread_cond_destroy(void *cond)
+{
+    jce_libhevc_xp_cond *cv = (jce_libhevc_xp_cond *)cond;
+    EnterCriticalSection(&cv->guard);
+    if (cv->first != NULL) {
+        LeaveCriticalSection(&cv->guard);
+        return -1; /* destroying while threads wait is invalid */
+    }
+    LeaveCriticalSection(&cv->guard);
+    DeleteCriticalSection(&cv->guard);
+    return 0;
+}
+
+WORD32 ithread_cond_wait(void *cond, void *mutex)
+{
+    jce_libhevc_xp_cond *cv = (jce_libhevc_xp_cond *)cond;
+    jce_libhevc_xp_waiter waiter;
+    jce_libhevc_xp_waiter **slot;
+    DWORD outcome;
+    waiter.event = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (waiter.event == NULL)
+        return -1;
+    waiter.next = NULL;
+    EnterCriticalSection(&cv->guard);
+    if (cv->last != NULL)
+        cv->last->next = &waiter;
+    else
+        cv->first = &waiter;
+    cv->last = &waiter;
+    LeaveCriticalSection(&cv->guard);
+
+    /* Register before releasing the caller's mutex, avoiding lost wakeups. */
+    LeaveCriticalSection((CRITICAL_SECTION *)mutex);
+    outcome = WaitForSingleObject(waiter.event, INFINITE);
+    if (outcome != WAIT_OBJECT_0) {
+        /* If the wait failed, unlink the stack-owned waiter before return. */
+        EnterCriticalSection(&cv->guard);
+        slot = &cv->first;
+        while (*slot != NULL && *slot != &waiter)
+            slot = &(*slot)->next;
+        if (*slot == &waiter) {
+            *slot = waiter.next;
+            if (cv->last == &waiter) {
+                jce_libhevc_xp_waiter *cursor = cv->first;
+                cv->last = NULL;
+                while (cursor != NULL) {
+                    cv->last = cursor;
+                    cursor = cursor->next;
+                }
+            }
+        }
+        LeaveCriticalSection(&cv->guard);
+    }
+    EnterCriticalSection((CRITICAL_SECTION *)mutex);
+    CloseHandle(waiter.event);
+    return outcome == WAIT_OBJECT_0 ? 0 : -1;
+}
+
+WORD32 ithread_cond_signal(void *cond)
+{
+    jce_libhevc_xp_cond *cv = (jce_libhevc_xp_cond *)cond;
+    jce_libhevc_xp_waiter *waiter;
+    WORD32 result = 0;
+    EnterCriticalSection(&cv->guard);
+    waiter = cv->first;
+    if (waiter != NULL) {
+        cv->first = waiter->next;
+        if (cv->first == NULL)
+            cv->last = NULL;
+        /* Once SetEvent succeeds, the waiter may exit its stack frame;
+         * never dereference waiter afterwards. */
+        if (!SetEvent(waiter->event)) {
+            waiter->next = cv->first;
+            cv->first = waiter;
+            if (cv->last == NULL)
+                cv->last = waiter;
+            result = -1;
+        }
+    }
+    LeaveCriticalSection(&cv->guard);
+    return result;
+}
+
+#else /* Modern Win32 native condition variable implementation. */
+
 WORD32 ithread_get_cond_struct_size(void)
 {
     return (WORD32)sizeof(CONDITION_VARIABLE) + (WORD32)sizeof(CRITICAL_SECTION);
@@ -206,4 +329,5 @@ WORD32 ithread_cond_signal(void *cond)
     return 0;
 }
 
+#endif /* XP/modern condition-variable selection */
 #endif /* _WIN32 */

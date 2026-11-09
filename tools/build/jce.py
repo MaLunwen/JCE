@@ -31,6 +31,7 @@ Shorthand: --dist == --variant dist (on every variant-aware subcommand).
 Global: --dry-run, --clean, -v/--verbose
 """
 from __future__ import annotations
+# JCE_BUILD_CONSISTENCY_XP_V3: patched driver
 
 import hashlib
 import argparse
@@ -43,6 +44,8 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
+import threading
 import sys
 import tempfile
 from pathlib import Path
@@ -158,19 +161,51 @@ def ctest_jobs(explicit=None) -> str:
     return "8"
 
 
+def _jce_progress_interval() -> float:
+    # JCE_BUILD_CONSISTENCY_XP_V3: all jce.py commands share a live heartbeat.
+    raw = os.environ.get("JCE_BUILD_PROGRESS_INTERVAL", "12")
+    try:
+        value = float(raw)
+    except ValueError:
+        return 12.0
+    return value if 0 < value <= 3600 else 12.0
+
+
 def run(cmd, env=None, cwd=None) -> None:
-    """Print, then (unless --dry-run) execute a command, aborting on failure."""
+    """Unified live step: preserve child output, show timing and idle heartbeat.
+
+    Native Conan/CMake/Ninja output is inherited, never buffered or stripped.
+    XP's dedicated stage executor additionally owns detailed JSON receipts.
+    """
     shown = cmd if isinstance(cmd, str) else " ".join(str(c) for c in cmd)
     log(f"$ {shown}")
     if DRY_RUN:
+        log("STEP SKIP status=DRY_RUN")
         return
-    rc = subprocess.run(
-        cmd, env=env, cwd=str(cwd) if cwd else None,
-        shell=isinstance(cmd, str),
-    ).returncode
+    words = shown.split()
+    label = " ".join(words[:2])[:110] if words else "command"
+    started = time.monotonic()
+    completed = threading.Event()
+    def heartbeat():
+        while not completed.wait(_jce_progress_interval()):
+            log(f"STEP RUNNING {label}: elapsed={time.monotonic() - started:.0f}s")
+    watcher = threading.Thread(target=heartbeat, name="jce-build-heartbeat", daemon=True)
+    watcher.start()
+    log(f"STEP BEGIN {label}")
+    try:
+        rc = subprocess.run(cmd, env=env, cwd=str(cwd) if cwd else None,
+                            shell=isinstance(cmd, str)).returncode
+    except BaseException:
+        log(f"STEP ABORTED {label}: elapsed={time.monotonic() - started:.1f}s")
+        raise
+    finally:
+        completed.set()
+        watcher.join(timeout=2)
+    elapsed = time.monotonic() - started
+    log(f"STEP END {label}: status={'OK' if rc == 0 else 'FAILED'} "
+        f"exit={rc} elapsed={elapsed:.1f}s")
     if rc != 0:
         die(f"command failed (exit {rc}): {shown}", rc)
-
 
 def host_arch() -> str:
     m = platform.machine().lower()
@@ -958,6 +993,9 @@ def ensure_host_tools(env: dict, tools=("jce_pak",)) -> dict[str, Path]:
         run(["cmake", "-S", ".", "-B", "build/host", "-G", "Ninja",
              f"-DCMAKE_TOOLCHAIN_FILE={tc}", "-DCMAKE_BUILD_TYPE=Release",
              "-DJCE_BUILD_EDITOR=OFF", "-DJCE_BUILD_TESTS=OFF",
+             "-DJCE_BUILD_SCRIPT_VM_PYTHON=OFF", "-DJCE_BUILD_SCRIPT_CSHARP=OFF",
+             "-DJCE_BUILD_SCRIPT_JAVA=OFF",
+             
              "-DJCE_ENABLE_CPPCHECK=OFF", "-DJCE_ENABLE_SDK_INSTALL=ON",
              "-DJCE_DELIVERY_PROFILE=authoring", "-DJCE_EDITOR_STANDALONE=OFF"],
             env=host_env, cwd=ROOT)
@@ -3716,16 +3754,39 @@ def _run_xp_tool(name, command):
         die(name + " failed or remains unverified (exit " + str(result.returncode) + ")")
 
 
+def cmd_platform_build(args) -> None:
+    # JCE_BUILD_CONSISTENCY_XP_V3: Windows Android/Web public .bat entry
+    # participates in the same jce.py progress/timing/error contract.
+    if HOST != "windows" or args.cmd not in ("android", "web"):
+        die("platform batch entry needs Windows and android/web")
+    script = ROOT / "tools" / "build" / ("build-" + args.cmd + ".bat")
+    if not script.is_file():
+        die("platform build script missing: " + str(script))
+    forwarded = getattr(args, "platform_args", [])
+    log("platform recipe: " + str(script))
+    command = [os.environ.get("ComSpec", "cmd.exe"), "/d", "/c", str(script), *forwarded]
+    run(command, cwd=ROOT)
+
+
 def dispatch_editor(args) -> None:
+    # JCE_XP_PROGRESS_EMBEDDED_V2: XP stages routed by jce.py, visible in CMD.
     if not args.xp:
-        if args.toolchain_root is not None:
-            die("editor: --toolchain-root requires --xp")
+        if (args.toolchain_root is not None or args.jobs is not None or args.phase != "build"):
+            die("editor: --toolchain-root, --jobs and --phase require --xp")
         cmd_editor(args)
         return
+    if args.jobs is not None and not 1 <= args.jobs <= 256:
+        die("editor --xp: --jobs must be in 1..256")
+    selected_jobs = args.jobs if args.jobs is not None else int(build_jobs())
+    if not 1 <= selected_jobs <= 256:
+        die("editor --xp: CMAKE_BUILD_PARALLEL_LEVEL must be in 1..256")
+    log(f"XP Editor dispatched by jce.py: arch={args.arch or 'x64'} "
+        f"variant={args.variant} phase={args.phase} jobs={selected_jobs}; "
+        "live Conan/Ninja output and periodic heartbeat enabled")
     if HOST != "windows" or args.arch not in (None, "x64", "x86"):
         die("editor --xp requires a Windows build host and x64 or x86")
     if (args.variant not in ("release", "dist") or args.delivery_profile != "embedded"
-            or args.clean or args.artifact_dir is not None or args.patented_codecs is not None):
+            or args.clean or args.artifact_dir is not None):
         die("editor --xp uses its own embedded GUI build; unsupported desktop option")
     toolchain = _xp_tool("xp_compat").resolve_toolchain_root(ROOT, args.toolchain_root)
     if not (toolchain / "bin").is_dir():
@@ -3748,7 +3809,9 @@ def dispatch_editor(args) -> None:
                     die("XP Editor needs a native shaderc; set JCE_SHADERC_EXECUTABLE")
             tools = ensure_host_tools(os.environ, names)
         cmd_xp_editor(argparse.Namespace(arch=args.arch or "x64", toolchain_root=toolchain,
-                     jobs=None, phase="build", shaderc=shaderc, host_pak=tools["jce_pak"],
+                     jobs=selected_jobs, phase=args.phase, variant=args.variant,
+                     patented_codecs=args.patented_codecs,
+                     shaderc=shaderc, host_pak=tools["jce_pak"],
                      host_bin2obj=tools["jce_bin2obj"]))
 
 
@@ -3756,7 +3819,10 @@ def cmd_xp_editor(args) -> None:
     command = [sys.executable, str(ROOT / "tools/build/xp_editor.py"),
                "--arch", args.arch, "--toolchain-root", str(args.toolchain_root),
                "--jobs", str(args.jobs if args.jobs is not None else build_jobs()),
-               "--phase", args.phase]
+               "--phase", args.phase, "--variant", getattr(args, "variant", "release")]
+    selected_codecs = getattr(args, "patented_codecs", None)
+    if selected_codecs is not None:
+        command.extend(("--patented-codecs", selected_codecs))
     for key in ("conan_home", "base_conan_home", "build_profile", "shaderc", "host_pak", "host_bin2obj", "export_inventory"):
         value = getattr(args, key, None)
         if value is not None:
@@ -3979,6 +4045,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--clean", action="store_true")
     sp.set_defaults(func=cmd_build_project)
 
+    # Public platform shims are delegated to the established BAT recipes.
+    for platform_name in ("android", "web"):
+        sp = sub.add_parser(platform_name, help="Windows platform build via the unified driver")
+        sp.set_defaults(func=cmd_platform_build)
+
     sp = sub.add_parser("editor", help="build the first-party editor")
     sp.add_argument("--delivery-profile", choices=("embedded", "authoring"), default="embedded",
                     help="embedded shipment (default) or optional external-VM authoring SDK")
@@ -3992,6 +4063,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--xp", action="store_true", help="build the Windows XP+ single-EXE GUI editor")
     sp.add_argument("--toolchain-root", type=Path,
                     help="with --xp, override the LLVM-MinGW-XP toolchain directory")
+    sp.add_argument("--jobs", type=int, default=None,
+                    help="XP editor only: Conan/Ninja parallel jobs, default CMAKE_BUILD_PARALLEL_LEVEL or 8")
+    sp.add_argument("--phase", choices=("prepare", "resolve", "dependencies", "configure", "build", "audit"),
+                    default="build", help="XP editor only: stage to execute")
     sp.set_defaults(func=dispatch_editor)
 
     sp = sub.add_parser("host-tools", help="build host jce_pak/jce_cook/jce_bin2obj")
@@ -4234,7 +4309,9 @@ def main(argv=None) -> int:
     # keeps this from turning a typo anywhere else into silence.
     parser = build_parser()
     args, unknown = parser.parse_known_args(argv)
-    FORWARDING = (cmd_design, cmd_automation)
+    FORWARDING = (cmd_design, cmd_automation, cmd_platform_build)
+    if getattr(args, "cmd", None) in ("web", "android"):
+        args.platform_args = unknown
     if unknown and getattr(args, "func", None) not in FORWARDING:
         parser.error("unrecognized arguments: %s" % " ".join(unknown))
     DRY_RUN = getattr(args, "dry_run", False)
@@ -4246,8 +4323,22 @@ def main(argv=None) -> int:
         args.variant = "dist"
     if hasattr(args, "graphics_api_tier"):
         os.environ["JCE_GRAPHICS_API_TIER"] = args.graphics_api_tier
-    args.func(args)
-    return 0
+    # JCE_BUILD_CONSISTENCY_XP_V3: every jce.py entry has a clear terminal result.
+    launch_start = time.monotonic()
+    label = getattr(args, "cmd", "command")
+    detail = " variant=" + str(args.variant) if hasattr(args, "variant") else ""
+    log(f"BUILD BEGIN {label}{detail}")
+    result = "FAILED"
+    try:
+        args.func(args)
+        result = "DRY_RUN" if DRY_RUN else "OK"
+        return 0
+    except SystemExit as error:
+        if error.code is None or error.code == 0:
+            result = "OK"
+        raise
+    finally:
+        log(f"BUILD END {label}: status={result} elapsed={time.monotonic()-launch_start:.1f}s")
 
 
 if __name__ == "__main__":

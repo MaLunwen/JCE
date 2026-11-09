@@ -232,7 +232,8 @@ class XpEditorBuildControls(unittest.TestCase):
         self.repo = Path(self.temporary.name) / "repo"
         self.toolchain = Path(self.temporary.name) / "llvm-mingw-xp-22.1.7-msvcrt"
         self.desktop_target = self.repo / "build/desktop/windows-x64-xp"
-        self.desktop_cache = self.desktop_target / "obj"
+        # JCE_EDITOR_VARIANT_LAYOUT_V4: XP fixture uses the canonical Dist tree by default.
+        self.desktop_cache = self.desktop_target / "obj/dist"
         self.desktop_exe = self.desktop_target / "dist/jce_editor.exe"
         self.legacy_cache = self.repo / "build/compat/windows-x64-xp-editor-llvm-msvcrt"
         self.cache = self.desktop_cache
@@ -307,18 +308,29 @@ class XpEditorBuildControls(unittest.TestCase):
         if command[:3] == ["conan", "graph", "info"]:
             return subprocess.CompletedProcess(command, 0, json.dumps(self.graph), "Conan graph diagnostic\n")
         if command[:2] == ["conan", "install"]:
-            generated = self.cache / "conan/build/Release/generators/conan_toolchain.cmake"
+            generated = (self.desktop_target / "conan" / self.cache.name /
+                         "build/Release/generators/conan_toolchain.cmake")
             generated.parent.mkdir(parents=True, exist_ok=True)
             generated.write_text("# CPU generated-interface port\n", encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, json.dumps(self.graph), "Conan diagnostic\n")
         if command[:2] == ["cmake", "-S"]:
-            values = {}
+            # JCE_XP_LAYOUT_PROVENANCE_V4_3: simulated CMake regeneration follows -B exactly.
+            binary_dir = Path(command[command.index("-B") + 1]).resolve()
+            self.assertEqual(binary_dir, self.cache.resolve(),
+                             "simulated configure used a different variant cache")
+            cache_file = binary_dir / "CMakeCache.txt"
+            values = XP._cache_values(cache_file) if cache_file.is_file() else {}
             for arg in command:
                 if arg.startswith("-D"):
                     name, value = arg[2:].split("=", 1)
                     values[name] = value
             for key, suffix in (("CMAKE_C_COMPILER", "-clang.exe"), ("CMAKE_CXX_COMPILER", "-clang++.exe")):
                 values[key] = str(self.toolchain / "bin" / ("x86_64-w64-mingw32" + suffix))
+            values.setdefault("JCE_ENABLE_PATENTED_CODECS", "ON")
+            for generated_stock_key in ("JCE_SHADER_STOCK_POLICY_NAME",
+                                        "JCE_SHADER_STOCK_POLICY_SHA256",
+                                        "JCE_SHADER_OUTPUT_DIR"):
+                values.pop(generated_stock_key, None)
             values.update(self.stock_metadata)
             (self.cache / "CMakeCache.txt").write_text("\n".join(key + ":STRING=" + value for key, value in values.items()) + "\n", encoding="utf-8")
             self.shader_directory.mkdir(parents=True, exist_ok=True)
@@ -335,6 +347,8 @@ class XpEditorBuildControls(unittest.TestCase):
                        build_profile=self.repo / "conan/profiles/windows-x64",
                        env={"PATH": "explicit-cpu-path", "LIB": "must-not-leak"}, **self.host_tools)
         options.update(kwargs)
+        # JCE_XP_RECEIPT_VARIANT_V4_3_2: follow the variant actually requested.
+        self._last_variant = options.get("variant", "dist")
         return XP.build(self.repo, "x64", self.toolchain, 2, **options)
 
     def native_installation(self):
@@ -350,6 +364,46 @@ class XpEditorBuildControls(unittest.TestCase):
             b"compiler.version=194\ncompiler.cppstd=20\ncompiler.runtime=dynamic\n")
         self.driver.find_vs_install = lambda arch: installation
         return installation
+
+    def test_release_codec_preference_and_dist_cache_are_separate(self):
+        # Actual producer + counted configure port; no vendor or compiler runs.
+        self.build("configure")
+        self.assertEqual(self.latest()["capabilities"]["patented_codecs"]["effective"], "OFF")
+        dist_owner = (self.desktop_cache / "xp-editor-owner.json").read_bytes()
+        self.cache = self.desktop_target / "obj/release"
+        self.assertFalse((self.cache / "CMakeCache.txt").exists(),
+                         "Release fixture inherited an existing CMake cache")
+        self.shader_directory = self.cache / "generated" / ("engine_assets-compat-" + self.stock_digest[:32]) / "shaders"
+        self.stock_metadata["JCE_SHADER_OUTPUT_DIR"] = str(self.shader_directory)
+        self.build("configure", variant="release")
+        command = next(cmd for cmd, _ in reversed(self.calls) if cmd[:2] == ["cmake", "-S"])
+        self.assertIn("-DJCE_BUILD_VARIANT=release", command)
+        self.assertFalse(any(flag.startswith("-DJCE_ENABLE_PATENTED_CODECS=") for flag in command))
+        self.assertEqual(self.latest()["capabilities"]["patented_codecs"]["effective"], "ON",
+                         "Release configured CMake values: " +
+                         repr(XP._cache_values(self.cache / "CMakeCache.txt")))
+        self.assertEqual(self.latest()["canonical_candidate"], str(self.desktop_target / "release/jce_editor.exe"))
+        self.assertEqual(self.latest()["cache"], str(self.cache))
+        self.assertEqual(dist_owner, (self.desktop_cache / "xp-editor-owner.json").read_bytes())
+        self.build("configure", variant="release", patented_codecs="off")
+        command = next(cmd for cmd, _ in reversed(self.calls) if cmd[:2] == ["cmake", "-S"])
+        self.assertIn("-DJCE_ENABLE_PATENTED_CODECS=OFF", command)
+        self.assertEqual(self.latest()["capabilities"]["patented_codecs"]["effective"], "OFF")
+        self.build("configure", variant="release")
+        self.assertEqual(self.latest()["capabilities"]["patented_codecs"]["effective"], "OFF")
+        self.build("configure", variant="release", patented_codecs="on")
+        self.assertEqual(self.latest()["capabilities"]["patented_codecs"]["effective"], "ON",
+                         "Release configured CMake values: " +
+                         repr(XP._cache_values(self.cache / "CMakeCache.txt")))
+        self.assertFalse((self.desktop_target / "release/jce_editor.exe").exists())
+
+    def test_release_and_dist_invalid_codec_modes_refuse_before_native_launch(self):
+        for bad in (True, "ON", "off;on", 1):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "XP patented-codecs"):
+                self.build("configure", variant="release", patented_codecs=bad)
+        with self.assertRaisesRegex(ValueError, "XP Editor variant"):
+            self.build("configure", variant="unsupported")
+        self.preflight.assert_not_called()
 
     def test_bx_diagnostic_request_reaches_graph_install_and_cache_identity(self):
         self.build("resolve", bgfx_bx_debug="on")
@@ -462,8 +516,38 @@ class XpEditorBuildControls(unittest.TestCase):
         self.assertFalse((self.cache / "native-build-profiles").exists())
 
     def latest(self):
-        pointer = json.loads((self.repo / "build/validation/xp-editor/x64/latest.json").read_text(encoding="utf-8"))
-        return json.loads(Path(pointer["receipt"]).read_text(encoding="utf-8"))
+        # JCE_XP_RECEIPT_VARIANT_V4_3_2: receipts are variant-specific.
+        # The producer writes Dist -> x64 and Release -> x64-release.
+        variant = getattr(self, "_last_variant", "dist")
+        self.assertIn(variant, ("release", "dist"))
+        lane = "x64-release" if variant == "release" else "x64"
+        pointer_path = self.repo / "build/validation/xp-editor" / lane / "latest.json"
+        pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+        receipt = json.loads(Path(pointer["receipt"]).read_text(encoding="utf-8"))
+        self.assertEqual(receipt.get("variant"), variant,
+                         "XP test loaded a receipt from the wrong build variant")
+        return receipt
+
+    def test_latest_receipt_selection_is_variant_specific(self):
+        # JCE_XP_RECEIPT_VARIANT_V4_3_2: this test invokes no compiler or VM.
+        base = self.repo / "build/validation/xp-editor"
+        for lane, variant in (("x64", "dist"), ("x64-release", "release")):
+            directory = base / lane
+            directory.mkdir(parents=True, exist_ok=True)
+            receipt_file = directory / "receipt-fixture.json"
+            receipt_file.write_text(json.dumps({"variant": variant, "marker": variant}), encoding="utf-8")
+            (directory / "latest.json").write_text(
+                json.dumps({"receipt": str(receipt_file)}), encoding="utf-8")
+        self._last_variant = "dist"
+        self.assertEqual(self.latest()["marker"], "dist")
+        self._last_variant = "release"
+        self.assertEqual(self.latest()["marker"], "release")
+        # A stale/crossed pointer must fail, not silently certify Release.
+        release = base / "x64-release/receipt-fixture.json"
+        release.write_text(json.dumps({"variant": "dist", "marker": "stale"}), encoding="utf-8")
+        with self.assertRaisesRegex(AssertionError, "wrong build variant"):
+            self.latest()
+
 
     def overlay_factory(self, base, home, major, *, package_store):
         """Small configuration-only factory port; never copy a package store."""
@@ -698,7 +782,7 @@ class XpEditorBuildControls(unittest.TestCase):
         self.assertFalse(any(command[:2] == ["conan", "install"] or command[0] == "cmake" for command in commands))
         self.assertNotIn("--build=missing", commands[-1])
         self.assertNotIn("--output-folder", commands[-1])
-        self.assertFalse((self.cache / "conan").exists())
+        self.assertFalse((self.desktop_target / "conan" / self.cache.name).exists())
         self.assertFalse((self.repo / "dist").exists())
         self.assertIsNone(receipt["final_artifact"])
 
@@ -712,7 +796,7 @@ class XpEditorBuildControls(unittest.TestCase):
 
     def test_resolve_never_reuses_or_modifies_a_generation_stamp(self):
         self.build("dependencies")
-        stamp = self.cache / "conan/xp-generation.json"
+        stamp = self.desktop_target / "conan" / self.cache.name / "xp-generation.json"
         before = stamp.read_bytes()
         self.calls.clear()
         self.graph["graph"]["nodes"]["1"]["binary"] = "Missing"
@@ -727,7 +811,7 @@ class XpEditorBuildControls(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "GNU ABI"):
             self.build("resolve")
         self.assertEqual(self.latest()["state"], "FAILED")
-        self.assertFalse((self.cache / "conan/xp-generation.json").exists())
+        self.assertFalse((self.desktop_target / "conan" / self.cache.name / "xp-generation.json").exists())
         self.graph["graph"]["nodes"]["1"]["settings"]["compiler"] = "clang"
         self.graph["graph"]["nodes"]["2"].pop("package_id")
         with self.assertRaisesRegex(ValueError, "build-host package identity"):
@@ -740,7 +824,7 @@ class XpEditorBuildControls(unittest.TestCase):
             self.build()
         self.assertEqual(self.latest()["state"], "FAILED")
         self.assertFalse(any(command[0] == "cmake" for command, _ in self.calls))
-        self.assertFalse((self.cache / "conan/xp-generation.json").exists())
+        self.assertFalse((self.desktop_target / "conan" / self.cache.name / "xp-generation.json").exists())
 
     def test_default_build_is_gui_editor_with_stock_assets_and_no_sdk(self):
         exe = self.build()
@@ -769,58 +853,59 @@ class XpEditorBuildControls(unittest.TestCase):
         self.shader_directory = self.cache / self.shader_directory.relative_to(self.desktop_cache)
         self.stock_metadata["JCE_SHADER_OUTPUT_DIR"] = str(self.shader_directory)
 
-    def test_matching_legacy_cache_reuses_objects_and_emits_only_the_desktop_candidate(self):
+    def test_historical_xp_cache_is_never_reinterpreted_as_new_variant_owner(self):
         self.prepare_legacy_cache()
-        self.build("dependencies")
-        retained = self.legacy_cache / "preserve.o"
-        retained.write_bytes(b"existing XP object")
-        self.calls.clear()
+        old = self.legacy_cache / "preserve.o"
+        old.write_bytes(b"keep legacy XP object")
+        self.build("prepare")
+        self.assertEqual(self.latest()["cache"], str(self.desktop_cache))
+        self.assertEqual(old.read_bytes(), b"keep legacy XP object")
+        self.assertTrue((self.desktop_cache / "xp-editor-owner.json").is_file())
+        self.assertTrue((self.legacy_cache / "xp-editor-owner.json").is_file())
 
-        exe = self.build()
+    def test_preexisting_unproved_exe_is_archived_and_rebuilt(self):
+        # JCE_XP_CANDIDATE_PROVENANCE_V4_4_1: simulates build, no real XP EXE.
+        self.desktop_exe.parent.mkdir(parents=True, exist_ok=True)
+        original = b"unowned previous editor bytes"
+        self.desktop_exe.write_bytes(original)
+        produced = self.build()
+        self.assertEqual(produced, self.desktop_exe)
+        self.assertNotEqual(produced.read_bytes(), original)
+        evidence = self.latest()["archived_preexisting_candidate"]
+        self.assertEqual(Path(evidence["backup"]).read_bytes(), original)
+        self.assertEqual(evidence["sha256"], hashlib.sha256(original).hexdigest())
+        self.assertFalse(evidence["restored_after_failure"])
 
-        self.assertEqual(exe, self.desktop_exe)
-        self.assertEqual(self.latest()["cache"], str(self.legacy_cache))
-        self.assertTrue(self.latest()["dependencies_reused"])
-        self.assertFalse(any(command[:2] == ["conan", "install"] for command, _ in self.calls))
-        configure = next(command for command, _ in self.calls if command[:2] == ["cmake", "-S"])
-        self.assertIn("-DJCE_EDITOR_ARTIFACT_DIR=" + str(exe.parent), configure)
-        self.assertEqual(retained.read_bytes(), b"existing XP object")
-        self.assertFalse((self.desktop_cache / "xp-editor-owner.json").exists())
-        self.assertFalse((self.legacy_cache / "dist/jce_editor.exe").exists())
+    def test_unproved_exe_is_restored_on_failed_compilation(self):
+        self.desktop_exe.parent.mkdir(parents=True, exist_ok=True)
+        original = b"original old candidate"
+        self.desktop_exe.write_bytes(original)
+        def fail_ninja(command, **kwargs):
+            if command[:2] == ["cmake", "--build"]:
+                self.desktop_exe.write_bytes(b"partial failed compilation")
+                return subprocess.CompletedProcess(command, 1, "", "ninja failed")
+            return self.runner(command, **kwargs)
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.build(runner=fail_ninja)
+        self.assertEqual(self.desktop_exe.read_bytes(), original)
+        evidence = self.latest()["archived_preexisting_candidate"]
+        self.assertTrue(evidence["restored_after_failure"])
+        self.assertEqual(Path(evidence["failed_build_output"]).read_bytes(),
+                         b"partial failed compilation")
+        self.assertEqual(self.latest()["state"], "FAILED")
 
-    def test_legacy_audit_uses_the_original_candidate_until_a_desktop_build(self):
-        self.prepare_legacy_cache()
-        desktop_exe = self.build()
-        legacy_exe = self.legacy_cache / "dist/jce_editor.exe"
-        legacy_exe.parent.mkdir()
-        desktop_exe.rename(legacy_exe)
-        cache_file = self.legacy_cache / "CMakeCache.txt"
-        cache_file.write_text(cache_file.read_text(encoding="utf-8").replace(
-            "JCE_EDITOR_ARTIFACT_DIR:STRING=" + str(desktop_exe.parent),
-            "JCE_EDITOR_ARTIFACT_DIR:STRING="), encoding="utf-8")
-        stamp = self.legacy_cache / "xp-built.json"
-        identity = json.loads(stamp.read_text(encoding="utf-8"))
-        identity["cmake_cache_sha256"] = XP._sha(cache_file)
-        stamp.write_text(json.dumps(identity), encoding="utf-8")
-        payload = {"embedded_assets": {"entries": 4}, "embedded_notices": {"LICENSE": "a" * 64}}
+    def test_configure_does_not_touch_previous_unproved_exe(self):
+        self.desktop_exe.parent.mkdir(parents=True, exist_ok=True)
+        original = b"previous editor remains through configure"
+        self.desktop_exe.write_bytes(original)
+        self.build("configure")
+        self.assertEqual(self.desktop_exe.read_bytes(), original)
+        self.assertNotIn("archived_preexisting_candidate", self.latest())
 
-        with mock.patch.object(XP, "_verify_payload", return_value=payload) as verify:
-            self.assertIsNone(self.build("audit"))
-            self.assertEqual(verify.call_args.args[0], legacy_exe)
-            self.assertEqual(self.latest()["audited_candidate"], str(legacy_exe))
-        desktop_exe.write_bytes(b"unowned candidate")
-        with self.assertRaisesRegex(ValueError, "candidate already exists outside the admitted build"):
-            self.build("audit")
-        self.assertEqual(desktop_exe.read_bytes(), b"unowned candidate")
-
-    def test_fresh_desktop_cache_refuses_to_overwrite_an_unowned_candidate(self):
-        self.desktop_exe.parent.mkdir(parents=True)
-        self.desktop_exe.write_bytes(b"existing candidate")
-        with self.assertRaisesRegex(ValueError, "candidate already exists outside the admitted build"):
-            self.build()
-        self.assertEqual(self.desktop_exe.read_bytes(), b"existing candidate")
-        self.assertFalse(self.desktop_cache.exists())
-        self.assertEqual(self.calls, [])
+    def test_second_admitted_build_does_not_archive_owned_exe(self):
+        self.build()
+        self.build()
+        self.assertNotIn("archived_preexisting_candidate", self.latest())
 
     def test_compatibility_shader_directory_uses_current_catalog_metadata(self):
         try:
