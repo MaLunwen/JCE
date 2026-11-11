@@ -40,8 +40,14 @@ JCE_INLINE bool jce_native_atomic_word_compare_exchange(JceNativeAtomicWord *wor
 #endif
 #elif JCE_COMPILER_GCC || JCE_COMPILER_CLANG
 typedef struct { size_t value; } JceNativeAtomicWord;
+/* Require a compiler-guaranteed lock-free native pointer width.  The
+ * builtin call is not necessarily a C99 integer constant expression
+ * when used as a file-scope array bound (observed on GCC). */
+#if !defined(__GCC_ATOMIC_POINTER_LOCK_FREE) || __GCC_ATOMIC_POINTER_LOCK_FREE != 2
+#error "JCE native-word atomics require always-lock-free pointers"
+#endif
 typedef char JceNativeWordMustBeLockFree[
-    __atomic_always_lock_free(sizeof(size_t), 0) ? 1 : -1];
+    sizeof(size_t) == sizeof(void *) ? 1 : -1];
 JCE_INLINE size_t jce_native_atomic_word_load(const JceNativeAtomicWord *word)
 { return __atomic_load_n(&word->value, __ATOMIC_RELAXED); }
 JCE_INLINE void jce_native_atomic_word_store(JceNativeAtomicWord *word, size_t value)

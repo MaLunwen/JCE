@@ -20,6 +20,8 @@ env:
   # Hosted runners may install declared native dependencies; local CLI defaults to check.
   JCE_SYSTEM_PACKAGE_MODE: install
   JCE_SYSTEM_PACKAGE_SUDO: "1"
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -191,7 +193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-24.04, windows-2022, macos-15]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -237,7 +239,7 @@ jobs:
     name: sdk-consumer (installed SDK + embedded assets)
     needs: changes
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -281,11 +283,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             arch: x64
-          - os: windows-latest
+          - os: windows-2022
             arch: x64
-          - os: macos-latest
+          - os: macos-15
             arch: arm64
     steps:
       - uses: actions/checkout@v4

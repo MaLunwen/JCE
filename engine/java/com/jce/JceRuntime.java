@@ -26,7 +26,7 @@ public final class JceRuntime implements AutoCloseable {
      * lockstep with project(JCE VERSION ...) in the root CMakeLists.txt
      * whenever the native surface used below changes shape.
      */
-    private static final int EXPECTED_API_VERSION = 0x000E0300;
+    private static final int EXPECTED_API_VERSION = 0x000E0400;
 
     /**
      * Mirror of JceAppResult in engine/include/jce/application/jce_engine.h.

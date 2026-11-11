@@ -1,0 +1,172 @@
+name: ci-architecture
+
+# Architecture admission is deliberately separate from the expensive JCE SDK
+# build. An object probe is evidence of a toolchain/ABI, NEVER an engine build.
+# The existing ci.yml remains the native SDK, unit-test and lint gate.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - ".github/workflows/ci-architecture.yml"
+      - "tools/build/ci_arch_probe.c"
+      - "tools/build/ci_arch_probe.py"
+      - "tools/tests/test_ci_arch_probe.py"
+  pull_request:
+    paths:
+      - ".github/workflows/ci-architecture.yml"
+      - "tools/build/ci_arch_probe.c"
+      - "tools/build/ci_arch_probe.py"
+      - "tools/tests/test_ci_arch_probe.py"
+  schedule:
+    - cron: "15 5 * * 0"
+  workflow_dispatch:
+    inputs:
+      full_windows_x86_sdk:
+        description: "Attempt actual Win32 JCE SDK (experimental, potentially slow)"
+        type: boolean
+        default: false
+      full_linux_x86_sdk:
+        description: "Attempt actual Linux i686 JCE SDK (experimental, potentially slow)"
+        type: boolean
+        default: false
+
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_BUILD_PARALLEL_LEVEL: "2"
+  JCE_SYSTEM_PACKAGE_MODE: install
+  JCE_SYSTEM_PACKAGE_SUDO: "1"
+  CONAN_HOME: ${{ github.workspace }}/.conan2
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe-tests:
+    name: verify architecture probe (positive + negative controls)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run architecture-probe unit controls
+        run: python -m unittest discover -s tools/tests -p test_ci_arch_probe.py -v
+
+  native-objects:
+    name: toolchain object ${{ matrix.target }}
+    needs: probe-tests
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: windows-x86,   runner: windows-2022,          msvc_arch: x86 }
+          - { target: windows-x64,   runner: windows-2022,          msvc_arch: amd64 }
+          - { target: windows-arm64, runner: windows-11-vs2026-arm, msvc_arch: arm64 }
+          - { target: linux-x86,     runner: ubuntu-24.04,         msvc_arch: none }
+          - { target: linux-x64,     runner: ubuntu-24.04,         msvc_arch: none }
+          - { target: linux-arm64,   runner: ubuntu-24.04-arm,     msvc_arch: none }
+          - { target: macos-x64,     runner: macos-15-intel,       msvc_arch: none }
+          - { target: macos-arm64,   runner: macos-15,             msvc_arch: none }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize MSVC target environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+      - name: Compile and inspect actual target machine code
+        run: python tools/build/ci_arch_probe.py --target ${{ matrix.target }}
+
+  cross-objects:
+    name: cross toolchain object ${{ matrix.target }}
+    needs: probe-tests
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: android-armv7,      runner: ubuntu-24.04 }
+          - { target: android-arm64,      runner: ubuntu-24.04 }
+          - { target: wasm32,             runner: ubuntu-24.04 }
+          - { target: ios-arm64-device,   runner: macos-15 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install distro Emscripten for WASM object probe
+        if: matrix.target == 'wasm32'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends emscripten
+          emcc --version
+      - name: Compile and inspect the cross-target object
+        run: python tools/build/ci_arch_probe.py --target ${{ matrix.target }}
+
+  windows-x86-sdk-experimental:
+    name: Windows x86 JCE full SDK (manual experimental gate)
+    if: github.event_name == 'workflow_dispatch' && inputs.full_windows_x86_sdk
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+      - name: Install Conan and Ninja
+        run: |
+          python -m pip install "conan>=2.0,<3" ninja
+          conan profile detect --force
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Prepare build-host executable tools
+        run: python scripts/jce.py host-tools --arch x64
+      - name: Compile JCE SDK for Windows x86 (failure is real, not advisory)
+        run: python scripts/jce.py sdk --arch x86 --variant release --no-debug --profiling off
+
+  linux-x86-sdk-experimental:
+    name: Linux i686 JCE full SDK (manual experimental gate)
+    if: github.event_name == 'workflow_dispatch' && inputs.full_linux_x86_sdk
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare 32-bit multilib compiler
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gcc-13 g++-13 gcc-13-multilib g++-13-multilib libegl-dev
+          gcc-13 -v
+      - name: Install Conan/Ninja
+        run: |
+          python -m pip install "conan>=2.0,<3" ninja
+          conan profile detect --force
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Build host tooling and try i686 JCE SDK
+        env:
+          CC: gcc-13
+          CXX: g++-13
+        run: |
+          python scripts/jce.py host-tools --arch x64
+          python scripts/jce.py sdk --arch x86 --variant release --no-debug --profiling off

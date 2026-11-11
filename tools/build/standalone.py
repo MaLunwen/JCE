@@ -485,6 +485,11 @@ def guard_cache_clean(paths, allowed_root: Path, *, entry_budget: int = 100000,
 
 def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None, plan=None) -> Path:
     """Isolated static dependency closure; never relabel a dynamic-CRT build."""
+    # CMake 4 must see this environment value before reading old vendor
+    # cmake_minimum_required() calls. Respect an explicit caller override.
+    # Do not edit Conan-cached dependency sources or packages.
+    env = dict(env)
+    env.setdefault("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
     # Cross-architecture single-EXE builds are permitted on the same OS host.
     # Build-time executables must be built for the BUILD host and pinned below.
     # An explicit different-OS target needs a separately configured toolchain.
@@ -522,7 +527,8 @@ def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None, p
                     "-o:h", "*:shared=False",
                     "-c:a", "tools.build:jobs=" + driver.build_jobs(env),
                     "--build=missing", "--output-folder", str(conan),
-                    *bgfx_args, *flags], cwd=driver.ROOT, env=env)
+                    *bgfx_args, *driver.system_package_conan_args(env),
+                    *flags], cwd=driver.ROOT, env=env)
         # A cross target cannot execute its own asset tools. Build and pin
         # native PAK/COFF wrappers, instead of executing ARM64 code on x64.
         cross_asset_flags = (driver.cross_asset_tool_overrides(env)

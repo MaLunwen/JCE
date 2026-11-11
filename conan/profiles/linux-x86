@@ -1,0 +1,19 @@
+# Experimental Linux i686 target. This profile selects 32-bit objects,
+# but does not certify the full JCE dependency closure on i386 Linux.
+# Native host build tools must stay in the linux-x64 build context.
+include(base)
+
+[settings]
+os=Linux
+arch=x86
+compiler=gcc
+compiler.version=13
+compiler.libcxx=libstdc++11
+compiler.cppstd=20
+
+[conf]
+tools.build:compiler_executables={"c": "gcc-13", "cpp": "g++-13"}
+tools.build:cflags=["-m32"]
+tools.build:cxxflags=["-m32"]
+tools.build:sharedlinkflags=["-m32"]
+tools.build:exelinkflags=["-m32"]

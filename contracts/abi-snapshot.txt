@@ -5,7 +5,7 @@
 # change so a reviewer sees the declaration and the snapshot diff
 # together.  Additions are safe for consumers; removals and
 # signature changes are not, and the gate fails on those.
-# 5234 declarations.
+# 5238 declarations.
 
 enum JceAiSceneDirectorStatus { JCE_AI_SCENE_DIRECTOR_IDLE = 0, JCE_AI_SCENE_DIRECTOR_WAITING, JCE_AI_SCENE_DIRECTOR_READY, JCE_AI_SCENE_DIRECTOR_FAILED, JCE_AI_SCENE_DIRECTOR_CANCELLED }    [runtime/jce_ai_scene_director.h]
 enum JceAiSceneError { JCE_AI_SCENE_ERROR_NONE = 0, JCE_AI_SCENE_ERROR_INVALID_ARGUMENT, JCE_AI_SCENE_ERROR_INVALID_CATALOG, JCE_AI_SCENE_ERROR_PROMPT_TOO_LARGE, JCE_AI_SCENE_ERROR_TRANSPORT, JCE_AI_SCENE_ERROR_TIMEOUT, JCE_AI_SCENE_ERROR_INVALID_RESPONSE, JCE_AI_SCENE_ERROR_STALE_RESPONSE, JCE_AI_SCENE_ERROR_INVALID_RECIPE, JCE_AI_SCENE_ERROR_COMPILE, JCE_AI_SCENE_ERROR_NO_FALLBACK }    [runtime/jce_ai_scene_director.h]
@@ -4006,7 +4006,9 @@ fn jce_ui_get_dpi_scale :: (const JceUIContext *) -> float    [middleware/ui/jce
 fn jce_ui_load_font :: (JceUIContext *, const char *) -> bool    [middleware/ui/jce_ui.h]
 fn jce_ui_process_input :: (JceUIContext *, const JceInput *) -> void    [middleware/ui/jce_ui.h]
 fn jce_ui_process_pointer_input :: (JceUIContext *, const JceInput *) -> void    [middleware/ui/jce_ui.h]
+fn jce_ui_process_pointer_state :: (JceUIContext *, float, float, bool, bool) -> void    [middleware/ui/jce_ui.h]
 fn jce_ui_render :: (JceUIContext *) -> void    [middleware/ui/jce_ui.h]
+fn jce_ui_render_view :: (JceUIContext *, uint16_t) -> void    [middleware/ui/jce_ui.h]
 fn jce_ui_resize :: (JceUIContext *, uint32_t, uint32_t) -> void    [middleware/ui/jce_ui.h]
 fn jce_ui_set_dpi_scale :: (JceUIContext *, float) -> void    [middleware/ui/jce_ui.h]
 fn jce_ui_update :: (JceUIContext *, float) -> void    [middleware/ui/jce_ui.h]
@@ -5029,6 +5031,8 @@ struct JceReverbZoneDesc { JceReverbShape shape; jce_vec3 center; jce_vec3 exten
 struct JceReverbZoneEcs { JceReverbZoneDesc desc; JceReverbZoneId zone_id; bool dirty }    [middleware/audio/jce_audio_ecs.h]
 struct JceRigidBody2DComponent { uint32_t body_handle_idx; uint8_t body_type; uint8_t shape_type; float mass; float friction; float restitution; bool fixed_rotation; uint32_t physics_layer }    [middleware/scene/jce_scene.h]
 struct JceRigidBodyComponent { uint32_t body_handle_idx; uint8_t body_type; uint8_t shape_type; float mass; float friction; float restitution; float drag; float angular_drag; bool use_gravity; bool is_kinematic; bool freeze_rotation; uint8_t ccd_mode; float ccd_threshold; float ccd_sphere_radius; float gravity_scale; uint32_t physics_layer; char physmat_path[256] }    [middleware/scene/jce_scene.h]
+struct JceRmlSceneBinding { char tag[64]; JceUIElementHandle element; int kind; uint64_t previous_hash; bool initialized }    [application/jce_rml_scene_overlay.h]
+struct JceRmlSceneOverlay { JceUIContext *ui; JceUIDocHandle document; JceRmlSceneBinding binds[JCE_RML_SCENE_BIND_MAX]; int bind_count; JceUIElementHandle menu; JceUIElementHandle pages[3]; JceUIElementHandle buttons[7]; int open_page; JceUIElementHandle help_button, help_close, help_panel; bool help_visible; uint32_t width, height }    [application/jce_rml_scene_overlay.h]
 struct JceRng { uint64_t state; uint64_t inc }    [os/core/jce_rand.h]
 struct JceRoadNetworkDesc { uint32_t initial_node_capacity; uint32_t initial_segment_capacity; uint32_t initial_point_capacity }    [middleware/world/jce_road_network.h]
 struct JceRoadNode { jce_vec3 position; uint32_t first_segment; uint32_t segment_count }    [middleware/world/jce_road_network.h]

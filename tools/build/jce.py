@@ -76,6 +76,7 @@ TARGETS = {
     "windows-x64":   dict(host="windows", arch="x86_64",  bits=64, eng_arch="x64",   profile="windows-x64",   preset_stem="windows-x64"),
     "windows-arm64": dict(host="windows", arch="aarch64", bits=64, eng_arch="arm64", profile="windows-arm64", preset_stem="windows-arm64"),
     "windows-x86":   dict(host="windows", arch="i686",    bits=32, eng_arch="x86",   profile="windows-x86",   preset_stem="windows-x86"),
+    "linux-x86":     dict(host="linux",   arch="i686",    bits=32, eng_arch="x86",   profile="linux-x86",     preset_stem="linux-x86"),
     "linux-x64":     dict(host="linux",   arch="x86_64",  bits=64, eng_arch="x64",   profile="linux-x64",     preset_stem="linux-x64"),
     "linux-arm64":   dict(host="linux",   arch="aarch64", bits=64, eng_arch="arm64", profile="linux-arm64",   preset_stem="linux-arm64"),
     "macos-x64":     dict(host="darwin",  arch="x86_64",  bits=64, eng_arch="x64",   profile="macos-x64",     preset_stem="macos-x64"),
@@ -415,6 +416,8 @@ def msvc_env(t: dict) -> dict:
             "COMSPEC", "PATHEXT", "NUMBER_OF_PROCESSORS",
             "PROCESSOR_ARCHITECTURE", "COMPUTERNAME", "OS", "CONAN_HOME",
             "JAVA_HOME", "CMAKE_BUILD_PARALLEL_LEVEL",
+            "CMAKE_POLICY_VERSION_MINIMUM", "JCE_SYSTEM_PACKAGE_MODE",
+            "JCE_SYSTEM_PACKAGE_SUDO",
             "JCE_GRAPHICS_API_TIER", "JCE_BGFX_CPU_PROFILER",
             "JCE_BGFX_DEBUG_ANNOTATION", "JCE_SHADERC_EXECUTABLE", "BGFX_SHADERC"}
     base = {k: v for k, v in os.environ.items() if k.upper() in keep}

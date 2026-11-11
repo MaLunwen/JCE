@@ -38,7 +38,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.14.3 LANGUAGES C)
+project(JCE VERSION 0.14.4 LANGUAGES C)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEDeliveryProfile.cmake")
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
@@ -825,6 +825,11 @@ else()
 		mimalloc-static
 		zstd::libzstd_static
 		xxHash::xxhash)
+	# The C99 packer links static C++ libraries (Tracy and enkiTS).
+	# Apple clang C linkage omits libc++; use a C++ linker on Apple.
+	if(APPLE)
+		set_target_properties(jce_pak PROPERTIES LINKER_LANGUAGE CXX)
+	endif()
 	jce_target_warnings(jce_pak)
 endif()
 
