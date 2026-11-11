@@ -74,6 +74,7 @@ static bool gv_renderer_restart_required(const char *requested,
 
 static int  s_aspect_idx  = 0;
 static bool s_show_stats  = false;
+static bool s_show_hints = false;
 static int  s_run_mode_idx = 0;
 static bool s_run_mode_loaded = false;
 static bool s_third_person = false;   /* play camera: false=first-person, true=behind-player */
@@ -364,6 +365,7 @@ void jce_editor_panel_game_view_content(void)
     if (!s_ui_state_loaded) {
         s_ui_state_loaded = true;
         s_show_stats = jce_editor_ui_state_load_int("gameview.stats", 0, 0, 1) != 0;
+        s_show_hints = jce_editor_ui_state_load_int("gameview.hints", 0, 0, 1) != 0;
     }
 
     /* Restore per-project view state once the project store is live — it is
@@ -507,6 +509,13 @@ void jce_editor_panel_game_view_content(void)
         if (ImGui::Checkbox(_lbl, &s_show_stats))
             jce_editor_ui_state_save_int("gameview.stats", s_show_stats ? 1 : 0);
     }
+
+    ImGui::SameLine();
+    char hints_label[96];
+    snprintf(hints_label, sizeof(hints_label), "%s###gameview_hints",
+             jce_editor_i18n_or("gameView.hud.hintsToggle", "Hints"));
+    if (ImGui::Checkbox(hints_label, &s_show_hints))
+        jce_editor_ui_state_save_int("gameview.hints", s_show_hints ? 1 : 0);
 
     ImGui::SameLine();
     char mouse_look_label[128];
@@ -1349,6 +1358,7 @@ void jce_editor_panel_game_view_content(void)
 
     /* HUD overlay: capture state + hint. */
     ImDrawList *dl = ImGui::GetWindowDrawList();
+    if (s_show_hints) {
     if (jce_editor_game_render_is_mouse_captured()) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(80, 220, 120, 230),
@@ -1366,9 +1376,11 @@ void jce_editor_panel_game_view_content(void)
         !jce_editor_game_render_is_mouse_captured()) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 22.0f),
                     IM_COL32(220, 240, 255, 220),
-                    "Mouse Look: click to focus | Alt: cursor | Esc: release");
+                     jce_editor_i18n_or("gameView.hud.mouseLookControls",
+                          "Mouse Look: click to focus | Alt: cursor | Esc: release")); // CK_0225_HINT_LOCALIZED
     }
 
+    } /* s_show_hints: stats remains independently controlled. */
     if (s_show_stats) {
         const char *current = jce_renderer_running_backend_name();
         if (!current || !current[0]) current = "?";

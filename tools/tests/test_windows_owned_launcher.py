@@ -75,10 +75,10 @@ class OwnedLauncherPlanControls(unittest.TestCase):
             directory = Path(temporary)
             receipt = {"stages": []}
             completed = subprocess.CompletedProcess(["declared-tool"], 0, "raw stdout\n", "raw stderr\n")
-            with mock.patch.object(LAUNCHER.subprocess, "run", return_value=completed) as execute:
-                stages = LAUNCHER.xp_editor._Stages(directory, receipt)
-                with contextlib.redirect_stdout(io.StringIO()):
-                    stages.run("counted", ["declared-tool"], directory, {}, timeout=3)
+            execute = mock.Mock(return_value=completed)
+            stages = LAUNCHER.xp_editor._Stages(directory, receipt, runner=execute)
+            with contextlib.redirect_stdout(io.StringIO()):
+                stages.run("counted", ["declared-tool"], directory, {}, timeout=3)
             execute.assert_called_once()
             self.assertEqual(execute.call_args.kwargs["timeout"], 3)
             self.assertEqual(execute.call_args.kwargs["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))

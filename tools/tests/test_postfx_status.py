@@ -105,7 +105,7 @@ int main(int argc,char **argv)
  puts("PostFX status PASS");return 0;
 }
 '''
-        base = ROOT / "build/postfx-status-tests"
+        base = ROOT / "build/tests/postfx-status-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

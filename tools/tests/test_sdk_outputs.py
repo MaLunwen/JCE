@@ -179,8 +179,8 @@ class SdkOutputControls(unittest.TestCase):
             plan = OPTIONS.resolve(fixture.driver, fixture.args, fixture.target)
             self.assertFalse(plan["custom"])
             self.assertEqual(plan["shaders"], "ON")
-            self.assertEqual(plan["build"], fixture.root / "build/desktop/windows-x64/obj")
-            self.assertEqual(plan["conan"], fixture.root / "build/desktop/windows-x64/conan")
+            self.assertEqual(plan["build"], fixture.root / "build/desktop/windows-x64/obj/dist")
+            self.assertEqual(plan["conan"], fixture.root / "build/desktop/windows-x64/conan/dist")
             self.assertEqual(plan["install"], fixture.root / "dist/sdk/win32-x86_64-dist-single")
         fixture.args.embed_engine_shaders = "off"
         with self.assertRaisesRegex(ValueError, "requires isolated"):
@@ -409,8 +409,8 @@ class SdkStagingControls(unittest.TestCase):
         fixture = self.fixture()
         plan = fixture.stage()
         self.assertEqual(plan["install"], fixture.args.staging_dir)
-        self.assertEqual(plan["build"], fixture.root / "build/desktop/windows-x64/obj")
-        self.assertEqual(plan["conan"], fixture.root / "build/desktop/windows-x64/conan")
+        self.assertEqual(plan["build"], fixture.root / "build/desktop/windows-x64/obj/dist")
+        self.assertEqual(plan["conan"], fixture.root / "build/desktop/windows-x64/conan/dist")
         self.assertFalse(plan["custom"])
         self.assertEqual(plan["shaders"], "ON")
         fixture.cache(CMAKE_INSTALL_PREFIX=str(fixture.root / "dist/sdk/prior"),

@@ -39,6 +39,8 @@
 #include <jce/renderer/jce_primitives.h>     /* transition fade quad: jce_draw_filled_rect / jce_rgba */
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
+#define JCE_RML_SCENE_HOST_RUNTIME 1
+#include <jce/application/jce_rml_scene_overlay.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>              /* .jce/project-settings.json reader */
@@ -144,6 +146,8 @@ static uint32_t           s_console_logged = 0;
  * scenes without postfx stay on the zero-overhead direct-to-backbuffer path. */
 static JceOffscreenTarget *s_post_target  = NULL;
 static JceUICanvas      *s_ui_canvas      = NULL;
+static JceRmlSceneOverlay s_rml_doc_overlay = {0};
+static bool s_rml_doc_checked = false;
 /* GPU-query occlusion culler (M5): activates two-pass coherence culling in the
  * shipped runtime so a dense world skips fully-hidden geometry (previously this
  * ran ONLY in the editor scene-view).  Created in app_init after the renderer +
@@ -2787,6 +2791,13 @@ static void app_draw(const JceServices *svc, void *ud)
             }
             jce_ui_canvas_render(s_ui_canvas, s_scene, JCE_VIEW_UI, UINT16_MAX,
                                  (float)sw, (float)sh, ptr_arg, s_last_dt);
+            /* RmlUI document lifetime/IO stays in the host adapter rather
+             * than expanding this already-large entry-point template. */
+            jce_rml_scene_overlay_runtime_tick(&s_rml_doc_overlay,&s_rml_doc_checked,
+                s_runtime_fs,svc->renderer,s_engine_pak,s_scene,sw,sh,s_last_dt,
+                ptr_arg != NULL,ptr_arg ? ptr_arg->x : 0.0f,
+                ptr_arg ? ptr_arg->y : 0.0f,ptr_arg ? ptr_arg->down : false,
+                (!s_cursor_captured || s_preset_alt_active) ? svc->input : NULL);
 
             /* ── The level-transition fade ─────────────────────────────
              *
@@ -2912,6 +2923,8 @@ static void app_exit(void *ud)
     if (s_runtime_host.runtime)        { jce_runtime_destroy(s_runtime_host.runtime);              s_runtime_host.runtime        = NULL; }
     if (!jce_runtime_stats_host_close(&s_runtime_host))
         LOG_WARN("app", "%s", "runtime stats flush failed");
+    jce_rml_scene_overlay_close(&s_rml_doc_overlay);
+    s_rml_doc_checked = false;
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
     /* Occlusion culler holds bgfx resources (proxy geom + query handles) —
      * destroy before the renderer/bgfx shut down. */

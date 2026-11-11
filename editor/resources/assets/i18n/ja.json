@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT 押下中 - カーソル解放]  ALT を離すと再キャプチャ",
     "gameView.hud.clickToFly": "クリックで FPS フライカメラ開始（WASD/Space/Shift、Ctrl=加速、ALT=カーソル解放、ESC=終了）",
     "gameView.hud.flyCaptured": "[FPS] WASD 移動 | Space 上昇 | Shift 下降 | Ctrl x5  （ALT 長押しでカーソル解放、ESC で終了）",
+    "gameView.hud.hintsToggle": "ヒント",
+    "gameView.hud.mouseLookControls": "マウス視点：クリックして操作 | Alt：カーソル | Esc：解除",
     "gameView.input.mouseLook": "マウス視点操作",
     "gameView.input.mouseLookHint": "スクリプト／三人称の視点操作：ゲームビューをクリックするとマウスをロックします。Alt を押している間はカーソルを解放し、Esc でロックを解除します。UI やストラテジーゲームではオフにしてください。",
     "gameView.notSet": "(未設定)",

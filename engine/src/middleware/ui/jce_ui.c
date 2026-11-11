@@ -253,6 +253,13 @@ bool jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
 
 /* ── Per-frame ─────────────────────────────────────────────────────── */
 
+void jce_ui_process_pointer_state(JceUIContext *ctx, float x, float y,
+                                  bool down, bool valid)
+{
+    if (!ctx) return;
+    jce_rml_process_pointer_state(ctx->backend, x, y, down, valid);
+}
+
 void jce_ui_process_input(JceUIContext *ctx, const JceInput *input)
 {
     if (!ctx) return;
@@ -274,6 +281,14 @@ void jce_ui_update(JceUIContext *ctx, float dt)
     if (!ctx) return;
     JCE_PROFILE_ZONE_N("UI::Update");
     jce_rml_update(ctx->backend, dt);
+    JCE_PROFILE_ZONE_END;
+}
+
+void jce_ui_render_view(JceUIContext *ctx, uint16_t view_id)
+{
+    if (!ctx) return;
+    JCE_PROFILE_ZONE_N("UI::RenderView");
+    jce_rml_render_view(ctx->backend, view_id);
     JCE_PROFILE_ZONE_END;
 }
 

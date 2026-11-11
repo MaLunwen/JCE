@@ -56,7 +56,12 @@ def _physfs_floor_configuration(conanfile, settings):
     else:
         if not _physfs_windows_desktop(conanfile, settings):
             return None
-        floor, config = _PHYSFS_FLOOR, _PHYSFS_FLOOR_CONFIG
+        # Windows on ARM64 starts at Windows 10. Keep the ARM64 profile's
+        # existing 0x0A00 compile floor; other desktop targets retain 0x0601.
+        # This is PhysFS-scoped, not a relaxation of all Conan flags.
+        floor, config = (("0x0A00", "directory-flags-arm64-v1")
+                         if str(settings.get_safe("arch")) == "armv8"
+                         else (_PHYSFS_FLOOR, _PHYSFS_FLOOR_CONFIG))
     for key, expected in ((_PHYSFS_FLOOR_CONF, floor), (_PHYSFS_FLOOR_CONFIG_CONF, config)):
         if conanfile.conf.get(key, default=expected) != expected:
             raise ValueError("PhysFS Windows floor conflicts with " + key)

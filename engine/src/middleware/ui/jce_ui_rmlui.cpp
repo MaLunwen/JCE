@@ -337,7 +337,7 @@ public:
                              scissor_w_, scissor_h_);
 
         bgfx_set_state(state, 0);
-        bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
+        bgfx_submit(view_id_, prog, 0, BGFX_DISCARD_ALL);
     }
 
     void ReleaseGeometry(Rml::CompiledGeometryHandle geometry) override
@@ -443,9 +443,11 @@ public:
     }
 
     void SetPak(JcePakArchive *pak) { pak_ = pak; }
+    void SetView(uint16_t view_id) { view_id_ = view_id; }
 
 private:
     JceRenderer *renderer_ = nullptr;
+    uint16_t view_id_ = JCE_VIEW_UI;
     JcePakArchive  *pak_      = nullptr;
 
     bool     scissor_enabled_ = false;
@@ -731,7 +733,18 @@ void jce_rml_elem_set_text(JceRmlBackend *b, uint32_t elem_idx,
 {
     if (!b || !text || elem_idx >= (uint32_t)b->elements.size()) return;
     Rml::Element *elem = b->elements[elem_idx];
-    if (elem) elem->SetInnerRML(text);
+    if (!elem) return;
+    /* SetInnerRML parses markup; the text API must escape it. The separate
+     * elem_set_inner_rml API is the explicitly trusted markup path. */
+    std::string safe;
+    for (const char *p = text; *p; ++p) {
+        if (*p == '&') safe += "&amp;";
+        else if (*p == '<') safe += "&lt;";
+        else if (*p == '>') safe += "&gt;";
+        else if (*p == '\n') safe += "<br/>";
+        else safe += *p;
+    }
+    elem->SetInnerRML(safe);
 }
 
 const char *jce_rml_elem_get_text(JceRmlBackend *b, uint32_t elem_idx)
@@ -1035,6 +1048,34 @@ void jce_rml_process_pointer_input(JceRmlBackend *b, const JceInput *input)
     }
 }
 
+void jce_rml_process_pointer_state(JceRmlBackend *b,
+                                    float x, float y, bool down, bool valid)
+{
+    if (!b || !b->context) return;
+    /* Invalid/off-panel pointers do not keep a stale hovered element, and
+     * a release after leaving the panel must not click the old target. */
+    if (!valid) {
+        /* Move OUT before releasing: releasing at the last hovered element
+         * can synthesize a click when the user actually released off panel. */
+        try { b->context->ProcessMouseMove(-10000, -10000, 0); }
+        catch (...) { LOG_ERROR(LOG_TAG, "viewport pointer leave threw"); }
+        if (b->pointer_down) {
+            try { b->context->ProcessMouseButtonUp(0, 0); }
+            catch (...) { LOG_ERROR(LOG_TAG, "viewport pointer release threw"); }
+        }
+        b->pointer_down = false;
+        return;
+    }
+    try {
+        b->context->ProcessMouseMove((int)x, (int)y, 0);
+        if (down && !b->pointer_down) b->context->ProcessMouseButtonDown(0, 0);
+        if (!down && b->pointer_down) b->context->ProcessMouseButtonUp(0, 0);
+        b->pointer_down = down;
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "viewport pointer dispatch threw");
+    }
+}
+
 void jce_rml_process_input(JceRmlBackend *b, const JceInput *input)
 {
     if (!b || !b->context || !input) return;
@@ -1095,6 +1136,14 @@ void jce_rml_render(JceRmlBackend *b)
         LOG_ERROR(LOG_TAG, "Context::Render threw unknown exception");
         return;
     }
+}
+
+void jce_rml_render_view(JceRmlBackend *b, uint16_t view_id)
+{
+    if (!b || !b->render_interface) return;
+    b->render_interface->SetView(view_id);
+    jce_rml_render(b);
+    b->render_interface->SetView(JCE_VIEW_UI);
 }
 
 void jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h)

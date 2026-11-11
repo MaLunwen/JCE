@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT held - cursor free]  release ALT to re-capture",
     "gameView.hud.clickToFly": "Click to enter FPS fly-cam (WASD/Space/Shift, Ctrl=boost, ALT=free, ESC=exit)",
     "gameView.hud.flyCaptured": "[FPS] WASD move | Space up | Shift down | Ctrl x5  (hold ALT to free cursor, ESC to exit)",
+    "gameView.hud.hintsToggle": "Hints",
+    "gameView.hud.mouseLookControls": "Mouse Look: click to focus | Alt: cursor | Esc: release",
     "gameView.input.mouseLook": "Mouse Look",
     "gameView.input.mouseLookHint": "Script/third-person mouse look: click Game View to lock. Hold Alt for the cursor; Esc releases. Turn off for UI or strategy games.",
     "gameView.notSet": "(not set)",

@@ -11,7 +11,7 @@
 - `engine_settings.rml`   — in-game settings UI (graphics tier, audio bus, input rebind).
 
 ## Rules
-1. **Engine-shipped, not game-owned.** Game projects extend by adding their own `.rml` to `examples/caged_kingdom/resources/ui/`.
+1. **Engine-shipped, not game-owned.** Game projects opt into document HUDs with `ui/hud.rml` and `ui/hud.bindings` under their authored `source_assets` root; packaged content resolves the same virtual keys.
 2. **Asset paths in RML use PhysFS-mounted paths** (e.g. `engine/ui/engine_debug_hud.rml`), NEVER absolute filesystem paths.
 3. **Style hierarchy**: shared `.rcss` lives under `engine/resources/ui/` (PAK'd); per-doc overrides inline.
 4. **i18n keys**: use `data-i18n="key"` attribute; runtime resolves via `jce_i18n_*`.

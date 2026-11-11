@@ -92,8 +92,8 @@ class SourcePinsGateTests(unittest.TestCase):
     def test_dist_effective_codec_switch_still_must_be_forced_off(self):
         name = "CMakeLists.txt"
         self.replace(name,
-                     "\tset(JCE_PATENTED_CODECS_ENABLED OFF)\nendif()\n\n# Assert",
-                     "\tset(JCE_PATENTED_CODECS_ENABLED ON)\nendif()\n\n# Assert")
+                     "\tendif()\n\tset(JCE_PATENTED_CODECS_ENABLED OFF)\nendif()",
+                     "\tendif()\n\tset(JCE_PATENTED_CODECS_ENABLED ON)\nendif()")
         self.gate(reason="CMakeLists.txt no longer forces JCE_PATENTED_CODECS_ENABLED OFF")
 
     def test_missing_acquisition(self):

@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT imeshikiliwa - kielekezi huru]  achilia ALT ili kunasa tena",
     "gameView.hud.clickToFly": "Bofya kuingia FPS fly-cam (WASD/Space/Shift, Ctrl=ongeza kasi, ALT=huru, ESC=toka)",
     "gameView.hud.flyCaptured": "[FPS] WASD hamisha | Space juu | Shift chini | Ctrl x5  (shikilia ALT kuachilia kielekezi, ESC kutoka)",
+    "gameView.hud.hintsToggle": "Vidokezo",
+    "gameView.hud.mouseLookControls": "Mwonekano wa panya: bofya | Alt: kishale | Esc: ondoka",
     "gameView.input.mouseLook": "Mwonekano wa kipanya",
     "gameView.input.mouseLookHint": "Mwonekano wa hati au mtu wa tatu: bofya mwonekano wa mchezo ili kufunga kipanya. Shikilia Alt kuachia kielekezi; Esc huondoa kufunga. Zima kwa kiolesura au michezo ya mkakati.",
     "gameView.notSet": "(haijawekwa)",

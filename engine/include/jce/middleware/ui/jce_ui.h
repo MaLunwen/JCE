@@ -183,11 +183,19 @@ JCE_API void jce_ui_process_input(JceUIContext *ctx, const JceInput *input);
    explicitly by the game or panel logic. */
 JCE_API void jce_ui_process_pointer_input(JceUIContext *ctx, const JceInput *input);
 
+/* Viewport-local primary pointer for embedded Game Views; coordinates are in
+ * the document's pixel coordinate system. Does not take a JceInput owner. */
+JCE_API void jce_ui_process_pointer_state(JceUIContext *ctx, float x, float y,
+                                          bool down, bool valid);
+
 /* Update document layout and animations. */
 JCE_API void jce_ui_update(JceUIContext *ctx, float dt);
 
 /* Render all visible documents.  Call during the render phase. */
 JCE_API void jce_ui_render(JceUIContext *ctx);
+/* Render to an already-configured bgfx overlay view (top-left orthographic,
+ * framebuffer and extent set by the host). For Editor Game View FBO parity. */
+JCE_API void jce_ui_render_view(JceUIContext *ctx, uint16_t view_id);
 
 /* Handle viewport resize. */
 JCE_API void jce_ui_resize(JceUIContext *ctx, uint32_t width, uint32_t height);

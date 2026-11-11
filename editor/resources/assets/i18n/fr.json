@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT enfoncée - curseur libre]  relâchez ALT pour recapturer",
     "gameView.hud.clickToFly": "Cliquez pour activer la caméra libre FPS (WASD/Espace/Maj, Ctrl=accélérer, ALT=libre, ÉCHAP=quitter)",
     "gameView.hud.flyCaptured": "[FPS] WASD déplacer | Espace monter | Maj descendre | Ctrl x5  (maintenez ALT pour libérer le curseur, ÉCHAP pour quitter)",
+    "gameView.hud.hintsToggle": "Conseils",
+    "gameView.hud.mouseLookControls": "Vue souris : cliquez pour viser | Alt : curseur | Échap : libérer",
     "gameView.input.mouseLook": "Vue à la souris",
     "gameView.input.mouseLookHint": "Vue par script ou à la troisième personne : cliquez dans la vue Jeu pour verrouiller la souris. Maintenez Alt pour libérer le curseur ; Échap quitte le verrouillage. Désactivez cette option pour les interfaces ou les jeux de stratégie.",
     "gameView.notSet": "(non défini)",

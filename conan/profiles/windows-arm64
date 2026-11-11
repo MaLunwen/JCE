@@ -15,4 +15,5 @@ compiler.runtime_type=Release
 # otherwise abort the build on MSVC ARM64 cross-compilation.
 tools.build:cflags=["/WX-", "/D_WIN32_WINNT=0x0A00"]
 tools.build:cxxflags=["/WX-", "/D_WIN32_WINNT=0x0A00"]
+ozz-animation/*:tools.build:cxxflags=["/WX-", "/D_WIN32_WINNT=0x0A00", "/wd4324"]
 # zeromq POLLER/IPC fix is handled by hook_zeromq_arm64_fix.py

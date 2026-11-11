@@ -68,7 +68,7 @@ def execute(test, code, negative=False):
         if not cxx:
             test.skipTest("No C++ compiler for exact Grass drawer controls")
         env, compiler = None, [cxx, "-std=c++20"]
-    base = ROOT / "build/grass-inspector-history-tests"
+    base = ROOT / "build/tests/grass-inspector-history-tests"
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=base) as temporary:
         directory = Path(temporary)

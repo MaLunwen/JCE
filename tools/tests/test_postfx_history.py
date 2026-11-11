@@ -125,7 +125,7 @@ int main(void)
  puts("PostFX history PASS");return 0;
 }
 '''
-        base = ROOT / "build/postfx-history-tests"
+        base = ROOT / "build/tests/postfx-history-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

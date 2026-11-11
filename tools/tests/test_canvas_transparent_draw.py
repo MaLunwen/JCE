@@ -85,7 +85,7 @@ int main(void)
  puts("transparent Canvas graphics PASS");return 0;
 }
 '''
-        base = ROOT / "build/canvas-transparent-tests"
+        base = ROOT / "build/tests/canvas-transparent-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)
@@ -189,7 +189,7 @@ int main(void)
  puts("transparent Canvas text owner PASS");return 0;
 }
 """
-        base = ROOT / "build/canvas-transparent-tests"
+        base = ROOT / "build/tests/canvas-transparent-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

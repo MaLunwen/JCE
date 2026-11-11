@@ -64,7 +64,7 @@ int main(void)
  puts("Bundle shader refs PASS");return 0;
 }
 '''
-        base = ROOT / "build/bundle-shader-tests"
+        base = ROOT / "build/tests/bundle-shader-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

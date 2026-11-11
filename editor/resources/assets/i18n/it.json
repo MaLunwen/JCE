@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT premuto - cursore libero]  rilascia ALT per ricatturare",
     "gameView.hud.clickToFly": "Fai clic per attivare la telecamera FPS (WASD/Space/Shift, Ctrl=boost, ALT=libero, ESC=esci)",
     "gameView.hud.flyCaptured": "[FPS] WASD muovi | Space su | Shift giù | Ctrl x5  (tieni ALT per liberare il cursore, ESC per uscire)",
+    "gameView.hud.hintsToggle": "Suggerimenti",
+    "gameView.hud.mouseLookControls": "Visuale mouse: clic per attivare | Alt: cursore | Esc: esci",
     "gameView.input.mouseLook": "Visuale con mouse",
     "gameView.input.mouseLookHint": "Visuale tramite script o in terza persona: fai clic nella vista Gioco per bloccare il mouse. Tieni premuto Alt per liberare il cursore; Esc sblocca. Disattiva per interfacce o giochi di strategia.",
     "gameView.notSet": "(non impostato)",

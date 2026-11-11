@@ -40,8 +40,8 @@ class EntryConsistencyTests(unittest.TestCase):
 
     def test_platform_args_are_forwarded_without_being_reinterpreted(self):
         driver = _driver()
-        for name, argv in (("web", ["D:/SDK path", "--dist", "--clean"]),
-                           ("android", ["D:/NDK path", "D:/SDK path", "arm64", "--clean"])):
+        for name, argv in (("web", [str(ROOT / "fixture SDK path"), "--dist", "--clean"]),
+                           ("android", [str(ROOT / "fixture NDK path"), str(ROOT / "fixture SDK path"), "arm64", "--clean"])):
             parser = driver.build_parser()
             args, unknown = parser.parse_known_args([name, *argv])
             self.assertEqual(args.cmd, name)

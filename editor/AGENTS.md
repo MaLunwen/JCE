@@ -54,6 +54,11 @@ editor/src/
 - [ ] Localize every label through `jce_editor_i18n.cpp`.
 - [ ] Wire any new state into `jce_editor_state.cpp` if it crosses panels.
 
+The optional Game View RmlUi document overlay reads `<source_assets>/ui/hud.rml`
+plus `ui/hud.bindings`, and displays scene component values without changing
+engine/editor ownership. Native pixels/input/PAK parity require device tests;
+old Canvas-only projects continue on their previous path.
+
 ## Common tasks
 
 | Task | Where |

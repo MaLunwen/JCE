@@ -36,6 +36,8 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -118,6 +120,8 @@ LINTS = [
     ("tools/tests/test_stock_shader_resolver.py", []),
     ("tools/tests/test_embed_stock_cmake.py", []),
     ("tools/tests/test_lint_stock_wrapper_input.py", []),
+    ("tools/tests/test_lint_realtime_v6.py", []),
+    ("tools/tests/test_lint_public_policy_v7_1.py", []),
     ("tools/tests/test_generated_output_defaults.py", []),
     ("tools/tests/test_i18n_pack_order.py", []),
     ("tools/tests/test_release_single_source.py", []),
@@ -410,12 +414,8 @@ LINTS = [
     # a month, and then the repository was made public.  The volatile half of
     # the README is generated now; this is what keeps it that way.
     "check_readme_facts.py",
-    # `git add -A` is one keystroke and a pushed commit is permanent. The
-    # unpublished AI authoring work lives under private/; this fails if any of
-    # it ever becomes tracked, AND if the .gitignore rule that keeps it out is
-    # ever removed -- checking only the effect would pass on a tree where the
-    # directory happens to be absent.
-    "check_private_tech_untracked.py",
+    # Public source layout and Git ignore boundaries are owned by the
+    # existing source-layout and repository-hygiene gates below.
     ("tools/lint/check_source_layout.py", ["--self-check"]),
     "check_source_layout.py",
     # The Automation API's tool surface: the tracked contract in
@@ -490,6 +490,8 @@ LINTS = [
     "check_editor_consumption.py",
     "check_skills.py",
     "check_test_window_discipline.py",
+    ("tools/tests/test_build_output_roots_v9.py", []),
+    ("tools/lint/check_build_output_roots.py", ["--check-existing"]),
     # The engine describes its components and so does tools/jce_scene_kit.py;
     # this asserts they describe the SAME ones.  Asking the engine needs a
     # built SDK, so on a checkout without one it reports SKIPPED rather than
@@ -552,15 +554,9 @@ _INTERPRETER_FAULTS = (
 )
 
 
-# Private suites are local additions, never prerequisites of the public core.
-_PRIVATE_DIR = REPO_ROOT / "private/tools/lint"
-_PRIVATE_CHECKS = ['check_ai_tooling.py', 'check_automation_contract.py', 'check_requirement_traceability.py', 'check_automation_write_declared.py', 'check_editor_automation_undo.py', 'check_no_ui_automation.py', 'check_introspection_parity.py']
-_PRIVATE_UNAVAILABLE: list[str] = []
-for _name in _PRIVATE_CHECKS:
-    if (_PRIVATE_DIR / _name).is_file():
-        LINTS.append(("private/tools/lint/" + _name, []))
-    else:
-        _PRIVATE_UNAVAILABLE.append(_name)
+# JCE_PUBLIC_LINT_V7_1: registered checks come from committed public source only.
+# Legacy private/ remains ignored local material, not a source or test provider.
+# Add new checks explicitly to the list above, using tracked public files.
 
 # ---------------------------------------------------------------------------
 #  A SECOND FAULT FAMILY, AND IT MUST NOT BE RETRIED.
@@ -722,7 +718,7 @@ def _crash_shaped(rc, out, skip_code):
 #
 # If a spurious failure recurs after this, the cache was not it, and that is
 # worth more than a guess that happened to be followed by quiet.
-def run_one(entry, *, stock_wrapper_exe: Path | None = None) -> tuple[str, int, str]:
+def run_one(entry, *, stock_wrapper_exe: Path | None = None, live_output: bool = False) -> tuple[str, int, str]:
     path, argv, label = resolve(entry, stock_wrapper_exe=stock_wrapper_exe)
     if not path.is_file():
         return label, 127, f"(skipped: {label} not found)"
@@ -740,8 +736,11 @@ def run_one(entry, *, stock_wrapper_exe: Path | None = None) -> tuple[str, int, 
         os.pathsep + inherited_pythonpath if inherited_pythonpath else "")
 
     def _spawn():
+        command = [sys.executable, str(path), *argv]
+        if live_output:
+            return _live_child(command, env, label)
         return subprocess.run(
-            [sys.executable, str(path), *argv],
+            command,
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -823,46 +822,129 @@ def write_transcript(results, failed):
         return None
 
 
+
+# JCE_LINT_REALTIME_V6: serial stage progress, heartbeat, optional live tee.
+def _progress_seconds(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError("progress interval must be a number") from error
+    if not 0 < parsed <= 3600:
+        raise argparse.ArgumentTypeError("progress interval must be within (0, 3600] seconds")
+    return parsed
+
+
+def _progress_default() -> float:
+    # The desktop driver and XP Editor use the same environment variable.
+    try:
+        return _progress_seconds(os.environ.get("JCE_BUILD_PROGRESS_INTERVAL", "12"))
+    except argparse.ArgumentTypeError:
+        return 12.0
+
+
+def _lint_outcome(code: int, output: str) -> str:
+    if code == 0:
+        return "PASS"
+    if code == EXIT_SKIPPED:
+        return "SKIP"
+    if code == 1 and _resource_matches(output):
+        return "NOT MEASURED -- the machine ran out, this is not a finding"
+    if code == 1:
+        return "FAIL (1)"
+    return f"CRASH ({code}) -- did not complete, this is not a finding"
+
+
+def _live_child(command: list[str], env: dict[str, str], label: str) -> subprocess.CompletedProcess:
+    """Optional output tee, retaining raw stdout/stderr for existing scoring.
+
+    Pump both pipes in threads so a noisy stderr cannot block stdout. This
+    mode is explicitly selected: normal CI remains quiet except for progress.
+    """
+    output: dict[str, list[bytes]] = {"stdout": [], "stderr": []}
+    lock = threading.Lock()
+    proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    def pump(kind: str, pipe) -> None:
+        with pipe:
+            for data in iter(lambda: pipe.readline(65536), b""):
+                output[kind].append(data)
+                line = data.decode("utf-8", "replace").rstrip("\r\n")
+                if line:
+                    with lock:
+                        message = f"[lint {kind}][{label}] {line}"
+                        try:
+                            print(message, flush=True)
+                        except UnicodeEncodeError:
+                            print(message.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
+    threads = [threading.Thread(target=pump, args=(kind, stream), daemon=True)
+               for kind, stream in (("stdout", proc.stdout), ("stderr", proc.stderr))]
+    for thread in threads:
+        thread.start()
+    try:
+        code = proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        for thread in threads:
+            thread.join()
+    return subprocess.CompletedProcess(command, code,
+        b"".join(output["stdout"]).decode("utf-8", "replace"),
+        b"".join(output["stderr"]).decode("utf-8", "replace"))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run all public source gates")
     parser.add_argument("--stock-wrapper-exe", type=stock_wrapper_path,
                         help="explicit native jce_bin2obj for actual stock CMake controls")
+    parser.add_argument("--progress-interval", type=_progress_seconds,
+                        default=_progress_default(), metavar="SECONDS",
+                        help="seconds between heartbeat messages (default: 12; also JCE_BUILD_PROGRESS_INTERVAL)")
+    parser.add_argument("--live-output", action="store_true",
+                        help="stream each child checker stdout/stderr; always retain full results")
     args = parser.parse_args(argv)
-    for name in _PRIVATE_UNAVAILABLE:
-        print("Private suite unavailable (not a PASS): " + name)
-    print(f"running {len(LINTS)} lint(s)...")
-    print("=" * 72)
+    total = len(LINTS)
+    print(f"running {total} lint(s)...", flush=True)
+    print("=" * 72, flush=True)
     results: list[tuple[str, int, str]] = []
-    for s in LINTS:
-        results.append(run_one(s, stock_wrapper_exe=args.stock_wrapper_exe))
+    for index, entry in enumerate(LINTS, 1):
+        label = resolve(entry, stock_wrapper_exe=args.stock_wrapper_exe)[2]
+        prefix = f"[lint {index}/{total}]"
+        print(f"{prefix} BEGIN {label}", flush=True)
+        started = time.monotonic()
+        finished = threading.Event()
+
+        def pulse() -> None:
+            while not finished.wait(args.progress_interval):
+                print(f"{prefix} RUNNING {label}; elapsed={time.monotonic()-started:.1f}s", flush=True)
+
+        heartbeat = threading.Thread(target=pulse, name="jce-lint-heartbeat", daemon=True)
+        heartbeat.start()
+        try:
+            if args.live_output:
+                name, code, output = run_one(entry, stock_wrapper_exe=args.stock_wrapper_exe,
+                                             live_output=True)
+            else:
+                name, code, output = run_one(entry, stock_wrapper_exe=args.stock_wrapper_exe)
+        except OSError as error:
+            # A launcher failure is NOT an inferred test failure; record that
+            # the checker could not run, and continue with independent checks.
+            name, code, output = label, 127, f"NOT_EXECUTED: subprocess launch failed: {error}"
+        finally:
+            finished.set()
+            heartbeat.join()
+        results.append((name, code, output))
+        elapsed = time.monotonic() - started
+        print(f"[{_lint_outcome(code, output)}] {name} ({index}/{total}, {elapsed:.1f}s)", flush=True)
+        if code not in (0, EXIT_SKIPPED):
+            # Short immediate clue without waiting for the end-of-suite transcript.
+            diagnostic = next((line.strip() for line in reversed(output.splitlines()) if line.strip()), "(no output)")
+            print(f"{prefix} DIAGNOSTIC {diagnostic[:300]}", flush=True)
 
     skipped = [(s, c, o) for (s, c, o) in results if c == EXIT_SKIPPED]
     failures = [(s, c, o) for (s, c, o) in results
                 if c != 0 and c != EXIT_SKIPPED]
-
-    for s, c, o in results:
-        if c == 0:
-            status = "PASS"
-        elif c == EXIT_SKIPPED:
-            status = "SKIP"
-        elif c == 1 and _resource_matches(o):
-            # exit 1 with a traceback is what an UNCAUGHT exception looks like,
-            # which is byte-identical to a checker that found something and
-            # exited 1 on purpose.  The text is the only thing that tells them
-            # apart, and getting it wrong sends a reader hunting for a defect
-            # in a gate that never ran.
-            status = "NOT MEASURED -- the machine ran out, this is not a finding"
-        elif c == 1:
-            status = "FAIL (1)"
-        else:
-            # A checker exits 1 when it finds a violation.  Anything else means
-            # it did not get to finish: an unhandled exception (2), a Windows
-            # access violation (3221225477 / 0xC0000005), a POSIX signal
-            # (128+N).  Those are NOT findings, and reporting them with the
-            # same word taught this session's reader that a checker had found
-            # something when it had in fact crashed before checking anything.
-            status = f"CRASH ({c}) -- did not complete, this is not a finding"
-        print(f"[{status}] {s}")
 
     if skipped:
         print("=" * 72)

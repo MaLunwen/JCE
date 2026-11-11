@@ -100,7 +100,7 @@ def execute_stock(test, code, negative=False, *, negative_exit=None, negative_ma
         if not cxx:
             test.skipTest("No C++ compiler for exact stock font controls")
         env, compiler = None, [cxx, "-std=c++20", "-I" + str(includes)]
-    base = ROOT / "build/host-font-selection-tests"
+    base = ROOT / "build/tests/host-font-selection-tests"
     base.mkdir(parents=True, exist_ok=True)
     with StockProbeDirectory(base) as temporary:
         directory = Path(temporary)
@@ -726,7 +726,7 @@ int main(void){
 class StockProbeCleanupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base = ROOT / "build/host-font-selection-tests"
+        cls.base = ROOT / "build/tests/host-font-selection-tests"
         cls.base.mkdir(parents=True, exist_ok=True)
 
     def holder(self, side_effect=None):

@@ -82,34 +82,28 @@ class LintStockWrapperInputTests(unittest.TestCase):
             self.assertIn("usage: rejected explicit subject", raw)
             self.assertIn(str(wrapper), label)
 
-    def test_absent_private_suites_are_reported_by_cli_only(self):
+    def test_public_lint_inventory_does_not_consume_legacy_private_directory(self):
+        # A local ignored tree cannot change the public CI inventory.
         spec = importlib.util.spec_from_file_location("jce_lint_public", SPEC.origin)
         runner = importlib.util.module_from_spec(spec)
         actual_is_file = Path.is_file
-        private_dir = ROOT / "private/tools/lint"
-
-        def public_is_file(path):
-            return path.parent != private_dir and actual_is_file(path)
-
-        import_stdout, import_stderr = io.StringIO(), io.StringIO()
-        with mock.patch.object(Path, "is_file", public_is_file), \
-             redirect_stdout(import_stdout), redirect_stderr(import_stderr):
+        legacy = ROOT / "private/tools/lint"
+        def fake_optional_local(path):
+            return True if path.parent == legacy else actual_is_file(path)
+        with mock.patch.object(Path, "is_file", fake_optional_local):
             spec.loader.exec_module(runner)
-        self.assertEqual(import_stdout.getvalue(), "")
-        self.assertEqual(import_stderr.getvalue(), "")
-        self.assertFalse(any(isinstance(entry, tuple) and entry[0].startswith("private/")
-                             for entry in runner.LINTS))
-
+        self.assertEqual(runner.LINTS, RUNNER.LINTS)
+        self.assertFalse(any("private/" in runner.resolve(entry)[2] for entry in runner.LINTS))
+        self.assertFalse(hasattr(runner, "_PRIVATE_CHECKS"))
+        self.assertFalse(hasattr(runner, "_PRIVATE_UNAVAILABLE"))
         with tempfile.TemporaryDirectory() as temporary:
             out = io.StringIO()
             with mock.patch.object(runner, "LINTS", []), \
-                 mock.patch.object(runner, "DEFAULT_LOG", Path(temporary) / "failure.log"), \
+                 mock.patch.object(runner, "DEFAULT_LOG", Path(temporary) / "old.log"), \
                  redirect_stdout(out):
                 self.assertEqual(runner.main([]), 0)
-        notices = [line for line in out.getvalue().splitlines()
-                   if line.startswith("Private suite unavailable")]
-        self.assertEqual(notices, ["Private suite unavailable (not a PASS): " + name
-                                   for name in runner._PRIVATE_CHECKS])
+        self.assertIn("running 0 lint(s)...", out.getvalue())
+        self.assertNotIn("Private suite unavailable", out.getvalue())
 
     def test_real_child_imports_repo_outside_cwd_and_preserves_caller_environment(self):
         # Import the actual runner by filename in an isolated Python process.

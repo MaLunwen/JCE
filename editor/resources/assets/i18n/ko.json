@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT 누름 - 커서 해제됨]  ALT를 놓으면 다시 캡처",
     "gameView.hud.clickToFly": "클릭하여 FPS 플라이 카메라 시작 (WASD/Space/Shift, Ctrl=가속, ALT=커서 해제, ESC=종료)",
     "gameView.hud.flyCaptured": "[FPS] WASD 이동 | Space 상승 | Shift 하강 | Ctrl x5  (ALT 누르면 커서 해제, ESC 종료)",
+    "gameView.hud.hintsToggle": "힌트",
+    "gameView.hud.mouseLookControls": "마우스 시점: 클릭해 조작 | Alt: 커서 | Esc: 해제",
     "gameView.input.mouseLook": "마우스 시점",
     "gameView.input.mouseLookHint": "스크립트/3인칭 시점: 게임 뷰를 클릭하면 마우스가 잠깁니다. Alt를 누르면 커서가 잠시 풀리고 Esc로 잠금을 해제합니다. UI 또는 전략 게임에서는 끄세요.",
     "gameView.notSet": "(설정되지 않음)",

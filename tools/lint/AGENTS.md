@@ -26,8 +26,10 @@ path; legacy reports/ history is not migrated or cleared. The prospective
 layout is contracts/build-output-layout.md. Actual Python path/log controls
 live in tools/tests/test_generated_output_defaults.py and run in this aggregate.
 
-run_all.py aggregates independent public gates. Private workflow suites are
-optional local additions and must be reported as unavailable when absent.
+run_all.py aggregates only explicitly registered, Git-tracked public gates.
+The existence or absence of legacy ignored private/ files cannot change the
+lint inventory or verdict. Public AI/automation code belongs in normal
+engine/, tools/ and tests/ owners with ordinary tests, not local gate discovery.
 The actual Game View resolver/selection controls and the consumer probe
 artifact/trace-validator controls are part of that public source aggregation.
 Their CPU results do not certify physical UI input or actual GPU transfers.
@@ -92,3 +94,13 @@ or adding an unused panel call. jce_fs_probe_read belongs to the Runtime
 implicit mixer-config resolution in jce_rt_audio.c; Editor Play supplies the
 explicit path authored by its Audio Mixer panel. The exemption does not claim
 a direct Editor metadata probe or actual runtime execution from lexical hits.
+
+## Generated build output owner (v9)
+
+The source-level and populated-root gate for generated build/ output is
+`tools/lint/check_build_output_roots.py` and its maintained authority is
+`contracts/build-output-roots.json`. Python compiler/probe tests must use
+`build/tests/<owned-probe-name>/`, not a new build/<probe>-tests/ top-level.
+New CMake/Conan, host, desktop and XP caches stay in their existing owners.
+Update both contract and negative tests before adding a new output root.
+No automated migration/deletion of build caches or audit evidence is allowed.

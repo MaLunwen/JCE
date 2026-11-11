@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[按住 ALT - 游標已釋放]  放開 ALT 重新捕捉",
     "gameView.hud.clickToFly": "點擊進入 FPS 飛行攝影機（WASD/Space/Shift，Ctrl=加速，ALT=釋放游標，ESC=退出）",
     "gameView.hud.flyCaptured": "[FPS] WASD 移動 | Space 上升 | Shift 下降 | Ctrl x5  （按住 ALT 釋放游標，ESC 退出）",
+    "gameView.hud.hintsToggle": "提示",
+    "gameView.hud.mouseLookControls": "滑鼠視角：點擊進入 | Alt：釋放游標 | Esc：退出捕捉",
     "gameView.input.mouseLook": "滑鼠視角",
     "gameView.input.mouseLookHint": "腳本或第三人稱視角：點擊遊戲視口以鎖定滑鼠。按住 Alt 暫時釋放，Esc 解除鎖定。介面或策略遊戲請關閉此項，使用自由游標。",
     "gameView.notSet": "(未設定)",

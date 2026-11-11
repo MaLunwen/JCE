@@ -53,7 +53,7 @@ int main(void)
 }
 '''
         harness = harness.replace('@ABSOLUTE_SHADER@', (ROOT / 'shaders/fs_test_dx11.bin').as_posix())
-        base = ROOT / "build/stock-shader-tests"
+        base = ROOT / "build/tests/stock-shader-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

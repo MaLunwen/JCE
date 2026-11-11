@@ -86,8 +86,11 @@ bool           jce_rml_load_font(JceRmlBackend *b, const char *pak_path);
 void           jce_rml_process_pointer_input(JceRmlBackend *b,
                                              const JceInput *input);
 void           jce_rml_process_input(JceRmlBackend *b, const JceInput *input);
+void           jce_rml_process_pointer_state(JceRmlBackend *b,
+                                             float x, float y, bool down, bool valid);
 void           jce_rml_update(JceRmlBackend *b, float dt);
 void           jce_rml_render(JceRmlBackend *b);
+void           jce_rml_render_view(JceRmlBackend *b, uint16_t view_id);
 void           jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h);
 
 /* ── DPI scaling ─────────────────────────────────────────────────────── */

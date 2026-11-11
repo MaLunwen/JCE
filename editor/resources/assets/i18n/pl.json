@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT wciśnięty - kursor wolny]  zwolnij ALT, aby ponownie przechwycić",
     "gameView.hud.clickToFly": "Kliknij, aby wejść w tryb kamery latającej FPS (WASD/Space/Shift, Ctrl=przyspieszenie, ALT=wolny, ESC=wyjście)",
     "gameView.hud.flyCaptured": "[FPS] WASD ruch | Space góra | Shift dół | Ctrl x5  (przytrzymaj ALT, aby zwolnić kursor, ESC aby wyjść)",
+    "gameView.hud.hintsToggle": "Wskazówki",
+    "gameView.hud.mouseLookControls": "Widok myszy: kliknij, by przejąć | Alt: kursor | Esc: zwolnij",
     "gameView.input.mouseLook": "Rozglądanie myszą",
     "gameView.input.mouseLookHint": "Widok skryptowy lub trzecioosobowy: kliknij widok gry, aby zablokować mysz. Przytrzymaj Alt, aby uwolnić kursor; Esc wyłącza blokadę. Wyłącz dla interfejsów i gier strategicznych.",
     "gameView.notSet": "(nie ustawiono)",

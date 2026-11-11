@@ -469,3 +469,5 @@ jce_scene_has_trigger_volume            # TriggerVolume presence via the Scene c
 
 jce_scene_has_water_normal_detail # Inspector presence uses jce_scene_has_comp through the registered WaterNormalDetail has callback; the drawer and Add Component call getter/setter/default directly.
 jce_scene_remove_water_normal_detail # Editor component removal and history use jce_scene_remove_comp through the registered WaterNormalDetail remove callback.
+jce_ui_process_pointer_state  # Editor Game View uses this only through application/jce_rml_scene_overlay.h; explicit pixel coordinates are provided by the host, not authored in an Inspector.
+jce_ui_render_view  # Host-adapter render dispatch for an already-configured Editor offscreen bgfx target; the Editor authors the RML document and must not issue a second draw.

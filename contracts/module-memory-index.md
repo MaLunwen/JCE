@@ -484,8 +484,10 @@ regression: tests/os/platform/test_jce_library.c and its sibling DLL fixtures.
 
 Public ownership and ignore boundaries: [source-layout.json](source-layout.json).
 Public skill: [JCE en-US](../skills/jce/SKILL.md);
-[zh-CN translation](../skills/jce-zh-cn/SKILL.md). Locale inventory: [skill-locales.json](skill-locales.json). `docs/`, `.docs/` and `private/`
-are local-only and are not required by public source checks or builds.
+[zh-CN translation](../skills/jce-zh-cn/SKILL.md). Locale inventory: [skill-locales.json](skill-locales.json). `docs/`, `.docs/`, and the retired ignored `private/` are local-only;
+they never supply public checks or build inputs. Review any relevant old
+implementation and place it under the ordinary public engine/, tools/, or
+tests/ owner before staging and committing it.
 
 Shared editor/Player stress fixtures: engine/src/middleware/scene/jce_scene_stress*.c;
 public API: engine/include/jce/middleware/scene/jce_scene_stress.h.
@@ -1864,3 +1866,8 @@ after unsuccessful geometry SSR. `scene/jce_sr_water_optics.c` owns the private
 sky-success vec4 lifecycle and per-viewport reset; `jce_sr_environment.c`
 publishes actual sky-submit success. Existing colour/depth resources are reused;
 this is neither offscreen IBL nor proof beyond the finite geometry march.
+
+Optional document HUD overlay: engine/include/jce/application/jce_rml_scene_overlay.h
+maps scene component values to RML element ids through an opt-in, project-owned
+ui/hud.bindings manifest. Editor Game View uses its own offscreen render view;
+the default host uses the backbuffer UI view. Legacy scenes remain unchanged.

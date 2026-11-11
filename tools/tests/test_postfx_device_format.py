@@ -48,7 +48,7 @@ int main(void)
  puts("PostFX device format PASS"); return 0;
 }
 '''
-        base = ROOT / "build/postfx-format-tests"
+        base = ROOT / "build/tests/postfx-format-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

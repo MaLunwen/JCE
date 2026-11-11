@@ -346,7 +346,7 @@ def execute(test, mutation=None, *, xp=False):
             test.skipTest("No C++ compiler for actual Game View backend controls")
         env, compiler = None, [cxx, "-std=c++20"]
         includes = ["-I", str(ROOT / "engine/include"), "-I", str(ROOT / "editor/src")]
-    base = ROOT / "build/game-view-backend-tests"
+    base = ROOT / "build/tests/game-view-backend-tests"
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=base) as temporary:
         directory = Path(temporary)

@@ -4,9 +4,7 @@
     "docs/",
     ".docs/"
   ],
-  "private_roots": [
-    "private/"
-  ],
+  "private_roots": [],
   "automated_implementations": [
     "tools/build/",
     "tools/lint/",
@@ -24,11 +22,7 @@
     "scripts/android/app/src/main/java/org/app/"
   ],
   "private_implementation_roots": [
-    "private/",
-    "engine/src/middleware/ai_dispatch/",
-    "tests/middleware/ai_dispatch/",
-    "tools/ai/",
-    "tools/automation/"
+    "private/"
   ],
   "consumer_regressions": "tests/consumers/<project>/"
 }

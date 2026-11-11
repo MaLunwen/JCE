@@ -452,6 +452,7 @@ class NativeEditorDispatchTests(unittest.TestCase):
              patch.object(driver, "DRY_RUN", True), \
              patch.object(driver, "resolve_target", return_value=target), \
              patch.object(driver, "msvc_env", return_value={}), \
+             patch.object(driver, "HOST", target["host"]), \
              patch.object(driver, "_standalone_module", return_value=owner):
             for options in ([], ["--standalone"], ["--delivery-profile", "authoring", "--standalone"]):
                 args = parser.parse_args(["editor", *options])

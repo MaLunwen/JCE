@@ -45,7 +45,20 @@ def self_check():
         (root / "contracts/source-layout.json").write_bytes((ROOT / "contracts/source-layout.json").read_bytes())
         git(root, "add", "contracts/source-layout.json")
         assert not violations(root)
-        for path in ["docs/local.md", "private/algorithm.py", "engine/src/renderer/internal/stb_image.h", "contracts/media-verification-2026-09-29.md", "scripts/bad.py"]:
+        # Ordinary public implementation directories have no special ban.
+        for path in ("engine/src/middleware/ai_dispatch/provider.c",
+                     "tests/middleware/ai_dispatch/probe.c",
+                     "tools/ai/operation.py", "tools/automation/workflow.py"):
+            q = root / path
+            q.parent.mkdir(parents=True, exist_ok=True)
+            q.write_text("sample\n", encoding="utf-8")
+            git(root, "add", path)
+            assert not violations(root), path
+        # Legacy private content is local scratch, not a publishable source
+        # tree. Move only reviewed work into ordinary public directories.
+        for path in ("docs/local.md", "private/algorithm.py",
+                     "engine/src/renderer/internal/stb_image.h",
+                     "contracts/media-verification-2026-09-29.md", "scripts/bad.py"):
             q = root / path
             q.parent.mkdir(parents=True, exist_ok=True)
             q.write_text("sample\n", encoding="utf-8")
@@ -53,7 +66,7 @@ def self_check():
             assert violations(root), path
             git(root, "rm", "--cached", "--", path)
         assert not violations(root)
-    print("source-layout self-check: PASS (5 negative controls)")
+    print("source-layout self-check: PASS (4 public roots, 5 negative controls)")
 
 
 def main():

@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT удерживается — курсор свободен]  отпустите ALT для повторного захвата",
     "gameView.hud.clickToFly": "Нажмите для входа в режим FPS-облёта (WASD/Space/Shift, Ctrl=ускорение, ALT=свободно, ESC=выход)",
     "gameView.hud.flyCaptured": "[FPS] WASD движение | Space вверх | Shift вниз | Ctrl x5  (удерживайте ALT для свободного курсора, ESC для выхода)",
+    "gameView.hud.hintsToggle": "Подсказки",
+    "gameView.hud.mouseLookControls": "Обзор мышью: нажмите для ввода | Alt: курсор | Esc: выход",
     "gameView.input.mouseLook": "Обзор мышью",
     "gameView.input.mouseLookHint": "Обзор скриптом или от третьего лица: щёлкните окно игры, чтобы захватить мышь. Удерживайте Alt для курсора; Esc снимает захват. Отключите для интерфейсов и стратегий.",
     "gameView.notSet": "(не задано)",

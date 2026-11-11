@@ -902,7 +902,7 @@ class PhysFsWindowsFloorTests(unittest.TestCase):
         except ModuleNotFoundError:
             raise unittest.SkipTest("installed Conan flag block unavailable")
         toolchain = SimpleNamespace(generator="Ninja", extra_cxxflags=[], extra_cflags=[],
-                                    extra_sharedlinkflags=[], extra_exelinkflags=[])
+                                    extra_asmflags=[], extra_sharedlinkflags=[], extra_exelinkflags=[])
         rendered = ExtraFlagsBlock(owner, toolchain, "extra_flags").get_rendered_content()
         self.assertIn('add_compile_definitions(', rendered)
         self.assertIn('_WIN32_WINNT=0x0601', rendered)

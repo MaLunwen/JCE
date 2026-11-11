@@ -139,10 +139,16 @@ def pe_imports(exe: Path) -> list[str]:
     return sorted({row["dll"] for row in _pe_import_records(exe.read_bytes())})
 
 
-def verify(exe: Path, *, require_gui: bool = False) -> dict:
+def verify(exe: Path, *, require_gui: bool = False,
+           windows_api_floor: int = 7, expected_machine: int | None = None) -> dict:
+    if windows_api_floor not in (7, 10):
+        raise ValueError("unsupported declared Windows API floor")
     blob = exe.read_bytes()
     records = _pe_import_records(blob)
     pe_offset, = struct.unpack_from("<I", blob, 0x3c)
+    machine, = struct.unpack_from("<H", blob, pe_offset + 4)
+    if expected_machine is not None and machine != expected_machine:
+        raise ValueError(f"editor PE architecture mismatch: 0x{machine:04x} != 0x{expected_machine:04x}")
     subsystem, = struct.unpack_from("<H", blob, pe_offset + 24 + 68)
     if require_gui and subsystem != 2:
         raise ValueError("editor delivery requires a Windows GUI executable (PE subsystem 2)")
@@ -154,17 +160,21 @@ def verify(exe: Path, *, require_gui: bool = False) -> dict:
                   name.startswith(("api-ms-win-core-", "ext-ms-win-")))]
     if forbidden:
         raise ValueError("single EXE still requires external DLLs: " + ", ".join(forbidden))
-    unsupported = sorted({row["dll"] + "!" + symbol
-                          for row in records for symbol in row["symbols"]
-                          if isinstance(symbol, str) and symbol in POST_WINDOWS7_IMPORTS})
-    if unsupported:
-        raise ValueError("Windows 7 target requires unavailable imported APIs: " + ", ".join(unsupported))
+    if windows_api_floor == 7:
+        unsupported = sorted({row["dll"] + "!" + symbol
+                              for row in records for symbol in row["symbols"]
+                              if isinstance(symbol, str) and symbol in POST_WINDOWS7_IMPORTS})
+        if unsupported:
+            raise ValueError("Windows 7 target requires unavailable imported APIs: " + ", ".join(unsupported))
     ordinals = [{"dll": row["dll"], "kind": row["kind"], "ordinal": symbol}
                 for row in records for symbol in row["symbols"] if isinstance(symbol, int)]
     return {"delivery": "native-single-exe", "exe_bytes": len(blob), "pe_subsystem": subsystem,
+            "pe_machine": f"0x{machine:04x}",
             "sha256": hashlib.sha256(blob).hexdigest(), "imports": imports,
             "windows_api_admission": {
-                "minimum_target": "Windows 7", "coverage": "known post-Windows-7 names only",
+                "minimum_target": f"Windows {windows_api_floor}",
+                "coverage": ("known post-Windows-7 names only" if windows_api_floor == 7
+                             else "Windows 10 floor; complete API availability NOT VERIFIED"),
                 "checked_names": sorted(POST_WINDOWS7_IMPORTS),
                 "named_import_count": sum(isinstance(symbol, str) for row in records for symbol in row["symbols"]),
                 "ordinal_imports": ordinals, "ordinal_api_floor": "unknown" if ordinals else "not applicable"},
@@ -174,6 +184,18 @@ def verify(exe: Path, *, require_gui: bool = False) -> dict:
             "project_modules_embedded": False,
             "external_language_build": ["python", "java", "csharp"],
             "sdk_embedded": False, "self_extracting": False}
+
+
+def verify_editor_target(exe: Path, variant: str, target: dict) -> dict:
+    """Architecture-strict, static-import audited producer receipt; no target execution."""
+    if target["host"] != "windows":
+        raise ValueError("Windows PE target required for native editor verification")
+    machines = {"x86_64": 0x8664, "i686": 0x014c, "aarch64": 0xaa64}
+    expected = machines.get(target["arch"])
+    if expected is None:
+        raise ValueError("unsupported Windows editor target architecture")
+    return verify(exe, require_gui=variant == "dist", expected_machine=expected,
+                  windows_api_floor=10 if expected == 0xaa64 else 7)
 
 
 def verify_assets(exe: Path, build: Path) -> dict:
@@ -463,18 +485,11 @@ def guard_cache_clean(paths, allowed_root: Path, *, entry_budget: int = 100000,
 
 def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None, plan=None) -> Path:
     """Isolated static dependency closure; never relabel a dynamic-CRT build."""
-    # An x86 Windows target is runnable on an x64 Windows build host through
-    # WOW64. Keep rejecting cross targets that cannot execute their generated
-    # build-time tools on the host (notably Windows ARM64).
-    wow64_runnable_x86 = (
-        target["host"] == driver.HOST == "windows"
-        and driver.host_arch() == "x86_64"
-        and target["arch"] == "i686"
-    )
-    if target["host"] != driver.HOST or (
-        target.get("cross") and not wow64_runnable_x86
-    ):
-        driver.die("embedded delivery needs the matching native host toolchain")
+    # Cross-architecture single-EXE builds are permitted on the same OS host.
+    # Build-time executables must be built for the BUILD host and pinned below.
+    # An explicit different-OS target needs a separately configured toolchain.
+    if target["host"] != driver.HOST:
+        driver.die("embedded delivery requires a supported host OS toolchain")
     if args.variant not in ("release", "dist"):
         driver.die("embedded delivery supports release/dist; use authoring for debug")
     if getattr(args, "script_java", False):
@@ -508,6 +523,10 @@ def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None, p
                     "-c:a", "tools.build:jobs=" + driver.build_jobs(env),
                     "--build=missing", "--output-folder", str(conan),
                     *bgfx_args, *flags], cwd=driver.ROOT, env=env)
+        # A cross target cannot execute its own asset tools. Build and pin
+        # native PAK/COFF wrappers, instead of executing ARM64 code on x64.
+        cross_asset_flags = (driver.cross_asset_tool_overrides(env)
+                             if target.get("cross") else [])
         # shaderc runs on the *build* host, even when the editor targets x86.
         # Without an explicit -D below CMake may silently create empty
         # CompileShaders targets, followed by a late PAK enumeration failure.
@@ -555,6 +574,7 @@ def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None, p
                 *(["-DJCE_EMBED_ENGINE_SHADERS=" + plan["shaders"]] if plan else []),
                 "-DJCE_ENABLE_AI_DISPATCH=OFF", "-DJCE_ENABLE_RENDERDOC=OFF",
                 "-DJCE_ENABLE_CPPCHECK=OFF", "-DJCE_BUILD_TESTS=OFF", "-DJCE_EMIT_LINK_MAP=ON",
+                *cross_asset_flags,
                 *([f"-DJCE_SHADERC_EXECUTABLE={shaderc}"] if shaderc else [])],
                cwd=driver.ROOT, env=env)
         # Catch CMake's disabled-shader case before Ninja tries packing a
@@ -637,7 +657,7 @@ def build_editor(driver, args, target: dict, env: dict) -> Path:
     if not driver.DRY_RUN:
         driver._assert_no_profiler_listener(exe, args.variant)
         if target["host"] == "windows":
-            report = verify(exe, require_gui=args.variant == "dist")
+            report = verify_editor_target(exe, args.variant, target)
             report["embedded_assets"] = verify_assets(exe, build)
             report["embedded_notices"] = verify_notices(exe, driver.ROOT)
         else:
@@ -710,7 +730,7 @@ def package_editor(driver, args) -> None:
         return
     if target["host"] != "windows":
         driver.die("embedded artifact built, but non-Windows dependency/relocation audit is not implemented; refusing unverified shipment")
-    report = verify(exe, require_gui=args.variant == "dist")
+    report = verify_editor_target(exe, args.variant, target)
     report["embedded_assets"] = verify_assets(exe, build)
     report["embedded_notices"] = verify_notices(exe, driver.ROOT)
     driver._assert_no_profiler_listener(exe, args.variant)

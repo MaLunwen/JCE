@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT mantenido - cursor libre]  suelta ALT para volver a capturar",
     "gameView.hud.clickToFly": "Haz clic para entrar en la cámara libre FPS (WASD/Space/Shift, Ctrl=impulso, ALT=libre, ESC=salir)",
     "gameView.hud.flyCaptured": "[FPS] WASD mover | Space subir | Shift bajar | Ctrl x5  (mantén ALT para liberar el cursor, ESC para salir)",
+    "gameView.hud.hintsToggle": "Consejos",
+    "gameView.hud.mouseLookControls": "Vista con ratón: clic para enfocar | Alt: cursor | Esc: soltar",
     "gameView.input.mouseLook": "Vista con ratón",
     "gameView.input.mouseLookHint": "Vista por script o en tercera persona: haz clic en la vista de juego para bloquear el ratón. Mantén Alt para liberar el cursor; Esc sale del bloqueo. Desactívalo para interfaces o juegos de estrategia.",
     "gameView.notSet": "(sin definir)",

@@ -433,7 +433,7 @@ int main(void)
     return 0;
 }
 '''
-        base = ROOT / "build/shader-deferred-tests"
+        base = ROOT / "build/tests/shader-deferred-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

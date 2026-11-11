@@ -126,3 +126,59 @@ recompile. Remove historical trees only after separate user-directed review.
 The XP `receipt.json`, optional real-time progress and guest compatibility qualification
 remain separate; consistent folder names are NOT evidence of successful builds
 or XP VM execution.
+
+## Build top-level ownership and test-root consolidation (v0.14.1 v9)
+
+The machine-readable authority for build/ top-level entries and the registered
+Python probe producers is `contracts/build-output-roots.json`. The source gate is
+`tools/lint/check_build_output_roots.py`; run it with `--check-existing` to
+inspect a populated local build tree. The same check is in the public Lint
+aggregate, after ordinary tests run, so unregistered top-level paths no longer
+silently accumulate.
+
+### Canonical generated tree
+
+```
+build/
+  .locks/                     shared process locks (never remove while in use)
+  host/                       native host CMake and its tools/
+  host-conan/                 host dependency generators
+  desktop/<target>/           MSVC/LLVM/Linux/macOS native target owner
+    obj/<variant>/            CMake/Ninja objects
+    conan/<variant>/          variant-specific Conan generators
+    <variant>/                built editor, e.g. jce_editor.exe
+  compat/                     LLVM-MinGW-XP and legacy platform caches
+  conan-config/               managed Conan hook/config overlays
+  shader-cache/               content-addressed shader cache
+  automation/                 editor/game automation runtime state
+  tests/<probe>-tests/        temporary test compiler and source workspaces
+  tests/_legacy/              moved prior top-level test work (manual review)
+  validation/                 receipts, logs, source backups, benchmarks
+  reports/                    current diagnostics, not compiled output
+  sdk/, web/, android/        other explicitly selected platform outputs
+```
+
+The v9 change is deliberately limited to *test workspace producers*.
+Do not relocate `host/`, `host-conan/`, `desktop/`, `compat/`, `conan-config/`,
+`shader-cache/`, `automation/`, `.locks/`, or a `CMakeCache.txt` by renaming
+its parent: CMake/Conan and SDK receipt identities include absolute paths.
+Nor does v9 change final `dist/` deliverables. The root set includes
+only explicit platform owners known to the contract; a new owner must add
+its definition and negative control before creating an additional top level.
+
+### Migration and retention
+
+The installer supports explicit `--organize-existing` on an idle checkout.
+It inspects all existing *top-level* `build/*-tests` directories; empty roots
+are removed, nonempty roots are moved without overwriting into
+`build/tests/_legacy/<original-name>/`. Links and Windows reparse points
+are refused. The historical data is not claimed safe to delete and no
+compiler/process is terminated. Review retained files yourself later.
+The default installer does not migrate any data. All build source files are
+backed up in `build/validation/build-layout-v9/source-backups/` before changes.
+
+Public Lint checks both static producer locations and the populated build root.
+A fresh clone with no build/ directory passes this layout gate without inventing
+or creating output. Native build, Python tests, ABI audit, and real XP guest
+execution are distinct verifications; this directory policy certifies none of
+them by itself.

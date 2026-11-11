@@ -39,6 +39,7 @@ extern "C" {
 #include <jce/renderer/jce_views.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
+#include <jce/application/jce_rml_scene_overlay.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/os/core/jce_filesystem.h>          /* active FS policy */
 #include <jce/os/platform/jce_input.h>
@@ -48,6 +49,7 @@ extern "C" {
 
 #include <cmath>
 #include <cstdlib>   /* getenv — JCE_KPI_OCCLUSION_LOG forensic toggle */
+#include <string>
 
 #define LOG_TAG "game_render"
 
@@ -103,6 +105,10 @@ struct GameRenderState {
     /* ECS-UI (Canvas) renderer — draws Canvas/UIImage/UIText/UIButton on
      * top of the game view and hit-tests the pointer. */
     JceUICanvas           *ui_canvas         = nullptr;
+    const JcePakArchive    *rml_pak           = nullptr;
+    JceRmlSceneOverlay     rml_overlay        = {};
+    std::string            rml_assets_root;
+    bool                   rml_checked        = false;
     JceUIPointer           ui_pointer        = {};
     /* OS text-input enable mirror: true while an InputField is focused so we
      * only toggle jce_window_start/stop_text_input on a focus-state change. */
@@ -190,6 +196,7 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
 
     g.renderer = renderer;
     g.window   = window;
+    g.rml_pak  = pak;
     JceGfxCaps caps = jce_gfx_caps();
     g.homogeneous_depth = caps.homogeneous_depth;
 
@@ -318,6 +325,10 @@ void jce_editor_game_render_shutdown(void)
         jce_occlusion_culler_destroy(g.occlusion_culler);
         g.occlusion_culler = nullptr;
     }
+    jce_rml_scene_overlay_close(&g.rml_overlay);
+    g.rml_assets_root.clear();
+    g.rml_checked = false;
+    g.rml_pak = nullptr;
     if (g.ui_canvas) { jce_ui_canvas_destroy(g.ui_canvas); g.ui_canvas = nullptr; }
     if (g.bridge) { jce_offscreen_target_destroy(g.bridge); g.bridge = nullptr; }
     jce_editor_game_render_end_play_camera();
@@ -995,6 +1006,38 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         jce_ui_canvas_set_default_font(proj ? proj->ui_default_font : nullptr);
         jce_ui_canvas_set_font_fallbacks(proj ? proj->ui_font_fallbacks
                                             : nullptr);
+
+        /* Optional DOCUMENT UI: projects opt in with assets/ui/hud.rml and
+         * hud.bindings. Native RmlUi renders on the Game View FBO, sharing the
+         * already-authoritative scene state (UIText/UIProgressBar values).
+         * This remains editor-owned; no CK-specific code enters engine. */
+        const std::string next_root = isolated ? std::string() : paths.particle_asset_root;
+        if (g.rml_assets_root != next_root) {
+            jce_rml_scene_overlay_close(&g.rml_overlay);
+            g.rml_assets_root = next_root;
+            g.rml_checked = false;
+        }
+        if (!g.rml_checked && !g.rml_assets_root.empty()) {
+            g.rml_checked = true;
+            const std::string doc_path = g.rml_assets_root + "/ui/hud.rml";
+            const std::string map_path = g.rml_assets_root + "/ui/hud.bindings";
+            if (jce_fs_host_exists_file(doc_path.c_str()) &&
+                jce_fs_host_exists_file(map_path.c_str())) {
+                uint64_t ndoc = 0, nmap = 0;
+                void *rml = jce_fs_host_read_all(doc_path.c_str(), &ndoc);
+                void *map = jce_fs_host_read_all(map_path.c_str(), &nmap);
+                if (rml && map && ndoc <= 1024u * 1024u && nmap <= 8192u &&
+                    jce_rml_scene_overlay_open(&g.rml_overlay,g.renderer,
+                        (JcePakArchive *)g.rml_pak,(const char *)rml,(size_t)ndoc,
+                        (const char *)map,(size_t)nmap,render_w,render_h)) {
+                    LOG_INFO(LOG_TAG,"[rml] scene document UI loaded from project assets");
+                } else {
+                    LOG_WARN(LOG_TAG,"[rml] UI document/bindings refused; check assets/ui");
+                }
+                jce_fs_buffer_free(rml);
+                jce_fs_buffer_free(map);
+            }
+        }
     }
 
     /* Game view always uses the shipped "shaded" pipeline — no debug
@@ -1277,6 +1320,11 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
          * Game view's text is softer than the player's will be. */
         jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,
                              (float)render_w, (float)render_h, ptr, render_dt);
+        if (g.rml_overlay.ui) {
+            jce_rml_scene_overlay_frame(&g.rml_overlay,scene,ui_view,
+                render_w,render_h,render_dt,g.ui_pointer.valid,
+                g.ui_pointer.x,g.ui_pointer.y,g.ui_pointer.down,nullptr);
+        }
 
         /* OS text-input follows InputField focus: start SDL text input only
          * when a field becomes focused, stop it when focus clears.  Toggle on

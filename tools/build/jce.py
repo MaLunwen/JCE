@@ -355,7 +355,7 @@ def find_vs_install(target_arch: str | None = None) -> Path | None:
     for vs in installs:
         if _vs_has_arch_cl(vs, target_arch, want_toolset=False):
             return vs
-    return installs[0] if installs else None
+    return None if target_arch else (installs[0] if installs else None)
 
 
 def find_vcvars(target_arch: str | None = None) -> Path | None:
@@ -394,6 +394,9 @@ def msvc_env(t: dict) -> dict:
         return _MSVC_ENV_CACHE[arch]
     vc = find_vcvars(t["arch"])
     if not vc:
+        if t["cross"]:
+            die("cross-compile refused: target MSVC vcvarsall.bat is missing; "
+                "install matching ARM64 build tools and Windows SDK")
         log("WARN: vcvarsall.bat not found; relying on current PATH for cl/link.")
         _MSVC_ENV_CACHE[arch] = dict(os.environ)
         return _MSVC_ENV_CACHE[arch]
@@ -435,6 +438,20 @@ def msvc_env(t: dict) -> dict:
     if not _msvc_env_ready(env):
         die(f"vcvarsall.bat did not produce a complete MSVC environment for "
             f"'{arch}' (cl/INCLUDE/LIB required).")
+    if t["arch"] == "aarch64":
+        # Target name, active tools and linker must all agree. This guard does
+        # NOT certify package ABIs or a successful ARM64 compilation.
+        target_arch = env.get("VSCMD_ARG_TGT_ARCH", "").lower()
+        resolved_cl = shutil.which("cl.exe", path=env.get("PATH", ""))
+        resolved_link = shutil.which("link.exe", path=env.get("PATH", ""))
+        def _arm64_tool(value, executable):
+            return bool(value and
+                str(value).replace("\\", "/").lower().endswith("/arm64/" + executable))
+        if (target_arch != "arm64" or
+            not _arm64_tool(resolved_cl, "cl.exe") or
+            not _arm64_tool(resolved_link, "link.exe")):
+            die("ARM64 MSVC environment refused: VSCMD target and cl/link paths "
+                "must be ARM64; x64 fallback is not permitted")
     _MSVC_ENV_CACHE[arch] = env
     return _MSVC_ENV_CACHE[arch]
 
@@ -631,7 +648,12 @@ def _editor_cache_paths(values):
         driver = argparse.Namespace(**globals())
         plan = owner.native_cache_plan(driver, args, target)
         args._native_cache_plan = plan
-        return [plan["build"], plan["conan"], owner.editor_artifact_dir(driver, args, target)]
+        return [
+            plan["build"],
+            plan["conan"],
+            owner.editor_artifact_dir(driver, args, target),
+            *(_host_cache_paths() if target.get("cross") else []),
+        ]
     tree, output = _authoring_editor_paths(target, args.variant)
     override = getattr(args, "artifact_dir", None)
     host_tools = _host_cache_paths() if target.get("cross") or target.get("emscripten") else []

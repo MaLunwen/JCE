@@ -35,7 +35,7 @@ def execute(test, code, expected_runtime_failure=None):
     spec = importlib.util.spec_from_file_location("material_cleanup_driver", ROOT / "tools/build/jce.py")
     driver = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(driver)
-    base = ROOT / "build/material-cleanup-tests"
+    base = ROOT / "build/tests/material-cleanup-tests"
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=base) as temporary:
         directory = Path(temporary)

@@ -46,7 +46,7 @@ class RendererCleanupTests(unittest.TestCase):
             "cleanup(&r);assert(programs==3&&uniforms==4);memset(&r,255,sizeof r);",
             "cleanup(&r);assert(programs==3&&uniforms==4);puts(\"Renderer owned cleanup PASS\");return 0;}"
         ])
-        base = ROOT / "build/renderer-cleanup-tests"
+        base = ROOT / "build/tests/renderer-cleanup-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

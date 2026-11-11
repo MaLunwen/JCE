@@ -30,9 +30,13 @@
      addresses per entity. It is the only one with entities, prefabs,
      serialization and the per-entity script bridge — the editor authors nine
      widget types on it.
-   - **RmlUI** (`jce_ui.h`) owns DOCUMENT UI: front-end shell, settings, menus,
-     anything needing flow/flex layout or CSS cascade. It is the only one with a
-     real layout engine.
+   - **RmlUI** (`jce_ui.h`) owns DOCUMENT UI: front-end shell, settings,
+     menus, and opt-in document HUDs using flow/flex layout or CSS cascade.
+     The optional application-level `jce_rml_scene_overlay.h` binds authored
+     document values to SCENE UI components by a project-owned tag manifest.
+     Existing ECS Canvas widgets remain authoritative for Lua/state and legacy
+     projects; the document is a presentation, never a second gameplay state.
+     RmlUi does not run browser JavaScript.
    This rule previously read "RmlUI is the GAME UI framework", which contradicted
    both the editor wiring and the script API. Neither system can take the
    other's job without becoming it; that is why both ship.

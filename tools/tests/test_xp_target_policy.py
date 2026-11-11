@@ -172,7 +172,7 @@ class XpCliTests(unittest.TestCase):
                 (["--variant", "release", "--patented-codecs", "off"], "release", "off"),
                 (["--variant", "dist", "--patented-codecs", "on"], "dist", "on")):
             with self.subTest(args=args), patch.object(driver, "_run_xp_tool") as run:
-                driver.main(["xp-editor", "--toolchain-root", "C:/xp-fixture", *args])
+                driver.main(["xp-editor", "--toolchain-root", str(ROOT / "fixtures/xp-toolchain"), *args])
                 command = run.call_args.args[1]
                 self.assertEqual(command[command.index("--variant") + 1], variant)
                 self.assertEqual("--patented-codecs" in command, codec is not None)

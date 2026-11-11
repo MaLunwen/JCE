@@ -57,7 +57,7 @@ int main(void)
  puts("GLES target policy PASS");return 0;
 }
 '''
-        base = ROOT / "build/gles-target-tests"
+        base = ROOT / "build/tests/gles-target-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)
@@ -177,7 +177,7 @@ int main(void) {
         self.assertNotEqual(begin, old_format)
         old_bridge = bridge.replace("jce_scene_renderer_taa_requested(s_scene_renderer) &&\n           jce_postfx_taa_supported()", "jce_cvar_get_bool(s_scene_renderer->cv_taa)")
         self.assertNotEqual(bridge, old_bridge)
-        base = ROOT / "build/taa-admission-tests"
+        base = ROOT / "build/tests/taa-admission-tests"
         base.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=base) as temporary:
             directory = Path(temporary)

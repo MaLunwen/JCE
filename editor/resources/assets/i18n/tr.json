@@ -907,6 +907,8 @@
     "gameView.hud.altFree": "[ALT basılı - imleç serbest]  yeniden yakalamak için ALT'ı bırakın",
     "gameView.hud.clickToFly": "FPS uçuş kamerasına girmek için tıklayın (WASD/Space/Shift, Ctrl=hızlan, ALT=serbest, ESC=çık)",
     "gameView.hud.flyCaptured": "[FPS] WASD hareket | Space yukarı | Shift aşağı | Ctrl x5  (imleci serbest bırakmak için ALT'ı basılı tutun, çıkmak için ESC)",
+    "gameView.hud.hintsToggle": "İpuçları",
+    "gameView.hud.mouseLookControls": "Fare bakışı: odaklamak için tıkla | Alt: imleç | Esc: çık",
     "gameView.input.mouseLook": "Fareyle bakış",
     "gameView.input.mouseLookHint": "Betik veya üçüncü şahıs bakışı: fareyi kilitlemek için Oyun Görünümüne tıklayın. İmleci serbest bırakmak için Alt tuşunu basılı tutun; Esc kilidi açar. Arayüz veya strateji oyunlarında kapatın.",
     "gameView.notSet": "(ayarlanmadı)",
