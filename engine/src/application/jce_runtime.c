@@ -1742,8 +1742,10 @@ static int rt_v3_changed(jce_vec3 a, jce_vec3 b)
 static int rt_q_changed(jce_quat a, jce_quat b)
 {
 	const float E = 1e-5f;
-	return fabsf(a.x - b.x) > E || fabsf(a.y - b.y) > E ||
-	       fabsf(a.z - b.z) > E || fabsf(a.w - b.w) > E;
+	const int same = fabsf(a.x - b.x) <= E && fabsf(a.y - b.y) <= E &&
+	                 fabsf(a.z - b.z) <= E && fabsf(a.w - b.w) <= E;
+	return !same && (fabsf(a.x + b.x) > E || fabsf(a.y + b.y) > E ||
+	                 fabsf(a.z + b.z) > E || fabsf(a.w + b.w) > E);
 }
 
 static void rt_push_external_transforms(JceRuntime *rt)
@@ -1818,22 +1820,24 @@ static void rt_push_external_transforms(JceRuntime *rt)
 		}
 	}
 
-	/* Character (kept out of bodies[]): honor a gizmo TRS edit during Play by
-	 * warping the kinematic capsule to the edited feet pose (feet -> center). */
+	/* JCE_CHARACTER_ROTATION_ONLY_NO_WARP_V5: rotation does not reset velocity. */
 	if (jce_character_valid(rt->character) && rt->character_entity != 0) {
 		jce_vec3 cwpos;
 		jce_quat cwrot;
 		if (jce_scene_get_world_pose(rt->scene, rt->character_entity, &cwpos,
-		                             &cwrot, NULL) &&
-		    (rt_v3_changed(cwpos, rt->char_last_pos) ||
-		     rt_q_changed(cwrot, rt->char_last_rot))) {
-			jce_vec3 center = cwpos;                 /* WORLD feet, see above */
-			center.y += rt->character_half_height;   /* feet -> capsule center */
-			jce_physics_character_set_position(rt->physics, rt->character, center);
-			rt->char_prev_pos = center;              /* collapse interpolation */
-			rt->char_cur_pos  = center;
-			rt->char_last_pos = cwpos;               /* feet, world */
-			rt->char_last_rot = cwrot;
+		                             &cwrot, NULL)) {
+			if (rt_v3_changed(cwpos, rt->char_last_pos)) {
+				jce_vec3 center = cwpos;
+				center.y += rt->character_half_height;
+				if (getenv("JCE_DIAG_CHARACTER_WARP"))
+					LOG_INFO(LOG_TAG, "character external position warp (%.3f,%.3f,%.3f)",
+					         (double)cwpos.x, (double)cwpos.y, (double)cwpos.z);
+				jce_physics_character_set_position(rt->physics, rt->character, center);
+				rt->char_prev_pos = center;
+				rt->char_cur_pos  = center;
+				rt->char_last_pos = cwpos;
+			}
+			rt->char_last_rot = cwrot;  /* rotation-only: keep the Bullet velocity */
 		}
 	}
 }

@@ -16,6 +16,7 @@
 #include <jce/middleware/scene/jce_scene.h>
 
 #include <string.h>
+#include <stdlib.h>
 
 #define LOG_TAG "runtime"
 
@@ -57,6 +58,21 @@ void rt_drive_character(JceRuntime *rt, float dt)
 	 * grace window — both standard platformer forgiveness mechanics. */
 	const float JUMP_BUFFER = 0.12f, JUMP_COYOTE = 0.12f;
 	bool grounded = jce_physics_character_is_grounded(rt->physics, rt->character);
+	/* Opt-in read-only trace of physics position, velocity and movement input. */
+	static int diag_character_motion = -1;
+	if (diag_character_motion < 0)
+		diag_character_motion = getenv("JCE_DIAG_CHARACTER_MOTION") ? 1 : 0;
+	if (diag_character_motion) {
+		static unsigned int sample_tick;
+		if (++sample_tick % 30u == 0u) {
+			jce_vec3 p, v;
+			jce_physics_character_get_position(rt->physics, rt->character, &p);
+			jce_physics_character_get_velocity(rt->physics, rt->character, &v);
+			LOG_INFO(LOG_TAG, "character.motion pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f) move=(%.3f,%.3f) grounded=%d",
+			         (double)p.x, (double)p.y, (double)p.z, (double)v.x, (double)v.y, (double)v.z,
+			         (double)dx, (double)dz, (int)grounded);
+		}
+	}
 	rt->char_coyote_t = grounded ? JUMP_COYOTE : rt->char_coyote_t - dt;
 	if (rt->input.jump_pressed) {
 		rt->char_jump_buf_t    = JUMP_BUFFER;

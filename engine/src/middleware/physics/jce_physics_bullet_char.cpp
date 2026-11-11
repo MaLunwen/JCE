@@ -131,6 +131,20 @@ void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx)
     bw->char_count--;
 }
 
+/* CK225_MOVEMENT_V3_SKIP_SELF_RAYS: broadphase-filter the capsule BEFORE
+ * selecting the nearest ray hit. A post-query self check discards real terrain
+ * behind the capsule; ground / step / head-clearance share this callback. */
+struct JceCharacterRayIgnoreSelf : btCollisionWorld::ClosestRayResultCallback {
+    const btCollisionObject *ignored;
+    JceCharacterRayIgnoreSelf(const btVector3 &from, const btVector3 &to,
+                              const btCollisionObject *self)
+      : btCollisionWorld::ClosestRayResultCallback(from, to), ignored(self) {}
+    bool needsCollision(btBroadphaseProxy *proxy) const override {
+        return proxy && proxy->m_clientObject != ignored &&
+            btCollisionWorld::ClosestRayResultCallback::needsCollision(proxy);
+    }
+};
+
 /* Down-ray helper shared by the ground probe / snap / step-up.  Casts
  * from `from` straight down `reach` metres against the character mask;
  * fills hit point + normal.  Returns false on miss (or self-hit). */
@@ -141,11 +155,11 @@ static bool char_ray_down(JceBulletWorld *bw, const btRigidBody *self,
                           const btCollisionObject **out_obj)
 {
     btVector3 to = from - btVector3(0, reach, 0);
-    btCollisionWorld::ClosestRayResultCallback cb(from, to);
+    JceCharacterRayIgnoreSelf cb(from, to, self);
     cb.m_collisionFilterGroup = f->filter_group;
     cb.m_collisionFilterMask  = f->filter_mask;
     bw->world->rayTest(from, to, cb);
-    if (!cb.hasHit() || cb.m_collisionObject == self) return false;
+    if (!cb.hasHit()) return false;
     if (out_point)  *out_point  = cb.m_hitPointWorld;
     if (out_normal) *out_normal = cb.m_hitNormalWorld;
     /* The hit object was already computed and thrown away.  It is what the
@@ -348,11 +362,11 @@ void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
                            btVector3 *n_out) -> bool {
             btVector3 from(c.x(), feet + lift_y, c.z());
             btVector3 to = from + dir * reach;
-            btCollisionWorld::ClosestRayResultCallback cb(from, to);
+            JceCharacterRayIgnoreSelf cb(from, to, b);
             cb.m_collisionFilterGroup = f->filter_group;
             cb.m_collisionFilterMask  = f->filter_mask;
             bw->world->rayTest(from, to, cb);
-            if (!cb.hasHit() || cb.m_collisionObject == b) return false;
+            if (!cb.hasHit()) return false;
             if (n_out) *n_out = cb.m_hitNormalWorld;
             return true;
         };
@@ -379,11 +393,11 @@ void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
                     btVector3 head_from = c + btVector3(0, half, 0);
                     btVector3 head_to   = head_from +
                                           btVector3(0, lift + btScalar(0.05), 0);
-                    btCollisionWorld::ClosestRayResultCallback hc(head_from, head_to);
+                    JceCharacterRayIgnoreSelf hc(head_from, head_to, b);
                     hc.m_collisionFilterGroup = f->filter_group;
                     hc.m_collisionFilterMask  = f->filter_mask;
                     bw->world->rayTest(head_from, head_to, hc);
-                    if (!hc.hasHit() || hc.m_collisionObject == b) {
+                    if (!hc.hasHit()) {
                         btTransform xf = b->getWorldTransform();
                         xf.setOrigin(c + btVector3(0, lift + btScalar(0.02), 0)
                                        + dir * btScalar(0.02));
