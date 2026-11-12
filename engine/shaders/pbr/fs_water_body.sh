@@ -34,9 +34,7 @@ uniform vec4 u_ambientColor;
 uniform vec4 u_iblParams;
 uniform vec4 u_water_shading;
 uniform vec4 u_water_time;
-#if !JCE_WATER_PHYSICAL
 SAMPLER2D(s_water_data, 4);
-#endif
 #else
 uniform vec4 u_cameraPos;       // xyz=world camera position
 uniform vec4 u_dirLights[4];    // [i*2+0]=dir.xyz,intensity  [i*2+1]=color.xyz
@@ -232,12 +230,10 @@ float water_linear_depth(float d)
 
 #endif
 
-#if !JCE_WATER_PHYSICAL || !JCE_WATER_GL21
 // x = water mode (0 Gerstner / 1 FFT / 2 STYLIZED), y = FFT patch size,
 // z = splash ratio (STYLIZED rain circles).  Bound for vs_water already.
 uniform vec4 u_water_mode;
-#endif
-#if !JCE_WATER_GL21
+#if !JCE_WATER_STYLIZED_ONLY
 uniform vec4 u_water_params; // .z: authored Gerstner footprint
 #endif
 
@@ -376,6 +372,17 @@ vec3 water_voronoi(vec2 uv)
 
 void main()
 {
+#if !JCE_WATER_STYLIZED_ONLY
+    /* Authored Gerstner footprint, including the GL 2.1 physical program.
+     * FFT history and stylized-overlay data keep their separate meanings.
+     * Sample before derivative work; apply coverage at the existing end. */
+    vec2 waterFootprint = vec2_splat(1.0);
+    float waterFootprintBlend = 0.0;
+    BRANCH if (u_water_params.z > 0.5 && u_water_mode.x < 0.5) {
+        waterFootprint = texture2D(s_water_data, v_texcoord0).rg;
+        waterFootprintBlend = 1.0;
+    }
+#endif
 #if !JCE_WATER_GL21
     float shoreWeight = 0.0;
     float shoreCoverage = 1.0;
@@ -395,16 +402,7 @@ void main()
         }
     }
 
-    /* JCE_LOOKDEV_R3: authored lake polygon, Gerstner only.
-     * Preserve the native terrain-derived nearshore classification.
-     * Do NOT read stage 4 in FFT or stylized-overlay modes. */
-    vec2 ckLakeFootprint = vec2_splat(1.0);
-    float ckLakeBlend = 0.0;
-    BRANCH if (u_water_params.z > 0.5 && u_water_mode.x < 0.5) {
-        ckLakeFootprint = texture2D(s_water_data, v_texcoord0).rg;
-        ckLakeBlend = 1.0;
-    }
-    shoreCoverage *= smoothstep(0.001, 0.01, ckLakeFootprint.y);
+    shoreCoverage *= smoothstep(0.001, 0.01, waterFootprint.y);
 
     /* Debug views, after the same shoreline coverage test as colour.
      *
@@ -586,10 +584,8 @@ void main()
     vec3 shallow = u_water_color_shallow.rgb;
     vec3 deep    = u_water_color_deep.rgb;
     float tintWeight = fresnel;
-#if !JCE_WATER_GL21
-    float shorelineGrade = smoothstep(0.0, 1.0, ckLakeFootprint.x);
-    tintWeight = mix(fresnel, shorelineGrade * 0.70 + fresnel * 0.30, ckLakeBlend);
-#endif
+    float shorelineGrade = smoothstep(0.0, 1.0, waterFootprint.x);
+    tintWeight = mix(fresnel, shorelineGrade * 0.70 + fresnel * 0.30, waterFootprintBlend);
     vec3 baseColor = mix(shallow, deep, tintWeight);
 
     // --- Reflection tint (environment or flat sky) ---------------------
@@ -1100,6 +1096,11 @@ void main()
         float openWater = (1.0 - clamp(foamAmt, 0.0, 1.0)) * (1.0 - shore_foam) * (1.0 - iceRatio);
         color += crestLight * ((1.0 - fresnel) * openWater);
     }
+#else
+    // Match the authored G-mask coverage without the modern nearshore field.
+    float footprintCoverage = smoothstep(0.001, 0.01, waterFootprint.y);
+    if (footprintCoverage < 0.01) discard;
+    alpha *= footprintCoverage;
 #endif
     // Aerial perspective from the eye to the displaced water surface.
     // The existing frame gate disables this when volumetric fog owns the pixel.

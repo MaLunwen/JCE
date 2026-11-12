@@ -1596,7 +1596,7 @@ static void sr_water_lazy_init(JceSceneRenderer *sr, bool legacy_gl21,
     if (!BGFX_HANDLE_IS_VALID(sr->u_water_mode))
         sr->u_water_mode = bgfx_create_uniform("u_water_mode",
                                                BGFX_UNIFORM_TYPE_VEC4, 1);
-    if (!legacy_physical && !BGFX_HANDLE_IS_VALID(sr->s_water_data))
+    if (!BGFX_HANDLE_IS_VALID(sr->s_water_data))
         sr->s_water_data = bgfx_create_uniform("s_water_data",
                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
     if (legacy_gl21 && !legacy_physical) return;
@@ -2254,9 +2254,10 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
      * color is painted in the ground beneath.  Waves forced off (flat plane);
      * splash ratio rides u_water_mode.z, data map binds at stage 4. */
     JceTexture stylized_data = { UINT16_MAX };
-    /* JCE_LOOKDEV_R3: stage 4 only for explicitly masked Gerstner water.
+    /* Stage 4 carries an explicit Gerstner footprint on every profile.
+     * Use the authored mode: an FFT analytic fallback is not an opt-in mask.
      * FFT historical maps and stylized ripple maps keep native routing. */
-    if (!legacy_gl21 && wc->water_mode == JCE_WATER_MODE_GERSTNER && wc->data_tex[0]) {
+    if (wc->water_mode == JCE_WATER_MODE_GERSTNER && wc->data_tex[0]) {
         stylized_data = sr_resolve_texture(sr, wc->data_tex);
         if (stylized_data.idx == UINT16_MAX) return; /* no rectangle fallback */
         wparams[2] = 1.0f;
@@ -2449,6 +2450,14 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
         } else {
             bgfx_set_texture(4, sr->s_water_data, dt, UINT32_MAX);
         }
+    } else {
+        /* GL 2.1 physical water uses the same clamped authored footprint.
+         * Publish a harmless texture for every draw; unmasked Gerstner and
+         * CPU FFT keep wparams.z == 0 and cannot inherit another body's mask. */
+        bgfx_texture_handle_t dt = { stylized_data.idx };
+        if (!BGFX_HANDLE_IS_VALID(dt)) dt = sr->white_tex;
+        bgfx_set_texture(4, sr->s_water_data, dt, wparams[2] > 0.5f
+            ? BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP : UINT32_MAX);
     }
 
     /* Directional shadows on the surface.  The translucent pass bound no

@@ -88,6 +88,8 @@ jobs:
         run: python tools/lint/check_file_size.py
       - name: Fast engine-layer dependencies
         run: python tools/lint/check_layer_dependencies.py
+      - name: Verify Conan Lua source-cache helper guards
+        run: python -m unittest discover -s tools/tests -p test_ci_seed_lua_source.py -v
       - name: Install lint test prerequisites
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: |
@@ -216,6 +218,8 @@ jobs:
           pip install "conan>=2.0" ninja
           conan profile detect --force
 
+      - name: Seed verified Conan Lua 5.4.8 source cache
+        run: python tools/build/ci_seed_lua_source.py
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
@@ -260,6 +264,8 @@ jobs:
           pip install --upgrade pip
           pip install "conan>=2.0" ninja
           conan profile detect --force
+      - name: Seed verified Conan Lua 5.4.8 source cache
+        run: python tools/build/ci_seed_lua_source.py
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
@@ -316,6 +322,8 @@ jobs:
           pip install "conan>=2.0" ninja Pillow numpy
           conan profile detect --force
 
+      - name: Seed verified Conan Lua 5.4.8 source cache
+        run: python tools/build/ci_seed_lua_source.py
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "8.0.x"
