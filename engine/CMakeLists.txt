@@ -210,7 +210,7 @@ if(JCE_PATENTED_CODECS_ENABLED)
 	set(FDK_AAC_INSTALL_PKGCONFIG_MODULE    OFF CACHE BOOL "" FORCE)
 	add_subdirectory(
 		"${_JCE_FDKAAC_DIR}"
-		"${CMAKE_CURRENT_BINARY_DIR}/fdk-aac")
+		"${CMAKE_CURRENT_BINARY_DIR}/fdk-aac" EXCLUDE_FROM_ALL)
 	# Suppress strict-warnings for vendored 3rd-party.
 	if(TARGET fdk-aac)
 		add_dependencies(fdk-aac jce_vendor_verify_fdk-aac)

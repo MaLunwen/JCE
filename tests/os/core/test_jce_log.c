@@ -9,6 +9,7 @@
 #include "unity.h"
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_thread.h>
 

@@ -38,7 +38,7 @@ if(CMAKE_GENERATOR MATCHES "Visual Studio|Xcode")
 	set(CMAKE_SUPPRESS_REGENERATION TRUE)
 endif()
 
-project(JCE VERSION 0.14.7 LANGUAGES C)
+project(JCE VERSION 0.14.8 LANGUAGES C)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCEDeliveryProfile.cmake")
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.

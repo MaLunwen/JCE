@@ -127,7 +127,7 @@ include(trace_capture_clock_controls.cmake)
 include(trace_reader_controls.cmake)
 include(filesystem_pak_bounded_controls.cmake)
 
-jce_add_unit_test(test_jce_filesystem_trace SOURCES test_jce_filesystem_trace.c LINK jce_core)
+jce_add_unit_test(test_jce_filesystem_trace SOURCES test_jce_filesystem_trace.c LINK jce_core sdl::sdl)
 
 jce_add_unit_test(test_jce_filesystem_lock_failure SOURCES test_jce_filesystem_lock_failure.c
     LINK jce_core physfs-static INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
