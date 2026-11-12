@@ -67,7 +67,8 @@ def set_source_cache(home: Path, cache: Path) -> None:
 
 
 def verified_cache_blob(cache: Path, sha: str = LUA_548_SHA256) -> bool:
-    path = cache / sha
+    # Conan DownloadCache.source_path() stores backups under cache/s/.
+    path = cache / "s" / sha
     if not path.exists():
         return False
     if path.is_symlink() or not path.is_file():
@@ -79,7 +80,7 @@ def verified_cache_blob(cache: Path, sha: str = LUA_548_SHA256) -> bool:
     if digest.hexdigest() != sha:
         raise ValueError("Conan source-cache entry SHA256 mismatch; refusing stale/corrupt data")
     # Conan's own get() produces metadata alongside the content-addressed blob.
-    if not (cache / (sha + ".json")).is_file():
+    if not (cache / "s" / (sha + ".json")).is_file():
         raise ValueError("Conan source-cache blob lacks Conan-generated provenance metadata")
     return True
 

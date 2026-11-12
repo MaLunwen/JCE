@@ -48,16 +48,28 @@ class ConanSourceSeedTests(unittest.TestCase):
     def test_valid_blob_requires_conan_generated_metadata(self):
         with tempfile.TemporaryDirectory() as dirname:
             cache = Path(dirname)
+            source_cache = cache / "s"
+            source_cache.mkdir()
             payload = b"fixture bytes only"
             sha = hashlib.sha256(payload).hexdigest()
-            (cache / sha).write_bytes(payload)
+            (source_cache / sha).write_bytes(payload)
             with self.assertRaisesRegex(ValueError, "metadata"):
                 seed.verified_cache_blob(cache, sha)
-            (cache / (sha + ".json")).write_text("{}", encoding="ascii")
+            (source_cache / (sha + ".json")).write_text("{}", encoding="ascii")
             self.assertTrue(seed.verified_cache_blob(cache, sha))
-            (cache / sha).write_bytes(b"corrupted")
+            (source_cache / sha).write_bytes(b"corrupted")
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 seed.verified_cache_blob(cache, sha)
+
+    def test_wrong_root_layout_is_not_a_conan_source_cache(self):
+        # Regression: old code read cache/<sha>; upstream reads cache/s/<sha>.
+        with tempfile.TemporaryDirectory() as dirname:
+            cache = Path(dirname)
+            payload = b"wrong layout"
+            sha = hashlib.sha256(payload).hexdigest()
+            (cache / sha).write_bytes(payload)
+            (cache / (sha + ".json")).write_text("{}", encoding="ascii")
+            self.assertFalse(seed.verified_cache_blob(cache, sha))
 
     def test_seed_exports_a_recipe_before_expectation_of_cache(self):
         # Offline command-port control: does not claim a real Conan cache hit.

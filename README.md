@@ -210,7 +210,7 @@ artifacts still require their own relocation and system-dependency validation.
 
 | | |
 | --- | --- |
-| Version | `0.14.6` (authoritative: `CMakeLists.txt`) |
+| Version | `0.14.7` (authoritative: `CMakeLists.txt`) |
 | Engine (C99) | 495 tracked `.c` under `engine/src/` |
 | Editor (C++20) | 236 tracked `.cpp` under `editor/src/`, 110 panels |
 | Public API | 316 headers under `engine/include/jce/`, 24 umbrellas, 4007 `JCE_API` symbols |
