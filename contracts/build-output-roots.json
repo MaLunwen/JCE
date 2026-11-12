@@ -1,37 +1,118 @@
 {
   "schema": 1,
   "root": "build",
-  "principle": "Only test workspaces are consolidated here; never rename live CMake, Conan, shader or runtime caches.",
+  "principle": "Register every current first-party build/ owner. Preserve historical CMake/Conan trees and do not move or delete compiled caches automatically.",
   "roots": {
-    ".locks": {"purpose": "Cross-process build and cache locks", "retention": "locks"},
-    "android": {"purpose": "Android platform build output when selected", "retention": "cache"},
-    "automation": {"purpose": "Editor and application automation scratch/IPC runtime", "retention": "runtime"},
-    "compat": {"purpose": "XP/legacy compiler, Conan and platform compatibility cache", "retention": "cache"},
-    "conan-config": {"purpose": "Conan configuration and first-party hook overlays", "retention": "cache"},
-    "desktop": {"purpose": "Platform and Release/Dist objects, Conan generators and executables", "retention": "cache"},
-    "host": {"purpose": "Native host tool CMake build and executables", "retention": "cache"},
-    "host-conan": {"purpose": "Native host Conan build-context generators", "retention": "cache"},
-    "reports": {"purpose": "Current lint/audit and analysis diagnostics", "retention": "evidence"},
-    "sdk": {"purpose": "Selected SDK staging or isolated SDK build work", "retention": "cache"},
-    "shader-cache": {"purpose": "Content-addressed shader compiler cache shared by builds", "retention": "cache"},
-    "tests": {"purpose": "Disposable source test compiler/probe workspaces, plus non-destructive retired-root archive", "retention": "ephemeral"},
-    "validation": {"purpose": "Run receipts, validation evidence and source-patch backups", "retention": "evidence"},
-    "web": {"purpose": "Web/Emscripten target-specific build and output", "retention": "cache"}
+    ".locks": {
+      "purpose": "Cross-process build and cache locks",
+      "retention": "locks"
+    },
+    "android": {
+      "purpose": "Android platform build output when selected",
+      "retention": "cache"
+    },
+    "automation": {
+      "purpose": "Editor and application automation scratch/IPC runtime",
+      "retention": "runtime"
+    },
+    "compat": {
+      "purpose": "XP/legacy compiler, Conan and platform compatibility cache",
+      "retention": "cache"
+    },
+    "conan-config": {
+      "purpose": "Conan configuration and first-party hook overlays",
+      "retention": "cache"
+    },
+    "desktop": {
+      "purpose": "Platform and Release/Dist objects, Conan generators and executables",
+      "retention": "cache"
+    },
+    "host": {
+      "purpose": "Native host tool CMake build and executables",
+      "retention": "cache"
+    },
+    "host-conan": {
+      "purpose": "Native host Conan build-context generators",
+      "retention": "cache"
+    },
+    "reports": {
+      "purpose": "Current lint/audit and analysis diagnostics",
+      "retention": "evidence"
+    },
+    "sdk": {
+      "purpose": "Selected SDK staging or isolated SDK build work",
+      "retention": "cache"
+    },
+    "shader-cache": {
+      "purpose": "Content-addressed shader compiler cache shared by builds",
+      "retention": "cache"
+    },
+    "tests": {
+      "purpose": "Disposable source test compiler/probe workspaces, plus non-destructive retired-root archive",
+      "retention": "ephemeral"
+    },
+    "validation": {
+      "purpose": "Run receipts, validation evidence and source-patch backups",
+      "retention": "evidence"
+    },
+    "web": {
+      "purpose": "Web/Emscripten target-specific build and output",
+      "retention": "cache"
+    },
+    "mobile": {
+      "purpose": "Native Android/iOS target objects, toolchain generators, Gradle staging",
+      "retention": "cache"
+    },
+    "jni": {
+      "purpose": "Desktop JNI native CMake and Conan target caches",
+      "retention": "cache"
+    },
+    "consumers": {
+      "purpose": "Independent installed-SDK regression consumers and stock runtime caches",
+      "retention": "cache"
+    }
   },
   "test_producers": {
-    "tools/tests/test_bundle_shader_refs.py": {"bundle-shader-tests": 1},
-    "tools/tests/test_canvas_transparent_draw.py": {"canvas-transparent-tests": 2},
-    "tools/tests/test_game_view_backend_selection.py": {"game-view-backend-tests": 1},
-    "tools/tests/test_render_pipeline_gles_targets.py": {"gles-target-tests": 1, "taa-admission-tests": 1},
-    "tools/tests/test_grass_inspector_history.py": {"grass-inspector-history-tests": 1},
-    "tools/tests/test_host_font_selection.py": {"host-font-selection-tests": 2},
-    "tools/tests/test_material_owned_cleanup.py": {"material-cleanup-tests": 1},
-    "tools/tests/test_postfx_device_format.py": {"postfx-format-tests": 1},
-    "tools/tests/test_postfx_history.py": {"postfx-history-tests": 1},
-    "tools/tests/test_postfx_status.py": {"postfx-status-tests": 1},
-    "tools/tests/test_renderer_owned_cleanup.py": {"renderer-cleanup-tests": 1},
-    "tools/tests/test_shader_deferred.py": {"shader-deferred-tests": 1},
-    "tools/tests/test_stock_shader_resolver.py": {"stock-shader-tests": 1}
+    "tools/tests/test_bundle_shader_refs.py": {
+      "bundle-shader-tests": 1
+    },
+    "tools/tests/test_canvas_transparent_draw.py": {
+      "canvas-transparent-tests": 2
+    },
+    "tools/tests/test_game_view_backend_selection.py": {
+      "game-view-backend-tests": 1
+    },
+    "tools/tests/test_render_pipeline_gles_targets.py": {
+      "gles-target-tests": 1,
+      "taa-admission-tests": 1
+    },
+    "tools/tests/test_grass_inspector_history.py": {
+      "grass-inspector-history-tests": 1
+    },
+    "tools/tests/test_host_font_selection.py": {
+      "host-font-selection-tests": 2
+    },
+    "tools/tests/test_material_owned_cleanup.py": {
+      "material-cleanup-tests": 1
+    },
+    "tools/tests/test_postfx_device_format.py": {
+      "postfx-format-tests": 1
+    },
+    "tools/tests/test_postfx_history.py": {
+      "postfx-history-tests": 1
+    },
+    "tools/tests/test_postfx_status.py": {
+      "postfx-status-tests": 1
+    },
+    "tools/tests/test_renderer_owned_cleanup.py": {
+      "renderer-cleanup-tests": 1
+    },
+    "tools/tests/test_shader_deferred.py": {
+      "shader-deferred-tests": 1
+    },
+    "tools/tests/test_stock_shader_resolver.py": {
+      "stock-shader-tests": 1
+    }
   },
   "legacy_test_archive": "build/tests/_legacy",
   "cleanup_policy": "Existing test roots may be relocated only explicitly, with preflight and no clobber. Never automatically delete caches, evidence, or source."

@@ -225,15 +225,9 @@ def preset_name(t: dict, kind: str) -> str:
 
 
 def preset_binary_dir(t: dict, kind: str) -> Path:
-    """Build dir matching each preset's binaryDir (legacy flat layout).
-
-    editor/game release & dist SHARE build/desktop/<stem> (the exe lands in
-    <stem>/<variant> via the engine's RUNTIME_OUTPUT/${JCE_BUILD_VARIANT});
-    debug and the SDK trees get their own dirs.
-    """
-    sub = {"release": "", "dist": "", "debug": "-debug",
-           "release-sdk": "-sdk", "dist-sdk": "-dist-sdk"}[kind]
-    return ROOT / "build" / "desktop" / f"{t['preset_stem']}{sub}"
+    """Variant-isolated desktop preset CMake tree (not the embedded Editor)."""
+    from tools.build.layout_contract import preset_cmake_dir
+    return preset_cmake_dir(ROOT, t["preset_stem"], kind)
 
 
 def host_build_profile() -> str:
@@ -268,9 +262,10 @@ def resolve_target(arch_cli: str | None) -> dict:
 def conan_dir(t: dict) -> Path:
     # Web (Emscripten) lives under build/web/ to match build-web.bat.
     if t.get("emscripten"):
-        return ROOT / "build" / "web" / "wasm-conan"
-    # One shared Conan output dir per target (matches the legacy .bat layout).
-    return ROOT / "build" / "desktop" / f"{t['key']}-conan"
+        return ROOT / "build" / "web" / "wasm" / "conan" / "sdk"
+    # Preset generators are separated from embedded-editor Release/Dist.
+    from tools.build.layout_contract import preset_conan_dir
+    return preset_conan_dir(ROOT, t["key"])
 
 
 def toolchain_path(t: dict, config: str = "Release") -> Path:
@@ -630,7 +625,7 @@ def _sdk_cache_paths(values):
     kind = "debug" if config == "Debug" else f"{variant}-sdk"
     tree = preset_binary_dir(target, kind)
     if target.get("emscripten"):
-        tree = ROOT / "build/web" / ("wasm-dist-sdk" if variant == "dist" else "wasm-sdk")
+        tree = ROOT / "build/web/wasm/obj/sdk" / kind
     prefix = sdk_install_dir(target, variant)
     if config == "Debug":
         prefix = prefix.parent / (prefix.name + "-debug")
@@ -719,7 +714,7 @@ def _confirmed_app_sdk_tools(args, sdk: Path, target: dict) -> dict[str, Path]:
 
 def _app_build_dir(project: Path, target: dict, variant: str) -> Path:
     if target.get("emscripten"):
-        return project / "build" / f"{target['host']}-{target['arch']}-{variant}"
+        return project / "build" / "web" / "wasm" / "obj" / "app" / variant
     return project / "build/desktop" / target["key"] / variant
 
 
@@ -736,9 +731,9 @@ def _app_cache_paths(values):
 
 def _smoke_build_dir(t, sdk, variant, build_dir=None, scripting=False):
     family = "web" if t.get("emscripten") else "desktop"
-    stem = "sdk-smoke-script" if scripting else "sdk-smoke"
+    role = "scripting" if scripting else "c99"
     directory = (Path(build_dir).resolve() if build_dir else
-                 ROOT / "build" / family / f"{stem}-{t['key']}-{variant}")
+                 ROOT / "build" / family / t["key"] / "smoke" / role / variant)
     sdk = Path(sdk).resolve()
     if (directory == ROOT or directory in ROOT.parents or
             (directory.is_relative_to(ROOT) and
@@ -1540,8 +1535,7 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
     if is_wasm:
         # Web SDK lives under build/web (matches build-web.bat) and configures
         # via explicit -S/-B Ninja, NOT a preset (there is no wasm preset).
-        bdir = ROOT / "build" / "web" / (
-            "wasm-dist-sdk" if variant == "dist" else "wasm-sdk")
+        bdir = ROOT / "build/web/wasm/obj/sdk" / kind
     if config == "Debug":
         # Debug SDK is release-flavoured (no -dist-debug preset) and installs to
         # its own tree so it never clobbers the Release SDK at the same path.

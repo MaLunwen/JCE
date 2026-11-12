@@ -11,6 +11,7 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_bundle_loader.h>
@@ -26,7 +27,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -1001,12 +1001,10 @@ static void test_pack_env_scenes(void)
     opts.cook_assets      = getenv("JCE_PACK_COOK") != NULL;
     opts.target_platform  = 0; /* JCE_COOK_PLATFORM_WINDOWS */
 
-    struct timespec t0, t1;
-    timespec_get(&t0, TIME_UTC);
+    const uint64_t t0 = jce_time_perf_counter();
     int rc = jce_bundle_pack_run(&opts, log_sink, NULL);
-    timespec_get(&t1, TIME_UTC);
-    double secs = (double)(t1.tv_sec - t0.tv_sec)
-                + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+    const uint64_t t1 = jce_time_perf_counter();
+    const double secs = jce_time_perf_to_seconds(t0, t1);
     printf("[env-pack] rc=%d errors=%d warnings=%d scenes=%zu cook=%d time=%.2fs\n",
            rc, g_error_count, g_warning_count, nf,
            (int)opts.cook_assets, secs);

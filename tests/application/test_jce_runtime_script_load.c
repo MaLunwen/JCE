@@ -253,7 +253,7 @@ static void test_on_collision_dispatches_to_both(void)
 /* Scan helper: count entities and capture the position of the one that is not
  * the spawner (i.e. the spawned prefab root). */
 typedef struct { int count; JceEntity exclude; bool found; float x, y, z; } SpawnScan;
-static int spawn_scan_cb(JceScene *s, JceEntity e, void *u)
+static void spawn_scan_cb(JceScene *s, JceEntity e, void *u)
 {
     SpawnScan *sc = (SpawnScan *)u;
     sc->count++;
@@ -261,7 +261,6 @@ static int spawn_scan_cb(JceScene *s, JceEntity e, void *u)
         JceTransform *t = jce_scene_get_transform(s, e);
         if (t) { sc->found = true; sc->x = t->position.x; sc->y = t->position.y; sc->z = t->position.z; }
     }
-    return 0;
 }
 
 /* jce.spawn instantiates a prefab at runtime, places its root, and the deferred

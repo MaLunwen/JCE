@@ -20,8 +20,8 @@ if not defined JCE_GAME_PROJECT_DIR (
     exit /b 2
 )
 
-set "CONAN_DIR=build\web\wasm-conan"
-set "BUILD_DIR=build\web\wasm"
+set "CONAN_DIR=build\web\wasm\conan\platform"
+set "BUILD_DIR=build\web\wasm\obj\platform\release"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
 set "HOST_PAK=build\host\tools\jce_pak.exe"
 
@@ -38,6 +38,8 @@ for %%A in (%*) do (
         set "EMSDK_PATH=%%~A"
     )
 )
+:: Use distinct CMake cache directories for Release and Dist.
+set "BUILD_DIR=build\web\wasm\obj\platform\%VARIANT%"
 :: Resolve emsdk WITHOUT naming one machine's disk.  In order: the argument
 :: above, $EMSDK (what emsdk_env exports), then the emcc wrapper already on
 :: PATH walked back to its checkout (emsdk_env puts

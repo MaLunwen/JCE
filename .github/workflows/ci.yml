@@ -25,7 +25,8 @@ env:
 
 # Cancel superseded runs on the same ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Scheduled audits and interactive pushes on main must not cancel each other.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'interactive' }}
   cancel-in-progress: true
 
 # ── TIERS, and why ────────────────────────────────────────────────────────
@@ -88,6 +89,14 @@ jobs:
         run: python tools/lint/check_file_size.py
       - name: Fast engine-layer dependencies
         run: python tools/lint/check_layer_dependencies.py
+      - name: Verify desktop CMake/Conan layout consistency
+        run: python tools/build/layout_contract.py --check
+      - name: Verify layout negative and migration controls
+        run: python -m unittest discover -s tools/tests -p test_build_layout_contract_v10.py -v
+      - name: Check complete build-directory ownership and platform parity
+        run: python tools/build/full_layout_contract.py --check
+      - name: Verify full-layout negative controls
+        run: python -m unittest discover -s tools/tests -p test_full_layout_contract_v11.py -v
       - name: Verify Conan Lua source-cache helper guards
         run: python -m unittest discover -s tools/tests -p test_ci_seed_lua_source.py -v
       - name: Install lint test prerequisites
@@ -191,7 +200,9 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     needs: [changes]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Cold Conan + Debug JCE compilation exceeded the old 60-minute Windows limit.
+    # Preserve real compiler/test failures; do not use continue-on-error.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -284,7 +295,9 @@ jobs:
     if: needs.changes.outputs.native == 'true'
     needs: [changes]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Cold Conan + Debug JCE compilation exceeded the old 60-minute Windows limit.
+    # Preserve real compiler/test failures; do not use continue-on-error.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

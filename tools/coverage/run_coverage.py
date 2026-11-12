@@ -11,7 +11,7 @@ Strategy:
 
 Usage:
     python tools/coverage/run_coverage.py \\
-        --build-dir build/desktop/windows-x64-debug \\
+        --build-dir build/desktop/windows-x64/obj/preset/debug \\
         --sources engine/src/os/core \\
         --threshold 85
 

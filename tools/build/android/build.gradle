@@ -20,6 +20,17 @@ allprojects {
     }
 }
 
+// Use an explicitly selected in-repository output root; Android Studio's
+// ordinary default remains available when JCE's builder was not invoked.
+// Gradle 8.x DirectoryProperty is preferred over the deprecated buildDir setter.
+def jceGradleRoot = System.getenv('JCE_ANDROID_GRADLE_BUILD_DIR')
+if (jceGradleRoot) {
+    allprojects { project ->
+        project.layout.buildDirectory.set(new File(jceGradleRoot,
+            project == rootProject ? 'root' : project.name))
+    }
+}
+
 task clean(type: Delete) {
     delete rootProject.buildDir
 }

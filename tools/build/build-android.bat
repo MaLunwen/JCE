@@ -7,7 +7,7 @@
 ::   sdk_path  - Android SDK root (default: ANDROID_HOME / ANDROID_SDK_ROOT)
 ::   arch      - arm64, arm, x86_64, or x86 (default: arm64)
 ::   --clean   - Force full rebuild (remove CMake + Conan caches)
-:: Output: tools\build\android\app\build\outputs\apk\debug\app-debug.apk
+:: Output: build\mobile\android-<arch>\gradle\app\outputs\apk\debug\app-debug.apk
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -102,12 +102,16 @@ if not defined JAVA_HOME (
     goto :error
 )
 
-set "CONAN_DIR=build\mobile\android-%ARCH%-conan"
-set "BUILD_DIR=build\mobile\android-%ARCH%"
+set "CONAN_DIR=build\mobile\android-%ARCH%\conan\platform"
+set "BUILD_DIR=build\mobile\android-%ARCH%\obj\platform\release"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
 set "HOST_PAK=build\host\tools\jce_pak.exe"
-set "ABI_DIR=tools\build\android\app\src\main\jniLibs\%ABI%"
+set "ABI_DIR=build\mobile\android-%ARCH%\staging\jniLibs\%ABI%"
 set "APK_COPY_DIR=build\mobile\android-%ARCH%\release"
+set "GRADLE_BUILD_DIR=build\mobile\android-%ARCH%\gradle"
+set "STAGING_DIR=build\mobile\android-%ARCH%\staging"
+for %%F in ("%GRADLE_BUILD_DIR%") do set "JCE_ANDROID_GRADLE_BUILD_DIR=%%~fF"
+for %%F in ("%STAGING_DIR%") do set "JCE_ANDROID_STAGING_ROOT=%%~fF"
 
 echo ================================================================
 echo   JCE Android Build (%ARCH% / %ABI%)
@@ -123,9 +127,9 @@ if "%DO_CLEAN%"=="1" (
     echo === Full clean ===
     if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
     if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
-    if exist "tools\build\android\app\build" rmdir /s /q "tools\build\android\app\build"
-    if exist "tools\build\android\app\src\main\jniLibs" rmdir /s /q "tools\build\android\app\src\main\jniLibs"
-    if exist "tools\build\android\app\src\main\assets" rmdir /s /q "tools\build\android\app\src\main\assets"
+    if exist "%GRADLE_BUILD_DIR%\app" rmdir /s /q "%GRADLE_BUILD_DIR%\app"
+    if exist "%STAGING_DIR%\jniLibs" rmdir /s /q "%STAGING_DIR%\jniLibs"
+    if exist "%STAGING_DIR%\assets" rmdir /s /q "%STAGING_DIR%\assets"
     echo   Done
     echo.
 )
@@ -138,9 +142,9 @@ if exist "%ABI_DIR%" (
     rmdir /s /q "%ABI_DIR%"
 )
 :: Remove Gradle build cache (Gradle cannot detect .so content changes)
-if exist "tools\build\android\app\build" (
+if exist "%GRADLE_BUILD_DIR%\app" (
     echo   Removing Gradle build cache
-    rmdir /s /q "tools\build\android\app\build"
+    rmdir /s /q "%GRADLE_BUILD_DIR%\app"
 )
 echo   OK
 echo.
@@ -262,7 +266,7 @@ echo   Copied libJCE.so
 
 :: Copy game_assets.pak into APK assets/ (loaded at runtime via SDL)
 set "PAK_SRC=%BUILD_DIR%\game_assets.pak"
-set "ASSETS_DIR=tools\build\android\app\src\main\assets"
+set "ASSETS_DIR=%STAGING_DIR%\assets"
 if not exist "%PAK_SRC%" (
     echo ERROR: game_assets.pak not found at: %PAK_SRC%
     goto :error
@@ -304,7 +308,7 @@ if errorlevel 1 (
 )
 popd
 
-set "APK=tools\build\android\app\build\outputs\apk\debug\app-debug.apk"
+set "APK=%GRADLE_BUILD_DIR%\app\outputs\apk\debug\app-debug.apk"
 if not exist "%APK%" (
     echo ERROR: APK not found at: %APK%
     goto :error

@@ -24,7 +24,14 @@ android {
         }
     }
     sourceSets.main {
-        jniLibs.srcDirs = ['src/main/jniLibs']
+        def stagingRoot = System.getenv('JCE_ANDROID_STAGING_ROOT')
+        if (stagingRoot) {
+            jniLibs.srcDirs = [new File(stagingRoot, 'jniLibs')]
+            assets.srcDirs = [new File(stagingRoot, 'assets')]
+        } else {
+            // Android Studio's native source-set path remains unchanged.
+            jniLibs.srcDirs = ['src/main/jniLibs']
+        }
         def sdlJava = System.getenv('JCE_SDL_JAVA_DIR')
         if (!sdlJava || !file(sdlJava).isDirectory()) {
             throw new GradleException('JCE_SDL_JAVA_DIR must name verified SDL Java sources; use the JCE Android builder.')

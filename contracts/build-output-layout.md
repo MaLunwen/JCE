@@ -182,3 +182,136 @@ A fresh clone with no build/ directory passes this layout gate without inventing
 or creating output. Native build, Python tests, ABI audit, and real XP guest
 execution are distinct verifications; this directory policy certifies none of
 them by itself.
+
+## Desktop preset-cache normalization (v0.14.8 CI #59 follow-up; v10)
+
+The **preset/SDK/test/authoring** path family and the existing **embedded
+Editor/XP** family now have explicit, non-overlapping owners. The single entry
+for builds remains `python scripts/jce.py`; Windows/Linux/macOS public shims
+forward to it, while Android/Web/iOS specialist flows remain in their own
+platform namespaces. `CMakePresets.json` and `tools/build/jce.py` use the same
+preset path contract, verified by `tools/build/layout_contract.py --check`.
+
+For desktop target `windows-x64` (other native OS/architectures use the same
+shape):
+
+```
+build/desktop/windows-x64/
+  obj/preset/release/        # CMake preset release (not embedded editor)
+  obj/preset/dist/           # CMake preset dist; NOT shared with release
+  obj/preset/debug/          # Debug test runner / CMake + Ninja
+  obj/preset/release-sdk/    # SDK Release
+  obj/preset/dist-sdk/       # SDK Dist
+  obj/preset/asan/           # Windows x64 ASan preset
+  conan/preset/              # Conan generators separated by build/{Release,Debug}
+  obj/release/               # Embedded editor Release CMake objects
+  obj/dist/                  # Embedded editor Dist CMake objects
+  conan/release/             # Embedded editor Release generators
+  conan/dist/                # Embedded editor Dist generators
+  authoring/obj/<variant>/   # Optional authoring editor CMake trees
+  release/                   # Editor executable output
+  dist/                      # Editor executable output
+```
+
+XP x86/x64 uses `build/desktop/windows-<arch>-xp/obj/<variant>` and
+`conan/<variant>`; its LLVM-MinGW/MSVCRT compatibility store and CMake caches
+are not touched. Native application SDK consumers retain their separate
+project-owned `build/desktop/<target>/<variant>` output. Web/Android/iOS and
+host-tools caches retain their explicit owners; this change does not rebase
+those toolchains.
+
+**Migration is read-only.** Historical sibling trees such as
+`windows-x64-debug`, `windows-x64-conan`, `windows-x64-sdk`, and the old
+`windows-x64/CMakeCache.txt` are still on disk but no longer the default
+preset targets. NEVER rename a directory holding `CMakeCache.txt` or Conan
+absolute-path generators. Do not delete or overwrite legacy data as part of
+installing this patch. A fresh configure may recompile dependencies and CMake
+objects; that is expected and is not a reported build failure.
+
+Run:
+
+```
+python tools/build/layout_contract.py --check --inventory
+python -m unittest discover -s tools/tests -p test_build_layout_contract_v10.py -v
+python scripts/jce.py test --configure --variant debug --arch x64 --jobs 2
+```
+
+`--inventory` classifies local historical roots without modifying them. The
+unit-test and layout gates prove only path/wiring correctness, NOT native
+compilation, SDK delivery, XP guest execution, or the full CI matrix. Native
+unit tests remain required, with real failure statuses retained. The GitHub
+Actions push/scheduled groups are independent so a scheduled audit cannot
+abort the same-commit interactive push. Windows-heavy native matrix jobs now
+allow up to 120 minutes; the job status still reflects real compiler and test
+results and does not skip failed checks.
+
+## Complete build-directory ownership (v11)
+
+All first-party **new** build locations have one physical owner and no shared
+CMake binary directory across target/mode/generator. The directory contract is
+checked by `python tools/build/full_layout_contract.py --check`; to inspect
+actual top-level and target directories without modifying them, use
+`python tools/build/full_layout_contract.py --inventory --json`.
+
+`build/desktop/<target>/obj/preset/<kind>` + `conan/preset` owns the CMake
+presets, while `obj/{release,dist}` + `conan/{release,dist}` retains embedded
+Editor ownership, and `authoring/` is the opt-in authoring Editor owner.
+`windows-x64-xp` and `windows-x86-xp` retain separate LLVM-MinGW/MSVCRT
+`obj/<variant>`/`conan/<variant>`; their compatibility stores stay in
+`build/compat`. `macos-universal/` is a lipo output, not a CMake tree.
+
+Other explicitly distinct roles:
+
+```
+build/host/                                 Native host CMake, tools (stable)
+build/host-conan/                           Native host Conan (stable)
+build/mobile/android-<arch>/obj/preset/release/       Android Ninja preset
+build/mobile/android-<arch>/obj/platform/release/     Android CLI builder
+build/mobile/android-<arch>/conan/{preset,platform}/   Distinct generators
+build/mobile/android-<arch>/gradle/app/                Gradle compiled outputs
+build/mobile/android-<arch>/staging/{jniLibs,assets}/  Gradle inputs
+build/mobile/android-<arch>/release/                   APK output copy
+build/mobile/ios-arm64/obj/preset/release/             iOS Ninja preset
+build/mobile/ios-arm64/obj/xcode/release/              iOS Xcode project
+build/mobile/ios-arm64/conan/{preset,xcode}/           Independent generators
+build/web/wasm/obj/preset/{release,dist}/              Web CMake presets
+build/web/wasm/obj/platform/{release,dist}/            Web BAT producer
+build/web/wasm/obj/sdk/{release-sdk,dist-sdk,debug}/    Web SDK driver
+build/web/wasm/conan/{preset,platform,sdk}/             Independent generators
+build/jni/desktop/obj/preset/release/                   JNI Ninja preset
+build/jni/desktop/conan/preset/                         JNI Conan generators
+build/desktop/<target>/smoke/{c99,scripting}/<variant>/ Native SDK smoke
+build/web/wasm/smoke/{c99,scripting}/<variant>/        WASM SDK smoke
+build/consumers/stock-runtime/windows-x64-dist/        Stock consumer
+build/sdk/                                         Isolated SDK staging
+build/tests/                                       Test working trees
+build/validation/                                  Evidence and patch backups
+build/reports/                                     Diagnostics
+build/.locks/                                      Active leases; do not delete
+build/conan-config/                                Conan hooks/overlays
+build/shader-cache/                                Content-addressed shaders
+build/automation/                                  Runtime IPC/automation
+```
+
+The Android Gradle plugin now receives staged `jniLibs`/`assets` from its
+specific target's `staging/` rather than writing them to the checked-in Gradle
+project. Its default source layout is still available for Android Studio when
+the explicit JCE build environment is absent. The generated Android
+`local.properties` and Gradle's own `.gradle/` metadata are tool-specific
+working files, not JCE's CMake/Conan/Gradle binary tree.
+
+Final releases stay outside build/ under `dist/editor`, `dist/sdk` or the
+consumer's `dist/apps`, and project-owned application caches stay in that
+project's build/ tree. The Conan binary package store (`CONAN_HOME`) and SDK/
+NDK/Xcode toolchain installations are external caches, not copies of JCE's
+`build/` directory. Nothing is moved into JCE automatically.
+
+**Migration:** Existing flat caches such as `build/desktop/windows-x64-debug`,
+`build/desktop/windows-x64-conan`, `build/web/wasm-conan`,
+`build/mobile/android-arm64-conan`, or CMakeCache.txt at a target root remain
+in place. CMakeCache files embed absolute source/build and generator identities;
+renaming or silently adopting them is unsafe. Start fresh in the new owner
+and only remove a historical cache after verifying its source/receipt owner
+and separately authorizing removal. Native compilation, linker, runtime,
+Android APK installation, iOS signing, browser operation, and XP VM tests are
+**not** established by this read-only layout gate.

@@ -47,8 +47,8 @@ else
     exit 1
 fi
 
-CONAN_DIR="build/mobile/ios-arm64-conan"
-BUILD_DIR="build/mobile/ios-arm64"
+CONAN_DIR="build/mobile/ios-arm64/conan/xcode"
+BUILD_DIR="build/mobile/ios-arm64/obj/xcode/release"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
 HOST_PAK="build/host/tools/jce_pak"
 

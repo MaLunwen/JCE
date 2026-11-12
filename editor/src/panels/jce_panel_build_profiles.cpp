@@ -361,11 +361,30 @@ static bool parse_conan_toolchain(const std::string &raw,
     size_t last = output.find_last_of('/');
     std::string folder = (last == std::string::npos) ? output
                                                      : output.substr(last + 1);
-    const std::string suf = "-conan";
-    if (folder.size() <= suf.size() ||
-        folder.compare(folder.size() - suf.size(), suf.size(), suf) != 0)
-        return false;
-    std::string profile = folder.substr(0, folder.size() - suf.size());
+    std::string profile;
+    if (folder == "preset") {
+        /* v10: build/desktop/<target>/conan/preset/build/<Config>/...
+         * This is a distinct generator owner from embedded Editor/XP caches.
+         * Validate the entire tail rather than guessing from a path segment. */
+        const std::string prefix = "build/desktop/";
+        if (output.rfind(prefix, 0) != 0) return false;
+        const std::string relative = output.substr(prefix.size());
+        const size_t boundary = relative.find('/');
+        if (boundary == std::string::npos ||
+            relative.substr(boundary) != "/conan/preset") return false;
+        profile = relative.substr(0, boundary);
+        if (profile.empty() ||
+            (profile.rfind("windows-", 0) != 0 &&
+             profile.rfind("linux-", 0) != 0 &&
+             profile.rfind("macos-", 0) != 0)) return false;
+    } else {
+        /* Historical presets remain readable, but no longer produce files. */
+        const std::string suf = "-conan";
+        if (folder.size() <= suf.size() ||
+            folder.compare(folder.size() - suf.size(), suf.size(), suf) != 0)
+            return false;
+        profile = folder.substr(0, folder.size() - suf.size());
+    }
 
     *out_profile    = profile;
     *out_output     = output;
