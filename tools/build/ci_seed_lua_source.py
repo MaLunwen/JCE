@@ -110,10 +110,14 @@ def seed(env: dict[str, str]) -> None:
     with tempfile.TemporaryDirectory(prefix="jce-ci-lua-source-") as dirname:
         temporary = Path(dirname)
         (temporary / "conanfile.py").write_text(ephemeral_recipe(), encoding="ascii")
-        subprocess.run([conan, "source", "."], cwd=temporary, env=env, timeout=240,
-                       check=True)
+        # `conan source .` loads a local recipe, which did not populate Conan's
+        # source backup cache on hosted runners (all three OSes observed).
+        # `conan create` exports a real recipe reference before running
+        # source(); only that lifecycle is documented to seed the cache.
+        subprocess.run([conan, "create", ".", "--test-folder="],
+                       cwd=temporary, env=env, timeout=240, check=True)
     if not verified_cache_blob(cache):
-        raise ValueError("Conan get() did not populate the documented SHA256 source cache")
+        raise ValueError("Conan create did not populate the documented SHA256 source cache")
     print("Lua 5.4.8 Conan source cache: verified SHA256 (freshly seeded)")
 
 

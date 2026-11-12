@@ -2419,12 +2419,11 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
             bgfx_set_texture(1, sr->s_water_disp2, sr->white_tex, UINT32_MAX);
     }
 
-    /* Stylized shore-distance data map (stage 4; white = harmless default:
-     * depth 1 everywhere -> zero shore strokes).  Stage 4, not 5: stage 5 is
-     * the engine's s_shadowMap slot and must stay free for it. */
+    /* Stage 4: data/foam on modern water, neutral or mask on legacy GL21.
+     * Never borrow another body's sampler; stage 5 belongs to shadows. */
+    bgfx_texture_handle_t dt = { stylized_data.idx };
+    if (!BGFX_HANDLE_IS_VALID(dt)) dt = sr->white_tex;
     if (!legacy_physical) {
-        bgfx_texture_handle_t dt = { stylized_data.idx };
-        if (!BGFX_HANDLE_IS_VALID(dt)) dt = sr->white_tex;
         float foam_params[4] = {0.0f, 0.0f, 1.0f, 0.0f};
         const JceWaterFoamState *foam = (!legacy_gl21 && water_mode == JCE_WATER_MODE_FFT)
             ? jce_water_field_set_foam(jce_scene_water_fields(scene), (uint64_t)e) : NULL;
@@ -2442,22 +2441,16 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
         }
         if (BGFX_HANDLE_IS_VALID(sr->u_water_foam))
             bgfx_set_uniform(sr->u_water_foam, foam_params, 1);
-        /* FFT history and stylized distance data are mutually exclusive. */
-        if (wparams[2] > 0.5f) { /* JCE_LOOKDEV_R3: Gerstner mask only */
-            bgfx_texture_handle_t footprint = { stylized_data.idx };
-            bgfx_set_texture(4, sr->s_water_data, footprint,
-                             BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
-        } else {
-            bgfx_set_texture(4, sr->s_water_data, dt, UINT32_MAX);
-        }
+    }
+    /* Gerstner masks override optional FFT/foam data for every profile. */
+    if (wparams[2] > 0.5f) {
+        bgfx_texture_handle_t footprint = { stylized_data.idx };
+        if (legacy_physical && !BGFX_HANDLE_IS_VALID(footprint))
+            footprint = dt;
+        bgfx_set_texture(4, sr->s_water_data, footprint,
+                         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
     } else {
-        /* GL 2.1 physical water uses the same clamped authored footprint.
-         * Publish a harmless texture for every draw; unmasked Gerstner and
-         * CPU FFT keep wparams.z == 0 and cannot inherit another body's mask. */
-        bgfx_texture_handle_t dt = { stylized_data.idx };
-        if (!BGFX_HANDLE_IS_VALID(dt)) dt = sr->white_tex;
-        bgfx_set_texture(4, sr->s_water_data, dt, wparams[2] > 0.5f
-            ? BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP : UINT32_MAX);
+        bgfx_set_texture(4, sr->s_water_data, dt, UINT32_MAX);
     }
 
     /* Directional shadows on the surface.  The translucent pass bound no

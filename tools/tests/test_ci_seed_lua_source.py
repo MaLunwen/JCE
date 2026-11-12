@@ -6,6 +6,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("jce_ci_seed_lua_source", ROOT / "tools/build/ci_seed_lua_source.py")
@@ -57,6 +58,22 @@ class ConanSourceSeedTests(unittest.TestCase):
             (cache / sha).write_bytes(b"corrupted")
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 seed.verified_cache_blob(cache, sha)
+
+    def test_seed_exports_a_recipe_before_expectation_of_cache(self):
+        # Offline command-port control: does not claim a real Conan cache hit.
+        with tempfile.TemporaryDirectory() as dirname:
+            workspace = Path(dirname)
+            env = {"CI": "true", "GITHUB_ACTIONS": "true",
+                   "GITHUB_WORKSPACE": str(workspace),
+                   "CONAN_HOME": str(workspace / ".conan2")}
+            with patch.object(seed.shutil, "which", return_value="conan"), \
+                 patch.object(seed.subprocess, "run") as runner, \
+                 patch.object(seed, "verified_cache_blob", side_effect=[False, True]):
+                seed.seed(env)
+            args = runner.call_args.args[0]
+            self.assertEqual(args, ["conan", "create", ".", "--test-folder="])
+            self.assertTrue(runner.call_args.kwargs["check"])
+            self.assertEqual(runner.call_args.kwargs["env"], env)
 
     def test_recipe_is_offline_generated_and_hash_pinned(self):
         recipe = seed.ephemeral_recipe()
