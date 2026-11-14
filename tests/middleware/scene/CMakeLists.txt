@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 
+# Actual private sky-IBL numeric admission; no graphics device.
+jce_add_unit_test(test_jce_sky_ibl_refresh
+    SOURCES test_jce_sky_ibl_refresh.c
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+
 jce_add_unit_test(test_jce_ui_canvas_capacity
     SOURCES test_jce_ui_canvas_capacity.c
     LINK jce_core jce_scene jce_resource jce_ui jce_renderer)
@@ -299,6 +304,22 @@ jce_add_unit_test(test_jce_water_buoyancy
 jce_add_unit_test(test_jce_foliage_scatter
     SOURCES test_jce_foliage_scatter.c
     LINK    jce_core jce_scene jce_resource)
+
+# Day/night body choice shares the environment predicate with color and CSM.
+jce_add_unit_test(test_jce_tod_key
+    SOURCES test_jce_tod_key.c
+    LINK jce_core jce_world
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Foliage: actual bounded energy owner; CPU behavior, not rendered pixels.
+jce_add_unit_test(test_jce_foliage_lighting
+    SOURCES test_jce_foliage_lighting.c
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+
+# Rigid imported MeshRenderer state scope; no native rendering in this fixture.
+jce_add_unit_test(test_jce_model_cull_override
+    SOURCES test_jce_model_cull_override.c
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
 
 # Foliage: density-mask acceptance, including that the maskless random sequence
 # stays byte-identical when masking is enabled.
@@ -1719,10 +1740,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/grass_colour_binding_controls.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/colour_pass_seed_controls.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/fcluster_colour_binding_controls.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/fcluster_cache_controls.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/water_colour_binding_controls.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/ssgi_lifetime_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/collect_layout_controls.cmake")
 
 jce_add_unit_test(test_jce_water_spectrum_authoring
     SOURCES test_jce_water_spectrum_authoring.c

@@ -932,6 +932,14 @@ void jce_state_step(float dt)
         !jce_runtime_host_policy_focus_step_allowed(&s_play_host.policy)) return;
     if (s_play_host.runtime_stats.runtime) {
         const float step_dt = dt > 0 ? dt : 1.0f/60.0f;
+        if (jce_editor_game_render_prepare_document_input(s.scene,
+                jce_editor_engine_input(), jce_editor_engine_actions())) {
+            jce_runtime_set_input(s_play_host.runtime_stats.runtime, nullptr);
+            jce_runtime_set_actions(s_play_host.runtime_stats.runtime, nullptr);
+        } else if (jce_editor_game_render_document_owns_free_pointer()) {
+            jce_runtime_set_input(s_play_host.runtime_stats.runtime, nullptr);
+            jce_runtime_set_actions(s_play_host.runtime_stats.runtime, nullptr);
+        }
         jce_runtime_step(s_play_host.runtime_stats.runtime, step_dt);
         jce_editor_play_module_tick(s_play_host.module, s.scene, step_dt);
         if (s.play_state == JCE_PLAY_STOPPED || !s_play_host.runtime_stats.runtime) return;
@@ -982,6 +990,15 @@ void jce_state_play_mode_tick(float dt)
             if (s_fdt) dt = s_fdtv;
         }
         s_play_host.render_dt = dt;
+        if (jce_editor_game_render_prepare_document_input(s.scene,
+                jce_editor_engine_input(), jce_editor_engine_actions())) {
+            jce_runtime_set_input(s_play_host.runtime_stats.runtime, nullptr);
+            jce_runtime_set_actions(s_play_host.runtime_stats.runtime, nullptr);
+        } else if (jce_editor_game_render_document_owns_free_pointer()) {
+            /* A released cursor owns the UI, including action-map mouse binds. */
+            jce_runtime_set_input(s_play_host.runtime_stats.runtime, nullptr);
+            jce_runtime_set_actions(s_play_host.runtime_stats.runtime, nullptr);
+        }
         jce_runtime_step(s_play_host.runtime_stats.runtime, dt);
         if (jce_runtime_quit_requested(s_play_host.runtime_stats.runtime)) { jce_state_stop(); return; }
         jce_editor_play_module_tick(s_play_host.module, s.scene, dt);

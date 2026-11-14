@@ -31,6 +31,7 @@
 #include <jce/os/core/jce_math.h>
 
 #include <stdint.h>
+#include <stddef.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -70,6 +71,83 @@ JCE_API uint32_t JCE_CALL jce_physics_debug_get_flags(void);
  * Call once per render frame (typically PRE_RENDER).  No state across
  * calls — safe to invoke from multiple worlds in turn. */
 JCE_API void JCE_CALL jce_physics_debug_flush(JcePhysicsWorld *world);
+
+/* Bounded, read-only shape query. Does not change global flags, the installed
+ * sink, the world debug drawer, or simulation. Call between simulation steps.
+ * bounds are world-space; only overlapping live collision shapes participate.
+ * flags accepts WIREFRAME/AABB/NORMALS only. Contacts/constraints still use flush.
+ * All limits must be nonzero; implementation ceilings are respectively
+ * 8192 objects, 4096 shape visits, 2048 mesh parts, 65536 triangles, 262144 lines.
+ * Compound nodes count as shape visits. At most 512 leaf shapes are retained.
+ * With range_radius == 0, mesh sampling occurs BEFORE reading indices/vertices; selected triangles
+ * span the complete admitted mesh, including its tail. Each triangle reads at
+ * most 3 indices and 3 vertices. Part metadata is visited at most twice.
+ * Normals are supplied for indexed triangles; other normal requests report
+ * UNSUPPORTED. Sphere/capsule/etc use finite native wire primitives. Unsupported shapes
+ * are reported, never replaced by boxes unless AABB was explicitly requested.
+ * A successful query can be partial: inspect status and counters, not just
+ * the bool result. An unshown edge does not mean a collider is absent. */
+typedef struct JcePhysicsDebugQuery {
+    uint32_t struct_size;
+    uint32_t flags;
+    jce_vec3 bounds_min;
+    jce_vec3 bounds_max;
+    uint32_t max_objects;
+    uint32_t max_shapes;
+    uint32_t max_mesh_parts;
+    uint32_t max_triangles;
+    uint32_t max_lines;
+    /* Optional suffix. World-space metric convention matches physics.h.
+     * Zero radius disables distance filtering. Positive radius first rejects
+     * shape AABBs and traverses existing quantized native BVHs, then budgets
+     * only nearby candidate faces. AABB intersection is conservative: faces
+     * crossing the boundary remain whole, not clipped into new geometry.
+     * At most 16384 candidate IDs and 131072 BVH nodes are retained/visited per
+     * query; overflow reports LIMIT. Meshes without a quantized native BVH
+     * report UNSUPPORTED in ranged mode instead of scanning all triangles.
+     * admitted_mesh_triangles then counts nearby candidates, not the world.
+     * Keep is opt-in through range_flags; zero-initialization keeps nobody.
+     * Only a currently live character in this world is prioritized. Handles
+     * are borrowed for this call; never retain them across runtime teardown. */
+    jce_vec3 range_center;
+    float range_radius;
+    JceCharacterHandle keep_character;
+    uint32_t range_flags;
+} JcePhysicsDebugQuery;
+
+#define JCE_PHYSICS_DEBUG_QUERY_V1_SIZE ((uint32_t)offsetof(JcePhysicsDebugQuery, range_center))
+typedef enum JcePhysicsDebugRangeFlag {
+    JCE_PHYS_QUERY_KEEP_CHARACTER = 1u << 0
+} JcePhysicsDebugRangeFlag;
+
+typedef enum JcePhysicsDebugQueryStatus {
+    JCE_PHYS_QUERY_COMPLETE = 0,
+    JCE_PHYS_QUERY_SAMPLED = 1u << 0,
+    JCE_PHYS_QUERY_LIMIT = 1u << 1,
+    JCE_PHYS_QUERY_UNSUPPORTED = 1u << 2,
+    JCE_PHYS_QUERY_INVALID_GEOMETRY = 1u << 3
+} JcePhysicsDebugQueryStatus;
+
+typedef struct JcePhysicsDebugQueryStats {
+    uint32_t struct_size;
+    uint32_t status;
+    uint32_t objects_visited;
+    uint32_t shapes_visited;
+    uint32_t shapes_admitted;
+    uint32_t mesh_parts_visited;
+    uint32_t triangles_read;
+    uint32_t lines_emitted;
+    uint32_t unsupported_shapes;
+    uint64_t admitted_mesh_triangles;
+} JcePhysicsDebugQueryStats;
+
+/* query.struct_size accepts sizeof(JcePhysicsDebugQuery) or the original V1
+ * prefix size; the old prefix is copied without reading the optional suffix.
+ * stats.struct_size must equal sizeof(JcePhysicsDebugQueryStats). Invalid
+ * arguments return false with no callbacks or world edits. */
+JCE_API bool JCE_CALL jce_physics_debug_query_shapes(
+    JcePhysicsWorld *world, const JcePhysicsDebugQuery *query,
+    jce_debug_line_fn sink, void *userdata, JcePhysicsDebugQueryStats *stats);
 
 /* ================================================================== */
 /* Contact-event listeners (BEGIN / STAY / END)                        */

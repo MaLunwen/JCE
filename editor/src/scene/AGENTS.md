@@ -1,5 +1,32 @@
 # editor/src/scene/ — Editor Scene Rendering & Asset Cache
 
+Play physics overlays in both viewports use `jce_editor_physics_overlay.h` and
+the public live-world debug sink. Do not substitute component boxes, visual
+model bounds or failed cooks for admitted native collision bodies. The view
+toggle owns wireframe; other Physics Debugger bits survive the scoped request.
+Restore public flags and a persistent sink before stack userdata expires. A
+missing live world produces no pretend 3D bodies. Box2D retains its explicitly
+separate authoring preview because this bridge exposes only the 3D world.
+Camera-space segment rejection is conservative; a two-pass traversal counts
+visible native lines, then uniformly samples the whole stream to 32,768 lines
+per view. Dense detail is diagnosed once, never silently truncated to an index
+prefix. This debug-only CPU traversal does not decode models or upload meshes.
+Renderer transient pressure may reduce detail again through its whole-queue
+sampling owner; neither display budget changes simulation geometry.
+Game PostFX bridge retention and draw admission consume the same combined
+wireframe/other-flags request, including Contacts/AABB without wireframe.
+Edit component previews use world pose and enabled primitive components;
+capsule axis/scale follow the authored primitive contract. Edit cooked-mesh
+preview limitations belong to the gizmo module, not the live Play overlay.
+
+Scene and Game render admission consumes the existing scene-loading state.
+While deferred loading remains active, neither viewport admits model/resource
+submission under pre-repair asset keys. Finalization repairs paths before the
+loader clears that state. Host update polling and the existing loading overlay
+remain independent of these draw gates; retain the prior target when present,
+without claiming a cold start has a completed image. The private trace records
+SceneLoading refusal and Game frame observation remains incomplete.
+
 The selected TriggerVolume overlay uses the runtime registration coordinate
 rule: world matrix translation plus the authored world-axis offset. Draw it
 before mesh-only early returns. OBB axes describe the overlap slab normals;
@@ -47,6 +74,7 @@ focus approximations are not certified complete dynamic-renderer envelopes.
 - `jce_scene_render_internal.h`             — cross-TU state.
 - `jce_editor_dynres_policy.h`              — private bounded adaptive-resolution policy for distinct available latched GPU observations.
 - `jce_editor_game_render.{h,cpp}`          — Play-mode render path (engine-owned, editor wraps).
+- `jce_editor_physics_overlay.h`           — shared private native-world collider overlay, conservative frustum rejection, bounded whole-stream sampling and scoped flag/sink lifetime.
 - `jce_editor_scene_asset_cache.{h,cpp}`    — facade over engine asset cache; tracks dirty-from-disk for hot-reload.
 - `jce_asset_cache_internal.h`              — cross-TU asset cache state.
 - `jce_asset_cache_resolve.cpp` (26 KB)     — GUID → loaded asset resolver.
@@ -264,6 +292,14 @@ independently of Game panel visibility. An active Play frame without an admitted
 camera refuses drawing rather than mutating preview. Scene snapshot restoration
 remains a separate history owner.
 
+The missing-camera diagnostic runs after player follow, primary Camera and
+VirtualCamera resolution, in their existing precedence. Only an actually
+applied player follow or resolved camera source suppresses the fallback warning.
+Without one, preserve the current pose and report the primary-resolution reason;
+the retained pose need not be the default. Deduplicate repeated failures until
+the reason changes, a source recovers or the Play camera lifetime ends. This
+diagnostic does not alter camera selection, pose, lens or rendering.
+
 Camera cuts invalidate Game previous-camera matrices and keep zero TAA history
 feedback pending until the existing legal PostFX apply call consumes it. Hidden
 or skipped views cannot clear the pending cut. This is CPU invocation ownership,
@@ -364,3 +400,42 @@ complete Game tail routes Canvas into the admitted FBO and keeps its matching
 texture for display/readback until next apply/resize/destruction. Scene View
 policy, PostFX allocations, input/focus/event retirement and runtime present
 remain unchanged. CPU routing tests are not pixel or performance evidence.
+
+
+The Play collider overlay now queries bounded native shape geometry once per
+visible viewport. Inverse view/projection corners supply conservative spatial
+bounds; exact segment frustum rejection remains in the shared overlay owner.
+Shape sampling happens before native index reads. Contacts/constraints alone
+may use the old flush path. Preserve saved global flags and the persistent sink.
+The finite line buffer is shared render-thread scratch, not a megabyte-sized
+Windows stack. Partial geometry is explicitly warned and never replaced with
+an authoring box. Do not describe a sampled or unsupported shape as absent.
+
+
+The optional document HUD resolves tags inside each input/sync operation through
+the shared application overlay. Do not retain entity handles across calls or
+replace first-match tag semantics with a UI-component query. Game input preflight
+records rml_input, the later focus query rml_focus, and the overlay owns rml_sync
+and rml_render. Canvas and native physics debug tails record game_canvas and
+game_physdbg. These opt-in existing phase slots measure CPU calls; they neither
+attribute GPU work nor change UI, input, debug geometry or quality policy.
+
+## Runtime 3D overlay range policy
+
+Scene and Game Play/Pause share `jce_editor_physics_debug_settings.h` through
+the existing editor-session UI state owner. Radius is 0..10000 metres using the
+physics world's metric convention; default is 30, and saved zero disables only
+distance. Default center is the current rendered camera, derived from the
+actual submitted view matrix after camera/follow selection. Optional Player
+center uses the current runtime position and falls back to that camera when
+missing or nonfinite. Always pass the independent current player-character
+handle to the public query, never a predicted entity or capsule guessed by size.
+
+Optional conservative frustum rejection is off by default. It and finite draw
+budgets can still omit a queried player edge; retaining a player from distance
+filtering does not certify visible pixels. Query the native BVH before mesh
+sampling; do not generate all world lines then merely hide distant output.
+The shared helper's legacy optional defaults preserve existing source callers;
+both production view callers explicitly supply the user's policy. Stopped
+Scene authoring gizmos and Box2D previews remain distinct and are not claimed
+to follow this runtime 3D range. No simulation/collider edits belong here.

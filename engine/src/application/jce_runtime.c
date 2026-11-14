@@ -27,6 +27,7 @@
 #include "jce_rt_internal.h"
 #include "middleware/scene/jce_water_ripple_internal.h"
 #include "jce_runtime_trace_internal.h"
+#include "jce_rt_script_cost.h"
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_perf_phase.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
@@ -286,16 +287,8 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 	 * its collider at the WORLD ORIGIN -- measured bit-identical to giving it
 	 * no parent at all (same penetration to six digits, same contact count).
 	 *
-	 * Composed ONCE here, for every spawner at the same time, because they all
-	 * take `const JceTransform *` -- so this cannot be a fix that reaches the
-	 * rigid-body path and silently misses vehicles, soft bodies, terrain,
-	 * compounds, meshes, characters, 2D bodies and tilemap colliders.
-	 *
-	 * A ROOT ENTITY IS UNCHANGED DOWN TO THE BYTE: jce_scene_get_world_pose
-	 * returns a parentless entity's Transform verbatim rather than routing it
-	 * through a matrix, so every scene authored before this spawns exactly
-	 * where it always did.  The scale comes through too -- a child of a scaled
-	 * parent was also getting its collider sized from the local scale. */
+	 * Compose once for all spawners, including world scale. Parentless entities
+	 * retain their original Transform bytes through jce_scene_get_world_pose. */
 	JceTransform tf_world = *tf_local;
 	jce_scene_get_world_pose(scene, e, &tf_world.position, &tf_world.rotation,
 	                         &tf_world.scale);
@@ -1313,39 +1306,6 @@ static void rt_spawn_configurable_joint(JceScene *scene, JceEntity e, void *ud)
 	ce->break_torque = cj->break_torque;
 }
 
-
-void jce_runtime_iterate_script_costs(const JceRuntime *rt,
-                                      JceScriptCostIterFn cb, void *user)
-{
-	if (!rt || !cb) return;
-	for (int i = 0; i < rt->script_count; ++i) {
-		const struct ScriptEntry *se = &rt->scripts[i];
-		JceScriptCostInfo info;
-		info.entity      = (uint64_t)se->entity;
-		info.script_path = se->script_path;
-		info.last_ms     = se->cost_last_ms;
-		info.avg_ms      = (se->cost_calls > 0)
-		                 ? (se->cost_total_ms / (double)se->cost_calls)
-		                 : 0.0;
-		info.calls       = se->cost_calls;
-		info.active      = se->active;
-		info.measured    = se->cost_measured;
-		cb(&info, user);
-	}
-}
-
-void jce_runtime_reset_script_costs(JceRuntime *rt)
-{
-	if (!rt) return;
-	for (int i = 0; i < rt->script_count; ++i) {
-		rt->scripts[i].cost_total_ms = 0.0;
-		rt->scripts[i].cost_calls    = 0u;
-		/* last_ms and measured survive a reset on purpose: the panel shows
-		 * the most recent frame's cost continuously, and clearing `measured`
-		 * would make a row that HAS been timed claim it never was until the
-		 * next frame arrives. */
-	}
-}
 
 /* rt_spawn_joint2d lives in jce_rt_physics.c beside rt_spawn_body2d, the
  * body it needs -- and out of this file, which is at its size baseline. */
@@ -3074,6 +3034,7 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 		 * profiling gate would be the very overhead the gate exists to
 		 * avoid. */
 		const bool prof = (jce_perf_phase_enabled() != 0);
+		RtScriptCostFrame script_cost = rt_script_cost_begin(prof);
 		double script_ms_total = 0.0;
 		for (int i = 0; i < rt->script_count; ++i) {
 			if (!rt->scripts[i].active) continue;
@@ -3101,6 +3062,8 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 				rt->scripts[i].cost_calls++;
 				rt->scripts[i].cost_measured  = true;
 				script_ms_total += ms;
+				if (script_cost.focus_path)
+					rt_script_cost_add(&script_cost, rt->scripts[i].script_path, ms);
 			} else {
 				rt_script_ref_update(rt->scripts[i].ref, s_dt);
 			}
@@ -3112,6 +3075,7 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 		 * and weapon timers -- one number for six things. */
 		if (prof)
 			jce_perf_phase_add("script", script_ms_total);
+		rt_script_cost_end(&script_cost);
 		/* Advance cooperative coroutines (jce.start_coroutine / wait_seconds)
 		 * with the same time-scaled dt the per-instance updates saw.  These are
 		 * shared cooperative timers, not per-entity, so they stay every-frame. */
@@ -5144,7 +5108,15 @@ JCE_API void JCE_CALL jce_runtime_set_contact_listener(JceRuntime *rt,
 JCE_API void JCE_CALL jce_runtime_set_input(JceRuntime *rt,
                                              const JceRuntimeInput *in)
 {
-	if (!rt || !in) return;
+	if (!rt) return;
+	if (!in) {
+		/* NULL cancels queued input; a zero non-NULL sample preserves sticky jump. */
+		memset(&rt->input, 0, sizeof(rt->input));
+		rt->input.speed_mult = 1.0f;
+		rt->char_jump_buf_t = 0.0f;
+		rt->char_jump_was_held = false;
+		return;
+	}
 	/* Whole-struct copy so a newly-added JceRuntimeInput field is NEVER silently
 	 * dropped (the field-by-field copy was a recurring footgun — e.g. attack_pressed).
 	 * Preserve the two explicit semantics afterwards: sticky jump (don't clear a

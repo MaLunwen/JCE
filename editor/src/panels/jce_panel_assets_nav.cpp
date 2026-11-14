@@ -12,6 +12,7 @@
 #include "core/jce_editor_build_profile.h"   /* jce_editor_favorites_snapshot */
 #include "dialogs/jce_editor_dialogs.h"
 #include "jce_panel_assets_internal.h"
+#include "jce_panel_assets_directory.h"
 
 static void persist_asset_browser_view_mode(void)
 {
@@ -27,27 +28,11 @@ static void persist_asset_browser_view_mode(void)
 
 /* ── Directory tree (recursive) ──────────────────────────────────── */
 
-/* Per-directory listing cache.
- *
- * The tree used to hit the filesystem every frame, for every visible node: one
- * jce_fs_host_list_dir for the node's children, then ANOTHER for each child
- * just to answer "does it have sub-folders" (the expander arrow). In a static
- * graveyard frame that measured 1.02 ms of a 1.12 ms panel and 1.02 of a
- * 2.99 ms frame -- the single largest phase in the frame, all of it syscalls
- * re-answering a question whose answer had not changed.
- *
- * A short TTL rather than an explicit invalidation everywhere: folders can
- * appear from outside the editor (a build writing into the tree, a git
- * checkout), and no in-editor hook can know about those. One second is below
- * the threshold where a person notices a folder is late, and it turns
- * per-frame enumeration into roughly one per second per visible node. */
+/* Complete directory snapshots are published at a tree-frame boundary.
+ * Tree refresh retains a minimum one-second interval plus queue latency; its
+ * filesystem work belongs to the existing async executor. */
 namespace {
-
-struct DirListing {
-    std::vector<std::string> subdirs;   /* sorted, absolute */
-    std::vector<bool>        has_kids;  /* parallel to subdirs */
-    double                   stamp;     /* seconds, jce_time_seconds() */
-};
+using DirListing = jce_asset_directory::Listing;
 
 double asset_tree_now(void)
 {
@@ -58,61 +43,26 @@ double asset_tree_now(void)
     return (double)jce_time_perf_to_ms(s_origin, jce_time_perf_counter()) * 0.001;
 }
 
-const double kDirCacheTTL = 1.0;
-
-std::unordered_map<std::string, DirListing> &dir_cache(void)
-{
-    static std::unordered_map<std::string, DirListing> c;
-    return c;
-}
-
 const DirListing &listing_for(const std::string &dir)
 {
-    DirListing &e = dir_cache()[dir];
-    const double now = asset_tree_now();
-    if (!e.subdirs.empty() || e.stamp != 0.0) {
-        if (now - e.stamp < kDirCacheTTL) return e;
-    }
-
-    e.subdirs.clear();
-    e.has_kids.clear();
-    e.stamp = now;
-
-    struct ListCtx {
-        std::vector<std::string> *subdirs;
-        const std::string        *dir;
-    } ctx;
-    ctx.subdirs = &e.subdirs;
-    ctx.dir     = &dir;
-    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
-        if (!is_dir) return true;
-        ListCtx *c = static_cast<ListCtx *>(ud);
-        char full[1024];
-        jce_path_join(full, sizeof(full), c->dir->c_str(), name);
-        c->subdirs->push_back(full);
-        return true;
-    };
-    jce_fs_host_list_dir(dir.c_str(), cb, &ctx);
-    std::sort(e.subdirs.begin(), e.subdirs.end());
-
-    e.has_kids.reserve(e.subdirs.size());
-    for (const std::string &sd : e.subdirs) {
-        struct HasChildCtx { bool has; } hc = { false };
-        auto hc_cb = [](const char *, bool is_dir, void *ud) -> bool {
-            if (is_dir) { static_cast<HasChildCtx *>(ud)->has = true; return false; }
-            return true;
-        };
-        jce_fs_host_list_dir(sd.c_str(), hc_cb, &hc);
-        e.has_kids.push_back(hc.has);
-    }
-    return e;
+    return jce_asset_directory::owner().listing(dir, asset_tree_now());
 }
 
-}  /* namespace */
+} /* namespace */
 
 void jce_editor_assets_tree_cache_invalidate(void)
 {
-    dir_cache().clear();
+    jce_asset_directory::owner().invalidate();
+}
+
+void jce_editor_assets_directory_init(void)
+{
+    jce_asset_directory::owner().initialize();
+}
+
+void jce_editor_assets_directory_shutdown(void)
+{
+    jce_asset_directory::owner().shutdown();
 }
 
 static void draw_dir_tree(const std::string &dir, int depth)
@@ -409,6 +359,7 @@ static void draw_asset_locations_section(void)
 
 void draw_asset_directory_tree(float tree_w, float panel_h)
 {
+    jce_asset_directory::owner().begin_tree(asset_tree_now());
     ImGui::BeginChild("AssetTree", ImVec2(tree_w, panel_h), ImGuiChildFlags_Borders);
     {
         /* Locations sidebar (drives / Home / Project / Favourites). */
@@ -465,6 +416,7 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
         }
     }
     ImGui::EndChild();
+    jce_asset_directory::owner().end_tree(asset_tree_now());
 }
 
 /* ── B. Breadcrumb bar ───────────────────────────────────────────── */

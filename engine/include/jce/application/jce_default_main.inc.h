@@ -1858,10 +1858,14 @@ static void app_update(float dt, void *ud)
         return;
     }
 
+    const bool document_input = jce_rml_scene_overlay_runtime_input(
+        &s_rml_doc_overlay, s_scene, in, acts, s_svc->window, &s_cursor_captured,
+        !s_preset_alt_active && jce_lifecycle_is_focused());
+
     /* Tab toggles FPS-look cursor capture.  Uncaptured ⇒ a free OS cursor the
      * player can click in-game UI with (FEATURE 4.1); captured ⇒ classic
      * mouse-look.  Apply the window mode change on the edge only. */
-    if (jce_input_key_pressed(in, JCE_KEY_TAB)) {
+    if (!document_input && jce_input_key_pressed(in, JCE_KEY_TAB)) {
         s_cursor_captured = !s_cursor_captured;
         if (s_svc->window) {
             jce_window_set_relative_mouse_mode(s_svc->window, s_cursor_captured);
@@ -1874,8 +1878,8 @@ static void app_update(float dt, void *ud)
     /* Hold ALT: temporarily release the captured cursor (inspect / reach
      * in-game UI); releasing ALT restores the game's capture state. */
     {
-        bool alt = jce_input_key_down(in, JCE_KEY_LALT) ||
-                   jce_input_key_down(in, JCE_KEY_RALT);
+        bool alt = !document_input && (jce_input_key_down(in, JCE_KEY_LALT) ||
+                   jce_input_key_down(in, JCE_KEY_RALT));
         if (alt && !s_preset_alt_active) {
             s_preset_alt_active    = true;
             s_preset_alt_saved_cap = s_cursor_captured;
@@ -1893,7 +1897,7 @@ static void app_update(float dt, void *ud)
     }
 
     /* Hold ESC 2s: clean quit (same path as the window close button). */
-    if (jce_input_key_down(in, JCE_KEY_ESCAPE)) {
+    if (!document_input && jce_input_key_down(in, JCE_KEY_ESCAPE)) {
         s_preset_esc_hold += dt;
         if (s_preset_esc_hold >= 2.0f) {
             LOG_INFO("app", "%s", "ESC held 2s — quitting");
@@ -1996,7 +2000,11 @@ static void app_update(float dt, void *ud)
          * Without this jce.is_key_down answered false in every shipped
          * game -- see JceRuntimeInput::keyboard. */
         ri.keyboard = in;
-        jce_runtime_set_input(s_runtime_host.runtime, &ri);
+        const bool block_game = document_input ||
+            (jce_rml_scene_overlay_has_modal_controls(&s_rml_doc_overlay) &&
+             (!s_cursor_captured || s_preset_alt_active));
+        if (block_game) memset(&ri, 0, sizeof ri);
+        jce_runtime_set_input(s_runtime_host.runtime, block_game ? NULL : &ri);
         {
             float pointer_x = 0.0f, pointer_y = 0.0f;
             uint32_t pointer_w = 0, pointer_h = 0;
@@ -2030,12 +2038,12 @@ static void app_update(float dt, void *ud)
                 touches[kept].pressure = pressure;
                 ++kept;
             }
-            jce_runtime_set_touch_input(s_runtime_host.runtime, touches, kept);
+            jce_runtime_set_touch_input(s_runtime_host.runtime, touches, block_game ? 0 : kept);
         }
         /* Bind the live action map so gameplay scripts can read authored verbs
          * and axes by name (jce.is_action_down / get_axis), beyond the fixed
          * walk/jump/sprint/attack fields above. */
-        jce_runtime_set_actions(s_runtime_host.runtime, acts);
+        jce_runtime_set_actions(s_runtime_host.runtime, block_game ? NULL : acts);
         jce_runtime_step(s_runtime_host.runtime, dt);
         if (jce_runtime_quit_requested(s_runtime_host.runtime)) { jce_engine_request_quit(); return; }
 
@@ -2105,7 +2113,7 @@ static void app_update(float dt, void *ud)
      *  - -dy → look up (mouse-up = look-up; standard non-inverted)
      * While uncaptured (Tab) the mouse is a free UI cursor and must not
      * steer the camera. */
-    if (s_cursor_captured) {
+    if (s_cursor_captured && !document_input) {
         float dx = 0.0f, dy = 0.0f;
         jce_input_mouse_delta(in, &dx, &dy);
         if (dx != 0.0f || dy != 0.0f) {
@@ -2120,7 +2128,7 @@ static void app_update(float dt, void *ud)
      * JCE_KEY_F == 9 (jce_keys.h:29). */
     static bool s_free_cam      = false;
     static bool s_free_cam_prev = false;
-    bool f_now = jce_input_key_down(in, JCE_KEY_F);
+    bool f_now = !document_input && jce_input_key_down(in, JCE_KEY_F);
     if (f_now && !s_free_cam_prev) s_free_cam = !s_free_cam;
     s_free_cam_prev = f_now;
 

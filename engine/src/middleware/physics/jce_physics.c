@@ -1378,6 +1378,14 @@ void jce_physics_debug_flush(JcePhysicsWorld *world)
 }
 
 
+bool JCE_CALL jce_physics_debug_query_shapes(JcePhysicsWorld *world,
+    const JcePhysicsDebugQuery *query, jce_debug_line_fn sink, void *userdata,
+    JcePhysicsDebugQueryStats *stats)
+{
+    return world && jce_bullet_debug_query_shapes(world->bullet, query, sink, userdata, stats);
+}
+
+
 JceBodyHandle JCE_CALL jce_physics_body_create_heightfield(
     JcePhysicsWorld *world, const JceHeightfieldBodyDesc *desc)
 {

@@ -8,6 +8,7 @@ module never renames, removes, or copies an existing CMake/Conan cache.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -23,6 +24,8 @@ NATIVE_STEMS = (
 NATIVE_CONAN_TARGETS = NATIVE_STEMS + ("linux-x86",)  # experimental i686 lane has no CMake desktop preset yet
 PRESET_KINDS = ("release", "dist", "debug", "release-sdk", "dist-sdk")
 OBJECT_KINDS = PRESET_KINDS + ("asan",)
+VS_VENDOR = "microsoft.com/VisualStudioSettings/CMake/1.0"
+WINDOWS_PRESET_TOOLSET = "v143,version=14.4"
 
 
 def _target(target: str) -> str:
@@ -58,22 +61,63 @@ def preset_cache_variables(root: Path, target: str, kind: str) -> dict[str, str]
 
 
 def _resolve(presets: dict[str, dict], name: str, stack=()) -> dict:
+    """Resolve the configure fields used by this gate, without macro expansion.
+
+    CMake prefers the first parent and does not inherit presentation/hidden
+    fields. Cache/environment entries retain explicit null overrides. Microsoft
+    vendor maps inherit per vendor URI, as in CMake Tools' vendor-map resolver;
+    CMake itself does not interpret vendor payloads.
+    """
     if name not in presets:
         raise ValueError("unknown inherited preset " + name)
     if name in stack:
         raise ValueError("preset inheritance loop: " + " -> ".join((*stack, name)))
     p = presets[name]
     result = {"cacheVariables": {}}
+    noninherited = {"name", "hidden", "inherits", "description", "displayName"}
+    maps = {"cacheVariables", "environment", "vendor", "warnings", "errors"}
+
+    def overlay(values, inherited=False):
+        for key, value in values.items():
+            if key == "inherits" or (inherited and key in noninherited):
+                continue
+            if key in maps:
+                result.setdefault(key, {}).update(copy.deepcopy(value))
+            elif key in ("architecture", "toolset"):
+                # CMake inherits value and strategy independently.
+                item = {"value": value} if isinstance(value, str) else value
+                result.setdefault(key, {}).update({k: copy.deepcopy(v) for k, v in item.items()
+                                                    if k != "value" or v != ""})
+            elif value == "" and key in ("generator", "binaryDir", "installDir", "toolchainFile"):
+                continue
+            else:
+                result[key] = copy.deepcopy(value)
+
     parents = p.get("inherits", ())
     if isinstance(parents, str):
         parents = (parents,)
-    for parent in parents:
+    for parent in reversed(parents):
         base = _resolve(presets, parent, (*stack, name))
-        result.update({k: v for k, v in base.items() if k != "cacheVariables"})
-        result["cacheVariables"].update(base.get("cacheVariables", {}))
-    result.update({k: v for k, v in p.items() if k not in ("cacheVariables", "inherits")})
-    result["cacheVariables"].update(p.get("cacheVariables", {}))
+        overlay(base, inherited=True)
+    overlay(p)
+    # An explicit null condition clears inheritance on this preset, but is not
+    # then inherited as a blocking null condition by its descendants.
+    if result.get("condition", False) is None:
+        result.pop("condition")
     return result
+
+
+def _host_metadata(name: str):
+    for prefix, host, vendor_host in (
+        ("windows-", "Windows", "Windows"), ("linux-", "Linux", "Linux"),
+        ("macos-", "Darwin", "macOS"), ("ios-", "Darwin", "macOS"),
+    ):
+        if name.startswith(prefix):
+            return ({"type": "equals", "lhs": "${hostSystemName}", "rhs": host}, [vendor_host])
+    if name in ("host-release", "jni-release", "android-arm64-release", "wasm-release", "wasm-dist"):
+        return ({"type": "inList", "string": "${hostSystemName}",
+                 "list": ["Windows", "Linux", "Darwin"]}, ["Windows", "Linux", "macOS"])
+    return None
 
 
 def _as_cmake_path(root: Path, path: Path) -> str:
@@ -83,11 +127,43 @@ def _as_cmake_path(root: Path, path: Path) -> str:
 def check_presets(repo: Path, data: dict) -> list[str]:
     """Verify every cross-host preset against the runtime path authority."""
     errors = []
+    minimum = data.get("cmakeMinimumRequired", {})
+    if data.get("version") == 6 and tuple(minimum.get(k, 0) for k in ("major", "minor", "patch")) < (3, 25, 0):
+        errors.append("preset schema 6 requires CMake 3.25 or later")
     names = [x.get("name") for x in data.get("configurePresets", [])]
     if len(names) != len(set(names)):
         errors.append("CMakePresets.json contains duplicate configurePreset names")
     presets = {x["name"]: x for x in data.get("configurePresets", [])}
     paths = {}
+    labels = {}
+    for name, entry in presets.items():
+        try:
+            resolved = _resolve(presets, name)
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if resolved.get("hidden"):
+            continue
+        label = resolved.get("displayName")
+        if not isinstance(label, str) or not label:
+            errors.append(f"{name}: public configurePreset requires displayName")
+        elif label in labels:
+            errors.append(f"{name}: duplicate configurePreset displayName with {labels[label]}")
+        else:
+            labels[label] = name
+        binary_dir = resolved.get("binaryDir")
+        if isinstance(binary_dir, str) and binary_dir:
+            if binary_dir in paths:
+                errors.append(f"{name}: shared binaryDir with {paths[binary_dir]}")
+            else:
+                paths[binary_dir] = name
+        host = _host_metadata(name)
+        if host is not None:
+            condition, vendor_hosts = host
+            if resolved.get("condition") != condition:
+                errors.append(f"{name}: host condition differs from the target family")
+            if resolved.get("vendor", {}).get(VS_VENDOR, {}).get("hostOS") != vendor_hosts:
+                errors.append(f"{name}: IDE hostOS differs from the target family")
     for target in NATIVE_STEMS:
         kinds = (*PRESET_KINDS, "asan") if target == "windows-x64" else PRESET_KINDS
         for kind in kinds:
@@ -101,10 +177,21 @@ def check_presets(repo: Path, data: dict) -> list[str]:
             got_dir = resolved.get("binaryDir")
             if got_dir != expected_dir:
                 errors.append(f"{name}: binaryDir {got_dir!r} != {expected_dir!r}")
-            elif got_dir in paths:
-                errors.append(f"{name}: shared binaryDir with {paths[got_dir]}")
-            else:
-                paths[got_dir] = name
+            if resolved.get("hidden"):
+                errors.append(f"{name}: canonical preset cannot be hidden")
+            if resolved.get("generator") != "Ninja":
+                errors.append(f"{name}: canonical preset generator must remain Ninja")
+            variables = resolved.get("cacheVariables", {})
+            sdk = kind.endswith("-sdk")
+            if variables.get("JCE_DELIVERY_PROFILE") != ("embedded" if sdk else "authoring"):
+                errors.append(f"{name}: delivery profile differs from the preset purpose")
+            if variables.get("JCE_BUILD_EDITOR") != ("OFF" if sdk else "ON"):
+                errors.append(f"{name}: Editor selection differs from the preset purpose")
+            if target.startswith("windows-"):
+                if resolved.get("architecture") != {"value": target.removeprefix("windows-"), "strategy": "external"}:
+                    errors.append(f"{name}: Windows Ninja architecture must be explicit and external")
+                if resolved.get("toolset") != {"value": WINDOWS_PRESET_TOOLSET, "strategy": "external"}:
+                    errors.append(f"{name}: Windows Ninja toolset must select the shared MSVC family")
             toolchain = _as_cmake_path(repo,
                 Path(preset_cache_variables(repo, target, kind)["CMAKE_TOOLCHAIN_FILE"]))
             got_tc = resolved.get("cacheVariables", {}).get("CMAKE_TOOLCHAIN_FILE")
@@ -123,9 +210,23 @@ def check_presets(repo: Path, data: dict) -> list[str]:
     build_names = [x.get("name") for x in data.get("buildPresets", [])]
     if len(build_names) != len(set(build_names)):
         errors.append("CMakePresets.json contains duplicate buildPreset names")
+    build_labels = {}
     for x in data.get("buildPresets", []):
         if x.get("configurePreset") not in presets:
             errors.append(f"buildPreset {x.get('name')}: nonexistent configurePreset")
+            continue
+        if not x.get("hidden"):
+            host = _host_metadata(x["configurePreset"])
+            if host is not None and x.get("condition") != host[0]:
+                errors.append(f"buildPreset {x.get('name')}: host condition differs from its configure preset")
+            label = x.get("displayName")
+            expected_label = "Build " + presets[x["configurePreset"]].get("displayName", "")
+            if label != expected_label:
+                errors.append(f"buildPreset {x.get('name')}: displayName must identify the associated configure preset")
+            if label in build_labels:
+                errors.append(f"buildPreset {x.get('name')}: duplicate displayName with {build_labels[label]}")
+            else:
+                build_labels[label] = x.get("name")
     return errors
 
 
@@ -146,6 +247,8 @@ def check_driver(repo: Path) -> list[str]:
         sys.path.insert(0, repo_path)
     driver = _load(repo / "tools/build/jce.py", "jce_build_layout_driver")
     standalone = _load(repo / "tools/build/standalone.py", "jce_build_layout_standalone")
+    if WINDOWS_PRESET_TOOLSET != "v143,version=" + driver._VC_TOOLSET_PREFIX:
+        errors.append("Windows preset toolset differs from the shared MSVC environment owner")
     for target in NATIVE_STEMS:
         t = dict(driver.TARGETS[target], key=target)
         for kind in PRESET_KINDS:

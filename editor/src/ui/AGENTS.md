@@ -1,5 +1,15 @@
 # editor/src/ui/ — Editor Chrome, Layout & Theme
 
+Shared panel initialization also enables the existing Asset Browser's private
+directory snapshot owner through declarations in jce_editor_panels.h. Shutdown
+cancels/releases its public async task references beside Bundle/Test Runner and
+before Console retirement, without waiting on filesystem work or including a
+private panel header here. Task-owned requests/results never borrow the panel
+lifecycle; late cancelled workers cannot publish after shutdown. Same-executor
+immediate reinit may overlap retiring old jobs; the two-flight admission bound
+belongs to each active lifecycle. The existing complete panel-state fixture
+checks both hooks and preserves the prior owners' teardown order.
+
 ## Identity
 - **Language**: C++20 + ImGui
 - **Role**: docking layout, panel registry, global style/theme/palette. The "frame" around `panels/`.

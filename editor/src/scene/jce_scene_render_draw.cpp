@@ -9,12 +9,14 @@
 
 #include "jce_scene_render_internal.h"
 #include "jce_scene_outline_policy.h"
+#include "jce_editor_physics_debug_settings.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_sequencer.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
+#include <jce/application/jce_runtime.h>
 #include <jce/os/core/jce_log.h>
 }
 
@@ -829,8 +831,11 @@ void draw_selection_outlines(void)
         }
 
         if (!scene) continue;
-        JceTransform *t = jce_scene_get_transform(scene, e);
-        if (!t) continue;
+        JceTransform *local = jce_scene_get_transform(scene, e);
+        if (!local) continue;
+        JceTransform world = *local;
+        jce_scene_get_world_pose(scene, e, &world.position, &world.rotation, &world.scale);
+        JceTransform *t = &world;
 
         bool drew_shape = drew_light_early || drew_trigger;
 
@@ -935,7 +940,8 @@ void draw_selection_outlines(void)
         /* --- Collider shapes (real geometry).  size/radius are
          *     interpreted in local entity space and scaled by the
          *     entity's TRS scale, matching Unity-style authoring. */
-        if (jce_scene_has_box_collider(scene, e)) {
+        if (jce_scene_has_box_collider(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_BOX_COLLIDER)) {
             JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
             jce_vec3 ofs = bc
                 ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
@@ -952,7 +958,8 @@ void draw_selection_outlines(void)
             jce_debug_draw_box(c, half, t->rotation, col_outline);
             drew_shape = true;
         }
-        if (jce_scene_has_sphere_collider(scene, e)) {
+        if (jce_scene_has_sphere_collider(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPHERE_COLLIDER)) {
             JceSphereColliderComponent *sc = jce_scene_get_sphere_collider(scene, e);
             jce_vec3 ofs = sc
                 ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
@@ -967,7 +974,8 @@ void draw_selection_outlines(void)
             jce_debug_draw_sphere(c, r, col_outline);
             drew_shape = true;
         }
-        if (jce_scene_has_capsule_collider(scene, e)) {
+        if (jce_scene_has_capsule_collider(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CAPSULE_COLLIDER)) {
             JceCapsuleColliderComponent *cc = jce_scene_get_capsule_collider(scene, e);
             jce_vec3 ofs = cc
                 ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
@@ -1000,7 +1008,8 @@ void draw_selection_outlines(void)
                                    col_outline);
             drew_shape = true;
         }
-        if (jce_scene_has_character_controller(scene, e)) {
+        if (jce_scene_has_character_controller(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CHARACTER_CONTROLLER)) {
             JceCharacterControllerComponent *cc =
                 jce_scene_get_character_controller(scene, e);
             jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
@@ -1310,8 +1319,46 @@ void draw_selection_outlines(void)
 
 /* ── Physics debug visualization ──────────────────────────────────── */
 
-void draw_physics_debug(void)
+/* Retain the separate Box2D authoring preview; the live bridge below is 3D.
+ * The 2D runtime API has no wireframe sink in this owner. */
+static void draw_physics_2d_preview(JceScene *scene)
 {
+    if (!scene) return;
+    for (int i = 0; i < jce_state_get_entity_count(); ++i) {
+        const uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (!id || !jce_state_entity_enabled(id)) continue;
+        const JceEntity entity = jce_state_to_ecs_entity(id);
+        if (!jce_scene_component_enabled(scene, entity, JCE_COMP_FLAG_COLLIDER_2D)) continue;
+        JceCollider2DComponent *collider = jce_scene_get_collider2d(scene, entity);
+        JceTransform *local = jce_scene_get_transform(scene, entity);
+        if (!collider || !local) continue;
+        JceTransform world = *local;
+        jce_scene_get_world_pose(scene, entity, &world.position, &world.rotation, &world.scale);
+        draw_collider2d_outline(&world, collider, 0xFF00FF00u, 0xFF00FFFFu, 0xFFFFFF00u);
+    }
+    jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+}
+
+void draw_physics_debug(const jce_mat4 &view, const jce_mat4 &projection)
+{
+    const int play_state = (int)jce_state_get_play_state();
+    if (play_state == 1 || play_state == 2) {
+        jce_vec3 physics_center{};
+        const bool player_center = jce_editor_physics_debug_settings::player_center(
+            jce_editor_play_get_runtime(), physics_center);
+        jce_editor_physics_overlay_draw(jce_editor_play_get_physics_world(),
+            view, projection, scene_view_id(), s_sr.renderer,
+            jce_state_get_show_physics_debug(), s_sr.physics_overlay_budget_warned,
+            jce_editor_physics_debug_settings::radius(),
+            jce_editor_physics_debug_settings::frustum(),
+            jce_runtime_get_player_character(jce_editor_play_get_runtime()),
+            player_center ? &physics_center : nullptr);
+        if (jce_state_get_show_physics_debug())
+            draw_physics_2d_preview(jce_state_get_scene());
+        return; /* Missing native world does not certify authored 3D bodies. */
+    }
+    if (!jce_state_get_show_physics_debug()) return;
+
     int count = jce_state_get_entity_count();
     if (count == 0) return;
 
@@ -1321,10 +1368,9 @@ void draw_physics_debug(void)
     int sel_n = 0;
     const uint32_t *sel = jce_state_get_selection(&sel_n);
 
-    /* Range-cull the FITTED compound wireframe (Unity-style green mesh): only
-     * the nearest few props to the camera get the detailed trimesh; the rest
-     * get a cheap bounds box. Keeps it "real but not over-rendered" and bounds
-     * the per-frame line count well under the debug-draw buffer. */
+    /* Edit-only authoring preview: near meshes get more sampled edges.
+     * Both budgets cover the whole source mesh; neither invents a bounds box.
+     * Live Play was handled above by the actual physics world. */
     jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
     const float detail_dist2 = 22.0f * 22.0f;
     int detail_budget = 10;
@@ -1346,8 +1392,11 @@ void draw_physics_debug(void)
         if (is_selected) continue;
 
         JceEntity e = jce_state_to_ecs_entity(id);
-        JceTransform *t = jce_scene_get_transform(scene, e);
-        if (!t) continue;
+        JceTransform *local = jce_scene_get_transform(scene, e);
+        if (!local) continue;
+        JceTransform world = *local;
+        jce_scene_get_world_pose(scene, e, &world.position, &world.rotation, &world.scale);
+        JceTransform *t = &world;
 
         jce_quat q = t->rotation;
         /* size/center/radius/height are interpreted in local entity space and
@@ -1357,7 +1406,8 @@ void draw_physics_debug(void)
         jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
         float sx = ss.x, sy = ss.y, sz = ss.z;
 
-        if (jce_scene_has_box_collider(scene, e)) {
+        if (jce_scene_has_box_collider(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_BOX_COLLIDER)) {
             JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
             jce_vec3 ofs = bc ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
                               : jce_v3(0, 0, 0);
@@ -1368,7 +1418,8 @@ void draw_physics_debug(void)
                               jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
             jce_debug_draw_box(c, half, q, col_box);
         }
-        if (jce_scene_has_sphere_collider(scene, e)) {
+        if (jce_scene_has_sphere_collider(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPHERE_COLLIDER)) {
             JceSphereColliderComponent *sc = jce_scene_get_sphere_collider(scene, e);
             jce_vec3 ofs = sc ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
                               : jce_v3(0, 0, 0);
@@ -1378,18 +1429,41 @@ void draw_physics_debug(void)
                               jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
             jce_debug_draw_sphere(c, r, col_sphere);
         }
-        if (jce_scene_has_capsule_collider(scene, e)) {
+        if (jce_scene_has_capsule_collider(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CAPSULE_COLLIDER)) {
             JceCapsuleColliderComponent *cc = jce_scene_get_capsule_collider(scene, e);
-            jce_vec3 ofs = cc ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
-                              : jce_v3(0, 0, 0);
-            float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
-            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
+            jce_vec3 ofs = cc
+                ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
+                : jce_v3(0, 0, 0);
+            jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+            float sx = ss.x, sy = ss.y, sz = ss.z;
+            /* Follow the AUTHORED axis, exactly as the runtime now does.
+             * jce_debug_draw_capsule draws Y-aligned and already takes a
+             * rotation, so the axis composes into that -- no new draw call
+             * and no second place for draw and physics to disagree. */
+            int cax = cc ? cc->axis : 1;
+            if (cax < 0 || cax > 2) cax = 1;
+            float a0 = (cax == 0) ? sy : sx;
+            float a1 = (cax == 2) ? sy : sz;
+            float r_scale = fmaxf(a0, a1);
+            float len_scale = (cax == 0) ? sx : ((cax == 2) ? sz : sy);
+            float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
+            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * len_scale;
             float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
-            jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
-                              jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
-            jce_debug_draw_capsule(c, r, hh, q, col_capsule);
+            jce_vec3 c = jce_v3_add(t->position,
+                              jce_q_rotate(t->rotation,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            /* Y -> X is -90 deg about Z; Y -> Z is +90 deg about X. */
+            jce_quat axis_q = (cax == 0)
+                ? jce_q_from_axis_angle(jce_v3(0.0f, 0.0f, 1.0f), -1.5707963f)
+                : (cax == 2)
+                ? jce_q_from_axis_angle(jce_v3(1.0f, 0.0f, 0.0f),  1.5707963f)
+                : jce_q_identity();
+            jce_debug_draw_capsule(c, r, hh, jce_q_multiply(t->rotation, axis_q),
+                                   col_capsule);
         }
-        if (jce_scene_has_character_controller(scene, e)) {
+        if (jce_scene_has_character_controller(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CHARACTER_CONTROLLER)) {
             JceCharacterControllerComponent *cc =
                 jce_scene_get_character_controller(scene, e);
             float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
@@ -1437,15 +1511,6 @@ void draw_physics_debug(void)
     }
 
     jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
-
-    /* P3-C.5 — flush Bullet's debug-draw (wireframes / AABBs / contacts)
-     * for the live Play world.  The line sink + flag mask are installed
-     * once at editor startup (see jce_panel_physics_debugger.cpp). */
-    JcePhysicsWorld *pw = jce_editor_play_get_physics_world();
-    if (pw && jce_physics_debug_get_flags() != 0) {
-        jce_physics_debug_flush(pw);
-        jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
-    }
 }
 
 /* ── Joint gizmos (P3-C.6) ────────────────────────────────────────── */
@@ -1649,6 +1714,9 @@ void draw_streaming_overlay(void)
  * wireframe is cached inside the gizmo (model path + settings keyed). */
 void draw_compound_collider_gizmos(void)
 {
+    const int play_state = (int)jce_state_get_play_state();
+    if (play_state == 1 || play_state == 2) return; /* Native overlay owns Play. */
+    if (!jce_state_get_show_physics_debug()) return;
     JceScene *scene = jce_state_get_scene();
     if (!scene) return;
 

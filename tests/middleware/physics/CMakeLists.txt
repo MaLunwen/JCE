@@ -199,3 +199,17 @@ jce_add_unit_test(test_jce_physics_debug_sink
 jce_add_unit_test(test_jce_physics2d_layers
     SOURCES test_jce_physics2d_layers.c
     LINK    jce_core jce_physics jce_resource)
+
+# Native Bullet indexed buffers exercise the bounded production debug reader.
+jce_add_cxx_test(test_jce_physics_debug_mesh
+    SOURCES test_jce_physics_debug_mesh.cpp
+    LINK jce_core jce_physics Bullet::Bullet
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")
+include(physics_debug_mesh_controls.cmake)
+
+# Complete production query against a real Bullet world/BVH; no renderer host.
+jce_add_cxx_test(test_jce_physics_debug_range
+    SOURCES test_jce_physics_debug_range.cpp
+        "${CMAKE_SOURCE_DIR}/engine/src/middleware/physics/jce_physics_debug_query.cpp"
+    LINK jce_core Bullet::Bullet
+    INCLUDES "${CMAKE_SOURCE_DIR}/engine/src")

@@ -131,6 +131,9 @@ bool  jce_editor_game_view_is_input_active(void);
 void  jce_editor_game_view_release_play_input(void);
 void  jce_editor_panel_timeline(void);
 void  jce_editor_panel_assets(void);
+/* Asset Browser scan handles are owned by the shared panel lifecycle. */
+void  jce_editor_assets_directory_init(void);
+void  jce_editor_assets_directory_shutdown(void);
 void  jce_editor_panel_file_viewer(void);
 void  jce_editor_panel_postfx(void);
 void  jce_editor_panel_particle_editor(void);

@@ -26,6 +26,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -73,23 +74,32 @@ def build(config: str) -> int:
             "to BUILD its managed half; a player needs only the runtime.")
         return 0
 
-    cmd = ["dotnet", "build", str(PROJECT), "-c", config, "--nologo",
-           "-v", "minimal"]
-    log(" ".join(cmd))
-    r = subprocess.run(cmd, cwd=str(HERE))
-    if r.returncode != 0:
-        return r.returncode
+    # MSBuild may place outputs in bin/x64/Release/net8.0 on Windows but
+    # bin/Release/net8.0 on Unix. Do not guess the Platform dimension.
+    # Stage under the managed project's existing obj/ owner; publish only
+    # once BOTH required outputs exist. A failed build leaves old artifacts
+    # untouched, and the unique temporary output is deleted on exit.
+    staging_root = PROJECT.parent / "obj"
+    staging_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="jce-csharp-output-", dir=staging_root) as temp:
+        built = Path(temp)
+        cmd = ["dotnet", "build", str(PROJECT), "-c", config, "--nologo",
+               "-v", "minimal", "--output", str(built)]
+        log(" ".join(cmd))
+        r = subprocess.run(cmd, cwd=str(HERE))
+        if r.returncode != 0:
+            return r.returncode
 
-    built = PROJECT.parent / "bin" / config / "net8.0"
-    ARTIFACTS.mkdir(parents=True, exist_ok=True)
-    for name in OUTPUTS:
-        src = built / name
-        if not src.is_file():
-            log("ERROR: `dotnet build` did not produce " + name + " in "
-                + str(built) + ". For a class LIBRARY the runtimeconfig only "
-                "appears with <EnableDynamicLoading>true</EnableDynamicLoading>.")
+        missing = [name for name in OUTPUTS if not (built / name).is_file()]
+        if missing:
+            log("ERROR: dotnet build did not publish: " + ", ".join(missing)
+                + " in " + str(built)
+                + ". Verify <EnableDynamicLoading>true</EnableDynamicLoading> "
+                  "for the class-library runtimeconfig.")
             return 1
-        shutil.copy2(src, ARTIFACTS / name)
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        for name in OUTPUTS:
+            shutil.copy2(built / name, ARTIFACTS / name)
     log("-> " + str(ARTIFACTS))
     return 0
 

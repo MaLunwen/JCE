@@ -24,6 +24,16 @@ typedef struct JceCamera   JceCamera;
 typedef struct JcePakArchive JcePakArchive;
 typedef struct JceRuntime  JceRuntime;
 struct JceWindow;
+struct JceScene;
+struct JceInput;
+struct JceInputActions;
+
+/* Document input is prepared before the Play runtime consumes its sample. */
+bool jce_editor_game_render_prepare_document_input(struct JceScene *scene,
+    const struct JceInput *input, const struct JceInputActions *actions);
+bool jce_editor_game_render_document_wants_input(void);
+bool jce_editor_game_render_has_virtual_camera(void);
+bool jce_editor_game_render_document_owns_free_pointer(void);
 
 /* Set / clear the FPS-style relative-mouse capture on the editor window.
  * When `capture` is true, the OS cursor is hidden + locked, mouse motion

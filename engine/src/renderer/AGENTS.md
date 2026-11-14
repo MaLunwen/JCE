@@ -1,5 +1,14 @@
 # engine/src/renderer — Renderer Layer (L3)
 
+Debug line flush uses LEQUAL without depth writes so coplanar floor/collider
+edges survive equality and the overlay does not poison later scene depth.
+The private `jce_debug_line_sample.h` copies complete vertex pairs across the
+whole queued range when remaining transient capacity is insufficient. Preserve
+the exact-copy path when all lines fit, endpoint/attribute pairing, even vertex
+counts and the once-only capacity warning; a queue prefix is not a faithful
+substitute for distributed collision detail. The fixed CPU queue still reports
+overflow; the Play overlay applies its smaller per-view budget before admission.
+
 Accepted canonical readbacks emit transition-only `readback.operation` packets
 from their existing slot owner. Capture-local operation/context/ticket identity,
 provider promise, observed serial, readiness and actual CPU release remain
@@ -77,15 +86,17 @@ off neither hashes nor allocates nor reads a new clock; this is not a measured
 zero-cost or frame-performance claim. Capture reset still requires producer
 quiescence. Core owns SHA once; private policy reads reuse the device latch.
 
-PBR static PCF selects its cascade sampler outside the unchanged nine/twenty-five
-tap loops. The shared sampler-parameter helper retains tier decisions, kernel
-rotation and arithmetic; hard taps, PCSS blocker search, coverage/bias and the
-dynamic-atlas combine keep their original owners. This declaration is also
-consumed by PBR variants, graph/classic materials and unlit shader parsing;
-compiling or replaying the default PBR entry alone does not qualify them all.
-Static shadow targets currently have one mip, point filtering and clamp. Revisit
-implicit-LOD behavior before changing that policy; a varying cascade branch
-does not establish derivative correctness for a future filtered mip chain.
+Static CSM PCF selects its cascade sampler before the shared csm_filter.sh
+kernel. Tiers retain 1/9/25 depth-fetch budgets; filtered tiers use balanced,
+staggered fixed rings rather than a per-fragment hashed rotation. Opposite taps,
+zero centroid and equal X/Y second moments guard directional bias. Reciprocal
+map size honors all positive resolutions. PCSS, texel bias, split blending and
+dynamic-atlas clamping retain their separate policies. CPU shader-port controls
+do not certify native compilation, visual acceptance or GPU performance.
+PBR variants, graph/classic materials and unlit shader parsing also consume the
+declaration; compiling only the default entry does not qualify them all. Static
+shadow targets retain one mip, point filtering and clamp. Revisit derivatives
+and implicit LOD before introducing a filtered mip chain.
 
 Grass CSM selects its cascade sampler once outside the unchanged four-tap PCF.
 Coverage, bias, tap order, cascade fallthrough and edge blending remain owned
@@ -1497,11 +1508,17 @@ retry and compiled historical negatives; actual glyph pixels remain separate.
 
 Mesh creation transactions: jce_mesh_create_internal.h supplies immutable private
 creation ports to the actual constructor. Each mesh copies provider identity;
-its user context must outlive it. Initialize VB/IB/wireframe IB to invalid before
-acquisition. Staging or attempted GPU buffer failure retires acquired handles
-once and returns NULL. Optional CPU wireframe-generation fallback stays explicit.
-renderer.mesh.create records CPU outcomes. Counted ports in
-tests/renderer/test_jce_mesh_create_lifecycle.c are not GPU completion evidence.
+its user context must outlive it. jce_mesh_index_data.h packs the original
+triangle prefix and wireframe suffix into one immutable IB for procedural,
+PBR and skinned meshes. Triangle counts/getters remain unchanged; every wire
+bind starts after that prefix. Preserve unique procedural edges and the
+existing PBR/skinned line pairs. No second static IB or retained CPU topology
+is needed. Optional topology/staging failure keeps a solid-only upload.
+Initialize owned handles to INVALID before acquisition; required staging or
+GPU buffer failure releases acquired handles once and returns NULL, including
+PBR/skinned uploads. renderer.mesh.create records CPU outcomes. Counted ports
+in tests/renderer/test_jce_mesh_create_lifecycle.c cover fixed-capacity
+admission and lifetime; these are not GPU completion or frame-time evidence.
 
 Scene directional/local depth surfaces are owned by
 `middleware/scene/jce_sr_shadow_targets.c` and admitted by the corresponding
@@ -1887,3 +1904,47 @@ shadow density. The authored coverage number is a control, not a measured
 screen-space cloud fraction; authored scenes need visual calibration after
 morphology changes. Keep period, deterministic, erosion, precipitation and
 split-vs-combined property tests when changing this field.
+
+The private jce_pbr_cull_override.h owns a render-thread two-sided scope beside
+the existing PBR UV override. Apply it to final mesh/model/skinned color and
+shadow states and the PBR normal-side uniform. Neutral scope is byte-identical;
+never mutate imported material storage or leak the scope to a subsequent draw.
+
+Underwater construction admits all required buffers, shaders, programs and
+uniforms before publication. Any failure releases only acquired ownership and
+returns NULL; render independently guards every required handle. Index-buffer
+statistics diagnose allocation refusal without assuming VRAM exhaustion or
+changing backend capacity. CPU injected failures are not native GPU results.
+
+glTF CPU upload admits a model only after every nonempty primitive's required
+vertex/index source and GPU mesh succeeds. On refusal, the existing model and
+CPU destructors unwind transferred and untransferred ownership once. Publish
+node/primitive counts only with allocated arrays. Empty primitives and the
+existing optional material/LOD policies remain independent; do not cache a
+partial missing-geometry model as successful admission.
+
+`jce_pbr_depth_internal.h` declares private MASK depth variants. Their lazy
+program cache lives with the PBR material owner and is released at shutdown;
+a failed variant is refused for that lifetime, never replaced by opaque depth.
+`jce_pbr_material_bind_depth` reuses the stock albedo, factor, cutoff and active
+UV transform, binding only the alpha source at sampler 0. Opaque draws retain
+their existing programs and require no alpha uniforms or texture binding.
+`jce_model_depth_bind.inc.h` selects the effective material per primitive;
+`jce_model_depth.inc.h` owns ordinary, skinned, crowd and velocity submissions.
+Other model depth routes use the same selector, including every instance chunk
+after DISCARD_ALL. Preserve existing cull scopes and triangle index spans.
+This owner does not add custom graph alpha, per-instance tint alpha, imported
+material double-sided policy or procedural FoliageCluster camera-depth support.
+CPU binding controls do not replace shader compilation or native image checks.
+
+
+## Cloud noise integer reuse
+
+`jce_cloud_noise.c` owns the shared XY-prefix and Z-tail integer hash helpers.
+The Worley neighbourhood reuses nine wrapped XY prefixes across its three
+Z planes. Preserve all 27 cell visits, the unwrapped feature positions, integer
+wrap semantics and the existing floating-point operation order. Hash reuse
+must not change density samples, noise frequencies, shadow resolution, slice
+budgets or publication cadence. Existing cloud-noise and shadow property owners
+remain authoritative; complete-buffer CPU parity is separate from native GPU
+pixels and whole-frame timing.

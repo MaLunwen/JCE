@@ -142,3 +142,34 @@ No new sampler or render target is required. This supplies visible screen sky,
 not offscreen IBL; the finite geometry march (20 m in the current authoring)
 cannot certify arbitrary farther occluders. Compiled controls and actual GPU
 identity, source/output pixels and disabled-path witnesses remain distinct.
+
+Static CSM filtering is shared in csm_filter.sh by csm_shadow.sh and
+fs_pbr_decl.sh. Fixed balanced ring taps preserve the 9/25 fetch budgets and
+near-original second moments without a high-frequency world-position hash.
+Keep sampler selection outside the kernel, honor actual inverse map resolution,
+and retain independent PCSS, bias, split/far/edge and dynamic-atlas policies.
+The CPU shader-port/moment controls are not native shader or pixel validation.
+
+Dynamic CSM atlas filtering is shared in csm_filter.sh::csm_dynamic_pcf by
+the complete PBR and common-surface consumers. Nine exact-centre POINT depth
+comparisons use nonnegative phase-weighted quadratic B-spline coverage. Preserve
+actual inverse atlas resolution, per-tap tile clamps, GL row mapping, one-read
+hard tier, disabled-atlas no-op, existing bias and static/dynamic min combine.
+The continuous reconstruction is intentionally more concentrated than the old
+equal-weight box (per-axis variance 1/4 vs 2/3 texel squared at centre); it does
+not increase atlas resolution or fix cascade fitting/rasterization instability.
+Do not interpolate raw depth or silently expand the nine-read budget. Actual
+native shader compilation, bindings, moving images and timings remain separate
+from the source-bound CPU continuity, moments, addressing and negative controls.
+
+`material_depth_alpha.sh` is the stock imported MASK depth predicate: transform
+the original UV, sample albedo alpha, multiply by base-color factor alpha, then
+discard strictly below the material cutoff. The `*_alpha` shadow, normal and
+velocity programs carry that UV through static, skinned and instanced geometry.
+Their sampler 0 must coexist with existing skin/crowd sampler slots. Opaque
+programs do not sample alpha. Preserve shared G-buffer outputs and motion math;
+guard shared-body additions with JCE_DEPTH_ALPHA. Declare compatibility cook
+pairs in contracts/shader-keywords.json and regenerate stock_profiles.json;
+new stage files require reconfiguration, compilation and embedding before use.
+A source lint or CPU predicate test does not certify a backend shader binary
+or fix the screenshot. This scope does not change procedural foliage coverage.

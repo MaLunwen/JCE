@@ -25,7 +25,7 @@
 #define CSM_SHADOW_SH
 
 /* Optional provider supplies toShadowDepth, csm_sample_depth,
- * csm_clip_for_cascade, csm_bias_scale_for_cascade, shadow_hash and
+ * csm_clip_for_cascade, csm_bias_scale_for_cascade and
  * sample_csm_shadow, plus the existing CSM uniforms and samplers. */
 #ifndef JCE_CSM_HELPERS_PROVIDED
 /* Stage 5 under CSM: the DYNAMIC-caster atlas (see sr_bind_frame_shadow_state).
@@ -40,6 +40,8 @@ SAMPLER2D(s_shadowMap, 5);
  * scene with no movers byte-identical to the single-map path. */
 uniform vec4 u_csmDynParams;
 
+#include "csm_filter.sh"
+
 /* min() the dynamic-caster atlas tile for this cascade into a static-map
  * result.
  *
@@ -52,8 +54,8 @@ uniform vec4 u_csmDynParams;
  * as the object crosses from one surface onto the other, which is a thing a
  * player does constantly and an investigator almost never does on purpose.
  *
- * The tile grid, the GL row flip and the clamped 3x3 are the same arithmetic
- * as the PBR copy; the two must agree because they address one texture. */
+ * The tile grid and GL row flip match PBR. The shared phase-weighted nine-tap
+ * helper keeps both receivers continuous and clamps every read to this tile. */
 float csm_dyn_min(float s, int cascade, vec2 csm_uv, float csm_z,
                   float depth_bias)
 {
@@ -71,8 +73,8 @@ float csm_dyn_min(float s, int cascade, vec2 csm_uv, float csm_z,
     vec2 lo  = org + dt * 0.5;
     vec2 hi  = org + invT - dt * 0.5;
 
-    /* Tap count follows the static filter tier, so the combine costs what the
-     * sample it augments costs. */
+    /* Hard tier keeps its one point comparison; both filtered tiers keep nine
+     * dynamic reads, independently of the static filter's 9/25 tap policy. */
     if (u_shadowQuality.x < 0.5)
     {
         vec2 ctr = clamp(org + csm_uv * invT, lo, hi);
@@ -80,18 +82,8 @@ float csm_dyn_min(float s, int cascade, vec2 csm_uv, float csm_z,
         return min(s, (csm_z - depth_bias > dd) ? 0.0 : 1.0);
     }
 
-    float dsum = 0.0;
-    for (int dy = -1; dy <= 1; dy++)
-    {
-        for (int dx = -1; dx <= 1; dx++)
-        {
-            vec2 t = clamp(org + csm_uv * invT
-                           + vec2(float(dx), float(dy)) * dt, lo, hi);
-            float dd = texture2D(s_shadowMap, t).r;
-            dsum += (csm_z - depth_bias > dd) ? 0.0 : 1.0;
-        }
-    }
-    return min(s, dsum * (1.0 / 9.0));
+    return min(s, csm_dynamic_pcf(s_shadowMap, org + csm_uv * invT,
+                                  csm_z, depth_bias, dt, lo, hi));
 }
 
 float toShadowDepth(float ndc_z)
@@ -132,14 +124,6 @@ float csm_bias_scale_for_cascade(int cascade)
     return u_csmBiasScales.w;
 }
 
-// Stable per-fragment hash for PCF kernel rotation (breaks grid patterns).
-float shadow_hash(vec3 p)
-{
-    p = fract(p * vec3(443.897, 441.423, 437.195));
-    p += dot(p, p.yzx + 19.19);
-    return fract((p.x + p.y) * p.z);
-}
-
 float sample_csm_shadow(int cascade,
                         vec3 world_pos,
                         vec3 shading_normal,
@@ -172,7 +156,7 @@ float sample_csm_shadow(int cascade,
         return -1.0;
     }
 
-    float inv_map_size = max(u_csmParams.x, 1.0 / 2048.0);
+    float inv_map_size = csm_inverse_map_size(u_csmParams.x);
     vec2 texel = vec2_splat(inv_map_size);
     float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
 
@@ -196,52 +180,30 @@ float sample_csm_shadow(int cascade,
                                            depth_bias, texel, filter_radius);
     }
 
-    // Shadow filter tier (see u_shadowQuality; mirrors fs_pbr.sc). GLSL-120
-    // safety rule: uniform branch selecting between CONSTANT-bound loops —
-    // never a variable loop bound, never `continue`.
-    // Tier 0: single hard tap (bias math above stays; hash rotation skipped).
+    // Tier 0 retains its single hard sample.  Select the static sampler once
+    // for the common 9/25-tap filter; mesh and terrain use identical footprints.
+    float s;
     if (u_shadowQuality.x < 0.5)
     {
         float depth0 = csm_sample_depth(cascade, csm_uv);
-        float s0 = (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
-        return csm_dyn_min(s0, cascade, csm_uv, csm_z, depth_bias);
+        s = (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
     }
-
-    // Tier 1: unrotated 3x3 PCF (9 taps).
-    if (u_shadowQuality.x < 1.5)
+    else
     {
-        float sum9 = 0.0;
-        for (int y = -1; y <= 1; y++)
-        {
-            for (int x = -1; x <= 1; x++)
-            {
-                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
-                float depth = csm_sample_depth(cascade, csm_uv + offset);
-                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        return csm_dyn_min(sum9 / 9.0, cascade, csm_uv, csm_z, depth_bias);
+        BRANCH if (cascade == 0)
+            s = csm_pcf_filter(s_csmShadow0, csm_uv, csm_z,
+                depth_bias, texel, filter_radius);
+        else BRANCH if (cascade == 1)
+            s = csm_pcf_filter(s_csmShadow1, csm_uv, csm_z,
+                depth_bias, texel, filter_radius);
+        else BRANCH if (cascade == 2)
+            s = csm_pcf_filter(s_csmShadow2, csm_uv, csm_z,
+                depth_bias, texel, filter_radius);
+        else
+            s = csm_pcf_filter(s_csmShadow3, csm_uv, csm_z,
+                depth_bias, texel, filter_radius);
     }
-
-    // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
-    // to eliminate visible grid patterns while keeping temporally stable shadows.
-    float angle = shadow_hash(world_pos) * 6.283185;
-    float rot_c = cos(angle);
-    float rot_s = sin(angle);
-
-    float sum = 0.0;
-    for (int y = -2; y <= 2; y++)
-    {
-        for (int x = -2; x <= 2; x++)
-        {
-            vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
-            vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
-                               raw.x * rot_s + raw.y * rot_c);
-            float depth = csm_sample_depth(cascade, csm_uv + offset);
-            sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-        }
-    }
-    return csm_dyn_min(sum / 25.0, cascade, csm_uv, csm_z, depth_bias);
+    return csm_dyn_min(s, cascade, csm_uv, csm_z, depth_bias);
 }
 
 #endif // JCE_CSM_HELPERS_PROVIDED

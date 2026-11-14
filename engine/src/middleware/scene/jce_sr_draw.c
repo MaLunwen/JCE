@@ -18,12 +18,14 @@
 #include <jce/renderer/jce_lighting_system.h>
 #include <jce/middleware/scene/jce_material_override.h>
 #include "jce_sr_internal.h"
+#include "jce_sr_tod_key.h"
 #include "jce_sr_portal.h"
 #include "jce_sr_sprites.h"
 #include "jce_sr_radix_sort.h"
 #include "jce_sr_prim_material_memo.h"
 #include "renderer/jce_render_encoder.h"
 #include "renderer/jce_model_deform_internal.h"
+#include "renderer/jce_pbr_cull_override.h"
 
 #include <jce/os/core/jce_timer.h>      /* jce_time_perf_counter / _to_ms */
 #include <jce/os/core/jce_perf_phase.h> /* jce_perf_phase_add (sub-phase timing) */
@@ -515,8 +517,8 @@ bool sr_try_submit_mesh_renderer_model_shadow(JceSceneRenderer *sr,
     if (!path || !jce_scene_has_transform(scene, e)) return false;
 
     SrModelCache *mc = sr_get_model(sr, path, (uint32_t)e);
-    const bool maps_ready = sr_mr_authored_maps_ready(
-        sr, jce_scene_get_mesh_renderer(scene, e));
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+    const bool maps_ready = sr_mr_authored_maps_ready(sr, mr);
     /* Explicit models claim both passes while loading; primitive defaults
      * and partial texture bindings are not substitutes for authored assets. */
     if (!mc || !mc->model || !maps_ready) return true;
@@ -543,7 +545,7 @@ bool sr_try_submit_mesh_renderer_model_shadow(JceSceneRenderer *sr,
      * buildings collapse to ~unique-mesh depth submits — the full-load shadow
      * bottleneck.  Skinned models are not instanceable and fall through.  The
      * batch is keyed by (model, lod) so LOD'd casters still instance. */
-    if (jce_model_is_instanceable(mc->model)) {
+    if (!(mr && mr->double_sided) && jce_model_is_instanceable(mc->model)) {
         if (sr->sh_batch_count > 0 && view_id != sr->sh_batch_view)
             sr_sh_flush(sr, sr->sh_batch_view);
         sr->sh_batch_view = view_id;
@@ -551,9 +553,11 @@ bool sr_try_submit_mesh_renderer_model_shadow(JceSceneRenderer *sr,
             return true;
     }
 
+    const bool previous_cull = jce_pbr_set_two_sided_override(mr && mr->double_sided);
     jce_model_set_draw_lod(lod);
     jce_model_draw_shadow(mc->model, sr->renderer, view_id, &model, NULL, 0);
     jce_model_set_draw_lod(0);
+    jce_pbr_set_two_sided_override(previous_cull);
     return true;
 }
 
@@ -610,6 +614,8 @@ bool sr_try_submit_meshlet_shadow(JceSceneRenderer *sr, JceScene *scene,
 
     const char *path = sr_mesh_renderer_model_path(scene, e);
     if (!path || !jce_scene_has_transform(scene, e)) return false;
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+    if (mr && mr->double_sided) return false;
     SrModelCache *mc = sr_get_model(sr, path, (uint32_t)e);
     if (!mc || !mc->model) return false;
 
@@ -2115,6 +2121,7 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
      * which one shared instanced submit cannot express → that entity stays solo. */
     JcePbrMaterial ov;
     bool have_ov = sr_mr_override_material(sr, mr, &ov);
+    const bool have_cull_override = mr && mr->double_sided;
     JceShaderHandle custom = { UINT16_MAX };
     if (mr && mr->has_custom_program) custom.idx = mr->custom_program_idx;
     else if (mr) custom = sr_resolve_custom_program(sr,mr->material_path);
@@ -2177,7 +2184,7 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
                                  * state, and additive is not alpha. */
                                 (mr->alpha_mode == 2 && mr->blend_mode > 1));
 
-    if (!wireframe && sr_mlcull_enabled() && !have_custom && !have_ov && !have_uv && !checker && !fading && !lod_xfade &&
+    if (!wireframe && sr_mlcull_enabled() && !have_custom && !have_ov && !have_uv && !have_cull_override && !checker && !fading && !lod_xfade &&
         !have_tint && entity_lod == 0 &&
         sr->foliage_gpu_cull_frame && sr->gpu_frame_planes_valid &&
         jce_gpu_scene_meshlet_supported(sr->gpu_scene) &&
@@ -2185,13 +2192,14 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
         return true;
 
     if (!wireframe && sr->model_receiver_layer == 0 &&
-        !have_custom && !have_ov && !have_uv && !checker && !fading && !lod_xfade &&
+        !have_custom && !have_ov && !have_uv && !have_cull_override && !checker && !fading && !lod_xfade &&
         jce_model_is_instanceable(mc->model)) {
         if (sr_inst_batch_add(sr, mc->model, model, (uint16_t)entity_lod,
                               have_tint ? tint : NULL))
             return true;
     }
 
+    const bool previous_cull = jce_pbr_set_two_sided_override(have_cull_override);
     if (have_ov) {
         if (have_custom) ov.custom_program = custom.idx;
         jce_model_set_material_override(&ov);
@@ -2257,6 +2265,7 @@ static bool sr_try_draw_mesh_renderer_model(JceSceneRenderer *sr,
     if (checker) jce_model_set_albedo_checker(false);
     if (have_uv) jce_pbr_material_set_uv_override(NULL, NULL);
     if (have_ov) jce_model_set_material_override(NULL);
+    jce_pbr_set_two_sided_override(previous_cull);
     if (overlay)
         sr_draw_model_view_wireframe(sr, mc->model, view_id, model, NULL,
             0, NULL, NULL, true);
@@ -3644,20 +3653,8 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
          * selection below — that decoupling is what actually lifts the 16-light
          * cap.  Only fill when Forward+ is on this frame (when off the cluster
          * is never uploaded, so skip the work to stay byte-identical/cheap). */
-        /* Resolve the ambient ONCE, then apply the procedural-sky fill to
-         * whatever it resolved to.
-         *
-         * The fill used to live inside the override branch only.  The override
-         * is an editor transport -- the editor pushes the scene's own authored
-         * ambient through it every frame -- so attaching the fill to it meant
-         * the compensation was a property of WHICH HOST WAS RENDERING rather
-         * than of the scene.  Both hosts read the same authored (0.11,0.14,
-         * 0.19)x0.18 for the space scene, yet the editor resolved ~0.2 (sky
-         * fill wins) and the shipped runtime ~0.0198 (no fill): a ~10x ambient
-         * difference that showed up as lit surfaces 1.52x brighter in the
-         * editor while the sky -- a separate pass -- matched exactly.
-         * Environment lighting is scene state in every standard engine and has
-         * to resolve identically wherever the scene is rendered. */
+        /* Resolve ambient once in both hosts. The editor transport must not
+         * receive a different procedural-sky fill from the shipped runtime. */
         jce_vec3 amb;
         float    ai;
         bool     have_ambient = true;
@@ -3770,7 +3767,7 @@ void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         if (sr->tod_active) {
             /* NOT memset: a zeroed handle 0 is a REAL texture. */
             JceDirLightDesc dl = jce_dir_light_desc_default();
-            dl.direction = jce_v3_scale(sr->tod_state.sun_direction, -1.0f);
+            dl.direction = jce_v3_scale(sr_tod_key_direction(&sr->tod_state), -1.0f);
             dl.color     = sr->tod_state.sun_color;
             dl.intensity = 1.0f;
             dl.casts_shadow = true;

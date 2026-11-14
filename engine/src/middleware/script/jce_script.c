@@ -520,6 +520,9 @@ static int l_sandbox_load(lua_State *L)
 {
     size_t      len = 0;
     const char *src;
+    /* luaL_loadbufferx pushes the compiled chunk. With exactly three caller
+     * arguments that chunk occupies slot 4; it is not a supplied _ENV. */
+    const int has_custom_env = !lua_isnoneornil(L, 4);
 
     if (lua_type(L, 1) != LUA_TSTRING) {
         lua_pushnil(L);
@@ -550,7 +553,7 @@ static int l_sandbox_load(lua_State *L)
         }
     }
 
-    if (!lua_isnoneornil(L, 4)) {       /* custom _ENV upvalue */
+    if (has_custom_env) {              /* caller-supplied _ENV upvalue */
         lua_pushvalue(L, 4);
         if (lua_setupvalue(L, -2, 1) == NULL)
             lua_pop(L, 1);              /* chunk has no _ENV; drop the value */

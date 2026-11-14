@@ -26,7 +26,7 @@ static unsigned clock_queries, thread_queries, memory_queries, tag_queries;
 static unsigned async_queries, gpu_queries, boot_queries, fatal_calls;
 static unsigned begin_calls, draw_calls, end_calls, outside_gpu_queries, fallback_queries;
 static bool memory_available, gpu_copy_available, frame_active;
-static bool async_available, real_default, shutdown_on_draw;
+static bool async_available, real_default, shutdown_on_draw, boot_failure;
 static bool fallback, begin_accept, no_draw;
 static JceMemStats memory_source;
 static JceAsyncExecutorStats async_source;
@@ -56,14 +56,23 @@ static bool counted_gpu(JceGpuTimingObservation *out, size_t size)
     *out = gpu_source; return gpu_copy_available;
 }
 static JceAsyncExecutor *counted_boot_executor(void)
-{ ++boot_queries; return real_default ? jce_async_default_executor() : (JceAsyncExecutor*)&executor_marker; }
+{
+    ++boot_queries;
+    if (boot_failure) return NULL;
+    return real_default ? jce_async_default_executor()
+                        : (JceAsyncExecutor *)&executor_marker;
+}
 static char *counted_getenv(const char *name)
 {
     if (strcmp(name,"JCE_RESOURCE_TRACE")==0) return (char*)env_enabled;
     TEST_ASSERT_EQUAL_STRING("JCE_RESOURCE_TRACE_MS",name); return (char*)env_interval;
 }
-static void fatal_msg(const char *format, ...)
-{ TEST_ASSERT_EQUAL_STRING("Structured async executor initialization failed",format); ++fatal_calls; }
+static void fatal_msg(bool allow_error_dialog, const char *format, ...)
+{
+    TEST_ASSERT_FALSE(allow_error_dialog);
+    TEST_ASSERT_EQUAL_STRING("Structured async executor initialization failed", format);
+    ++fatal_calls;
+}
 static bool counted_fallback(const JceRenderer *renderer)
 { (void)renderer; ++fallback_queries; return fallback; }
 static void counted_begin(const JceRenderer *renderer, JceWindow *window)
@@ -153,7 +162,7 @@ void setUp(void)
     gpu_source.context_generation=UINT64_MAX;gpu_source.gpu_source_frame=17;gpu_source.read_host_frame_index=23;
     gpu_source.unavailable_reason=JCE_GPU_TIMING_AVAILABLE;
     memory_available=gpu_copy_available=begin_accept=async_available=true;
-    real_default=shutdown_on_draw=false;
+    real_default=shutdown_on_draw=boot_failure=false;
     frame_active=fallback=no_draw=false;clock_ns=0;calling_thread=77;tag_current=UINT64_MAX;tag_peak=UINT64_MAX;
     env_enabled=NULL;env_interval=NULL;memset(&g_app_desc,0,sizeof g_app_desc);g_app_desc.draw=counted_draw;
     event_count=0;jce_trace_set_enabled(true);jce_trace_reset();jce_trace_task_restore_id(0);
@@ -164,6 +173,17 @@ void tearDown(void)
         JCE_ASYNC_SHUTDOWN_CANCEL_ALL, JCE_ASYNC_WAIT_INFINITE);
     jce_trace_set_enabled(false);
 }
+/* The REAL Engine boot wire is extracted unchanged into actual_resource_bind.
+ * A failed executor must report through the nonmodal fixture policy. */
+static void test_failed_async_boot_uses_nonmodal_fatal_path(void)
+{
+    boot_failure = true;
+    actual_resource_init(&engine);
+    TEST_ASSERT_FALSE(actual_resource_bind(&engine));
+    TEST_ASSERT_EQUAL_UINT32(1, boot_queries);
+    TEST_ASSERT_EQUAL_UINT32(1, fatal_calls);
+}
+
 static void test_default_off_has_no_clock_stats_events_or_engine_allocations(void)
 {
     actual_resource_init(&engine);TEST_ASSERT_TRUE(actual_resource_bind(&engine));
@@ -346,6 +366,7 @@ int main(void)
     jce_thread_mark_main();
     UNITY_BEGIN();
     RUN_TEST(test_default_off_has_no_clock_stats_events_or_engine_allocations);
+    RUN_TEST(test_failed_async_boot_uses_nonmodal_fatal_path);
     RUN_TEST(test_enabled_but_trace_off_performs_no_observation);
     RUN_TEST(test_zero_clock_deadline_and_jump_never_catch_up);
     RUN_TEST(test_backward_clock_rebases_without_unsigned_wrap);

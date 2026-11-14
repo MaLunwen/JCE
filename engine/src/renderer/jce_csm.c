@@ -24,40 +24,6 @@ static void compute_splits(float *splits, uint32_t count,
     }
 }
 
-/* Compute 8 frustum corners in world space for a sub-frustum [zn, zf]. */
-static void frustum_corners_world(jce_vec3 corners[8],
-                                  float fov_deg, float aspect,
-                                  float zn, float zf,
-                                  const jce_mat4 *inv_view)
-{
-    float tan_half = tanf(fov_deg * 0.5f * JCE_DEG2RAD);
-    float hn = zn * tan_half;
-    float wn = hn * aspect;
-    float hf = zf * tan_half;
-    float wf = hf * aspect;
-
-    /* View-space corners (looking down -Z). */
-    jce_vec3 vs[8] = {
-        /* Near plane */
-        { -wn,  hn, -zn },
-        {  wn,  hn, -zn },
-        {  wn, -hn, -zn },
-        { -wn, -hn, -zn },
-        /* Far plane */
-        { -wf,  hf, -zf },
-        {  wf,  hf, -zf },
-        {  wf, -hf, -zf },
-        { -wf, -hf, -zf },
-    };
-
-    /* Transform to world space. */
-    for (int i = 0; i < 8; i++) {
-        jce_vec4 v = jce_v4(vs[i].x, vs[i].y, vs[i].z, 1.0f);
-        jce_vec4 w = jce_m4_mul_v4(inv_view, v);
-        corners[i] = jce_v3(w.x, w.y, w.z);
-    }
-}
-
 void jce_csm_compute(JceCsmData *out,
                      uint32_t cascade_count,
                      float near_plane,
@@ -83,10 +49,29 @@ void jce_csm_compute(JceCsmData *out,
     compute_splits(out->splits, cascade_count, near_plane, far_plane,
                    split_lambda);
 
-    /* Compute inverse view matrix for frustum corner generation. */
+    /* Only the sphere centre needs a world transform.  Fitting its radius in
+     * view space keeps camera position/rotation rounding out of the half-metre
+     * radius buckets (a bucket change changes the entire shadow texel grid). */
     jce_mat4 inv_view = jce_m4_inverse(camera_view);
+    const float tan_half = tanf(fov_deg * 0.5f * JCE_DEG2RAD);
+    const float map_size = shadow_map_size > 0 ? (float)shadow_map_size : 2048.0f;
 
     jce_vec3 ld = jce_v3_normalize(*light_dir);
+
+    /* A continuous light basis over the daylight hemisphere.  Switching the
+     * reference-up axis at |sun.y| = .99 rotated the atlas abruptly near
+     * zenith.  This closed-form tangent frame has its singularity BELOW the
+     * horizon instead; the fallback covers that unused downward pole. */
+    jce_vec3 right_ws, up_ws;
+    if (ld.y < -0.9999f) {
+        right_ws = jce_v3_normalize(jce_v3_cross(ld, jce_v3(0, 0, 1)));
+        up_ws = jce_v3_cross(right_ws, ld);
+    } else {
+        const float a = 1.0f / (1.0f + ld.y);
+        const float b = -ld.x * ld.z * a;
+        right_ws = jce_v3(1.0f - ld.x * ld.x * a, -ld.x, b);
+        up_ws = jce_v3(b, -ld.z, 1.0f - ld.z * ld.z * a);
+    }
 
     /* The near-plane extension toward the sun (so tall casters between the
      * cascade sphere and the sun are captured instead of clipped) is computed
@@ -101,22 +86,18 @@ void jce_csm_compute(JceCsmData *out,
         float zn = out->splits[c];
         float zf = out->splits[c + 1];
 
-        /* Get world-space frustum corners for this cascade. */
-        jce_vec3 corners[8];
-        frustum_corners_world(corners, fov_deg, aspect, zn, zf, &inv_view);
-
-        /* Compute frustum center. */
-        jce_vec3 center = jce_v3(0, 0, 0);
-        for (int i = 0; i < 8; i++)
-            center = jce_v3_add(center, corners[i]);
-        center = jce_v3_scale(center, 1.0f / 8.0f);
-
-        /* Compute bounding sphere radius for stable cascade sizing. */
-        float radius = 0.0f;
-        for (int i = 0; i < 8; i++) {
-            float d = jce_v3_len(jce_v3_sub(corners[i], center));
-            if (d > radius) radius = d;
-        }
+        /* A symmetric perspective slice has its corner centroid on -Z.
+         * Far corners bound the sphere because zf >= zn.  Evaluate the same
+         * centroid/radius without subtracting large world-space positions. */
+        const float mid_z = (zn + zf) * 0.5f;
+        const float half_depth = (zf - zn) * 0.5f;
+        const float half_height = zf * tan_half;
+        const float half_width = half_height * aspect;
+        jce_vec4 cw = jce_m4_mul_v4(&inv_view, jce_v4(0, 0, -mid_z, 1));
+        jce_vec3 center = jce_v3(cw.x, cw.y, cw.z);
+        float radius = sqrtf(half_width * half_width +
+                             half_height * half_height +
+                             half_depth * half_depth);
         /* Quantize radius to a stable absolute step independent of the
          * radius itself.  Earlier "scale by fraction of radius" was an
          * algebraic identity (ceil(r / (r/k)) * (r/k) == r) and provided
@@ -127,25 +108,15 @@ void jce_csm_compute(JceCsmData *out,
          * pure camera rotation. */
         radius = ceilf(radius * 2.0f) * 0.5f;
 
-        /* Build a stable light-space basis whose orientation depends ONLY on
-         * the light direction (not on camera state).  This guarantees the
-         * shadow-map texel grid is anchored to a fixed world frame, so when
-         * the camera rotates the cascade center snaps to the same texels
-         * every frame and shadows stop shimmering. */
-        jce_vec3 up_ref = (fabsf(ld.y) > 0.99f) ? jce_v3(0, 0, 1) : jce_v3(0, 1, 0);
-        jce_vec3 right_ws = jce_v3_normalize(jce_v3_cross(ld, up_ref));
-        jce_vec3 up_ws    = jce_v3_normalize(jce_v3_cross(right_ws, ld));
-
         /* Snap cascade center onto the world-anchored light-space texel grid.
          * Only the atlas-plane axes need texel snapping. Quantising the
          * light-depth axis changes the shadow compare origin in discrete
          * steps during camera dolly/zoom, which reads as brightness flicker. */
-        float map_size = shadow_map_size > 0 ? (float)shadow_map_size : 2048.0f;
         float texel_size = (radius * 2.0f) / map_size;
+        float cx = jce_v3_dot(center, right_ws);
+        float cy = jce_v3_dot(center, up_ws);
+        const float cz = jce_v3_dot(center, ld);
         if (texel_size > 0.0f) {
-            float cx = jce_v3_dot(center, right_ws);
-            float cy = jce_v3_dot(center, up_ws);
-            float cz = jce_v3_dot(center, ld);
             cx = floorf(cx / texel_size + 0.5f) * texel_size;
             cy = floorf(cy / texel_size + 0.5f) * texel_size;
             center = jce_v3_add(jce_v3_add(jce_v3_scale(right_ws, cx),
@@ -172,7 +143,7 @@ void jce_csm_compute(JceCsmData *out,
          * washed-out shadows).  Full height is kept so tall LOCAL buildings are
          * still captured = no truncation regression.  Anchored to world-space
          * bounds => still camera-independent. */
-        float cz_center = jce_v3_dot(center, ld);
+        float cz_center = cz;
         float near_extend = 0.0f;
         if (have_caster_extent) {
             const float K = 2.0f; /* footprint slack for the tilted light axis */
@@ -199,9 +170,23 @@ void jce_csm_compute(JceCsmData *out,
             if (near_extend > cap) near_extend = cap;
         }
 
-        jce_vec3 light_pos  = jce_v3_add(center,
-                                         jce_v3_scale(ld, radius + near_extend));
-        jce_mat4 light_view = jce_m4_look_at(light_pos, center, up_ws);
+        /* Reuse the exact basis AND snapped coordinates.  look_at(light_pos,
+         * center) subtracts large positions to reconstruct this direction;
+         * that roundoff made the atlas orientation change during camera motion
+         * even though light_dir was fixed.  Its X row is -right_ws. */
+        jce_mat4 light_view = jce_m4_identity();
+        light_view.raw[0][0] = -right_ws.x;
+        light_view.raw[1][0] = -right_ws.y;
+        light_view.raw[2][0] = -right_ws.z;
+        light_view.raw[0][1] = up_ws.x;
+        light_view.raw[1][1] = up_ws.y;
+        light_view.raw[2][1] = up_ws.z;
+        light_view.raw[0][2] = ld.x;
+        light_view.raw[1][2] = ld.y;
+        light_view.raw[2][2] = ld.z;
+        light_view.raw[3][0] = cx;
+        light_view.raw[3][1] = -cy;
+        light_view.raw[3][2] = -(cz + radius + near_extend);
 
         /* Ortho projection around bounding sphere with Z padding for
          * world-space normal-offset bias applied in the fragment shader.  The

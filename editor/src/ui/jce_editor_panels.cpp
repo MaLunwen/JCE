@@ -291,6 +291,7 @@ void jce_editor_panels_init(void)
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
     jce_editor_panel_console_init();
+    jce_editor_assets_directory_init();
 
     /* Restore persisted locale + theme (locale restore is load-bearing:
      * skipping it boots the editor in the default language). */
@@ -327,6 +328,7 @@ void jce_editor_panels_shutdown(void)
     jce_editor_lan_discovery_shutdown();
     jce_editor_panel_bundle_browser_shutdown();
     jce_editor_panel_test_runner_shutdown();
+    jce_editor_assets_directory_shutdown();
     jce_hierarchy_storage_shutdown();
     jce_file_viewer_shutdown();
     jce_editor_panel_console_shutdown();

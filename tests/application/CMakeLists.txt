@@ -2094,7 +2094,7 @@ if(NOT _resource_observation_begin_position LESS _resource_observation_draw_posi
    NOT _resource_observation_no_draw_position LESS _resource_observation_begin_position)
     message(FATAL_ERROR "Resource observations must preserve real no-draw and active-frame placement")
 endif()
-set(_resource_observation_wires "${_resource_observation_parse}\nstatic void actual_resource_init(struct JceEngine *e)\n{\n${_resource_observation_init}}\nstatic bool actual_resource_bind(struct JceEngine *e)\n{\n${_resource_observation_bind}    return true;\nfail: return false;\n}\nstatic void actual_resource_no_draw(struct JceEngine *e, bool render_blocked)\n{\n${_resource_observation_no_draw}}\nstatic void actual_resource_normal(struct JceEngine *e)\n{\n${_resource_observation_begin}${_resource_observation_draw}${_resource_observation_normal}${_resource_observation_end}}\n")
+set(_resource_observation_wires "${_resource_observation_parse}\nstatic void actual_resource_init(struct JceEngine *e)\n{\n${_resource_observation_init}}\nstatic bool actual_resource_bind(struct JceEngine *e)\n{\n    const bool allow_error_dialog = false; /* headless fixture: never open an SDL modal */\n${_resource_observation_bind}    return true;\nfail: return false;\n}\nstatic void actual_resource_no_draw(struct JceEngine *e, bool render_blocked)\n{\n${_resource_observation_no_draw}}\nstatic void actual_resource_normal(struct JceEngine *e)\n{\n${_resource_observation_begin}${_resource_observation_draw}${_resource_observation_normal}${_resource_observation_end}}\n")
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/resource-observation")
 set(_resource_observation_wires_path "${CMAKE_CURRENT_BINARY_DIR}/resource-observation/engine-wires.inc.h")
 unset(_resource_observation_previous)
@@ -2160,3 +2160,5 @@ include("${CMAKE_CURRENT_LIST_DIR}/launch_policy_controls.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/audio_retirement_controls.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/audio_pending_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/rml_scene_batch_controls.cmake")

@@ -8,6 +8,7 @@
 #include "core/jce_editor_viewport_trace.h"
 #include "core/jce_editor_frame_observation.h"
 #include <jce/application/jce_runtime_stats_host.h>
+#include <jce/application/jce_rml_scene_overlay.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/scene/jce_scene_camera.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
@@ -24,7 +25,10 @@
 #include <jce/renderer/jce_views.h>
 #include <type_traits>
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 static std::vector<JceCamera *> owned;
@@ -36,6 +40,8 @@ static int play_state;
 static JceCamera *applied_camera;
 static bool authored_ortho;
 static bool player_available, vcam_available, primary_available;
+static JceSceneCameraResolveResult primary_failure;
+static std::vector<std::string> warnings;
 static JceRuntime *fake_runtime = reinterpret_cast<JceRuntime *>(uintptr_t(1));
 static JceRenderer *fake_renderer = reinterpret_cast<JceRenderer *>(uintptr_t(2));
 static JceScene *fake_scene = reinterpret_cast<JceScene *>(uintptr_t(3));
@@ -80,6 +86,7 @@ static void grab_port(JceWindow *, bool) {}
 static void culler_destroy_port(JceOcclusionCuller *) { ++optional_destroys; }
 static void canvas_destroy_port(JceUICanvas *) { ++optional_destroys; }
 static void postfx_destroy_port(JcePostFXPipeline *) { ++optional_destroys; }
+static void overlay_close_port(JceRmlSceneOverlay *) {}
 static JceSceneRenderer *scene_renderer_port() { return fake_scene_renderer; }
 static JceScene *scene_port() { return fake_scene; }
 static int state_port() { return play_state; }
@@ -90,7 +97,7 @@ static bool JCE_CALL player_port(const JceRuntime *, jce_vec3 *position)
 static JceSceneCameraResolveResult primary_port(JceScene *, JceCamera *camera, JceSceneCameraPose *)
 {
     ++primary_calls; applied_camera = camera;
-    if (!primary_available) return JCE_SCENE_CAMERA_RESOLVE_NOT_FOUND;
+    if (!primary_available) return primary_failure;
     jce_camera_set_mode(camera, authored_ortho ? JCE_CAMERA_ORTHO : JCE_CAMERA_PERSPECTIVE);
     jce_camera_set_ortho_height(camera, 42.0f);
     jce_camera_set_fov(camera, 35.0f);
@@ -107,12 +114,24 @@ static void JCE_CALL vcam_port(JceScene *, float, JceVcamOutput *out, bool *pres
     out->fov_deg = 24;
 }
 static void JCE_CALL vcam_reset_port() {}
+static void warning_port(const char *, const char *format, ...)
+{
+    ++logs;
+    char text[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof text, format, args);
+    va_end(args);
+    warnings.emplace_back(text);
+}
 static_assert(std::is_same_v<decltype(&player_port), decltype(&jce_runtime_get_player_position)>);
 static_assert(std::is_same_v<decltype(&primary_port), decltype(&jce_scene_camera_apply_primary)>);
 static_assert(std::is_same_v<decltype(&vcam_port), decltype(&jce_vcam_system_evaluate)>);
 constexpr uint16_t JCE_EDITOR_GAME_VIEW_BASE = JCE_VIEW_EDITOR_GAME;
 #define LOG_TAG "game-camera-test"
-#define LOG_WARN(...) (++logs)
+#undef LOG_WARN
+#undef LOG_ERROR
+#define LOG_WARN(...) warning_port(__VA_ARGS__)
 #define LOG_ERROR(...) (++logs)
 #define jce_camera_clone camera_clone_port
 #define jce_camera_create camera_create_port
@@ -127,6 +146,7 @@ constexpr uint16_t JCE_EDITOR_GAME_VIEW_BASE = JCE_VIEW_EDITOR_GAME;
 #define jce_occlusion_culler_destroy culler_destroy_port
 #define jce_ui_canvas_destroy canvas_destroy_port
 #define jce_postfx_destroy postfx_destroy_port
+#define jce_rml_scene_overlay_close overlay_close_port
 #define jce_editor_get_scene_renderer scene_renderer_port
 #define jce_state_get_scene scene_port
 #define jce_state_get_play_state state_port
@@ -212,6 +232,7 @@ struct Fixture {
         hook_clears = optional_destroys = logs = 0;
         camera_failure = bridge_failure = runtime_failure = false; restore_success = true;
         player_available = vcam_available = authored_ortho = false; primary_available = true;
+        primary_failure = JCE_SCENE_CAMERA_RESOLVE_NOT_FOUND; warnings.clear();
         play_state = 0; s.play_state = 0; applied_camera = nullptr;
         observed_feedback = -1; applies = 0;
         REQUIRE(owned.empty());
@@ -379,4 +400,69 @@ TEST_CASE_FIXTURE(Fixture, "camera less scene starts Play from complete preview 
         CHECK(std::memcmp(&before.proj_wide, &after, sizeof after) == 0);
         stop(); before.unchanged(); CHECK(owned.size() == 1);
     }
+}
+
+TEST_CASE_FIXTURE(Fixture, "active virtual camera resolves a missing primary without a fallback warning")
+{
+    preview(); play(); primary_available = false; vcam_available = true;
+    test_actual_game_camera_frame(800, 600);
+    CHECK(primary_calls == 1); CHECK(g.virtual_camera_active); CHECK(warnings.empty());
+    jce_vec3 position = jce_camera_get_position(g.play_camera);
+    CHECK(position.x == 3); CHECK(position.y == 4); CHECK(position.z == 5);
+    CHECK(jce_camera_get_fov(g.play_camera) == doctest::Approx(24.0f));
+
+    vcam_available = false;
+    test_actual_game_camera_frame(800, 600);
+    REQUIRE(warnings.size() == 1);
+    CHECK_FALSE(g.virtual_camera_active);
+    CHECK(warnings.back().find("no entity has a primary Camera") != std::string::npos);
+    jce_vec3 retained = jce_camera_get_position(g.play_camera);
+    CHECK(retained.x == position.x); CHECK(retained.y == position.y); CHECK(retained.z == position.z);
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 1);
+    vcam_available = true;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 1);
+    vcam_available = false;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 2);
+}
+
+TEST_CASE_FIXTURE(Fixture, "player follow suppresses fallback only when the runtime supplies a position")
+{
+    preview(); play(); primary_available = false; player_available = true;
+    test_actual_game_camera_frame(800, 600);
+    CHECK(warnings.empty()); CHECK_FALSE(g.virtual_camera_active);
+    jce_vec3 position = jce_camera_get_position(g.play_camera);
+    CHECK(position.x == doctest::Approx(1)); CHECK(position.y == doctest::Approx(5));
+    CHECK(position.z == doctest::Approx(10));
+    player_available = false;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 1);
+    player_available = true;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 1);
+    g.play_runtime = nullptr;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 2);
+}
+
+TEST_CASE_FIXTURE(Fixture, "missing camera source reports its reason and re-arms after recovery or Stop")
+{
+    preview(); configure_preview(g.camera, 1); play(); primary_available = false;
+    CameraWitness before(g.play_camera);
+    test_actual_game_camera_frame(800, 600);
+    REQUIRE(warnings.size() == 1);
+    CHECK(warnings.back().find("Keeping the current camera pose") != std::string::npos);
+    CHECK(warnings.back().find("default camera") == std::string::npos);
+    before.unchanged();
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 1);
+    primary_failure = JCE_SCENE_CAMERA_RESOLVE_AMBIGUOUS;
+    test_actual_game_camera_frame(800, 600);
+    REQUIRE(warnings.size() == 2);
+    CHECK(warnings.back().find("more than one primary Camera") != std::string::npos);
+    primary_failure = JCE_SCENE_CAMERA_RESOLVE_INVALID_POSE;
+    test_actual_game_camera_frame(800, 600);
+    REQUIRE(warnings.size() == 3);
+    CHECK(warnings.back().find("not a valid pose") != std::string::npos);
+    primary_available = true;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 3);
+    primary_available = false;
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 4);
+    stop(); play();
+    test_actual_game_camera_frame(800, 600); CHECK(warnings.size() == 5);
 }

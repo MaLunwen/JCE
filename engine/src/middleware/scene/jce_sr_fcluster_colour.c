@@ -1,5 +1,6 @@
 /* FoliageCluster colour emission: whole-cluster admission and complete state. */
 #include "jce_sr_fcluster_colour.h"
+#include "jce_sr_foliage_lighting.h"
 #include "jce_sr_colour_output.h"
 #include "jce_sr_shadow_frame.h"
 #include "renderer/jce_lighting_system_internal.h"
@@ -48,13 +49,22 @@ static JceGrassColourReceipt sr_fcluster_submit_colour_geometry(JceSceneRenderer
     /* Publish only after geometry admission. No input is inherited
      * from a previous sorted draw or a pass-start uniform update range. */
     jce_vec3 to_light = jce_v3(0.3f, 0.8f, 0.2f);
-    sr_resolve_primary_dir_light(sr, scene, list, false, &to_light, NULL, NULL);
+    jce_vec3 sun_color = jce_v3(0, 0, 0), ambient_color = jce_v3(0, 0, 0);
+    float sun_intensity = 0.0f, ambient_intensity = 0.0f;
+    sr_resolve_primary_dir_light(sr, scene, list, false, &to_light,
+        &sun_color, &sun_intensity);
+    jce_light_env_get_ambient(sr->light_env, &ambient_color, &ambient_intensity);
+    const float sun_rgb[3] = {sun_color.x, sun_color.y, sun_color.z};
+    const float ambient_rgb[3] = {ambient_color.x, ambient_color.y, ambient_color.z};
+    float multiplier[3];
+    sr_foliage_lighting_multiplier(field->color_multiplier, sun_rgb, sun_intensity,
+        ambient_rgb, ambient_intensity, multiplier);
     const float light[4] = {to_light.x, to_light.y, to_light.z, 0.0f};
     const float colors[16] = {
         field->shadow_color[0], field->shadow_color[1], field->shadow_color[2], 0.0f,
         field->mid_color[0], field->mid_color[1], field->mid_color[2], 0.0f,
         field->highlight_color[0], field->highlight_color[1], field->highlight_color[2], 0.0f,
-        field->color_multiplier[0], field->color_multiplier[1], field->color_multiplier[2], 1.0f
+        multiplier[0], multiplier[1], multiplier[2], 1.0f
     };
     const float time[4] = {sr->water_time, 0.0f, 0.0f, 0.0f};
     bgfx_set_uniform(sr->u_foliage_time, time, 1u);

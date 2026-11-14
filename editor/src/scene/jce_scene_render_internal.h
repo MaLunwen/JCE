@@ -11,6 +11,7 @@
 #define JCE_SCENE_RENDER_INTERNAL_H
 
 #include "jce_editor_scene_render.h"
+#include "jce_editor_physics_overlay.h"
 #include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "scene/jce_scene_camera_focus.h"
@@ -75,6 +76,7 @@ struct SceneTsrHistory {
 
 struct SceneRenderState {
     bool                    initialized;
+    bool physics_overlay_budget_warned;
     bool                    homogeneous_depth;
     JceRenderer            *renderer;
     JceOffscreenTarget  *bridge;
@@ -177,7 +179,7 @@ void draw_grid(void);
 void draw_selection_outlines(void);
 void draw_ghost_entity(void);
 void draw_hover_highlight(void);
-void draw_physics_debug(void);
+void draw_physics_debug(const jce_mat4 &view, const jce_mat4 &projection);
 void draw_joint_gizmos(void);
 void draw_cloth_gizmos(void);
 void draw_navmesh_overlay(void);

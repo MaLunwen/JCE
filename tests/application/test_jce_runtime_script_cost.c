@@ -38,6 +38,7 @@
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_perf_phase.h>
+#include <SDL3/SDL_stdinc.h>
 
 #include "unity.h"
 
@@ -45,6 +46,7 @@
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define BUSY_FILE  "test_cost_busy.lua"
@@ -66,7 +68,17 @@ static const char *const IDLE_LUA =
     "function M:on_update(dt) end\n"
     "return M\n";
 
-void setUp(void) {}
+void setUp(void)
+{
+    /* Native environment owner matches the Engine's C runtime getenv table. */
+#if JCE_PLATFORM_WINDOWS
+    TEST_ASSERT_EQUAL_INT(0, _putenv_s("JCE_PERF_SCRIPT_DETAIL", "1"));
+    TEST_ASSERT_EQUAL_INT(0, _putenv_s("JCE_PERF_SCRIPT_PATH", BUSY_FILE));
+#else
+    TEST_ASSERT_EQUAL_INT(0, SDL_setenv_unsafe("JCE_PERF_SCRIPT_DETAIL", "1", 1));
+    TEST_ASSERT_EQUAL_INT(0, SDL_setenv_unsafe("JCE_PERF_SCRIPT_PATH", BUSY_FILE, 1));
+#endif
+}
 void tearDown(void)
 {
     remove(BUSY_FILE);
@@ -115,6 +127,67 @@ static Collected sample(JceRuntime *rt, uint64_t busy, uint64_t idle)
     c.idle_entity = idle;
     jce_runtime_iterate_script_costs(rt, collect, &c);
     return c;
+}
+
+static double completed_phase(const char *name)
+{
+    for (int i = 0; i < jce_perf_phase_count(); ++i) {
+        const char *observed = NULL;
+        double ms = 0.0;
+        if (jce_perf_phase_peek_frame(i, &observed, &ms) && observed &&
+            strcmp(observed, name) == 0)
+            return ms;
+    }
+    TEST_FAIL_MESSAGE("requested script cost phase is unavailable");
+    return 0.0;
+}
+
+static void sum_current_cost(const JceScriptCostInfo *info, void *user)
+{
+    double *sums = user;
+    TEST_ASSERT_TRUE(info->measured);
+    TEST_ASSERT_EQUAL_UINT32(1, info->calls);
+    sums[strcmp(info->script_path, BUSY_FILE) == 0 ? 0 : 1] += info->last_ms;
+}
+
+static void test_detail_uses_current_calls_and_sums_multiple_matching_instances(void)
+{
+    jce_test_write_file(BUSY_FILE, BUSY_LUA);
+    jce_test_write_file(IDLE_FILE, IDLE_LUA);
+    JceScene *scene = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(scene);
+    make_scripted(scene, "focus_a", BUSY_FILE);
+    make_scripted(scene, "focus_b", BUSY_FILE);
+    make_scripted(scene, "other", IDLE_FILE);
+    JceRuntimeDesc desc = {0};
+    desc.scene = scene;
+    JceRuntime *runtime = jce_runtime_create(&desc);
+    TEST_ASSERT_NOT_NULL(runtime);
+    jce_perf_phase_set_enabled(1);
+    jce_perf_phase_frame_tick();
+    jce_runtime_step(runtime, 0.016f);
+    double sums[2] = {0};
+    jce_runtime_iterate_script_costs(runtime, sum_current_cost, sums);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, sums[0], completed_phase("script_focus"));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, sums[1], completed_phase("script_other"));
+    TEST_ASSERT_DOUBLE_WITHIN(1e-9, sums[0] + sums[1], completed_phase("script"));
+    jce_runtime_destroy(runtime);
+    jce_scene_destroy(scene);
+
+    /* A later runtime with no focus call must publish zero, not the old row. */
+    scene = jce_scene_create();
+    TEST_ASSERT_NOT_NULL(scene);
+    make_scripted(scene, "only_other", IDLE_FILE);
+    desc.scene = scene;
+    runtime = jce_runtime_create(&desc);
+    TEST_ASSERT_NOT_NULL(runtime);
+    jce_runtime_step(runtime, 0.016f);
+    jce_perf_phase_frame_tick();
+    TEST_ASSERT_EQUAL_DOUBLE(0.0, completed_phase("script_focus"));
+    TEST_ASSERT_EQUAL_DOUBLE(completed_phase("script"), completed_phase("script_other"));
+    jce_runtime_destroy(runtime);
+    jce_scene_destroy(scene);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -316,5 +389,6 @@ int main(void)
     RUN_TEST(test_the_expensive_script_is_the_expensive_row);
     RUN_TEST(test_with_profiling_off_the_rows_say_so);
     RUN_TEST(test_reset_clears_the_average_and_keeps_the_last_frame);
+    RUN_TEST(test_detail_uses_current_calls_and_sums_multiple_matching_instances);
     return UNITY_END();
 }

@@ -502,7 +502,10 @@ JCE_API float       JCE_CALL jce_runtime_interpolation_alpha(const JceRuntime *r
 /* Push the latest player input.  Latched until the next call.  When
  * `in->jump_pressed` is true, the flag remains set until step() consumes
  * it — callers may issue press-and-release pulses on key down without
- * worrying about exact frame alignment. */
+ * worrying about exact frame alignment. Passing NULL explicitly cancels all
+ * sampled input and pending character jump input (including the landing
+ * buffer), without changing velocity or advancing simulation. Hosts use this
+ * when a modal document takes input ownership. NULL runtime is a no-op. */
 JCE_API void        JCE_CALL jce_runtime_set_input(JceRuntime *rt,
                                                    const JceRuntimeInput *in);
 
@@ -535,6 +538,11 @@ JCE_API void        JCE_CALL jce_runtime_set_touch_input(
  * jce_actions_update, before jce_runtime_step. */
 JCE_API void        JCE_CALL jce_runtime_set_actions(JceRuntime *rt,
                                                      const JceInputActions *actions);
+
+/* Current player capsule identity for read-only physics queries. No runtime,
+ * physics world or Player returns INVALID. Borrow only with this runtime's
+ * physics world during the current call; no scene/entity/body guessing. */
+JCE_API JceCharacterHandle JCE_CALL jce_runtime_get_player_character(const JceRuntime *rt);
 
 /* Read the live character controller world position.  Returns false
  * when no CharacterController exists in the scene. */

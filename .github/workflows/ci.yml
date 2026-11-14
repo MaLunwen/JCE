@@ -97,6 +97,8 @@ jobs:
         run: python tools/build/full_layout_contract.py --check
       - name: Verify full-layout negative controls
         run: python -m unittest discover -s tools/tests -p test_full_layout_contract_v11.py -v
+      - name: CI #61 C99 and managed-output regression controls
+        run: python -m unittest discover -s tools/tests -p test_ci_v0149_build_blockers.py -v
       - name: Verify Conan Lua source-cache helper guards
         run: python -m unittest discover -s tools/tests -p test_ci_seed_lua_source.py -v
       - name: Install lint test prerequisites
@@ -344,10 +346,14 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: Build managed scripting artifacts
-        run: |
-          python scripting/csharp/build_csharp.py
-          python scripting/java/build_java.py
+      # Separate native commands: on Windows pwsh, a successful final command
+      # can hide a nonzero exit from the preceding dotnet/Python invocation.
+      - name: Build C# managed scripting artifacts
+        run: python scripting/csharp/build_csharp.py
+      - name: Verify C# assembly and runtimeconfig are current
+        run: python scripting/csharp/build_csharp.py --check
+      - name: Build Java managed scripting artifacts
+        run: python scripting/java/build_java.py
       - name: Build and run Debug tests through the shared driver
         run: python scripts/jce.py test --configure --variant debug --arch ${{ matrix.arch }} --jobs 2
       - name: POSIX C99 declarations and negative control

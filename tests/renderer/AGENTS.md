@@ -1,5 +1,13 @@
 # Renderer CPU fixtures
 
+Mesh creation lifecycle coverage now expects one immutable static index handle
+per indexed mesh. The triangle prefix and optional wire suffix have distinct
+counts; optional wire staging refusal preserves solid geometry, while required
+buffer failure retires the constructor's own handles. The existing model colour
+submit fixture checks exact base/reduced-LOD ranges, including coarsest-band
+reuse, so a whole-buffer bind cannot expose the packed wire suffix as triangles.
+These controlled CPU assertions do not establish native GPU capacity or pixels.
+
 The CPU skin fixture tests the production deformer without a graphics device.
 It covers blending with the last supported joint, pre-deformed input,
 normal/tangent transforms and invalid influences without losing the source
@@ -510,3 +518,24 @@ format safety, newline stripping and explicit truncation are checked without
 a device. The complete-owner old-LOG_INFO mutation must compile and produce
 ordinary direct assertion failures, beyond CTest WILL_FAIL. These callback
 consumption controls do not prove an upstream trace emitter or driver result.
+
+
+`postfx_agx_controls.cmake` extracts the complete actual composite tonemap
+operators, dispatch and combine functions, with unique boundary checks and
+syntax-only typed C++ ports. The shared ordinary fixture verifies grayscale,
+color/HDR, finite/range and non-AgX/output-gamma behavior. Its missing-EOTF
+variant removes only the real transfer and must compile then fail normal
+assertions, separately from CTest WILL_FAIL. Keep the shader as the algorithm
+authority; no copied curve or GPU/pixel claim belongs in these CPU controls.
+
+`csm_dynamic_filter_controls.cmake` extracts the complete actual dynamic PCF
+helper, complete common-surface consumer and complete PBR dynamic block. Only
+the PBR entry signature/preceding static result and typed vector/point-sampler
+ports are supplied; float-literal suffixes are syntax adapters. Both GL row
+conventions execute finite hard/filtered/disabled, depth bias, four-cascade
+tile isolation, sharp-edge continuity, comparison coverage moments and static
+min-combine cases at actual supported atlas sizes. The whole-owner equal-box
+weight negative preserves all nine reads and addressing, and must compile then
+fail ordinary continuity/moment assertions independently of CTest WILL_FAIL.
+These are CPU arithmetic/address controls, not compiled GPU shaders, actual
+atlas bindings, native motion/pixel acceptance or performance measurements.

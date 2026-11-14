@@ -945,6 +945,11 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         render_trace.reason(JceEditorViewportRenderReason::ProbeBusy);
         return;
     }
+    /* The loader repairs asset keys only when the final slice completes.
+     * Keep any prior frame under its loading overlay until those keys are stable. */
+    if (jce_state_is_scene_loading()) {
+        render_trace.reason(JceEditorViewportRenderReason::SceneLoading); return;
+    }
     render_trace.admitted();
 
     /* iGPU ADAPTIVE dynamic resolution (editor scene view): steer the 3D render
@@ -1486,8 +1491,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     ed_vp_mark("evp_render", &_vpt);
     draw_selection_outlines();
     ed_vp_mark("evp_outlines", &_vpt);
-    if (jce_state_get_show_physics_debug()) {
-        draw_physics_debug();
+    if (jce_state_get_show_physics_debug() ||
+        (jce_physics_debug_get_flags() & ~uint32_t(JCE_PHYS_DBG_WIREFRAME))) {
+        draw_physics_debug(view, proj);
         /* Selected compound collider's fitted wireframe is part of the collider
          * overlay — only show it when that overlay is toggled on, so selecting
          * an object with the overlay OFF shows just the selection outline. */

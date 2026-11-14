@@ -110,6 +110,12 @@ static std::string details_type_label_for_entry(const FileEntry &fe)
 
 /* ── Single grid item ────────────────────────────────────────────── */
 
+void prepare_asset_grid_caption(const FileEntry &fe)
+{
+    asset_grid_caption_text(fe.grid_caption, fe.name,
+        asset_grid_caption_metrics((float)JCE_THUMBNAIL_SIZE));
+}
+
 void draw_asset_grid_item(const FileEntry &fe, int index,
                           int cols, int &col, bool &want_ctx_popup)
 {
@@ -290,100 +296,10 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
         }
     }
 
-    /* File name label */
-    {
-        bool is_selected = s_assets.selected_set.count(index) != 0;
-        float name_w = (float)JCE_THUMBNAIL_SIZE;
-        float line_h = ImGui::GetTextLineHeightWithSpacing();
-        float max_h  = line_h * 2.0f;
-        ImVec2 name_start = ImGui::GetCursorScreenPos();
-
-        std::string stem = fe.name;
-        std::string ext_part;
-
-        ImVec4 name_col = is_selected
-            ? JCE_COLOR_ASSET_SEL_TEXT
-            : ImGui::GetStyleColorVec4(ImGuiCol_Text);
-        ImVec4 ext_col  = is_selected
-            ? ImVec4(name_col.x * 0.75f, name_col.y * 0.75f,
-                     name_col.z * 0.85f, name_col.w)
-            : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-
-        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + name_w);
-
-        if (is_selected) {
-            ImGui::PushStyleColor(ImGuiCol_Text, name_col);
-            ImGui::TextWrapped("%s", stem.c_str());
-            ImGui::PopStyleColor();
-            if (!ext_part.empty()) {
-                ImGui::SameLine(0, 0);
-                ImGui::PushStyleColor(ImGuiCol_Text, ext_col);
-                ImGui::TextWrapped("%s", ext_part.c_str());
-                ImGui::PopStyleColor();
-            }
-        } else {
-            ImVec2 full_sz = ImGui::CalcTextSize(
-                fe.name.c_str(), NULL, false, name_w);
-            if (full_sz.y <= max_h) {
-                ImGui::PushStyleColor(ImGuiCol_Text, name_col);
-                ImGui::TextWrapped("%s", stem.c_str());
-                ImGui::PopStyleColor();
-                if (!ext_part.empty()) {
-                    ImGui::SameLine(0, 0);
-                    ImGui::PushStyleColor(ImGuiCol_Text, ext_col);
-                    ImGui::TextWrapped("%s", ext_part.c_str());
-                    ImGui::PopStyleColor();
-                }
-            } else {
-                ImGui::PushStyleColor(ImGuiCol_Text, name_col);
-                if (!ext_part.empty()) {
-                    char trunc[256];
-                    int slen = (int)stem.size();
-                    int cut = slen;
-                    for (cut = slen - 1; cut > 0; cut--) {
-                        snprintf(trunc, sizeof(trunc), "%.*s...%s",
-                                 cut, stem.c_str(), ext_part.c_str());
-                        ImVec2 ts = ImGui::CalcTextSize(
-                            trunc, NULL, false, name_w);
-                        if (ts.y <= max_h) break;
-                    }
-                    if (cut <= 0)
-                        snprintf(trunc, sizeof(trunc), "...%s",
-                                 ext_part.c_str());
-                    char stem_trunc[256];
-                    snprintf(stem_trunc, sizeof(stem_trunc),
-                             "%.*s...", (cut > 0 ? cut : 0),
-                             stem.c_str());
-                    ImGui::TextWrapped("%s", stem_trunc);
-                    ImGui::SameLine(0, 0);
-                    ImGui::PopStyleColor();
-                    ImGui::PushStyleColor(ImGuiCol_Text, ext_col);
-                    ImGui::TextWrapped("%s", ext_part.c_str());
-                } else {
-                    const char *src = fe.name.c_str();
-                    int len = (int)strlen(src);
-                    char trunc[256];
-                    int cut = len;
-                    for (cut = len - 1; cut > 0; cut--) {
-                        snprintf(trunc, sizeof(trunc),
-                                 "%.*s...", cut, src);
-                        ImVec2 ts = ImGui::CalcTextSize(
-                            trunc, NULL, false, name_w);
-                        if (ts.y <= max_h) break;
-                    }
-                    if (cut <= 0)
-                        snprintf(trunc, sizeof(trunc), "...");
-                    ImGui::TextWrapped("%s", trunc);
-                }
-                ImGui::PopStyleColor();
-            }
-            float used_h = ImGui::GetCursorScreenPos().y - name_start.y;
-            if (used_h < max_h)
-                ImGui::Dummy(ImVec2(0, max_h - used_h));
-        }
-
-        ImGui::PopTextWrapPos();
-    }
+    /* File name label; item/selection/rename submission stays unchanged. */
+    draw_asset_grid_caption(fe.grid_caption, fe.name,
+        s_assets.selected_set.count(index) != 0, (float)JCE_THUMBNAIL_SIZE,
+        JCE_COLOR_ASSET_SEL_TEXT);
 
     ImGui::EndGroup();
 

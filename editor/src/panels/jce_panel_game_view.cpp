@@ -704,7 +704,7 @@ void jce_editor_panel_game_view_content(void)
     }
 
     const bool viewport_work = jce_editor_viewport_wants_render(region_start, view_size,
-        jce_editor_viewport_capture_requested(jce_editor_kpi_game_capture_global_active()),
+        jce_editor_viewport_capture_requested(jce_editor_kpi_game_capture_global_forces_render()),
         "editor.game.policy");
     /* Suppress GPU work, while still running the existing input/focus/Stop
      * lifecycle below: a clipped panel must release previous held inputs. */
@@ -785,7 +785,13 @@ void jce_editor_panel_game_view_content(void)
         if (const char *capture_path =
                 jce_editor_kpi_game_capture_global_due_path()) {
             JceEditorGameScreenshotFrame frame{};
-            if (jce_editor_game_render_screenshot(capture_path, &frame)) {
+            uint32_t capture_width = 0, capture_height = 0;
+            const bool capture_current =
+                jce_editor_kpi_game_capture_global_forces_render() ||
+                jce_editor_game_render_get_committed_extent(
+                    &capture_width, &capture_height);
+            if (capture_current &&
+                jce_editor_game_render_screenshot(capture_path, &frame)) {
                 jce_editor_kpi_game_capture_global_mark_submitted(
                     frame.source_frame, frame.submit_frame);
             }
@@ -834,8 +840,11 @@ void jce_editor_panel_game_view_content(void)
         play_active && !has_player_controller;
     /* Auto: lock for native CharacterController. Explicit Mouse Look: allow
      * script-driven cameras like CK even with no CharacterController. */
-    const bool capture_allowed = !play_active || has_player_controller ||
-                                 s_script_mouse_look;
+    const bool script_camera = play_active && jce_editor_game_render_has_virtual_camera();
+    const bool document_input = play_active &&
+        jce_editor_game_render_document_wants_input();
+    const bool capture_allowed = !document_input &&
+        (!play_active || has_player_controller || s_script_mouse_look);
 
     /* ── ScrollView wheel channel ───────────────────────────────────────
      * Forward ImGui's mouse-wheel (vertical io.MouseWheel = +up, horizontal
@@ -900,7 +909,7 @@ void jce_editor_panel_game_view_content(void)
             viewport_work, !io.AppFocusLost,
             view_focused || click_inside, was_captured,
             click_inside, click_elsewhere, alt_held,
-            ImGui::IsKeyPressed(ImGuiKey_Escape, false), capture_allowed,
+            ImGui::IsKeyPressed(ImGuiKey_Escape, false) && !document_input, capture_allowed,
             alt_just_released
         };
         const JceGameViewFocusOutput focus =
@@ -910,7 +919,7 @@ void jce_editor_panel_game_view_content(void)
          * relative mode. Use its returned state, not an unchecked request. */
         bool effective_capture =
             jce_editor_game_render_set_mouse_capture(focus.request_capture);
-        const bool game_keyboard = focus.keyboard_owned;
+        const bool game_keyboard = focus.keyboard_owned && !document_input;
         if (play_active && was_captured != effective_capture) {
             LOG_INFO("editor.game_view",
                      "Game View pointer lock: %s mode=%s alt=%d focus=%d "
@@ -1002,9 +1011,9 @@ void jce_editor_panel_game_view_content(void)
                             * Play drove straight into the wall. */
                            getenv("JCE_INPUT_REPLAY")) ? 1 : 0;
 
-        if (game_keyboard || pad_drives || s_qa_drives) {
+        if (!document_input && (game_keyboard || pad_drives || s_qa_drives)) {
             /* V toggles first/third-person follow camera (Play mode). */
-            if (effective_capture && has_player_controller &&
+            if (!script_camera && effective_capture && has_player_controller &&
                 play_active && ImGui::IsKeyPressed(ImGuiKey_V, false)) {
                 s_third_person = !s_third_person;
                 jce_editor_pstate_set_int("gameview.third_person",
@@ -1058,7 +1067,7 @@ void jce_editor_panel_game_view_content(void)
             }
             /* Script-owned relative camera (CK) consumes pointer delta via
              * Runtime. Never also rotate the editor's fallback camera. */
-            if (!(play_active && s_script_mouse_look && !has_player_controller) &&
+            if (!script_camera && !(play_active && s_script_mouse_look && !has_player_controller) &&
                 (yaw != 0.0f || pitch != 0.0f)) {
                 jce_camera_rotate(cam, yaw, pitch);
             }
@@ -1267,7 +1276,8 @@ void jce_editor_panel_game_view_content(void)
         /* If there's a player character in Play mode, snap the game
          * view camera to its eye position every frame (regardless of
          * capture state) so the user always sees through the player. */
-        if (play_active) {
+        if (script_camera) s_orient_to_player_forward = false;
+        if (play_active && !script_camera) {
             float px, py, pz;
             if (jce_editor_play_get_player_position(&px, &py, &pz)) {
                 if (s_third_person) {
@@ -1351,7 +1361,7 @@ void jce_editor_panel_game_view_content(void)
      * genuinely locked. Alt/Esc/focus-loss therefore cannot keep orbiting the
      * camera. Auto mode retains existing free-pointer UI semantics. */
     input_viewport.owner = play_active &&
-        (!s_script_mouse_look || input_viewport.captured)
+        (!s_script_mouse_look || input_viewport.captured || document_input)
         ? JCE_EDITOR_GAME_INPUT_RUNTIME : JCE_EDITOR_GAME_INPUT_NONE;
     jce_editor_game_input_bridge_publish(
         jce_editor_game_input_bridge_shared(), &input_viewport);

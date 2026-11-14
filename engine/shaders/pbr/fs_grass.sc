@@ -107,7 +107,7 @@ float grass_sample_csm(int cascade, vec3 world_pos, vec3 to_light)
         z < 0.0 || z > 1.0)
         return -1.0;                       // sentinel: cascade doesn't cover
 
-    float inv_map = max(u_csmParams.x, 1.0 / 2048.0);
+    float inv_map = u_csmParams.x > 0.0 ? u_csmParams.x : (1.0 / 2048.0);
     float clerp   = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
     float ndl     = max(to_light.y, 0.1); // carpet normal = +Y
     float slope   = sqrt(max(1.0 - ndl * ndl, 0.0)) / ndl;

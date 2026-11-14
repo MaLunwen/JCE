@@ -9,8 +9,10 @@
 #include "jce_skinned_mesh_deform_internal.h"
 #include "jce_view_wireframe_internal.h"
 #include "jce_upload_metrics.h"
+#include "jce_mesh_index_data.h"
 #include <jce/renderer/jce_skinned_mesh.h>
 #include "renderer/jce_render_encoder.h"   /* jce_dbg_xform_matrices */
+#include "jce_pbr_cull_override.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 
@@ -26,7 +28,6 @@
 struct JceSkinnedMesh {
     bgfx_vertex_buffer_handle_t vbh;
     bgfx_index_buffer_handle_t  ibh;
-    bgfx_index_buffer_handle_t  wf_ibh;     /* wireframe line indices */
     bgfx_vertex_layout_t        layout;
     uint32_t num_verts;
     uint32_t num_indices;
@@ -166,6 +167,58 @@ bool jce_skinned_mesh_pick_geometry(const JceSkinnedMesh *mesh,
     return true;
 }
 
+/* Keep optional topology in the same immutable IB as the triangle prefix.
+ * Upload failures reject the whole mesh; no valid-looking object owns INVALID
+ * geometry. All handles are initialized before any allocation can fail. */
+static void sm_init_handles(JceSkinnedMesh *mesh)
+{
+    mesh->vbh.idx = mesh->ibh.idx = UINT16_MAX;
+    mesh->ml_ibh.idx = mesh->ml_data.idx = UINT16_MAX;
+    for (uint32_t level = 0; level < JCE_SM_MAX_LOD; ++level)
+        mesh->lod_ibh[level].idx = UINT16_MAX;
+}
+
+static bool sm_create_buffers(JceSkinnedMesh *mesh, const void *vertices,
+                              uint32_t stride, const uint32_t *indices)
+{
+    const char *failure = NULL;
+    const bgfx_memory_t *vmem = bgfx_copy(vertices, mesh->num_verts * stride);
+    if (!vmem) { failure = "vertex_staging_allocation"; goto failed; }
+    const uint64_t vertex_bytes = vmem->size;
+    mesh->vbh = bgfx_create_vertex_buffer(vmem, &mesh->layout, BGFX_BUFFER_NONE);
+    jce_upload_metrics_record(JCE_UPLOAD_STATIC_VERTEX, vertex_bytes,
+        mesh->vbh.idx != UINT16_MAX);
+    if (mesh->vbh.idx == UINT16_MAX) {
+        failure = "vertex_buffer_allocation"; goto failed;
+    }
+    if (indices && mesh->num_indices > 0) {
+        uint32_t wire_count = 0;
+        uint32_t *packed = jce_mesh_pack_indices(indices, mesh->num_indices,
+                                                false, &wire_count);
+        const bgfx_memory_t *imem = bgfx_copy(packed ? packed : indices,
+            (mesh->num_indices + wire_count) * (uint32_t)sizeof(uint32_t));
+        if (!imem && packed) {
+            wire_count = 0;
+            imem = bgfx_copy(indices, mesh->num_indices * (uint32_t)sizeof(uint32_t));
+        }
+        JCE_FREE(packed);
+        if (!imem) { failure = "index_staging_allocation"; goto failed; }
+        const uint64_t index_bytes = imem->size;
+        mesh->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+        jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, index_bytes,
+            mesh->ibh.idx != UINT16_MAX);
+        if (mesh->ibh.idx == UINT16_MAX) {
+            failure = "index_buffer_allocation"; goto failed;
+        }
+        mesh->num_wf_indices = wire_count;
+    }
+    return true;
+failed:
+    LOG_WARN(LOG_TAG, "mesh upload rejected vertices=%u indices=%u reason=%s",
+        mesh->num_verts, mesh->num_indices, failure);
+    return false;
+}
+
 JceSkinnedMesh *jce_skinned_mesh_create(
     const JceSkinnedVertex *vertices, uint32_t num_verts,
     const uint32_t *indices, uint32_t num_indices,
@@ -178,6 +231,7 @@ JceSkinnedMesh *jce_skinned_mesh_create(
 
     JceSkinnedMesh *m = (JceSkinnedMesh *)JCE_CALLOC(1, sizeof(*m));
     if (!m) return NULL;
+    sm_init_handles(m);
 
     init_skinned_layout(&m->layout);
     m->num_verts   = num_verts;
@@ -203,56 +257,9 @@ JceSkinnedMesh *jce_skinned_mesh_create(
         }
     }
 
-    const bgfx_memory_t *vmem = bgfx_copy(vertices,
-                                           num_verts * (uint32_t)sizeof(JceSkinnedVertex));
-    const uint64_t payload_bytes_7 = vmem ? vmem->size : 0u;
-    m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
-    jce_upload_metrics_record(JCE_UPLOAD_STATIC_VERTEX, payload_bytes_7,
-        m->vbh.idx != UINT16_MAX);
-    if (m->vbh.idx == UINT16_MAX) {
-        /* bgfx static vertex-buffer pool exhausted (or upload failed): fail the
-         * whole mesh instead of returning a zombie with an invalid vbh that
-         * would forever submit nothing. Degrades gracefully under handle
-         * pressure rather than feeding a broken handle into the draw list. */
-        LOG_WARN(LOG_TAG, "skinned mesh: vertex buffer allocation failed");
-        if (m->base_cpu) JCE_FREE(m->base_cpu);
-        JCE_FREE(m);
+    if (!sm_create_buffers(m, vertices, (uint32_t)sizeof(*vertices), indices)) {
+        jce_skinned_mesh_destroy(m);
         return NULL;
-    }
-
-    if (indices && num_indices > 0) {
-        const bgfx_memory_t *imem = bgfx_copy(indices,
-                                               num_indices * (uint32_t)sizeof(uint32_t));
-        const uint64_t payload_bytes_6 = imem ? imem->size : 0u;
-        m->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
-        jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_6,
-            m->ibh.idx != UINT16_MAX);
-
-        /* Build wireframe IBO: each triangle -> 3 line pairs. */
-        uint32_t num_tris = num_indices / 3;
-        uint32_t wf_count = num_tris * 6;
-        uint32_t *wf = wf_count && wf_count <= UINT32_MAX / sizeof(*wf)
-            ? JCE_MALLOC((size_t)wf_count * sizeof(*wf)) : NULL;
-        if (wf) {
-            for (uint32_t t = 0; t < num_tris; t++) {
-                uint32_t a = indices[t*3+0], b = indices[t*3+1], c = indices[t*3+2];
-                wf[t*6+0]=a; wf[t*6+1]=b;
-                wf[t*6+2]=b; wf[t*6+3]=c;
-                wf[t*6+4]=c; wf[t*6+5]=a;
-            }
-            const bgfx_memory_t *wmem = bgfx_copy(wf, wf_count * (uint32_t)sizeof(uint32_t));
-            const uint64_t payload_bytes_5 = wmem ? wmem->size : 0u;
-            m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
-            jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_5,
-                m->wf_ibh.idx != UINT16_MAX);
-            m->num_wf_indices = wf_count;
-            JCE_FREE(wf);
-        } else {
-            m->wf_ibh.idx = UINT16_MAX;
-        }
-    } else {
-        m->ibh.idx    = UINT16_MAX;
-        m->wf_ibh.idx = UINT16_MAX;
     }
 
     if (cpu_pick)
@@ -275,6 +282,7 @@ JceSkinnedMesh *jce_pbr_mesh_create(
 
     JceSkinnedMesh *m = (JceSkinnedMesh *)JCE_CALLOC(1, sizeof(*m));
     if (!m) return NULL;
+    sm_init_handles(m);
 
     init_pbr_layout(&m->layout);
     m->num_verts   = num_verts;
@@ -295,54 +303,9 @@ JceSkinnedMesh *jce_pbr_mesh_create(
         }
     }
 
-    const bgfx_memory_t *vmem = bgfx_copy(vertices,
-                                           num_verts * (uint32_t)sizeof(JcePbrVertex));
-    const uint64_t payload_bytes_4 = vmem ? vmem->size : 0u;
-    m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
-    jce_upload_metrics_record(JCE_UPLOAD_STATIC_VERTEX, payload_bytes_4,
-        m->vbh.idx != UINT16_MAX);
-    if (m->vbh.idx == UINT16_MAX) {
-        /* See jce_skinned_mesh_create: fail cleanly on pool exhaustion rather
-         * than return a zombie mesh with an invalid vertex buffer. */
-        LOG_WARN(LOG_TAG, "PBR mesh: vertex buffer allocation failed");
-        if (m->base_cpu) JCE_FREE(m->base_cpu);
-        JCE_FREE(m);
+    if (!sm_create_buffers(m, vertices, (uint32_t)sizeof(*vertices), indices)) {
+        jce_skinned_mesh_destroy(m);
         return NULL;
-    }
-
-    if (indices && num_indices > 0) {
-        const bgfx_memory_t *imem = bgfx_copy(indices,
-                                               num_indices * (uint32_t)sizeof(uint32_t));
-        const uint64_t payload_bytes_3 = imem ? imem->size : 0u;
-        m->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
-        jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_3,
-            m->ibh.idx != UINT16_MAX);
-
-        /* Build wireframe IBO. */
-        uint32_t num_tris = num_indices / 3;
-        uint32_t wf_count = num_tris * 6;
-        uint32_t *wf = wf_count && wf_count <= UINT32_MAX / sizeof(*wf)
-            ? JCE_MALLOC((size_t)wf_count * sizeof(*wf)) : NULL;
-        if (wf) {
-            for (uint32_t t = 0; t < num_tris; t++) {
-                uint32_t a = indices[t*3+0], b = indices[t*3+1], c = indices[t*3+2];
-                wf[t*6+0]=a; wf[t*6+1]=b;
-                wf[t*6+2]=b; wf[t*6+3]=c;
-                wf[t*6+4]=c; wf[t*6+5]=a;
-            }
-            const bgfx_memory_t *wmem = bgfx_copy(wf, wf_count * (uint32_t)sizeof(uint32_t));
-            const uint64_t payload_bytes_2 = wmem ? wmem->size : 0u;
-            m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
-            jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_2,
-                m->wf_ibh.idx != UINT16_MAX);
-            m->num_wf_indices = wf_count;
-            JCE_FREE(wf);
-        } else {
-            m->wf_ibh.idx = UINT16_MAX;
-        }
-    } else {
-        m->ibh.idx    = UINT16_MAX;
-        m->wf_ibh.idx = UINT16_MAX;
     }
 
     if (!jce_pick_gpu_readback_available())
@@ -360,8 +323,6 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
         bgfx_destroy_vertex_buffer(mesh->vbh);
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_destroy_index_buffer(mesh->ibh);
-    if (mesh->wf_ibh.idx != UINT16_MAX)
-        bgfx_destroy_index_buffer(mesh->wf_ibh);
     for (uint32_t l = 0; l < mesh->lod_count; ++l)
         if (mesh->lod_ibh[l].idx != UINT16_MAX)
             bgfx_destroy_index_buffer(mesh->lod_ibh[l]);
@@ -413,7 +374,7 @@ static struct { uint64_t state; uint32_t stencil;     /* Static-batch member cul
  * leaves behind. */
 static void sm_apply_submit_state(void)
 {
-    bgfx_set_state(s_submit.state ? s_submit.state : BGFX_STATE_DEFAULT, 0);
+    bgfx_set_state(jce_pbr_cull_override(s_submit.state ? s_submit.state : BGFX_STATE_DEFAULT, BGFX_STATE_CULL_MASK), 0);
     if (s_submit.stencil) bgfx_set_stencil(s_submit.stencil, BGFX_STENCIL_NONE);
 }
 
@@ -489,12 +450,12 @@ void jce_skinned_mesh_submit_vertices(const JceSkinnedMesh *mesh,
 
     sm_bind_vertices(mesh, source);
 
-    if (r && jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
-        /* Wireframe: line pairs from the wf_ibh, no back-face culling. */
-        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-        bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+    if (r && jce_renderer_get_wireframe(r) && mesh->num_wf_indices > 0) {
+        /* Wireframe: line suffix of the immutable IB, no back-face culling. */
+        bgfx_set_index_buffer(mesh->ibh, mesh->num_indices, mesh->num_wf_indices);
+        bgfx_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                      | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
-                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
+                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, BGFX_STATE_CULL_MASK), 0);
     } else {
         if (mesh->ibh.idx != UINT16_MAX) {
             /* An armed range draws that slice; no range draws the whole
@@ -508,7 +469,7 @@ void jce_skinned_mesh_submit_vertices(const JceSkinnedMesh *mesh,
                 s_submit.range_first < mesh->num_indices) {
                 first = s_submit.range_first;
                 count = s_submit.range_count;
-                if (first + count > mesh->num_indices)
+                if (count > mesh->num_indices - first)
                     count = mesh->num_indices - first;
             }
             bgfx_set_index_buffer(mesh->ibh, first, count);
@@ -545,11 +506,11 @@ void jce_skinned_mesh_submit_morphed(const JceSkinnedMesh *mesh,
     bgfx_dynamic_vertex_buffer_handle_t dvb = { dyn_vb_idx };
     bgfx_set_dynamic_vertex_buffer(0, dvb, 0, mesh->num_verts);
 
-    if (r && jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
-        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-        bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+    if (r && jce_renderer_get_wireframe(r) && mesh->num_wf_indices > 0) {
+        bgfx_set_index_buffer(mesh->ibh, mesh->num_indices, mesh->num_wf_indices);
+        bgfx_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                      | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
-                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
+                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, BGFX_STATE_CULL_MASK), 0);
     } else {
         if (mesh->ibh.idx != UINT16_MAX)
             bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
@@ -596,8 +557,8 @@ void jce_skinned_mesh_submit_shadow_vertices(const JceSkinnedMesh *mesh,
 
     /* Depth-only: write Z, cull front faces to reduce peter-panning —
      * identical state to jce_mesh_submit_shadow() for the static path. */
-    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+    bgfx_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, BGFX_STATE_CULL_MASK), 0);
 
     bgfx_program_handle_t prog = { program.idx };
     jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
@@ -616,8 +577,8 @@ void jce_skinned_mesh_bind_shadow(const JceSkinnedMesh *mesh)
     bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+    bgfx_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, BGFX_STATE_CULL_MASK), 0);
 }
 
 /* Morph shadow submit: mirror of jce_skinned_mesh_submit_shadow that binds the
@@ -643,8 +604,8 @@ void jce_skinned_mesh_submit_shadow_morphed(const JceSkinnedMesh *mesh,
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+    bgfx_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, BGFX_STATE_CULL_MASK), 0);
 
     bgfx_program_handle_t prog = { program.idx };
     jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
@@ -667,15 +628,15 @@ void jce_skinned_mesh_submit_wireframe_vertices(const JceSkinnedMesh *mesh,
     const JceSkinVertexSource *source, bool overlay)
 {
     if (!mesh || !r || program.idx == UINT16_MAX ||
-        mesh->wf_ibh.idx == UINT16_MAX) {
+        mesh->num_wf_indices == 0) {
         bgfx_discard(BGFX_DISCARD_ALL);
         return;
     }
     JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitWireframe");
 
     sm_bind_vertices(mesh, source);
-    bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-    bgfx_set_state(jce_view_wireframe_state(overlay, mesh->num_wf_indices), 0);
+    bgfx_set_index_buffer(mesh->ibh, mesh->num_indices, mesh->num_wf_indices);
+    bgfx_set_state(jce_pbr_cull_override(jce_view_wireframe_state(overlay, mesh->num_wf_indices), BGFX_STATE_CULL_MASK), 0);
 
     bgfx_program_handle_t prog = { program.idx };
     jce_enc_submit_implicit(view_id, prog, 0, BGFX_DISCARD_ALL);
@@ -711,7 +672,7 @@ void jce_skinned_mesh_submit_pick_vertices(const JceSkinnedMesh *mesh,
                      BGFX_STATE_MSAA;
     if (!double_sided)
         state |= BGFX_STATE_CULL_CW;
-    bgfx_set_state(state, 0);
+    bgfx_set_state(jce_pbr_cull_override(state, BGFX_STATE_CULL_MASK), 0);
 
     bgfx_program_handle_t prog = { program.idx };
     jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
@@ -908,7 +869,7 @@ void jce_skinned_mesh_submit_lod(const JceSkinnedMesh *mesh,
                                  uint32_t level)
 {
     if (!mesh) return;
-    /* No LOD for this level, or wireframe view (must keep its base wf_ibh):
+    /* No LOD for this level, or wireframe view (must keep its base line suffix):
      * fall through to the base submit so behaviour is byte-identical. */
     if (level >= mesh->lod_count || mesh->lod_ibh[level].idx == UINT16_MAX ||
         (r && jce_renderer_get_wireframe(r))) {
@@ -941,8 +902,8 @@ void jce_skinned_mesh_submit_shadow_lod(const JceSkinnedMesh *mesh,
     /* Caller uploaded the bone palette / transform before this call. */
     bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
     bgfx_set_index_buffer(mesh->lod_ibh[level], 0, mesh->lod_num_indices[level]);
-    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+    bgfx_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, BGFX_STATE_CULL_MASK), 0);
     bgfx_program_handle_t prog = { program.idx };
     jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
     JCE_PROFILE_ZONE_END;

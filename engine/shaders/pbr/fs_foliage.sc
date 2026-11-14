@@ -12,8 +12,9 @@ $input v_texcoord0, v_normal, v_worldpos, v_localpos
 /*
  * fs_foliage.sc -- 3-tone toon foliage card (paired with vs_foliage.sc).
  *
- * Unlit by design: the authored ramp colors ARE the lighting for the
- * current look (season x time-of-day) -- exactly the reference model.
+ * The authored ramp defines the stylized shading shape. The CPU folds
+ * bounded primary-light plus resolved ambient energy into multiplier,
+ * so darkness cannot leave these cards unconditionally emissive.
  *   ramp key t = clamp(worldY * 0.1 + ndl, 0, 1)
  *   ndl        = dot(shellNormal, toLight) * 0.6 + 0.4
  *   color      = ramp(shadow, mid, highlight)(t) * multiplier

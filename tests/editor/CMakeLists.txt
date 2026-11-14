@@ -2899,3 +2899,11 @@ include(launch_diagnostics_controls.cmake)
 include(scene_content_clock_controls.cmake)
 
 include(draw_log_controls.cmake)
+
+# Actual shared Play overlay with public SDK types and counted CPU endpoints.
+jce_add_cxx_test(test_jce_physics_overlay
+    SOURCES test_jce_physics_overlay.cpp)
+
+include(asset_caption_controls.cmake)
+
+include(asset_directory_controls.cmake)

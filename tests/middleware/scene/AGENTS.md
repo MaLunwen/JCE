@@ -1,3 +1,22 @@
+`test_jce_collect_layout` consumes exact production collection callbacks,
+collection admission/publication, metadata, freeze/dirty repair, shared model
+publication/reset/entry, drain boundaries and complete public model-cache
+invalidation. Controlled Scene, resource and full-build payload ports create
+no window/device. Ordered-ID/count changes, wide handles, roster/structure/
+scene/owner/metadata mutations, dirty-ring refusal, entity-list reserve refusal
+and retry, default-mode late publication and pending/loaded/failed reset slots
+retain ordinary assertions. Cold and unrelated-publication refreshes retain a
+far-origin overlapping surface, then reject genuinely distant geometry once
+exact focus resumes; late cold/ALL and focus-off publications must recover
+their proof rather than strand unbounded collection. A downstream count-clamp input proves the next
+real recollect detects a changed layout; it does not qualify that allocation
+owner or stationary retry after its independent refusal. The source runner
+generates strict unchanged owner regions for collect_layout_controls.cmake.
+Old unconditional generation and omitted identity/publication/reset gates
+must compile and fail unchanged ordinary assertions; CTest WILL_FAIL alone
+is not the direct negative witness. CPU ports do not certify native shader/
+GPU execution, physics, complete async-loader operation or frame-time gains.
+
 `test_jce_ssgi_lifetime` consumes the complete private retention/release owner
 and strict uniquely delimited actual create/resize, activity-clear, retirement,
 scene-reset and renderer-destroy wires. Typed CPU create/resize/destroy and
@@ -52,6 +71,21 @@ mutations must fail ordinary assertions. Dual membership and mover erasure
 remain unchanged. This does not certify local-atlas foliage or product pixels.
 
 # Scene CPU owner controls
+
+`test_jce_sky_ibl_refresh` compiles the complete private numeric admission
+owner. Raw scalars that differ from their printed forms, normalized angular
+movement, accumulation against the last admitted direction, scalar edits,
+invalidated state and degenerate directions retain ordinary assertions.
+The focused patch verification additionally compiles the complete actual
+`sr_refresh_sky_ibl` and `sr_ibl_poll` with typed async/sky/upload ports; queue,
+worker/upload failure and stale HDR completion remain distinct. Restoring
+the original formatted-key admission must compile and fail those assertions.
+Disabled procedural IBL must generate and submit nothing, including while the
+sun or ambient changes. The actual-owner controls retain an accepted task
+across disable, collect it through the existing poll, and distinguish unchanged
+cache reuse from refresh after a disabled-time sky change. Removing only the
+enabled guard must compile and fail these ordinary assertions.
+These CPU controls are not native worker, GPU image or whole-frame evidence.
 
 Follow the repository and parent tests/ charters. Public API consumers retain
 their normal dependency boundary.
@@ -372,6 +406,16 @@ these tests do not certify shader execution, pixels or memory retirement.
 Existing colour-special controls assert the actual non-null camera reaches the
 cluster port, and early-gate ports retain that private signature.
 
+Foliage-cluster cache controls extract the actual capacity/record, complete
+slot admission, procedural generation and both complete cluster-retirement
+loops. Typed world/hash/allocation/mesh ports cover a 52-entry stable set,
+over-budget deterministic eviction, full entity identity, changed geometry,
+allocation refusal/retry and every reset/destructor slot. Old 48-slot capacity
+and truncated reset/destruction variants must compile then fail ordinary Unity
+assertions. The fixed 64-slot budget allocates CPU leaf records lazily; its
+512 KiB ceiling excludes metadata and expanded meshes. These CPU controls do
+not certify full Scene operation, shader pixels, GPU memory or frame-time gains.
+
 Water colour binding controls reuse the complete PBR/lighting counted-uniform
 harness and execute actual geometry/global-prefix and complete terminal-submit
 source regions. They exclude intervening simulation/resource/custom-uniform work.
@@ -414,3 +458,11 @@ entry, retaining all public impulse/energy/bed controls. Zero-target relaxation
 must decay velocity energy without overshoot, compose across split durations,
 and ignore nonpositive/nonfinite dt. The test does not replace the solver or
 execute a graphics backend.
+
+The test_jce_tod_key CPU fixture checks the private body selector against the
+existing environment predicate without mutating solar state.
+test_jce_foliage_lighting exercises actual bounded incident-energy math;
+test_jce_model_cull_override exercises the private cull state and restoration
+scope. The fcluster binding fixture additionally checks night-to-unlit draws.
+These helpers do not substitute for a complete native SDK build, shader
+compilation, visible cave/foliage captures or measured whole-frame performance.

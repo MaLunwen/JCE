@@ -18,6 +18,7 @@
 #include "viewers/jce_file_viewer.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "jce_panel_assets_caption.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -36,6 +37,7 @@ struct FileEntry {
     bool is_dir;
     uintmax_t size;
     std::string modified_at;
+    mutable AssetGridCaptionCache grid_caption;
 };
 
 enum AssetBrowserViewMode {
@@ -133,6 +135,7 @@ void draw_asset_search_bar(void);
 
 void draw_asset_grid_item(const FileEntry &fe, int index,
                           int cols, int &col, bool &want_ctx_popup);
+void prepare_asset_grid_caption(const FileEntry &fe);
 void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
                              bool &want_ctx_popup);
 void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries);

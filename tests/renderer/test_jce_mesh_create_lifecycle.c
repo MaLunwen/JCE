@@ -6,8 +6,9 @@
 typedef struct Controls {
     unsigned copies, copied_releases, vertex_calls, index_calls;
     unsigned vertex_destroys, index_destroys, next_vertex, next_index;
-    unsigned fail_copy, fail_vertex, fail_index;
-    bool vertices[16], indices[16];
+    unsigned fail_copy, fail_copy_again, fail_vertex, fail_index;
+    uint32_t last_index[16], last_index_count;
+    bool vertices[8192], indices[4096];
 } Controls;
 static Controls controls;
 static JceMeshVertex vertices[3];
@@ -15,7 +16,8 @@ static const uint32_t indices[3] = {0,1,2};
 static const bgfx_memory_t *copy_bytes(const void *bytes, uint32_t count, void *user)
 {
     Controls *c=(Controls *)user;
-    if (++c->copies==c->fail_copy) return NULL;
+    ++c->copies;
+    if (c->copies==c->fail_copy || c->copies==c->fail_copy_again) return NULL;
     bgfx_memory_t *memory=(bgfx_memory_t *)malloc(sizeof(*memory)+count);
     TEST_ASSERT_NOT_NULL(memory);
     memory->data=(uint8_t *)(memory+1); memory->size=count;
@@ -30,25 +32,29 @@ static bgfx_vertex_buffer_handle_t create_vertex(const bgfx_memory_t *memory,
     Controls *c=(Controls *)user; TEST_ASSERT_NOT_NULL(layout); consume(memory,c);
     if (++c->vertex_calls==c->fail_vertex) return (bgfx_vertex_buffer_handle_t){UINT16_MAX};
     uint16_t handle=(uint16_t)c->next_vertex++;
-    TEST_ASSERT_LESS_THAN_UINT16(16,handle); c->vertices[handle]=true;
+    TEST_ASSERT_LESS_THAN_UINT16(8192,handle); c->vertices[handle]=true;
     return (bgfx_vertex_buffer_handle_t){handle};
 }
 static bgfx_index_buffer_handle_t create_index(const bgfx_memory_t *memory, void *user)
 {
-    Controls *c=(Controls *)user; consume(memory,c);
-    if (++c->index_calls==c->fail_index) return (bgfx_index_buffer_handle_t){UINT16_MAX};
+    Controls *c=(Controls *)user;
+    c->last_index_count=memory->size/(uint32_t)sizeof(uint32_t);
+    TEST_ASSERT_LESS_OR_EQUAL_UINT32(16,c->last_index_count);
+    memcpy(c->last_index,memory->data,memory->size); consume(memory,c);
+    if (++c->index_calls==c->fail_index || c->next_index==4096)
+        return (bgfx_index_buffer_handle_t){UINT16_MAX};
     uint16_t handle=(uint16_t)c->next_index++;
-    TEST_ASSERT_LESS_THAN_UINT16(16,handle); c->indices[handle]=true;
+    TEST_ASSERT_LESS_THAN_UINT16(4096,handle); c->indices[handle]=true;
     return (bgfx_index_buffer_handle_t){handle};
 }
 static void destroy_vertex(bgfx_vertex_buffer_handle_t handle, void *user)
 {
-    Controls *c=(Controls *)user; TEST_ASSERT_LESS_THAN_UINT16(16,handle.idx);
+    Controls *c=(Controls *)user; TEST_ASSERT_LESS_THAN_UINT16(8192,handle.idx);
     TEST_ASSERT_TRUE(c->vertices[handle.idx]); c->vertices[handle.idx]=false; ++c->vertex_destroys;
 }
 static void destroy_index(bgfx_index_buffer_handle_t handle, void *user)
 {
-    Controls *c=(Controls *)user; TEST_ASSERT_LESS_THAN_UINT16(16,handle.idx);
+    Controls *c=(Controls *)user; TEST_ASSERT_LESS_THAN_UINT16(4096,handle.idx);
     TEST_ASSERT_TRUE(c->indices[handle.idx]); c->indices[handle.idx]=false; ++c->index_destroys;
 }
 static const JceMeshCreateProvider provider = {BGFX_RENDERER_TYPE_NOOP,copy_bytes,
@@ -63,16 +69,18 @@ void setUp(void)
 }
 void tearDown(void)
 {
-    for(unsigned i=0;i<16;++i) { TEST_ASSERT_FALSE(controls.vertices[i]); TEST_ASSERT_FALSE(controls.indices[i]); }
+    for(unsigned i=0;i<8192;++i) TEST_ASSERT_FALSE(controls.vertices[i]);
+    for(unsigned i=0;i<4096;++i) TEST_ASSERT_FALSE(controls.indices[i]);
     unsigned failed=controls.fail_copy&&controls.copies>=controls.fail_copy?1u:0u;
+    if (controls.fail_copy_again && controls.copies>=controls.fail_copy_again) ++failed;
     TEST_ASSERT_EQUAL_UINT(controls.copies-failed,controls.copied_releases);
 }
 static void success_owns_valid_zero_handles(void)
 {
     JceMesh *mesh=create(true); TEST_ASSERT_NOT_NULL(mesh);
     TEST_ASSERT_EQUAL_UINT16(0,jce_mesh_get_vbh(mesh)); TEST_ASSERT_EQUAL_UINT16(0,jce_mesh_get_ibh(mesh));
-    TEST_ASSERT_EQUAL_UINT(3,controls.copies); jce_mesh_destroy(mesh);
-    TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(2,controls.index_destroys);
+    TEST_ASSERT_EQUAL_UINT(2,controls.copies); jce_mesh_destroy(mesh);
+    TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(1,controls.index_destroys);
 }
 static void nonindexed_mesh_owns_no_index_buffer(void)
 {
@@ -92,7 +100,7 @@ static void vertex_creation_failure_owns_no_handle(void)
 }
 static void index_staging_failure_retires_vertex_once(void)
 {
-    controls.fail_copy=2; TEST_ASSERT_NULL(create(true));
+    controls.fail_copy=2; controls.fail_copy_again=3; TEST_ASSERT_NULL(create(true));
     TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(0,controls.index_destroys);
 }
 static void index_creation_failure_never_returns_pseudo_ready_mesh(void)
@@ -100,21 +108,45 @@ static void index_creation_failure_never_returns_pseudo_ready_mesh(void)
     controls.fail_index=1; TEST_ASSERT_NULL(create(true));
     TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(0,controls.index_destroys);
 }
-static void wireframe_staging_failure_retires_both_owned_buffers(void)
+static void optional_wire_staging_failure_keeps_solid_mesh(void)
 {
-    controls.fail_copy=3; TEST_ASSERT_NULL(create(true));
-    TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(1,controls.index_destroys);
+    controls.fail_copy=2;
+    JceMesh *mesh=create(true); TEST_ASSERT_NOT_NULL(mesh);
+    TEST_ASSERT_EQUAL_UINT(3,controls.copies);
+    TEST_ASSERT_EQUAL_UINT(1,controls.index_calls);
+    TEST_ASSERT_EQUAL_UINT(3,controls.last_index_count);
+    TEST_ASSERT_EQUAL_UINT32_ARRAY(indices,controls.last_index,3);
+    jce_mesh_destroy(mesh);
 }
-static void wireframe_creation_failure_retires_both_owned_buffers(void)
+static void packed_topology_preserves_triangle_prefix_and_unique_edges(void)
 {
-    controls.fail_index=2; TEST_ASSERT_NULL(create(true));
-    TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(1,controls.index_destroys);
+    const uint32_t expected[9]={0,1,2,0,1,0,2,1,2};
+    JceMesh *mesh=create(true); TEST_ASSERT_NOT_NULL(mesh);
+    TEST_ASSERT_EQUAL_UINT(3,jce_mesh_index_count(mesh));
+    TEST_ASSERT_EQUAL_UINT(1,controls.index_calls);
+    TEST_ASSERT_EQUAL_UINT(9,controls.last_index_count);
+    TEST_ASSERT_EQUAL_UINT32_ARRAY(expected,controls.last_index,9);
+    jce_mesh_destroy(mesh);
+}
+static void fixed_pool_admits_more_than_2048_meshes_and_rejects_capacity(void)
+{
+    JceMesh *meshes[4096];
+    for(unsigned i=0;i<4096;++i) {
+        meshes[i]=create(true); TEST_ASSERT_NOT_NULL(meshes[i]);
+        TEST_ASSERT_EQUAL_UINT(i,jce_mesh_get_ibh(meshes[i]));
+    }
+    TEST_ASSERT_NULL(create(true));
+    TEST_ASSERT_EQUAL_UINT(4097,controls.vertex_calls);
+    TEST_ASSERT_EQUAL_UINT(4097,controls.index_calls);
+    TEST_ASSERT_EQUAL_UINT(1,controls.vertex_destroys);
+    for(unsigned i=0;i<4096;++i) jce_mesh_destroy(meshes[i]);
+    TEST_ASSERT_EQUAL_UINT(4096,controls.index_destroys);
 }
 static void failed_creation_can_retry_without_double_retirement(void)
 {
     controls.fail_index=1; TEST_ASSERT_NULL(create(true)); controls.fail_index=0;
     JceMesh *mesh=create(true); TEST_ASSERT_NOT_NULL(mesh); jce_mesh_destroy(mesh);
-    TEST_ASSERT_EQUAL_UINT(2,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(2,controls.index_destroys);
+    TEST_ASSERT_EQUAL_UINT(2,controls.vertex_destroys); TEST_ASSERT_EQUAL_UINT(1,controls.index_destroys);
 }
 static void malformed_provider_rejected_before_allocation(void)
 {
@@ -132,8 +164,9 @@ int main(void)
     RUN_TEST(vertex_creation_failure_owns_no_handle);
     RUN_TEST(index_staging_failure_retires_vertex_once);
     RUN_TEST(index_creation_failure_never_returns_pseudo_ready_mesh);
-    RUN_TEST(wireframe_staging_failure_retires_both_owned_buffers);
-    RUN_TEST(wireframe_creation_failure_retires_both_owned_buffers);
+    RUN_TEST(optional_wire_staging_failure_keeps_solid_mesh);
+    RUN_TEST(packed_topology_preserves_triangle_prefix_and_unique_edges);
+    RUN_TEST(fixed_pool_admits_more_than_2048_meshes_and_rejects_capacity);
     RUN_TEST(failed_creation_can_retry_without_double_retirement);
     RUN_TEST(malformed_provider_rejected_before_allocation);
     return UNITY_END();

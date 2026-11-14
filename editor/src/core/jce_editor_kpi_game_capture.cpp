@@ -3,6 +3,7 @@
 extern "C" {
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/core/jce_timer.h>
 }
 
 #include <cerrno>
@@ -16,10 +17,25 @@ struct GlobalCaptureState {
     uint16_t width = 1280;
     uint16_t height = 720;
     uint32_t rendered_frames = 0;
+    uint32_t source_frame = 0;
+    uint32_t submit_frame = 0;
     bool active = false;
+    bool natural = false;
+    bool natural_started = false;
+    bool natural_run_closed = false;
 };
 
 GlobalCaptureState g_capture;
+
+void end_natural_run(const char *reason)
+{
+    if (!g_capture.active || !g_capture.natural || g_capture.natural_run_closed)
+        return;
+    g_capture.natural_run_closed = true;
+    jce_log_write(JCE_LOG_LEVEL_INFO, "editor.game_view", __FILE__, __LINE__,
+                  "Game View capture schedule ended reason=%s elapsed_seconds=%.9f",
+                  reason, g_capture.schedule.elapsed_seconds);
+}
 
 void set_error(char *error, size_t error_size, const char *message)
 {
@@ -111,11 +127,12 @@ bool jce_editor_kpi_game_capture_global_configure(
             shots_spec, &g_capture.schedule, error, error_size)) {
         return false;
     }
-    if (size_spec && size_spec[0] &&
+    g_capture.natural = size_spec && std::strcmp(size_spec, "natural") == 0;
+    if (!g_capture.natural && size_spec && size_spec[0] &&
         !jce_editor_kpi_game_capture_parse_size(
             size_spec, &g_capture.width, &g_capture.height)) {
         set_error(error, error_size,
-                  "game capture size must be WIDTHxHEIGHT");
+                  "game capture size must be WIDTHxHEIGHT or natural");
         g_capture = {};
         return false;
     }
@@ -125,12 +142,18 @@ bool jce_editor_kpi_game_capture_global_configure(
 
 void jce_editor_kpi_game_capture_global_disable(void)
 {
+    end_natural_run("shutdown");
     g_capture = {};
 }
 
 bool jce_editor_kpi_game_capture_global_active(void)
 {
     return g_capture.active;
+}
+
+bool jce_editor_kpi_game_capture_global_forces_render(void)
+{
+    return g_capture.active && !g_capture.natural;
 }
 
 bool jce_editor_kpi_game_capture_global_in_flight(void)
@@ -140,7 +163,8 @@ bool jce_editor_kpi_game_capture_global_in_flight(void)
 
 bool jce_editor_kpi_game_capture_global_needs_focus(void)
 {
-    return g_capture.active && !g_capture.schedule.failed &&
+    return g_capture.active && !g_capture.natural &&
+           !g_capture.schedule.failed &&
            !jce_editor_kpi_game_capture_finished(&g_capture.schedule) &&
            g_capture.rendered_frames < 10u;
 }
@@ -150,6 +174,20 @@ void jce_editor_kpi_game_capture_global_tick(
 {
     if (!g_capture.active)
         return;
+    if (g_capture.natural) {
+        /* One diagnostic run must not overwrite its paths on a later Play.
+         * Preserve the current entry and accepted readback through Stop so
+         * the ordinary owner poll can still publish its terminal receipt. */
+        if (play_state == JCE_EDITOR_KPI_PLAY_STOPPED) {
+            if (g_capture.natural_started)
+                end_natural_run("stopped");
+            return;
+        }
+        if (g_capture.natural_run_closed)
+            return;
+        if (play_state == JCE_EDITOR_KPI_PLAY_PLAYING)
+            g_capture.natural_started = true;
+    }
     jce_editor_kpi_game_capture_tick(
         &g_capture.schedule, play_state, dt_seconds);
 }
@@ -157,7 +195,7 @@ void jce_editor_kpi_game_capture_global_tick(
 bool jce_editor_kpi_game_capture_global_render_size(
     uint16_t *out_width, uint16_t *out_height)
 {
-    if (!g_capture.active || !out_width || !out_height)
+    if (!g_capture.active || g_capture.natural || !out_width || !out_height)
         return false;
     *out_width = g_capture.width;
     *out_height = g_capture.height;
@@ -173,7 +211,7 @@ void jce_editor_kpi_game_capture_global_note_rendered(void)
 const char *jce_editor_kpi_game_capture_global_due_path(void)
 {
     const JceEditorKpiGameCaptureEntry *entry =
-        g_capture.active
+        g_capture.active && !g_capture.natural_run_closed
             ? jce_editor_kpi_game_capture_due(&g_capture.schedule)
             : nullptr;
     return entry ? entry->path : nullptr;
@@ -182,22 +220,41 @@ const char *jce_editor_kpi_game_capture_global_due_path(void)
 void jce_editor_kpi_game_capture_global_mark_submitted(
     uint32_t source_frame, uint32_t submit_frame)
 {
-    if (!g_capture.active)
+    if (!g_capture.active || g_capture.natural_run_closed)
         return;
     auto &schedule = g_capture.schedule;
     const auto *entry = jce_editor_kpi_game_capture_due(&schedule);
     if (!entry || !jce_editor_kpi_game_capture_mark_submitted(&schedule))
         return;
+    g_capture.source_frame = source_frame;
+    g_capture.submit_frame = submit_frame;
+    const uint64_t counter = jce_time_perf_counter();
+    const uint64_t frequency = jce_time_perf_freq();
     jce_log_write(JCE_LOG_LEVEL_INFO, "editor.game_view", __FILE__, __LINE__,
                   "Game View capture admitted source_frame=%u submit_frame=%u "
-                  "due_seconds=%.9f admitted_seconds=%.9f path=%s",
+                  "due_seconds=%.9f admitted_seconds=%.9f "
+                  "counter=%llu frequency=%llu path=%s",
                   static_cast<unsigned>(source_frame),
                   static_cast<unsigned>(submit_frame),
-                  entry->seconds, schedule.elapsed_seconds, entry->path);
+                  entry->seconds, schedule.elapsed_seconds,
+                  static_cast<unsigned long long>(counter),
+                  static_cast<unsigned long long>(frequency), entry->path);
 }
 
 void jce_editor_kpi_game_capture_global_mark_complete(bool success)
 {
-    if (g_capture.active)
-        jce_editor_kpi_game_capture_mark_complete(&g_capture.schedule, success);
+    if (!g_capture.active || !g_capture.schedule.in_flight)
+        return;
+    const auto &entry = g_capture.schedule.entries[g_capture.schedule.next_index];
+    const uint64_t counter = jce_time_perf_counter();
+    const uint64_t frequency = jce_time_perf_freq();
+    jce_log_write(JCE_LOG_LEVEL_INFO, "editor.game_view", __FILE__, __LINE__,
+                  "Game View capture terminal success=%d source_frame=%u "
+                  "submit_frame=%u counter=%llu frequency=%llu path=%s",
+                  success ? 1 : 0,
+                  static_cast<unsigned>(g_capture.source_frame),
+                  static_cast<unsigned>(g_capture.submit_frame),
+                  static_cast<unsigned long long>(counter),
+                  static_cast<unsigned long long>(frequency), entry.path);
+    jce_editor_kpi_game_capture_mark_complete(&g_capture.schedule, success);
 }

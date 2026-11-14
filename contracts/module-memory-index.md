@@ -1,5 +1,86 @@
 # Module ownership index
 
+Native natural-size Game image scheduling remains in
+`editor/src/core/jce_editor_kpi_game_capture.{h,cpp}` and the existing Game panel.
+The scene viewport owns actual current-frame rendering, file readback and
+completion; the controller owns only its first-Play schedule and receipt
+identity. `tools/editor_play_screenshots.py` belongs to the tools charter and
+is consumed by `editor_play_diagnostic.py` for owned PNG validation, bounded
+receipts and separately reported screenshot-interval exclusions. It adds no OS
+screen capture, process launcher or rendering policy. Existing capture/diagnostic
+test owners cover CPU boundaries; native PNG contents and performance remain
+independent acceptance work.
+
+
+Asset Browser directory snapshots: editor/src/panels/jce_panel_assets_directory.h
+owns copied scan requests, task-owned results, two active-lifecycle flight slots,
+current-folder generations and visible tree FIFO/cache. The existing public
+async executor owns scheduling; editor adds no worker pool or filesystem service.
+assets.cpp consumes the 350 ms membership poll and preserves synchronous changed
+folder materialization. nav.cpp publishes complete tree results before recursion
+with a minimum one-second refresh interval, preserving stale valid rows through
+work/failure and deferred root invalidation. ui/jce_editor_panels owns its public
+init/shutdown hooks; late tasks own no UI state. Cooperative execution remains on
+the owner pump, and immediate lifecycle restart can overlap cancelled old jobs
+until executor retirement. tests/editor/asset_directory_controls.cmake compiles
+the actual owner/caller bodies with real headless ImGui and controlled public
+async/filesystem ports; seven ordinary mutants and panel-state hook controls are
+separate from native executor/SDL/UI/FPS evidence.
+
+Exact collected-layout identity remains in scene/jce_scene_renderer.c: focus
+movement recollects normally and preserves generation only for the complete,
+identical ordered result and owner/cohort. Existing scene/jce_sr_model_bounds.c
+publishes default and opt-in geometry invalidation; the normal drain batches
+default retirement while selective dependency tracking stays opt-in. Scene
+entry and public model-cache reset share those owners. Invalid bounds proofs
+refresh through a conservative collect-all before returning to exact focus;
+both collection modes require valid ownership for reuse. CPU controls live in
+tests/middleware/scene/test_jce_collect_layout.c and its registered
+collect_layout_controls.cmake; tools/validation/collect_layout_controls.py
+prepares actual owner regions and ordinary negative variants. These do not
+constitute native renderer, asynchronous-loader or whole-frame acceptance.
+
+Natural visible Editor diagnostics belong to `tools/editor_play_diagnostic.py`.
+The explicit checkout supplies process_sampler, perf_bench's log authority and
+benchmark_suite's CSV authority. The tool controls one child capture without
+autoplay, fixed timestep, viewport forcing or render-quality policy. Its
+focused Game CPU spans retain actual clocks, runtime-tick observations and
+native writer byte/record integrity; they do not certify GPU presentation or
+causal before/after performance. Controls live in
+`tools/tests/test_editor_play_diagnostic.py`; tools/AGENTS.md owns the boundary.
+Stable comparisons exclude observed lifecycle and mixed-view frames. Recurring
+phase ranking requires declared coverage; sparse event averages remain separate.
+The first visible CSV marker does not establish native startup or presentation.
+
+The private editor/src/scene/jce_editor_physics_overlay.h owns shared Scene/Game
+Play/Pause collider drawing from admitted live native physics shapes, optional
+conservative camera segment rejection, bounded shape requests, retained-line
+sampling, and scoped flags/sink lifetime. jce_editor_physics_debug_settings.h
+reuses the existing UI-state persistence owner for a default 30-metre radius
+(0 disables distance only), Current Camera/Player centre and optional frustum.
+Both callers use the rendered view; absent Player position falls back to that
+camera. application/jce_rt_character.c exposes the current borrowed character
+identity; the Bullet bridge resolves its live character slot before giving it
+priority and a distance exemption. Shape requests read only bounded native
+indices; contacts/constraints retain the separate legacy debug flush.
+Game bridge retention consumes the same request, including non-wireframe flags.
+renderer/jce_debug_line_sample.h owns whole-line transient reduction used by
+jce_debug_draw.c; no prefix fallback, and line rendering preserves scene depth.
+gizmo/jce_gizmo_compound_collider.cpp owns cached Edit-only cooked previews,
+including full-range triangle sampling and capsule caps; Edit convex hull bounds
+are an explicit preview limit. tests/editor/test_jce_physics_overlay.cpp consumes
+the actual private CPU owners with SDK-typed ports. The private physics
+`jce_physics_debug_query.cpp` owns finite native object/shape/part admission and
+bounded normalization of the old query prefix. `jce_physics_debug_range.hpp`
+walks the live quantized BVH with explicit node/candidate limits before nearby
+triangle quotas; `jce_physics_debug_mesh.hpp` owns bounded indexed reads.
+Boundary-intersecting shapes/faces stay whole; LIMIT/UNSUPPORTED/INVALID remain
+explicit. No cross-frame pointers, render asset loads or per-frame hull cooking
+are added. Stopped authoring and 2D previews keep their existing separate paths.
+The native range control links the production query to real Bullet CPU objects;
+the overlay/settings controls use typed endpoint fixtures. Neither is a full
+JCE host/SDK build, native IDE acceptance, or rendered-pixel validation.
+
 Per-operation readback witnesses remain in renderer/jce_render_readback.c;
 its existing slots retain capture-local identities and readiness history.
 `tools/readback_operation_observation.py` is an opt-in typed consumer inside
@@ -67,6 +148,16 @@ existing public reflection parser and validated payload range; no second BGFX
 parser or runtime dependency is introduced. The wrapper bounds and verifies
 bytes and exclusively creates output; CPU artifact identity does not imply
 active draw consumption. `tools/tests/test_shader_payload.py` owns the controls.
+
+Asset Browser captions remain derived members of the existing FileEntry
+vectors. `editor/src/panels/jce_panel_assets_caption.h` owns exact-name/font/
+context/atlas/size/spacing/DPI/wrap keyed reuse of the existing two-line byte
+truncation result; kind-filter copies warm the original entry. No global path
+map or cell virtualization changes selection, rename, tooltip or keyboard
+submission. `tests/editor/asset_caption_controls.cmake` consumes this owner and
+actual filtered-copy wiring with real ImGui; output/layout/call budgets and
+ordinary cache-bypass/stale-key/missing-warmup negatives remain distinct from
+native UI and whole-frame performance acceptance.
 
 Console keeps its existing UI state and bounded Engine/Editor log rings as
 owners. Intrinsic text geometry is derived there; real ImGui ItemSize retains
@@ -607,6 +698,34 @@ Shared directional receiver depth bias: engine/shaders/pbr/shadow_bias.sh.
 Static cascade inspection: engine/src/middleware/scene/jce_sr_debug_targets.c.
 Cooperative build resource ownership: tools/build/cache_lock.py, integrated
 by tools/build/jce.py; original dependency trees remain untouched.
+
+Native Windows IDE preparation: tools/build/ide.py reuses the shared driver,
+MSVC/Conan/layout owners and cache leases. tools/build/ide_jsonc.py owns local
+JSONC preflight, exact backups, guarded publication/rollback and generated-entry
+identity; tools/build/ide_modkit.py resolves one selected build's shader paths.
+tools/build/conan_msvc.py admits the active target compiler/linker and optional
+developer-shell markers, then binds normalized cl/VS paths in Conan host-context
+configuration. Shared clean MSVC activation requests the same toolset prefix
+through vcvarsall. The shared generation fingerprint owns reuse; no separate
+compiler discovery or build-context override is introduced. Counted path and
+command controls are registered in tools/tests/test_build_driver.py; they do
+not certify Windows execution or package ABI compatibility.
+tools/build/ide_cache.py owns bounded source/generator admission and selective
+retirement of stale CMake system/compiler descriptions across retained versions.
+It reuses ide_jsonc's byte/alias checks and transaction with original cache and
+file backups. The existing rollback-local command dispatches the metadata receipt
+owner and guards current identities; target objects, executables and dependency
+caches are outside retirement. Real CMake/Conan controls qualify the recovery
+mechanism separately from native Windows/IDE execution.
+Local CMakeUserPresets never enter public source. Root CMakePresets.json owns
+the visible native target/variant menu and external architecture/toolset;
+layout_contract.py validates its paths, inheritance and effective host lanes.
+ide.py prepares that canonical cache, hides only unchanged owned legacy aliases,
+and binds VS Code native tasks/debugging to the active CMake preset/target.
+Actual Python controls are tools/tests/test_ide_build.py, test_ide_modkit.py and
+test_build_layout_contract_v10.py; real CMake parser/build fixtures and native
+compiler/IDE execution have separately declared scopes. The charter is
+tools/build/AGENTS.md.
 
 Exact authored camera pose and interactive FPS policy: engine/src/renderer/jce_camera.c;
 public contract engine/include/jce/renderer/jce_camera.h. Explicit forward/up
@@ -1871,3 +1990,100 @@ Optional document HUD overlay: engine/include/jce/application/jce_rml_scene_over
 maps scene component values to RML element ids through an opt-in, project-owned
 ui/hud.bindings manifest. Editor Game View uses its own offscreen render view;
 the default host uses the backbuffer UI view. Legacy scenes remain unchanged.
+
+Rendering correction owners: scene/jce_sr_tod_key.h delegates sun/moon key
+selection to the existing environment predicate while scene-renderer writeback
+retains solar identity. scene/jce_sr_foliage_lighting.h supplies bounded incident
+energy to the existing ramp binder. renderer/jce_pbr_cull_override.h is the
+private two-sided scope consumed by final geometry and PBR normal state; the
+scene draw/cull owners bracket it and avoid incompatible instance batches.
+renderer/jce_underwater.c admits complete resources; scene renderer/environment
+own bounded shared-resource retries and foliage-uniform lifetime.
+pbr/csm_filter.sh supplies balanced deterministic 9/25-tap static CSM filtering;
+renderer/jce_csm.c owns the invariant fit and scene/jce_sr_shadow.c derives its
+cull basis from the actual cascade VP. CPU controls and native graphics/perf
+acceptance remain explicitly separate.
+
+Mesh index storage: renderer/jce_mesh_index_data.h packs triangle and wire
+topology into disjoint spans of one immutable static IB. Mesh/skinned/model
+submitters and scene/jce_sr_water_caustic_atlas.c bind explicit spans; reduced
+LOD and meshlet buffers retain separate owners. renderer/jce_gltf_loader.c
+rejects incomplete required geometry uploads and unwinds CPU/GPU ownership.
+scene/jce_sr_water_mesh_cache.h gates failed water geometry creation against
+device frames, keeps matching resident entries usable and commits replacements
+only after allocation. Existing scene reset clears the refusal latch.
+
+Editor Scene/Game viewport admission consumes the existing deferred scene-load
+state before resource work. io/jce_editor_scene_serial.cpp still owns path repair
+and finalization; main update polling and the existing layout loading overlay
+remain independent. core/jce_editor_viewport_trace.h records SceneLoading as a
+private refusal reason, without changing existing reason identities.
+
+Imported MASK depth coverage: renderer/jce_pbr_depth_internal.h declares
+material-owned depth/normal/velocity programs; jce_pbr_material.c owns lazy
+loading, alpha binding and shutdown. jce_model_depth_bind.inc.h selects the
+effective per-primitive material; jce_model_depth.inc.h owns shared depth and
+motion submissions, while remaining model GPU/morph routes reuse the selector.
+renderer/jce_model_depth_internal.h exposes only the private cutout query to
+scene/jce_sr_cull.c so material-blind velocity queues use per-object fallback.
+pbr/material_depth_alpha.sh owns stock texture-times-factor alpha with the
+same UV transform and strict cutoff. Opaque and procedural foliage paths keep
+their existing behavior; custom graph/tint alpha and imported double-sided
+shadow policy are outside this change. Backend compilation and native cloud,
+tree-shadow and motion witnesses remain distinct from CPU binding controls.
+# Procedural sky IBL numeric identity
+
+The private `engine/src/middleware/scene/jce_sr_ibl_refresh.h` owns admission
+against the last accepted numeric sky state. SceneRenderer stores this small
+snapshot; the environment owner invalidates it on queue/bake/upload failure
+or HDR transition. Formatted log keys are not cache authority. The existing
+worker and GPU upload lifecycle is unchanged. Direct CPU owner and actual
+admission/completion tests do not establish target-machine frame-time gains.
+The environment owner admits new procedural work only while scene IBL is
+enabled. Already accepted tasks keep the same poll/retirement owner, and the
+last admitted snapshot survives disable for correct re-enable/cache reuse.
+
+
+Sandbox text loading: middleware/script/jce_script.c captures whether the caller supplied a non-nil fourth argument before luaL_loadbufferx pushes its compiled chunk. This preserves ordinary one/two/three-argument factories and existing explicit environments without weakening text-only restrictions. The existing script sandbox CTest adds delayed-global factory, isolation and refusal cases. Selected-C/Lua integration is separate from a complete native Editor build.
+
+Static cooked triangle shapes: middleware/physics/jce_physics_bullet.cpp preallocates known signed-capacity storage and appends the original valid ordered triangles without Bullet's linear vertex-weld scan. Shape ownership and BVH construction remain unchanged; duplicate vertex storage is an explicit memory tradeoff. Native Bullet coordinate and BVH-ray comparisons are separate from JCE contact-solver and target-host performance acceptance.
+
+
+Document HUD tag resolution: application/jce_rml_scene_overlay.h owns bounded
+operation-local tag-ID/first-entity snapshots for values, visibility and input.
+Each snapshot uses the public entity order, includes duplicate-tag first-match
+semantics and expires before the next operation; no scene pointer/handle cache
+survives retagging, deletion or a scene swap. Key-edge mailbox and release
+quarantine keep their existing owners. Tests/application/rml_scene_batch_controls.cmake
+registers complete-header C99/C++20 CPU controls with actual tag-helper source
+and typed dependency ports; its per-binding mutation restores repeated scans.
+Editor GameRender adds six phases through the existing perf-phase owner for document input/focus,
+value sync, document draw, Canvas and physics debug. Native SDK, full Editor
+compilation, pixels and whole-frame performance require separate validation.
+
+
+Cloud-noise integer reuse: renderer/jce_cloud_noise.c shares XY-prefix and
+Z-tail hashing inside the existing cellular-noise owner. Wrapped hash identity,
+all cell visits and floating distance order remain unchanged; cloud resolution,
+slicing and publication remain with their existing owners.
+
+Active composite AgX output: shaders/postfx/fs_composite.sc returns display-linear
+color before the shared output gamma. tests/renderer/postfx_agx_controls.cmake
+and test_jce_postfx_agx.cpp execute complete actual source with typed CPU ports
+and an ordinary missing-transfer negative. See postfx and renderer-test charters;
+CPU acceptance is distinct from native shader compilation and visible output.
+
+Optional exact-path script cost partition: application/jce_rt_script_cost.c
+now owns the existing public runtime cost iterate/reset implementations and the
+private bounded process-latched selector in jce_rt_script_cost.h. The existing
+rt_tick_gameplay callback timer supplies current on_update ms to two fixed
+literal phases, script_focus/script_other; no public ABI, timer, registry or
+per-entity phase names are added. Default capture remains unchanged.
+tools/editor_play_diagnostic.py explicitly forwards --script-path/--ecull-detail
+and distinguishes detail_request from actual detail_observation: exact native
+selector receipt, finite zero-inclusive partition rows and same-frame sum
+qualification; missing evidence stays unavailable independently of raw capture
+completion. Ecull detail remains six existing serial miss-path subphases.
+The existing runtime script-cost native target and diagnostic Python suite own
+regressions. Source/CPU control success does not certify rebuilt native Lua,
+Editor/GPU output or performance improvement.

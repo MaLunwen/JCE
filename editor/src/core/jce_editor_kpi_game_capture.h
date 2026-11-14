@@ -48,12 +48,17 @@ bool jce_editor_kpi_game_capture_finished(
     const JceEditorKpiGameCaptureSchedule *schedule);
 
 /* Process-global QA controller used by the editor host and Game View panel.
- * It owns only schedule state; rendering/readback stays in scene/. */
+ * It owns only schedule state; rendering/readback stays in scene/.
+ * The explicit size "natural" retains ordinary viewport admission and extent.
+ * It photographs one Play session; Stop closes new requests but retains an
+ * accepted readback until its terminal result. Default/numeric sizes retain
+ * the deterministic capture policy, including restart on a later Play. */
 bool jce_editor_kpi_game_capture_global_configure(
     const char *shots_spec, const char *size_spec,
     char *error, size_t error_size);
 void jce_editor_kpi_game_capture_global_disable(void);
 bool jce_editor_kpi_game_capture_global_active(void);
+bool jce_editor_kpi_game_capture_global_forces_render(void);
 bool jce_editor_kpi_game_capture_global_in_flight(void);
 bool jce_editor_kpi_game_capture_global_needs_focus(void);
 void jce_editor_kpi_game_capture_global_tick(

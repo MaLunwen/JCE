@@ -776,3 +776,101 @@ recompile. Remove historical trees only after separate user-directed review.
 The XP `receipt.json`, optional real-time progress and guest compatibility qualification
 remain separate; consistent folder names are NOT evidence of successful builds
 or XP VM execution.
+
+## Native Windows IDE preparation
+
+`jce.py ide` delegates to `ide.py`, using the existing target/layout, MSVC,
+Conan generation fingerprint, job budget and cache lease owners. It prepares
+the separate desktop preset lane, then configures without building or running
+JCE targets. Shared Conan install may build missing dependency packages.
+An explicit, repeatable `ide --rebuild-dependency NAME` requests source rebuilds
+through that same shared Conan owner. Accept bounded exact package names only;
+reject wildcards, references and command fragments. Deduplicate the names and
+map them to `--build=NAME/*` while retaining the normal missing-package policy,
+profiles, compiler configuration, hooks, package store and compiler job budget.
+Explicit requests bypass generation reuse on every invocation. Keep the normal
+graph fingerprint independent of this one-shot execution request so the next
+ordinary invocation can reuse successfully generated metadata. Invalidate the
+success marker before execution and never restore it after failure. Rollback
+of local IDE settings cannot be combined with dependency rebuild requests and
+does not roll back Conan package revisions. Command-port tests verify routing,
+reuse, repeated force and failed-stamp behavior; they do not compile a dependency
+or establish Windows linking, runtime ABI compatibility or Editor execution.
+Native embedded Editor Release/Dist caches remain independent. The canonical
+root preset is the one visible configure owner for each native lane. Its
+external architecture/toolset metadata lets VS and CMake Tools establish their
+own compiler environment; the shared preparation command records observed
+CMake/Ninja/cl paths in the existing cache using CMake's forward-slash spelling.
+`conan_msvc.py` binds the observed target cl and its installation in host-context
+Conan configuration, reusing the shared architecture/toolset family policy.
+The compiler, linker and optional active shell/installation markers must agree;
+fresh independent VS discovery cannot replace that observed selection. The
+existing Conan command fingerprint includes these paths, so old bare-cl
+generators are refreshed through Conan itself. Cross-target cl never replaces
+the independent build-context compiler. These are path/environment admission
+checks, not executed compiler, SDK or complete package ABI certification.
+No developer path or fixed Visual
+Studio product release is published. Desktop release/debug/dist and ASan are
+explicit authoring Editor configurations; SDK variants override that policy.
+Do not infer a single-EXE shipment merely from a Release or Dist build variant.
+The active cl/link target directories and developer-shell architecture must
+match the requested native target, and a recognizable newer MSVC family cannot
+override the shared Conan profile. Clean activation requests the shared toolset
+prefix explicitly with vcvarsall's -vcvars_ver, so an installation's default
+does not select another family.
+Missing PATH CMake/Ninja may be resolved
+only from that same observed VS installation (or shared discovery owner),
+then version-probed and added only to this invocation environment. No host-wide
+PATH edit or package download is introduced. Root Conan generation remains disabled;
+SDK/editor/test routes preserve user presets instead of deleting the file.
+
+`ide_jsonc.py` preserves unrelated JSONC slices, preflights all local settings,
+and backs up exact preimages under build/validation/ide before atomic per-file
+publication. All requested local files share one rollback scope around CMake
+configure. Do not generate additional visible `jce-ide-*` aliases. Historical
+owned aliases require their recorded complete-content SHA256 before hiding;
+unknown user edits refuse migration. Old unstamped VS Code entries may migrate
+only when their complete content matches the known previous generator shape.
+Native CMake tasks bind the active preset; debugging binds the selected CMake
+target path and uses one build-before-run owner. Do not restore a Python process
+build task or a fixed Release executable path. Compare bytes immediately
+before replacement and preserve observed concurrent edits/aliases, continuing
+rollback for other files. Cooperative locks and read checks are not an OS
+compare-and-swap against noncooperating editors. Backups and conflict receipts
+remain local generated evidence. `ide_cache.py` admits only the canonical Windows
+IDE tree and its source/generator-owned cache. It inspects bounded numeric CMake
+version directories together, because a newer IDE and the preparation executable
+can retain different system/compiler descriptions in the same tree. Absent Conan
+binding or changed compiler identity triggers exact backup of CMakeCache.txt and
+retirement of only CMakeSystem.cmake and CMake<language>Compiler.cmake files.
+It does not delete CMakeFiles, target object directories, executables or packages,
+and never rewrites generated CMake contents. CMake performs normal redetection.
+--prepare-only may retire stale descriptions, but records RETIRED_NOT_CONFIGURED;
+native Configure must still perform redetection. Unknown ownership, aliased paths,
+budgets and changed preimages refuse metadata mutation; failed configure output remains
+separate from original backups. The existing --rollback-local dispatches the
+metadata receipt owner and checks the recorded current cache/file identities.
+Its rollback restores that prior metadata state, not a newly validated build.
+Real CMake/Conan fixture recovery is separate from native Windows/IDE acceptance.
+Metadata inventory keys use forward slashes on every host. Derive parent
+keys with Path(...).parent.as_posix() before dictionary lookup, so Windows
+does not turn valid descriptions into missing entries or skip validation.
+PureWindowsPath controls model key formatting only; they do not certify a
+Windows filesystem, CMake configuration or compiler execution.
+`ide --rollback-local BACKUP` restores a successful local receipt only after
+checking every recorded current/backup SHA256 and source-root ownership. Unknown
+later edits or altered backups refuse before mutation; repeated completed
+restoration is reported separately. Roll back local IDE configuration before
+removing the source patch that supplies this command. Local settings rollback
+does not change Conan/build caches; metadata rollback uses its separate receipt.
+
+`ide_modkit.py` reads one explicitly selected CMake cache and its selected
+Conan CMakeDeps directory, without searching the package store. The caller
+execution-probes the recorded shaderc before applying four Modkit settings.
+Absent/ambiguous shader metadata is an explicit optional warning; existing
+shader settings and otherwise valid CMake preparation survive. Profile,
+varying and render defines still belong to actual shader commands.
+`tools/tests/test_ide_build.py` and `test_ide_modkit.py` cover actual Python
+owners, temporary files, parser/command ports and ordinary failure controls.
+They do not certify Windows compilation, shader diagnostics in VS Code, IDE
+debugging, native Editor execution or pixels.

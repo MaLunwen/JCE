@@ -22,6 +22,9 @@
 #include "renderer/jce_render_encoder.h"
 #include "jce_pbr_custom_trace_internal.h"
 #include "jce_model_toon_hair_internal.h"
+#include "jce_pbr_depth_internal.h"
+#include "jce_renderer_lifecycle_internal.h"
+#include "jce_pbr_cull_override.h"
 
 #define LOG_TAG "jce_pbr_material"
 
@@ -29,7 +32,7 @@
 /* Static uniforms and fallback textures (lazy-initialized)            */
 /* ================================================================== */
 
-/* THE MATERIAL'S UNIFORM HANDLES, in one object.
+/* The material owner's uniform handles and MASK programs, in one object.
  *
  * Nine separate file statics is nine globals, and the dedup audit counts them
  * -- adding the two the extended lobes needed took the count past its
@@ -55,6 +58,8 @@ static struct {
     bgfx_uniform_handle_t pbr_lobes2;
     bgfx_uniform_handle_t translucency_color;
     bgfx_uniform_handle_t toon_atlas;
+    JceShaderHandle depth_programs[JCE_PBR_DEPTH_COUNT];
+    unsigned depth_attempted;
 } s_mu;
 /* Per-draw UV transform override; see the header.  Same shape and lifetime as
  * jce_model.c's s_material_override, and armed by the same code.
@@ -66,6 +71,7 @@ static struct {
  * expressiveness -- and a second file-scope global to say "the first one is
  * valid" is a second thing that can be left stale. */
 static float s_uv_override[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+bool jce_pbr_force_two_sided = false;
 
 static bgfx_uniform_handle_t s_albedo;
 static bgfx_uniform_handle_t s_metal_rough;
@@ -137,6 +143,55 @@ static void ensure_uniforms(void)
 
     s_uniforms_init = true;
     LOG_DEBUG(LOG_TAG, "PBR uniforms and fallback textures initialized");
+}
+
+/* MASK variants share this material resource owner's device lifetime.
+ * Handle zero is valid; the attempt mask distinguishes zero initialization. */
+JceShaderHandle jce_pbr_depth_program(JcePbrDepthKind kind)
+{
+    static const char *const vertex[JCE_PBR_DEPTH_COUNT] = {
+        "shadow_alpha", "shadow_alpha_inst", "shadow_alpha_skinned",
+        "shadow_alpha_skinned_inst", "gbuffer_alpha", "gbuffer_alpha_skinned",
+        "gbuffer_vel_alpha", "gbuffer_vel_alpha_skinned", "gbuffer_vel_alpha_skinned_inst"
+    };
+    static const char *const fragment[JCE_PBR_DEPTH_COUNT] = {
+        "shadow_alpha", "shadow_alpha", "shadow_alpha", "shadow_alpha",
+        "gbuffer_alpha", "gbuffer_alpha", "gbuffer_vel_alpha", "gbuffer_vel_alpha",
+        "gbuffer_vel_alpha"
+    };
+    if ((unsigned)kind >= JCE_PBR_DEPTH_COUNT) return JCE_INVALID_SHADER;
+    const unsigned bit = 1u << (unsigned)kind;
+    if (!(s_mu.depth_attempted & bit)) {
+        s_mu.depth_programs[kind] = jce_renderer_shader_load_named_internal(
+            NULL, vertex[kind], fragment[kind]);
+        s_mu.depth_attempted |= bit;
+        if (!jce_shader_valid(s_mu.depth_programs[kind]))
+            LOG_WARN(LOG_TAG, "alpha depth program unavailable: vs=%s fs=%s; cutout depth refused",
+                vertex[kind], fragment[kind]);
+    }
+    return s_mu.depth_programs[kind];
+}
+
+bool jce_pbr_material_bind_depth(const JcePbrMaterial *mat)
+{
+    if (!mat || mat->alpha_mode != JCE_ALPHA_MASK) return true;
+    ensure_uniforms();
+    const bgfx_texture_handle_t texture = jce_texture_valid(mat->albedo_map)
+        ? (bgfx_texture_handle_t){mat->albedo_map.idx} : s_white_tex;
+    if (!BGFX_HANDLE_IS_VALID(texture) || !BGFX_HANDLE_IS_VALID(s_albedo) ||
+        !BGFX_HANDLE_IS_VALID(s_mu.base_color) || !BGFX_HANDLE_IS_VALID(s_mu.pbr_params) ||
+        !BGFX_HANDLE_IS_VALID(s_mu.uv_transform)) return false;
+    const bool uv_armed = s_uv_override[0] > 0.0f;
+    const float *tile = uv_armed ? s_uv_override : mat->uv_tiling;
+    const float *offset = uv_armed ? s_uv_override + 2 : mat->uv_offset;
+    const float uv[4] = {tile[0] != 0.0f ? tile[0] : 1.0f,
+        tile[1] != 0.0f ? tile[1] : 1.0f, offset[0], offset[1]};
+    const float params[4] = {0.0f, 0.0f, 0.0f, mat->alpha_cutoff};
+    jce_enc_set_uniform(s_mu.base_color, mat->base_color_factor, 1);
+    jce_enc_set_uniform(s_mu.pbr_params, params, 1);
+    jce_enc_set_uniform(s_mu.uv_transform, uv, 1);
+    jce_enc_set_texture(0, s_albedo, texture, UINT32_MAX);
+    return true;
 }
 
 /* ================================================================== */
@@ -341,7 +396,7 @@ uint64_t jce_pbr_material_render_state(const JcePbrMaterial *mat)
     }
 
     /* Double-sided materials skip back-face culling (default cull is CW). */
-    if (!mat || !mat->double_sided)
+    if (!jce_pbr_force_two_sided && (!mat || !mat->double_sided))
         state |= BGFX_STATE_CULL_CW;
 
     return state;
@@ -443,7 +498,7 @@ void jce_pbr_material_bind_texture_overrides(
                                                       : mat->normal_scale;
     float normal_scale[4] = {
         effective_normal_scale,
-        mat->double_sided ? 1.0f : 0.0f,
+        (mat->double_sided || jce_pbr_force_two_sided) ? 1.0f : 0.0f,
         s_view_mode,
         mat->receive_shadows_off ? 1.0f : 0.0f
     };
@@ -793,6 +848,13 @@ static uint16_t load_custom_program(const JceFileSystem *fs,
 
 void jce_pbr_material_shutdown(void)
 {
+    for (unsigned i = 0; i < JCE_PBR_DEPTH_COUNT; ++i) {
+        if ((s_mu.depth_attempted & (1u << i)) &&
+            jce_shader_valid(s_mu.depth_programs[i]))
+            jce_shader_program_destroy(s_mu.depth_programs[i]);
+        s_mu.depth_programs[i] = JCE_INVALID_SHADER;
+    }
+    s_mu.depth_attempted = 0u;
     for (int i = 0; i < s_prog_cache.count; i++) {
         if (s_prog_cache.entries[i].used && s_prog_cache.entries[i].program != UINT16_MAX) {
             JceShaderHandle h = { s_prog_cache.entries[i].program };
@@ -825,6 +887,7 @@ void jce_pbr_material_shutdown(void)
     }
     s_view_mode = 0.0f;
     memset(s_uv_override, 0, sizeof(s_uv_override));
+    jce_pbr_force_two_sided = false;
 }
 
 /* ================================================================== */

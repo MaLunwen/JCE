@@ -1,5 +1,17 @@
 # editor/src/core/ — Editor Singletons & State
 
+The existing KPI Game capture controller accepts the explicit size `natural`.
+This mode retains the live viewport extent and ordinary focus/render admission,
+uses one Play schedule per process, and closes new requests on the first Stop
+after Play begins.
+Stop preserves an admitted entry until the existing screenshot owner publishes
+its terminal result; later Play never reuses the image paths. Shared public
+performance counters describe admission/terminal CPU observations, not Present
+or GPU duration. Shutdown may leave an unresolved readback and must not invent
+success. Default/numeric capture keeps its deterministic sizing/focus/restart
+policy. Rendering and file/readback lifetime stay with the existing scene owner.
+
+
 Scene replacement consumes the boolean stop_play_before_scene_swap gate. It
 also retries a STOPPED session's retained authoring snapshot; false forbids
 root/mount/scene replacement and preserves the snapshot for retry. Only final
@@ -1073,3 +1085,9 @@ still win; ordinary-project fallback does not search engine-workspace outputs.
 The pure resolver owns ordering only. CPU profile/gatherer controls exercise
 real owner bodies and ordinary old-seed/missing-layout/old-name failures; they
 do not certify saved disk IO, GUI state switches or the spawned executable.
+
+The private viewport render reason SceneLoading identifies a draw refused by
+the existing deferred scene-load state before GPU/resource admission. Preserve
+older numeric reasons. Scene/Game retain their presentation targets when present;
+main-update polling and layout progress remain independently owned. A cancelled
+CPU trace sample does not establish loading responsiveness or GPU presentation.

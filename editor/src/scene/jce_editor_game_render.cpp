@@ -8,13 +8,15 @@
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_editor_scene_asset_cache.h"  /* finalize() — GPU-upload async loads */
 #include "scene/jce_editor_viewport_common.h"    /* plumbing shared with Scene View */
-#include "gizmo/jce_gizmo_compound_collider.h"   /* draw fitted compound colliders */
+#include "jce_editor_physics_overlay.h"
+#include "jce_editor_physics_debug_settings.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_viewport_trace.h"
 #include "core/jce_editor_frame_observation.h"
 
 #include "jce_scene_content_context.h"   /* project content roots (C++ linkage) */
 #include "core/jce_editor_project.h"
+#include "core/jce_editor_game_input_bridge.h"
 
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
@@ -22,6 +24,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene_camera.h>
 #include <jce/os/core/jce_console.h>  /* r.taa cvar query for game-view TAA */
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_perf_phase.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_render_pipeline.h>  /* scene_extent: one answer, shared with the shipped runtime */
 #include <jce/os/core/jce_timer.h>
@@ -81,6 +84,7 @@ struct GameRenderState {
     uint32_t               extent_frame      = 0u;
     bool                   extent_written    = false;
     bool                   stats_frame_completed = false; /* CPU-only HUD freshness. */
+    bool physics_overlay_budget_warned;
 
     /* GPU-query occlusion culler (Play / game-view).  The game view shares the
      * ENGINE scene renderer with the scene view but renders in its own pass with
@@ -107,6 +111,9 @@ struct GameRenderState {
     JceUICanvas           *ui_canvas         = nullptr;
     const JcePakArchive    *rml_pak           = nullptr;
     JceRmlSceneOverlay     rml_overlay        = {};
+    bool                   document_blocked   = false;
+    bool                   virtual_camera_active = false;
+    JceSceneCameraResolveResult camera_warning_result = JCE_SCENE_CAMERA_RESOLVE_OK;
     std::string            rml_assets_root;
     bool                   rml_checked        = false;
     JceUIPointer           ui_pointer        = {};
@@ -326,6 +333,7 @@ void jce_editor_game_render_shutdown(void)
         g.occlusion_culler = nullptr;
     }
     jce_rml_scene_overlay_close(&g.rml_overlay);
+    g.document_blocked = false;
     g.rml_assets_root.clear();
     g.rml_checked = false;
     g.rml_pak = nullptr;
@@ -379,6 +387,45 @@ bool jce_editor_game_render_is_mouse_captured(void)
     return g.mouse_captured;
 }
 
+bool jce_editor_game_render_prepare_document_input(JceScene *scene,
+    const JceInput *input, const JceInputActions *actions)
+{
+    const bool profile = jce_perf_phase_enabled() != 0;
+    const uint64_t phase_start = profile ? jce_time_perf_counter() : 0u;
+    const auto &viewport = jce_editor_game_input_bridge_shared()->viewport;
+    const JceInput *ui_input = viewport.visible && viewport.focused ? input : nullptr;
+    jce_rml_scene_overlay_prepare_input(&g.rml_overlay, scene, ui_input);
+    g.document_blocked = jce_rml_scene_overlay_blocks_gameplay(
+        &g.rml_overlay, scene, input, actions);
+    if (g.document_blocked && g.mouse_captured)
+        jce_editor_game_render_set_mouse_capture(false);
+    if (profile)
+        jce_perf_phase_add("rml_input",jce_time_perf_to_ms(phase_start,jce_time_perf_counter()));
+    return g.document_blocked;
+}
+
+bool jce_editor_game_render_has_virtual_camera(void)
+{
+    return g.play_runtime && g.virtual_camera_active;
+}
+
+bool jce_editor_game_render_document_wants_input(void)
+{
+    const bool profile = jce_perf_phase_enabled() != 0;
+    const uint64_t phase_start = profile ? jce_time_perf_counter() : 0u;
+    const bool wanted = g.document_blocked || jce_rml_scene_overlay_wants_input(
+        &g.rml_overlay, jce_state_get_scene());
+    if (profile)
+        jce_perf_phase_add("rml_focus",jce_time_perf_to_ms(phase_start,jce_time_perf_counter()));
+    return wanted;
+}
+
+bool jce_editor_game_render_document_owns_free_pointer(void)
+{
+    return !g.mouse_captured &&
+        jce_rml_scene_overlay_has_modal_controls(&g.rml_overlay);
+}
+
 void jce_editor_game_render_set_ui_pointer(float x, float y,
                                            bool down, bool valid)
 {
@@ -403,6 +450,7 @@ bool jce_editor_game_render_begin_play_camera(void)
         return false;
     }
     g.play_camera = camera;
+    g.camera_warning_result = JCE_SCENE_CAMERA_RESOLVE_OK;
     g.taa_prev_valid = false;
     g.camera_cut_pending = true;
     return true;
@@ -412,6 +460,7 @@ void jce_editor_game_render_end_play_camera(void)
 {
     JceCamera *camera = g.play_camera;
     g.play_camera = nullptr;
+    g.camera_warning_result = JCE_SCENE_CAMERA_RESOLVE_OK;
     if (camera) jce_camera_destroy(camera);
     g.taa_prev_valid = false;
     g.camera_cut_pending = true;
@@ -423,6 +472,15 @@ void jce_editor_game_render_end_play_camera(void)
  * on_value_changed / InputField on_submit).  Called by jce_editor_play.cpp. */
 void jce_editor_game_render_set_play_runtime(JceRuntime *rt)
 {
+    if (g.play_runtime != rt) {
+        /* Scene pointers and modal key edges never survive Stop/restart,
+         * including when the viewport is hidden during the transition. */
+        jce_rml_scene_overlay_close(&g.rml_overlay);
+        g.document_blocked = false;
+        g.virtual_camera_active = false;
+        g.rml_checked = false;
+        g.ui_pointer = {};
+    }
     g.play_runtime = rt;
 }
 
@@ -743,6 +801,13 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         render_trace.reason(JceEditorViewportRenderReason::ProbeBusy); return;
     }
 
+    /* Match Scene View: do not allocate geometry under pre-repair asset keys.
+     * Scene polling and its loading overlay remain owned by the editor frame. */
+    if (jce_state_is_scene_loading()) {
+        s_game_frame_observation.refuse(JceEditorViewportRenderReason::SceneLoading);
+        render_trace.reason(JceEditorViewportRenderReason::SceneLoading); return;
+    }
+
     JceSceneRenderer *engine_sr = jce_editor_get_scene_renderer();
     JceScene         *scene     = jce_state_get_scene();
     const int play_state = (int)jce_state_get_play_state();
@@ -766,10 +831,13 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * (jce_camera_third_person_follow) instead of the free-fly debug camera, so
      * editor-Play and the shipped runtime frame the scene identically.  Falls
      * back to free-fly when not playing or the scene has no character. */
+    bool has_player_follow = false;
     if (play_active && g.play_runtime) {
         jce_vec3 player_pos;
-        if (jce_runtime_get_player_position(g.play_runtime, &player_pos))
+        if (jce_runtime_get_player_position(g.play_runtime, &player_pos)) {
             jce_camera_third_person_follow(camera, player_pos);
+            has_player_follow = true;
+        }
     }
 
     /* Resolve the authored scene camera after the Play runtime has stepped and
@@ -797,36 +865,10 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         JceSceneCameraPose cpose;
         const JceSceneCameraResolveResult cres =
             jce_scene_camera_apply_primary(scene, camera, &cpose);
-        /* Say it ONCE when the scene cannot supply a camera.  Silently
-         * keeping the default is how this whole defect stayed invisible:
-         * Play renders something plausible from a camera nobody authored,
-         * and "my scene looks wrong in Play" has no line anywhere to
-         * attach itself to.  Each distinct outcome is reported once so a
-         * scene switch reports again without spamming a frame loop. */
-        {
-            static JceSceneCameraResolveResult s_said =
-                JCE_SCENE_CAMERA_RESOLVE_OK;
-            if (cres != JCE_SCENE_CAMERA_RESOLVE_OK && cres != s_said) {
-                s_said = cres;
-                const char *why =
-                    cres == JCE_SCENE_CAMERA_RESOLVE_NOT_FOUND
-                        ? "no entity has a primary Camera"
-                    : cres == JCE_SCENE_CAMERA_RESOLVE_AMBIGUOUS
-                        ? "more than one primary Camera"
-                    : cres == JCE_SCENE_CAMERA_RESOLVE_INVALID_POSE
-                        ? "the primary Camera's transform is not a valid pose"
-                        : "invalid argument";
-                LOG_WARN(LOG_TAG,
-                         "Play is using the default camera: %s. The shipped "
-                         "game resolves the same way, so it will look the "
-                         "same there -- this is the scene, not the editor.",
-                         why);
-            }
-        }
-
         JceVcamOutput output;
         bool has_vcam = false;
         jce_vcam_system_evaluate(scene, frame_dt, &output, &has_vcam);
+        g.virtual_camera_active = has_vcam;
         if (has_vcam) {
             jce_camera_set_position(
                 camera, jce_v3(output.position[0], output.position[1],
@@ -836,7 +878,32 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                                  output.target[2]));
             jce_camera_set_fov(camera, output.fov_deg);
         }
+        /* Diagnose the final source, after all existing camera owners ran.
+         * A VCam or an actual player follow resolves a missing primary. With
+         * no source, retain the current pose (which may be preview navigation
+         * or the previous resolved pose), not necessarily the default camera.
+         * Recovery and Play lifetime boundaries re-arm this bounded warning. */
+        const JceSceneCameraResolveResult unresolved =
+            has_vcam || has_player_follow ? JCE_SCENE_CAMERA_RESOLVE_OK : cres;
+        if (unresolved != JCE_SCENE_CAMERA_RESOLVE_OK &&
+            unresolved != g.camera_warning_result) {
+            const char *why =
+                unresolved == JCE_SCENE_CAMERA_RESOLVE_NOT_FOUND
+                    ? "no entity has a primary Camera"
+                : unresolved == JCE_SCENE_CAMERA_RESOLVE_AMBIGUOUS
+                    ? "more than one primary Camera"
+                : unresolved == JCE_SCENE_CAMERA_RESOLVE_INVALID_POSE
+                    ? "the primary Camera's transform is not a valid pose"
+                    : "invalid argument";
+            LOG_WARN(LOG_TAG,
+                     "Play has no resolved camera source: %s; no active "
+                     "VirtualCamera or player follow. Keeping the current "
+                     "camera pose.", why);
+        }
+        g.camera_warning_result = unresolved;
     } else {
+        g.virtual_camera_active = false;
+        g.camera_warning_result = JCE_SCENE_CAMERA_RESOLVE_OK;
         jce_vcam_system_reset();
     }
 
@@ -1286,12 +1353,14 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     jce_editor_viewport_claim_view_band("editor-game-view", GAME_VIEW_BASE);
 
     uint16_t postfx_ui_fb = UINT16_MAX;
+    const bool physics_overlay_requested = jce_state_get_show_physics_debug() ||
+        (jce_physics_debug_get_flags() & ~uint32_t(JCE_PHYS_DBG_WIREFRAME));
     const bool postfx_overlay = g.ui_canvas && jce_editor_game_postfx_overlay_target(
         g.bridge, g.postfx, g.postfx_output_tex, render_w, render_h,
-        g.renderer, scene, jce_state_get_show_physics_debug(), &postfx_ui_fb);
+        g.renderer, scene, physics_overlay_requested, &postfx_ui_fb);
     const bool postfx_composited = !postfx_overlay && jce_editor_viewport_composite_postfx(
         g.bridge, GAME_VIEW_BASE, g.postfx_output_tex, render_w, render_h,
-        g.renderer, scene, g.ui_canvas != nullptr, jce_state_get_show_physics_debug());
+        g.renderer, scene, g.ui_canvas != nullptr, physics_overlay_requested);
     if (postfx_composited)
         g.postfx_output_tex = UINT16_MAX; /* bridge is now the final frame */
 
@@ -1318,12 +1387,18 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
          * scales.  The editor presents through a single texture, so here the
          * UI shares the scene's resolution -- at render_scale below 1.0 the
          * Game view's text is softer than the player's will be. */
+        const bool profile_canvas = jce_perf_phase_enabled() != 0;
+        const uint64_t canvas_start = profile_canvas ? jce_time_perf_counter() : 0u;
         jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,
                              (float)render_w, (float)render_h, ptr, render_dt);
+        if (profile_canvas)
+            jce_perf_phase_add("game_canvas",jce_time_perf_to_ms(canvas_start,jce_time_perf_counter()));
         if (g.rml_overlay.ui) {
             jce_rml_scene_overlay_frame(&g.rml_overlay,scene,ui_view,
                 render_w,render_h,render_dt,g.ui_pointer.valid,
-                g.ui_pointer.x,g.ui_pointer.y,g.ui_pointer.down,nullptr);
+                g.ui_pointer.x,g.ui_pointer.y,g.ui_pointer.down,
+                jce_editor_game_input_bridge_shared()->viewport.focused && g.play_runtime
+                    ? jce_editor_engine_input() : nullptr);
         }
 
         /* OS text-input follows InputField focus: start SDL text input only
@@ -1350,78 +1425,21 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     }
 
     /* Physics debug wireframes (toggled via scene-view View menu). */
-    if (jce_state_get_show_physics_debug() && scene) {
-        const uint32_t col_box     = 0xFF00FF00;
-        const uint32_t col_sphere  = 0xFF00FFFF;
-        const uint32_t col_capsule = 0xFFFFFF00;
-        int count = jce_state_get_entity_count();
-        for (int i = 0; i < count; i++) {
-            uint32_t id = jce_state_get_entity_id_by_index(i);
-            if (id == 0 || !jce_state_entity_exists(id)) continue;
-            if (!jce_state_entity_enabled(id)) continue;
-            JceEntity e = jce_state_to_ecs_entity(id);
-            JceTransform *t = jce_scene_get_transform(scene, e);
-            if (!t) continue;
-            jce_quat q = t->rotation;
-            /* Honor each collider's size/center/radius (matches the physics +
-             * the scene-view overlay) — was a fixed 0.5*scale cube before. */
-            jce_vec3 sca = jce_v3_abs_safe_scale(t->scale);
-            float sx = sca.x, sy = sca.y, sz = sca.z;
-            if (jce_scene_has_box_collider(scene, e)) {
-                JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
-                jce_vec3 ofs = bc ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
-                                  : jce_v3(0, 0, 0);
-                float bx = bc ? bc->size[0] : 1.0f, by = bc ? bc->size[1] : 1.0f,
-                      bz = bc ? bc->size[2] : 1.0f;
-                jce_vec3 half = jce_v3(0.5f * bx * sx, 0.5f * by * sy, 0.5f * bz * sz);
-                jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
-                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
-                jce_debug_draw_box(c, half, q, col_box);
-            }
-            if (jce_scene_has_sphere_collider(scene, e)) {
-                JceSphereColliderComponent *sc = jce_scene_get_sphere_collider(scene, e);
-                jce_vec3 ofs = sc ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
-                                  : jce_v3(0, 0, 0);
-                float r = ((sc && sc->radius > 0.0f) ? sc->radius : 0.5f)
-                          * fmaxf(sx, fmaxf(sy, sz));
-                jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
-                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
-                jce_debug_draw_sphere(c, r, col_sphere);
-            }
-            if (jce_scene_has_capsule_collider(scene, e)) {
-                JceCapsuleColliderComponent *cc = jce_scene_get_capsule_collider(scene, e);
-                jce_vec3 ofs = cc ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
-                                  : jce_v3(0, 0, 0);
-                float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
-                float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
-                float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
-                jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
-                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
-                jce_debug_draw_capsule(c, r, hh, q, col_capsule);
-            }
-            if (jce_scene_has_character_controller(scene, e)) {
-                JceCharacterControllerComponent *cc =
-                    jce_scene_get_character_controller(scene, e);
-                float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
-                float h = ((cc && cc->height > 0.0f) ? cc->height : 1.6f) * sy;
-                float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
-                jce_vec3 cc_c = t->position; cc_c.y += hh + r;  /* feet -> capsule center */
-                jce_debug_draw_capsule(cc_c, r, hh, q, col_capsule);
-            }
-            if (jce_scene_has_compound_collider(scene, e)) {
-                JceCompoundColliderComponent *cpc =
-                    jce_scene_get_compound_collider(scene, e);
-                if (cpc) jce_gizmo_compound_collider_draw_from_component(
-                             scene, e, cpc, 0xFF00FF00u, 0);  /* overlay: bounds, green */
-            }
-            if (jce_scene_has_mesh_collider(scene, e)) {
-                JceMeshColliderComponent *msc =
-                    jce_scene_get_mesh_collider(scene, e);
-                if (msc) jce_gizmo_mesh_collider_draw_from_component(
-                             scene, e, msc, 0xFF00FF00u, 0);  /* overlay: bounds, green */
-            }
-        }
-        jce_debug_draw_flush(base, g.renderer);
+    /* Draw admitted native bodies, not authoring boxes or render bounds. */
+    const bool show_physics_wireframe = jce_state_get_show_physics_debug();
+    if (scene && physics_overlay_requested) {
+        const bool profile_debug = jce_perf_phase_enabled() != 0;
+        const uint64_t debug_start = profile_debug ? jce_time_perf_counter() : 0u;
+        jce_vec3 physics_center{};
+        const bool player_center = jce_editor_physics_debug_settings::player_center(g.play_runtime, physics_center);
+        jce_editor_physics_overlay_draw(jce_editor_play_get_physics_world(),
+            view, color_proj, base, g.renderer, show_physics_wireframe,
+            g.physics_overlay_budget_warned,
+            jce_editor_physics_debug_settings::radius(),
+            jce_editor_physics_debug_settings::frustum(),
+            jce_runtime_get_player_character(g.play_runtime), player_center ? &physics_center : nullptr);
+        if (profile_debug)
+            jce_perf_phase_add("game_physdbg",jce_time_perf_to_ms(debug_start,jce_time_perf_counter()));
     }
 
     /* TAA end-of-frame (game view): stash the UN-JITTERED camera for next

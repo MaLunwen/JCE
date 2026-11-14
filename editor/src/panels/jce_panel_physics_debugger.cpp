@@ -13,6 +13,7 @@
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_project_settings.h"
+#include "scene/jce_editor_physics_debug_settings.h"
 
 #include <jce/middleware/physics/jce_physics2d.h>
 
@@ -86,10 +87,6 @@ extern "C" void jce_editor_panel_physics_debugger_content(void)
     ensure_line_sink_installed();
 
     JceProjectSettings *ps = (JceProjectSettings *)jce_project_settings_current();
-    if (!ps) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.noProjectSettings"));
-        return;
-    }
 
     ImGui::TextWrapped("%s", jce_editor_i18n("physicsDebugger.toggleHint"));
     ImGui::Spacing();
@@ -109,12 +106,32 @@ extern "C" void jce_editor_panel_physics_debugger_content(void)
             { "physicsDebugger.flags.normals",     JCE_PHYS_DBG_NORMALS     },
         };
         for (const auto &t : toggles) {
-            bool on = (flags & t.bit) != 0;
+            const bool wireframe = t.bit == JCE_PHYS_DBG_WIREFRAME;
+            bool on = wireframe ? jce_state_get_show_physics_debug()
+                                : (flags & t.bit) != 0;
             if (ImGui::Checkbox(jce_editor_i18n(t.key), &on)) {
+                if (wireframe) jce_state_set_show_physics_debug(on);
                 if (on) flags |= t.bit; else flags &= ~t.bit;
             }
         }
         if (flags != before) jce_physics_debug_set_flags(flags);
+
+        /* Per-user drawing policy, not an undoable scene/physics mutation. */
+        int center = int(jce_editor_physics_debug_settings::center());
+        const char *centers[] = {jce_editor_i18n("physicsDebugger.centerCamera"),
+                                jce_editor_i18n("physicsDebugger.centerPlayer")};
+        if (ImGui::Combo(jce_editor_i18n("physicsDebugger.center"), &center, centers, 2))
+            jce_editor_physics_debug_settings::set_center(
+                jce_editor_physics_debug_settings::Center(center));
+        float radius = jce_editor_physics_debug_settings::radius();
+        if (ImGui::DragFloat(jce_editor_i18n("physicsDebugger.drawRadius"), &radius,
+                            0.5f, 0.0f, jce_editor_physics_debug_settings::maximum_radius_m,
+                            "%.1f", ImGuiSliderFlags_AlwaysClamp))
+            jce_editor_physics_debug_settings::set_radius(radius);
+        ImGui::TextWrapped("%s", jce_editor_i18n("physicsDebugger.drawRadiusHint"));
+        bool frustum = jce_editor_physics_debug_settings::frustum();
+        if (ImGui::Checkbox(jce_editor_i18n("physicsDebugger.frustumCull"), &frustum))
+            jce_editor_physics_debug_settings::set_frustum(frustum);
 
         ImGui::Separator();
         bool show_joints = jce_state_get_show_joint_gizmos();
@@ -125,6 +142,11 @@ extern "C" void jce_editor_panel_physics_debugger_content(void)
         if (ImGui::Checkbox(jce_editor_i18n("physicsDebugger.flags.clothGizmos"),
                             &show_cloth))
             jce_state_set_show_cloth_gizmos(show_cloth);
+    }
+
+    if (!ps) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.noProjectSettings"));
+        return;
     }
 
     bool dirty = false;

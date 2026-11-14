@@ -34,12 +34,13 @@ void sr_model_bounds_drop_tables(JceSceneRenderer *sr)
 
 void sr_model_bounds_reset(JceSceneRenderer *sr)
 {
-    if (!sr->model_bounds_enabled) return;
-    SrModelDeps *deps = &sr->model_bounds_deps;
-    if (deps->epoch == UINT64_MAX)
-        deps->fallback = true;
-    else
-        sr_model_deps_reset(deps, deps->epoch + 1);
+    if (sr->model_bounds_enabled) {
+        SrModelDeps *deps = &sr->model_bounds_deps;
+        if (deps->epoch == UINT64_MAX)
+            deps->fallback = true;
+        else
+            sr_model_deps_reset(deps, deps->epoch + 1);
+    }
     sr->model_bounds_roster = 0;
     sr_model_bounds_drop_tables(sr);
     sr_model_bounds_retire_geometry(sr);
@@ -47,13 +48,13 @@ void sr_model_bounds_reset(JceSceneRenderer *sr)
 
 void sr_model_bounds_enter(JceSceneRenderer *sr, JceScene *scene)
 {
-    if (!sr->model_bounds_enabled) return;
     const uint64_t instance = jce_scene_internal_instance_id(scene);
     if (sr->model_bounds_scene != instance) {
         sr_model_bounds_reset(sr);
         sr->model_bounds_scene = instance;
         sr->resource_prepared_valid = false;
     }
+    if (!sr->model_bounds_enabled) return;
     const uint64_t roster = jce_scene_get_roster_epoch(scene);
     if (sr->model_bounds_roster != roster) {
         SrModelDeps *deps = &sr->model_bounds_deps;
@@ -64,8 +65,11 @@ void sr_model_bounds_enter(JceSceneRenderer *sr, JceScene *scene)
 
 void sr_model_bounds_note(JceSceneRenderer *sr, const char *path, JceModel *ready)
 {
-    if (!sr->model_bounds_enabled) return;
+    /* Publication invalidates retained geometry in both modes. The default
+     * mode batches a conservative refresh at the next existing drain boundary;
+     * dependency tracking and selective row repair remain opt-in. */
     sr->model_bounds_geometry_dirty = true;
+    if (!sr->model_bounds_enabled) return;
     SrModelDeps *deps = &sr->model_bounds_deps;
     if (sr->model_bounds_revision == UINT64_MAX) {
         deps->fallback = true;

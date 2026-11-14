@@ -1,10 +1,57 @@
 # editor/src/panels/ — ImGui Dock Panels
 
+Natural scheduled Game captures do not force hidden, clipped or unfocused
+viewport work. The panel uses the controller's explicit forces-render policy,
+then requires the existing current-frame completed CPU render extent before
+requesting a natural image. It waits on ordinary render admission and does not
+fall back to another target or desktop image. Deterministic capture keeps its
+prior override. Completed CPU render and accepted readback are distinct from
+file completion, correct pixels and presentation.
+
+
+Asset Browser periodic membership snapshots belong to the private
+`jce_panel_assets_directory.h` owner shared by assets.cpp and nav.cpp. Current
+folder polls retain the 350 ms admission interval; tree entries retain a
+minimum one-second refresh interval plus visible-directory FIFO queue latency.
+One current-folder task and one tree task are admitted per active panel
+lifecycle through the public default async executor. Cancellation retains its
+slot until terminal; rejection never runs a synchronous enumeration fallback.
+Requests own copied paths/generations, separate task-owned results survive
+request cleanup, and no callback borrows UI state. Tree publication/invalidation
+occurs before recursive drawing, retaining complete old listings during work or
+failed parent scans. Failed child probes retain previous expander knowledge;
+new unknown children stay expandable. Root changes clear at the next frame
+boundary, navigation invalidates only current-folder work, and explicit refresh
+invalidates both. Shared panels init/shutdown own admission and nonblocking
+cancel/release; cancelled old workers may retire after shutdown, so immediate
+same-executor reinitialization can transiently overlap old jobs without stale
+publication. Existing changed-directory/navigation materialization and location
+rows retain their synchronous behavior. Cooperative executors run work on their
+owner pump; only threaded execution removes periodic filesystem work from that
+thread. A successful public directory scan is not an atomic OS snapshot.
+
+Physics Debugger's Wireframe checkbox and the viewport collider toggle share
+`jce_state_get/set_show_physics_debug`; do not leave contradictory on/off owners.
+Contacts/AABB and other public flags retain their independent checkboxes. The
+Scene/Game overlay scopes the native request and restores the public flag mask.
+
 Project Settings Quality offers only the renderer's supported VSync requests:
 Off and Every VBlank. Legacy positive counts display as enabled, but opening
 or refreshing the panel must not normalize stored values. Only an actual
 selection change writes zero or one through the existing dirty/save owner.
 This control does not promise alternate-VBlank synchronization.
+
+Asset Browser grid-caption derivation belongs to each FileEntry through
+`jce_panel_assets_caption.h`; no path-indexed global cache is added. Exact name
+bytes and current ImGui context/font/atlas identities, size, spacing, viewport
+DPI and wrap geometry invalidate it. Directory/search refresh retires the
+entry's strings. Kind-filter copies prepare their original entry first, so
+warming is not discarded with the temporary view. Preserve the existing
+byte-prefix/256-byte truncation output, every cell/interaction submission and
+full selected/rename text; selected rows retain their variable height.
+Real-ImGui CPU controls cover old-output/layout equivalence, warm measurement
+budgets, invalidation and actual filtered-copy ownership. Their four ordinary
+negative controls are distinct from native UI, glyph coverage and FPS evidence.
 
 Asset Browser scene activation delegates content binding entirely to the normal
 scene loader. The grid must not reassign the scene directory from the file's
@@ -702,3 +749,15 @@ This gate adds no producer, cache, timer, public API or performance guarantee.
 
 The WaterNearshore Inspector picks terrain entities through the scene SDK.
 The selector is undoable and the scene registry owns component persistence.
+
+## Physics Debugger runtime range
+
+The Runtime 3D radius, center and optional frustum controls use the same private
+Scene/Game settings owner and existing per-user UI-state persistence. They are
+not undoable scene mutations. Default radius is 30 m, valid UI range 0..10000;
+zero is unlimited distance subject to existing drawing budgets. Center choices
+are Current camera (default) and Player; missing Player falls back to camera.
+Read-only display never writes a missing preference. Keep these controls
+available without project settings; only project-owned matrix/stat sections
+need that owner. Labels explain Play/Pause scope, independent Edit/2D previews
+and that frustum/budget limits still apply to distance-retained player geometry.

@@ -6,9 +6,11 @@
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
+#include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/application/jce_runtime.h>
 #include <jce/os/platform/jce_window.h>
 #include <cstdint>
+#include <initializer_list>
 #include <type_traits>
 
 struct JceOffscreenTarget { uint16_t color = 7; };
@@ -19,6 +21,7 @@ static JcePostFXPipeline pipelines[2];
 static unsigned creates;
 static JceScene *current_scene;
 static bool bottom_left, physics_debug, show_ui;
+static uint32_t physics_flags;
 static unsigned copies, queries, canvas_calls, event_calls, shot_calls;
 static uint16_t copied_source, shot_source, shot_width, shot_height;
 static int shot_yflip;
@@ -69,6 +72,8 @@ static bool load_port(JcePostFXPipeline *, const JcePakArchive *) { return true;
 static void view_base_port(JcePostFXPipeline *pipeline, uint16_t base) { pipeline->view_base = base; }
 static uint16_t frame_buffer_port(const JceOffscreenTarget *) { return 19; }
 static bool jce_state_get_show_physics_debug() { return physics_debug; }
+static uint32_t JCE_CALL physics_flags_port() { return physics_flags; }
+static_assert(std::is_same_v<decltype(&physics_flags_port), decltype(&jce_physics_debug_get_flags)>);
 enum { JCE_SHOW_FLAG_UI = 1 };
 static bool jce_state_show_flag(int) { return show_ui; }
 static JceScene *jce_state_get_scene() { return current_scene; }
@@ -119,6 +124,7 @@ struct ScenePipelineOwner { JcePostFXPipeline *postfx_pipeline = nullptr; };
 #define jce_postfx_load_shaders load_port
 #define jce_postfx_set_view_base view_base_port
 #define jce_allocator_default allocator_port
+#define jce_physics_debug_get_flags physics_flags_port
 #define LOG_WARN(...) ((void)0)
 #include JCE_TEST_VIEWPORT_COMPOSITE_OWNER
 
@@ -131,6 +137,7 @@ struct Fixture {
     Fixture()
     {
         bottom_left = physics_debug = false; show_ui = true;
+        physics_flags = 0;
         copies = queries = canvas_calls = event_calls = shot_calls = 0;
         copied_source = shot_source = shot_width = shot_height = 0;
         copied_flip = false; shot_yflip = -1;
@@ -241,6 +248,19 @@ TEST_CASE("production Game physics tail keeps copy without skipping Canvas retir
     test_game_composite(&f.scene, 640, 360);
     CHECK(copies == 1); CHECK(queries == 0); CHECK(g.postfx_output_tex == UINT16_MAX);
     CHECK(canvas_calls == 1); CHECK(event_calls == 1);
+}
+
+TEST_CASE("Game non-wireframe physics flags retain the bridge while stale wireframe alone does not")
+{
+    for (uint32_t active : {uint32_t(JCE_PHYS_DBG_CONTACTS), uint32_t(JCE_PHYS_DBG_AABB)}) {
+        Fixture f; physics_flags = active;
+        test_game_composite(&f.scene, 640, 360);
+        CHECK(copies == 1); CHECK(g.postfx_output_tex == UINT16_MAX);
+        CHECK(canvas_calls == 1); CHECK(event_calls == 1);
+    }
+    Fixture f; physics_flags = JCE_PHYS_DBG_WIREFRAME;
+    test_game_composite(&f.scene, 640, 360);
+    CHECK(copies == 0); CHECK(g.postfx_output_tex == 11);
 }
 
 TEST_CASE("production Scene tail excludes actual scaled TSR and RCAS consumers")

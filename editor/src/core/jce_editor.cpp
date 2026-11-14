@@ -635,7 +635,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
                 jce_editor_kpi_game_capture_global_disable();
             } else {
                 LOG_INFO(LOG_TAG,
-                         "deterministic Game View capture enabled");
+                         "Game View capture enabled");
             }
         }
     }

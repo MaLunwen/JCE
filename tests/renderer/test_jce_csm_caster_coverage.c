@@ -328,6 +328,100 @@ static void test_without_caster_bounds_the_near_plane_sits_on_the_sphere(void)
         "classify() cannot report that class and the sweep above is blind");
 }
 
+/* Rigid camera input with no large-coordinate target subtraction in look_at;
+ * this isolates LIGHT-view stability from camera-construction precision. */
+static jce_mat4 motion_view(float x, float y, float z, float yaw)
+{
+    const float pitch = -0.15f;
+    const jce_vec3 f = jce_v3(cosf(pitch) * sinf(yaw), sinf(pitch),
+                              -cosf(pitch) * cosf(yaw));
+    const jce_vec3 s = jce_v3_normalize(jce_v3_cross(f, jce_v3(0, 1, 0)));
+    const jce_vec3 u = jce_v3_cross(s, f);
+    const jce_vec3 eye = jce_v3(x, y, z);
+    jce_mat4 m = jce_m4_identity();
+    m.raw[0][0] = s.x; m.raw[1][0] = s.y; m.raw[2][0] = s.z;
+    m.raw[0][1] = u.x; m.raw[1][1] = u.y; m.raw[2][1] = u.z;
+    m.raw[0][2] = -f.x; m.raw[1][2] = -f.y; m.raw[2][2] = -f.z;
+    m.raw[3][0] = -jce_v3_dot(s, eye);
+    m.raw[3][1] = -jce_v3_dot(u, eye);
+    m.raw[3][2] = jce_v3_dot(f, eye);
+    return m;
+}
+
+static JceCsmData motion_fit(jce_mat4 view, jce_vec3 sun, float fov,
+                             float far_, uint32_t cascades)
+{
+    const jce_vec3 lo = jce_v3(-50000, -10, -50000);
+    const jce_vec3 hi = jce_v3(50000, 25, 50000);
+    JceCsmData d;
+    jce_csm_compute(&d, cascades, 0.1f, far_, fov, ASPECT, &view, &sun,
+                    false, MAP_SIZE, 0.72f, &lo, &hi);
+    return d;
+}
+
+static void test_radius_bucket_does_not_follow_world_roundoff(void)
+{
+    /* Fit exactly at a half-metre bucket boundary: the former world-space
+     * corner subtraction intermittently promoted this radius by 0.5 m. */
+    const float far_ = 10.0f, radius = 16.0f, half_depth = (far_ - 0.1f) * 0.5f;
+    const float tangent = sqrtf((radius * radius - half_depth * half_depth) /
+                                (far_ * far_ * (1.0f + ASPECT * ASPECT)));
+    const float fov = 2.0f * atanf(tangent) * JCE_RAD2DEG;
+    const jce_vec3 sun = jce_v3_normalize(jce_v3(0.37f, 0.62f, -0.69f));
+    const JceCsmData first = motion_fit(motion_view(0, 1.8f, 0, 0),
+                                        sun, fov, far_, 1);
+    for (int i = 0; i < 2000; i++) {
+        const float a = (float)i * 0.003f, dist = (float)(i % 5) * 2500.0f;
+        const JceCsmData d = motion_fit(motion_view(dist + cosf(a) * 20.0f,
+            1.8f + dist * 0.3f, dist + sinf(a) * 20.0f, a), sun, fov, far_, 1);
+        TEST_ASSERT_EQUAL_MEMORY_MESSAGE(&first.radius[0], &d.radius[0],
+            sizeof(float), "camera motion changed a radius bucket");
+    }
+}
+
+static void test_fixed_sun_has_camera_independent_atlas_axes(void)
+{
+    const jce_vec3 sun = jce_v3_normalize(jce_v3(0.37f, 0.62f, -0.69f));
+    const JceCsmData first = motion_fit(motion_view(0, 1.8f, 0, 0.2f),
+                                        sun, 60.0f, 180.0f, 3);
+    for (int i = 0; i < 2000; i++) {
+        const float a = (float)i * 0.003f, dist = (float)(i % 5) * 2500.0f;
+        const JceCsmData d = motion_fit(motion_view(dist + cosf(a) * 20.0f,
+            1.8f + dist * 0.3f, dist + sinf(a) * 20.0f, a), sun, 60.0f, 180.0f, 3);
+        for (int c = 0; c < 3; c++) {
+            for (int col = 0; col < 3; col++) {
+                for (int row = 0; row < 2; row++) {
+                    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(2e-6f / first.radius[c],
+                        first.vp[c].raw[col][row], d.vp[c].raw[col][row],
+                        "fixed sun atlas axes drifted during camera motion");
+                }
+            }
+        }
+    }
+}
+
+static void test_sun_near_zenith_does_not_switch_reference_axes(void)
+{
+    const jce_mat4 view = motion_view(15, 2, 25, 0.6f);
+    JceCsmData prev;
+    memset(&prev, 0, sizeof prev);
+    for (int i = 0; i <= 1000; i++) {
+        const float e = (81.0f + (float)i * 0.002f) * JCE_DEG2RAD;
+        const jce_vec3 sun = jce_v3(0.6f * cosf(e), sinf(e), -0.8f * cosf(e));
+        const JceCsmData d = motion_fit(view, sun, 60.0f, 180.0f, 3);
+        if (i) {
+            for (int col = 0; col < 3; col++) {
+                for (int row = 0; row < 2; row++) {
+                    TEST_ASSERT_FLOAT_WITHIN_MESSAGE(0.0001f / d.radius[0],
+                        prev.vp[0].raw[col][row], d.vp[0].raw[col][row],
+                        "smooth daylight sun motion abruptly rotated the atlas");
+                }
+            }
+        }
+        prev = d;
+    }
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -336,5 +430,8 @@ int main(void)
     RUN_TEST(test_only_the_near_plane_ever_rejects_a_caster);
     RUN_TEST(test_the_near_column_is_not_always_zero);
     RUN_TEST(test_without_caster_bounds_the_near_plane_sits_on_the_sphere);
+    RUN_TEST(test_radius_bucket_does_not_follow_world_roundoff);
+    RUN_TEST(test_fixed_sun_has_camera_independent_atlas_axes);
+    RUN_TEST(test_sun_near_zenith_does_not_switch_reference_axes);
     return UNITY_END();
 }

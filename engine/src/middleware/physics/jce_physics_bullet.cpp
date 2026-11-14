@@ -54,6 +54,7 @@ extern "C" {
 
 #include <cstdint>
 #include <cstring>
+#include <climits>
 
 /* Max vertices kept for a plain CONVEX_HULL child.  Beyond this the hull
    is reduced via btShapeHull so an un-decimated mesh cannot bloat the
@@ -120,6 +121,7 @@ void jce_bullet_install_allocator_(void)
 /* ================================================================== */
 
 #include "jce_physics_bullet_internal.hpp"
+#include "jce_physics_debug_query.hpp"
 
 /* Resolve a packed handle to a live pool slot, or UINT32_MAX if the
    handle is stale / out of range / dead.  Centralises the slot+gen
@@ -812,7 +814,13 @@ static btCollisionShape *build_child_shape(const JceBulletColliderChild *c,
     case JCE_SHAPE_TRIANGLE_MESH: {
         if (!c->vertices || c->vertex_count == 0 ||
             !c->indices  || c->index_count < 3) return nullptr;
+        /* Bullet's arrays use signed int capacities. Keep the complete,
+           ordered triangle stream, without its quadratic vertex weld scan. */
+        if (c->index_count > static_cast<uint32_t>(INT_MAX)) return nullptr;
         auto *mesh = new btTriangleMesh();
+        const int capacity = static_cast<int>(c->index_count / 3u * 3u);
+        mesh->preallocateVertices(capacity);
+        mesh->preallocateIndices(capacity);
         uint32_t added = 0;
         for (uint32_t t = 0; t + 2 < c->index_count; t += 3) {
             uint32_t i0 = c->indices[t + 0];
@@ -828,7 +836,7 @@ static btCollisionShape *build_child_shape(const JceBulletColliderChild *c,
             const float *d = &c->vertices[i2 * 3];
             mesh->addTriangle(btVector3(a[0], a[1], a[2]),
                               btVector3(b[0], b[1], b[2]),
-                              btVector3(d[0], d[1], d[2]), true);
+                              btVector3(d[0], d[1], d[2]), false);
             ++added;
         }
         if (added == 0) { delete mesh; return nullptr; }
@@ -2408,6 +2416,20 @@ void jce_bullet_debug_draw(JceBulletWorld *bw,
     drawer->set_sink(fn, ud);
     bw->world->debugDrawWorld();
     drawer->set_sink(nullptr, nullptr);
+}
+
+bool jce_bullet_debug_query_shapes(JceBulletWorld *bw,
+    const JcePhysicsDebugQuery *query, jce_debug_line_fn sink, void *userdata,
+    JcePhysicsDebugQueryStats *stats)
+{
+    const btCollisionObject *keep = nullptr;
+    if (bw && query && query->struct_size == sizeof(*query) &&
+        (query->range_flags & JCE_PHYS_QUERY_KEEP_CHARACTER)) {
+        const uint32_t index = query->keep_character.idx;
+        if (index < bw->char_capacity && bw->char_alive[index])
+            keep = bw->char_bodies[index];
+    }
+    return bw && jce_bullet_debug_query_native(bw->world, query, sink, userdata, stats, keep);
 }
 
 /* Clean up debug-drawer slot when the world is destroyed.  Tacked

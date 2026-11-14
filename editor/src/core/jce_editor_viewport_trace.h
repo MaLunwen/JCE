@@ -6,7 +6,7 @@
 enum class JceEditorViewportRenderReason {
     Admitted = 0, Unavailable = 1, EmptyExtent = 2, ImpostorBusy = 3,
     ProbeBusy = 4, MissingSceneOwner = 5, TargetRefused = 6,
-    ResourcesRefused = 7, Incomplete = 8
+    ResourcesRefused = 7, Incomplete = 8, SceneLoading = 9
 };
 enum class JceEditorViewportPolicyReason {
     Admitted = 0, Capture = 1, InvalidLayout = 2, FocusLost = 3,

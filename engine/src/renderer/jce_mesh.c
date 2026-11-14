@@ -5,6 +5,7 @@
 #include "renderer/jce_vertex_layout.h"
 #include "jce_upload_metrics.h"
 #include "jce_mesh_create_internal.h"
+#include "jce_mesh_index_data.h"
 #include "jce_model_deform_internal.h"
 #include "jce_view_wireframe_internal.h"
 #include "os/core/jce_trace_scope_internal.h"
@@ -19,13 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include "renderer/jce_render_encoder.h"
+#include "jce_pbr_cull_override.h"
 
 #define LOG_TAG "jce_mesh"
 
 struct JceMesh {
     bgfx_vertex_buffer_handle_t vbh;
     bgfx_index_buffer_handle_t  ibh;
-    bgfx_index_buffer_handle_t  wf_ibh;     /* wireframe line indices */
     bgfx_vertex_layout_t        layout;
     JceMeshCreateProvider       creation;
     uint32_t                    num_verts;
@@ -34,99 +35,6 @@ struct JceMesh {
     float                       aabb_min[3];
     float                       aabb_max[3];
 };
-
-typedef struct JceEdgeKey {
-    uint32_t a;
-    uint32_t b;
-} JceEdgeKey;
-
-static int edge_key_compare(const void *lhs, const void *rhs)
-{
-    const JceEdgeKey *l = (const JceEdgeKey *)lhs;
-    const JceEdgeKey *r = (const JceEdgeKey *)rhs;
-    if (l->a < r->a) return -1;
-    if (l->a > r->a) return 1;
-    if (l->b < r->b) return -1;
-    if (l->b > r->b) return 1;
-    return 0;
-}
-
-static bool build_unique_wireframe_indices(const uint32_t *indices,
-                                           uint32_t num_indices,
-                                           uint32_t **out_wf,
-                                           uint32_t *out_wf_count)
-{
-    if (!indices || num_indices < 3 || !out_wf || !out_wf_count)
-        return false;
-
-    const uint32_t num_tris = num_indices / 3;
-    const uint32_t edge_capacity = num_tris * 3;
-    if (edge_capacity == 0)
-        return false;
-
-    JceEdgeKey *edges = (JceEdgeKey *)JCE_MALLOC((size_t)edge_capacity * sizeof(JceEdgeKey));
-    if (!edges)
-        return false;
-
-    uint32_t edge_count = 0;
-    for (uint32_t t = 0; t < num_tris; t++) {
-        const uint32_t tri[3] = {
-            indices[t * 3 + 0],
-            indices[t * 3 + 1],
-            indices[t * 3 + 2]
-        };
-
-        for (int e = 0; e < 3; e++) {
-            uint32_t a = tri[e];
-            uint32_t b = tri[(e + 1) % 3];
-            if (a == b)
-                continue;
-            if (a > b) {
-                uint32_t tmp = a;
-                a = b;
-                b = tmp;
-            }
-            edges[edge_count].a = a;
-            edges[edge_count].b = b;
-            edge_count++;
-        }
-    }
-
-    if (edge_count == 0) {
-        JCE_FREE(edges);
-        return false;
-    }
-
-    qsort(edges, edge_count, sizeof(JceEdgeKey), edge_key_compare);
-
-    uint32_t unique_count = 1;
-    for (uint32_t i = 1; i < edge_count; i++) {
-        if (edges[i].a != edges[i - 1].a || edges[i].b != edges[i - 1].b)
-            unique_count++;
-    }
-
-    uint32_t *wf = (uint32_t *)JCE_MALLOC((size_t)unique_count * 2u * sizeof(uint32_t));
-    if (!wf) {
-        JCE_FREE(edges);
-        return false;
-    }
-
-    uint32_t write = 0;
-    wf[write++] = edges[0].a;
-    wf[write++] = edges[0].b;
-    for (uint32_t i = 1; i < edge_count; i++) {
-        if (edges[i].a == edges[i - 1].a && edges[i].b == edges[i - 1].b)
-            continue;
-        wf[write++] = edges[i].a;
-        wf[write++] = edges[i].b;
-    }
-
-    JCE_FREE(edges);
-
-    *out_wf = wf;
-    *out_wf_count = write;
-    return true;
-}
 
 /* Shared mesh vertex layout: position float3 + normal float3 + texcoord
  * float2 + tangent float4 (xyz = tangent, w = bitangent sign).
@@ -258,7 +166,7 @@ JceMesh *jce_mesh_create_with_provider(const JceMeshVertex *vertices, uint32_t n
     JceMesh *m = (JceMesh *)JCE_CALLOC(1, sizeof(*m));
     if (!m) { jce_trace_scope_end(scope, JCE_TRACE_TASK_FAILED); return NULL; }
     m->creation = *provider;
-    m->vbh.idx = m->ibh.idx = m->wf_ibh.idx = UINT16_MAX;
+    m->vbh.idx = m->ibh.idx = UINT16_MAX;
     const char *failure = NULL;
     init_mesh_layout(&m->layout, provider->renderer_type);
     m->num_verts   = num_verts;
@@ -315,10 +223,19 @@ JceMesh *jce_mesh_create_with_provider(const JceMeshVertex *vertices, uint32_t n
         failure = "vertex_buffer_allocation"; goto failed;
     }
 
-    /* Create index buffer (optional). */
+    /* Triangle prefix and optional line suffix need only one static handle. */
     if (indices && num_indices > 0) {
-        const bgfx_memory_t *imem = provider->copy(indices,
-            num_indices * (uint32_t)sizeof(uint32_t), provider->user);
+        uint32_t wire_count = 0;
+        uint32_t *packed = jce_mesh_pack_indices(indices, num_indices, true, &wire_count);
+        const bgfx_memory_t *imem = provider->copy(packed ? packed : indices,
+            (num_indices + wire_count) * (uint32_t)sizeof(uint32_t), provider->user);
+        if (!imem && packed) {
+            /* Optional wire staging must not suppress the solid geometry. */
+            wire_count = 0;
+            imem = provider->copy(indices,
+                num_indices * (uint32_t)sizeof(uint32_t), provider->user);
+        }
+        JCE_FREE(packed);
         if (!imem) { failure = "index_staging_allocation"; goto failed; }
         const uint64_t payload_bytes_1 = imem->size;
         m->ibh = provider->create_index(imem, provider->user);
@@ -327,33 +244,7 @@ JceMesh *jce_mesh_create_with_provider(const JceMeshVertex *vertices, uint32_t n
         if (m->ibh.idx == UINT16_MAX) {
             failure = "index_buffer_allocation"; goto failed;
         }
-
-        /* Build wireframe index buffer using UNIQUE undirected edges.
-         * This preserves full wireframe topology while avoiding duplicate
-         * interior edges from adjacent triangles. */
-        uint32_t *wf = NULL;
-        uint32_t wf_count = 0;
-        if (build_unique_wireframe_indices(indices, num_indices,
-                                           &wf, &wf_count)
-            && wf && wf_count > 0) {
-            const bgfx_memory_t *wmem = provider->copy(wf,
-                wf_count * (uint32_t)sizeof(uint32_t), provider->user);
-            JCE_FREE(wf); wf = NULL;
-            if (!wmem) { failure = "wireframe_staging_allocation"; goto failed; }
-            const uint64_t payload_bytes_0 = wmem->size;
-            m->wf_ibh = provider->create_index(wmem, provider->user);
-            jce_upload_metrics_record(JCE_UPLOAD_STATIC_INDEX, payload_bytes_0,
-                m->wf_ibh.idx != UINT16_MAX);
-            if (m->wf_ibh.idx == UINT16_MAX) {
-                failure = "wireframe_index_buffer_allocation"; goto failed;
-            }
-            m->num_wf_indices = wf_count;
-        } else {
-            m->wf_ibh.idx = UINT16_MAX;
-        }
-    } else {
-        m->ibh.idx = UINT16_MAX;
-        m->wf_ibh.idx = UINT16_MAX;
+        m->num_wf_indices = wire_count;
     }
 
     jce_trace_scope_end(scope, JCE_TRACE_TASK_SUCCEEDED);
@@ -384,8 +275,6 @@ void jce_mesh_destroy(JceMesh *mesh)
         mesh->creation.destroy_vertex(mesh->vbh, mesh->creation.user);
     if (mesh->ibh.idx != UINT16_MAX)
         mesh->creation.destroy_index(mesh->ibh, mesh->creation.user);
-    if (mesh->wf_ibh.idx != UINT16_MAX)
-        mesh->creation.destroy_index(mesh->wf_ibh, mesh->creation.user);
     JCE_FREE(mesh);
 }
 
@@ -395,16 +284,16 @@ void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id
 
     jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
 
-    if (jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
-        /* Wireframe: use line index buffer, no face culling. */
-        jce_enc_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-        jce_enc_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+    if (jce_renderer_get_wireframe(r) && mesh->num_wf_indices > 0) {
+        /* Wireframe: suffix of the immutable IB, no face culling. */
+        jce_enc_set_index_buffer(mesh->ibh, mesh->num_indices, mesh->num_wf_indices);
+        jce_enc_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                      | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
-                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
+                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, BGFX_STATE_CULL_MASK), 0);
     } else {
         if (mesh->ibh.idx != UINT16_MAX)
             jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
-        jce_enc_set_state(BGFX_STATE_DEFAULT, 0);
+        jce_enc_set_state(jce_pbr_cull_override(BGFX_STATE_DEFAULT, BGFX_STATE_CULL_MASK), 0);
     }
 
     JceShaderHandle sh = jce_renderer_get_program_mesh(r);
@@ -416,15 +305,15 @@ void jce_mesh_submit_view_wireframe(const JceMesh *mesh, const JceRenderer *r,
                                     uint16_t view_id, bool overlay)
 {
     const JceShaderHandle program = jce_renderer_get_program_mesh(r);
-    if (!mesh || mesh->wf_ibh.idx == UINT16_MAX || program.idx == UINT16_MAX) {
+    if (!mesh || mesh->num_wf_indices == 0 || program.idx == UINT16_MAX) {
         if (jce_tls_encoder) bgfx_encoder_discard(jce_tls_encoder, BGFX_DISCARD_ALL);
         else bgfx_discard(BGFX_DISCARD_ALL);
         return;
     }
 
     jce_enc_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
-    jce_enc_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
-    jce_enc_set_state(jce_view_wireframe_state(overlay, mesh->num_wf_indices), 0);
+    jce_enc_set_index_buffer(mesh->ibh, mesh->num_indices, mesh->num_wf_indices);
+    jce_enc_set_state(jce_pbr_cull_override(jce_view_wireframe_state(overlay, mesh->num_wf_indices), BGFX_STATE_CULL_MASK), 0);
     jce_enc_submit(view_id, (bgfx_program_handle_t){program.idx}, 0, BGFX_DISCARD_ALL);
 }
 
@@ -452,7 +341,7 @@ void jce_mesh_submit_pbr_state(const JceMesh *mesh, const JceRenderer *r,
     /* state==0 keeps the historical opaque behaviour.  A non-zero state
      * carries the material's blend / cull (double_sided drops CULL_CW) /
      * depth-write flags, built by jce_pbr_material_render_state(). */
-    jce_enc_set_state(state ? state : BGFX_STATE_DEFAULT, 0);
+    jce_enc_set_state(jce_pbr_cull_override(state ? state : BGFX_STATE_DEFAULT, BGFX_STATE_CULL_MASK), 0);
 
     JceShaderHandle sh = jce_renderer_get_program_pbr(r);
     bgfx_program_handle_t prog = { sh.idx };
@@ -471,7 +360,7 @@ void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
     if (mesh->ibh.idx != UINT16_MAX)
         jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    jce_enc_set_state(BGFX_STATE_DEFAULT, 0);
+    jce_enc_set_state(jce_pbr_cull_override(BGFX_STATE_DEFAULT, BGFX_STATE_CULL_MASK), 0);
 
     /* Fall back to the renderer's default PBR program when the
      * override handle is invalid — keeps callers simple (they can
@@ -503,7 +392,7 @@ void jce_mesh_submit_pick_id(const JceMesh        *mesh,
                      BGFX_STATE_MSAA;
     if (!double_sided)
         state |= BGFX_STATE_CULL_CW;
-    jce_enc_set_state(state, 0);
+    jce_enc_set_state(jce_pbr_cull_override(state, BGFX_STATE_CULL_MASK), 0);
 
     bgfx_program_handle_t prog = { program.idx };
     jce_enc_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
@@ -518,7 +407,7 @@ void jce_mesh_submit_terrain(const JceMesh *mesh, const JceRenderer *r, uint16_t
     if (mesh->ibh.idx != UINT16_MAX)
         jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    jce_enc_set_state(BGFX_STATE_DEFAULT, 0);
+    jce_enc_set_state(jce_pbr_cull_override(BGFX_STATE_DEFAULT, BGFX_STATE_CULL_MASK), 0);
 
     JceShaderHandle sh = jce_renderer_get_program_terrain(r);
     bgfx_program_handle_t prog = { sh.idx };
@@ -540,8 +429,8 @@ void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t 
         jce_enc_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
     /* Depth-only: write Z, cull front faces to reduce peter-panning. */
-    jce_enc_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
-                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+    jce_enc_set_state(jce_pbr_cull_override(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, BGFX_STATE_CULL_MASK), 0);
 
     JceShaderHandle sh = jce_renderer_get_program_shadow(r);
     bgfx_program_handle_t prog = { sh.idx };

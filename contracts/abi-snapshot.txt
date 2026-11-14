@@ -5,7 +5,7 @@
 # change so a reviewer sees the declaration and the snapshot diff
 # together.  Additions are safe for consumers; removals and
 # signature changes are not, and the gate fails on those.
-# 5238 declarations.
+# 5244 declarations.
 
 enum JceAiSceneDirectorStatus { JCE_AI_SCENE_DIRECTOR_IDLE = 0, JCE_AI_SCENE_DIRECTOR_WAITING, JCE_AI_SCENE_DIRECTOR_READY, JCE_AI_SCENE_DIRECTOR_FAILED, JCE_AI_SCENE_DIRECTOR_CANCELLED }    [runtime/jce_ai_scene_director.h]
 enum JceAiSceneError { JCE_AI_SCENE_ERROR_NONE = 0, JCE_AI_SCENE_ERROR_INVALID_ARGUMENT, JCE_AI_SCENE_ERROR_INVALID_CATALOG, JCE_AI_SCENE_ERROR_PROMPT_TOO_LARGE, JCE_AI_SCENE_ERROR_TRANSPORT, JCE_AI_SCENE_ERROR_TIMEOUT, JCE_AI_SCENE_ERROR_INVALID_RESPONSE, JCE_AI_SCENE_ERROR_STALE_RESPONSE, JCE_AI_SCENE_ERROR_INVALID_RECIPE, JCE_AI_SCENE_ERROR_COMPILE, JCE_AI_SCENE_ERROR_NO_FALLBACK }    [runtime/jce_ai_scene_director.h]
@@ -132,6 +132,8 @@ enum JcePathStatus { JCE_PATH_STATUS_PENDING = 0, JCE_PATH_STATUS_FOUND, JCE_PAT
 enum JcePhysics2DJointKind { JCE_PHYSICS2D_JOINT_DISTANCE = 0, JCE_PHYSICS2D_JOINT_HINGE = 1, JCE_PHYSICS2D_JOINT_SPRING = 2 }    [middleware/physics/jce_physics2d.h]
 enum JcePhysicsCombine { JCE_PHYS_COMBINE_AVERAGE = 0, JCE_PHYS_COMBINE_MIN = 1, JCE_PHYS_COMBINE_MAX = 2, JCE_PHYS_COMBINE_MULTIPLY = 3 }    [middleware/physics/jce_physics_material.h]
 enum JcePhysicsDebugFlag { JCE_PHYS_DBG_NONE = 0, JCE_PHYS_DBG_WIREFRAME = 1u << 0, JCE_PHYS_DBG_AABB = 1u << 1, JCE_PHYS_DBG_CONTACTS = 1u << 2, JCE_PHYS_DBG_CONSTRAINTS = 1u << 3, JCE_PHYS_DBG_NORMALS = 1u << 4, JCE_PHYS_DBG_ALL = 0xFFFFFFFFu }    [middleware/physics/jce_physics_debug.h]
+enum JcePhysicsDebugQueryStatus { JCE_PHYS_QUERY_COMPLETE = 0, JCE_PHYS_QUERY_SAMPLED = 1u << 0, JCE_PHYS_QUERY_LIMIT = 1u << 1, JCE_PHYS_QUERY_UNSUPPORTED = 1u << 2, JCE_PHYS_QUERY_INVALID_GEOMETRY = 1u << 3 }    [middleware/physics/jce_physics_debug.h]
+enum JcePhysicsDebugRangeFlag { JCE_PHYS_QUERY_KEEP_CHARACTER = 1u << 0 }    [middleware/physics/jce_physics_debug.h]
 enum JcePhysicsJointKind { JCE_PHYSICS_JOINT_NONE = 0, JCE_PHYSICS_JOINT_BALL = 1, JCE_PHYSICS_JOINT_HINGE = 2, JCE_PHYSICS_JOINT_SLIDER = 3, JCE_PHYSICS_JOINT_6DOF = 4 }    [middleware/physics/jce_physics_joint_query.h]
 enum JcePlatformBackendKind { JCE_PLATFORM_BACKEND_LOCAL = 0, JCE_PLATFORM_BACKEND_STEAM, JCE_PLATFORM_BACKEND_EOS, JCE_PLATFORM_BACKEND_CUSTOM }    [os/core/jce_platform_services.h]
 enum JcePlayerLoopPhase { JCE_PHASE_INITIALIZATION = 0, JCE_PHASE_EARLY_UPDATE, JCE_PHASE_FIXED_UPDATE, JCE_PHASE_UPDATE, JCE_PHASE_LATE_UPDATE, JCE_PHASE_PRE_RENDER, JCE_PHASE_POST_RENDER, JCE_PHASE_END_OF_FRAME, JCE_PHASE_COUNT }    [runtime/jce_player_loop.h]
@@ -2117,6 +2119,7 @@ fn jce_physics_constraint_set_motor :: (JcePhysicsWorld *, JceConstraintHandle, 
 fn jce_physics_create :: (const JcePhysicsWorldDesc *) -> JcePhysicsWorld *    [middleware/physics/jce_physics.h]
 fn jce_physics_debug_flush :: (JcePhysicsWorld *) -> void    [middleware/physics/jce_physics_debug.h]
 fn jce_physics_debug_get_flags :: (void) -> uint32_t    [middleware/physics/jce_physics_debug.h]
+fn jce_physics_debug_query_shapes :: (JcePhysicsWorld *, const JcePhysicsDebugQuery *, jce_debug_line_fn, void *, JcePhysicsDebugQueryStats *) -> bool    [middleware/physics/jce_physics_debug.h]
 fn jce_physics_debug_set_flags :: (uint32_t) -> void    [middleware/physics/jce_physics_debug.h]
 fn jce_physics_debug_set_line_sink :: (jce_debug_line_fn, void *) -> void    [middleware/physics/jce_physics_debug.h]
 fn jce_physics_destroy :: (JcePhysicsWorld *) -> void    [middleware/physics/jce_physics.h]
@@ -2547,6 +2550,7 @@ fn jce_runtime_entity_gas :: (JceRuntime *, uint64_t) -> JceGameplayAbilitySyste
 fn jce_runtime_entity_ragdoll :: (JceRuntime *, uint64_t) -> JceRagdoll *    [application/jce_runtime.h]
 fn jce_runtime_fracture_entity :: (JceRuntime *, uint64_t) -> void    [application/jce_runtime.h]
 fn jce_runtime_get_actor_stats :: (const JceRuntime *, uint32_t *, uint32_t *) -> void    [application/jce_runtime.h]
+fn jce_runtime_get_player_character :: (const JceRuntime *) -> JceCharacterHandle    [application/jce_runtime.h]
 fn jce_runtime_get_player_forward :: (const JceRuntime *, jce_vec3 *) -> bool    [application/jce_runtime.h]
 fn jce_runtime_get_player_position :: (const JceRuntime *, jce_vec3 *) -> bool    [application/jce_runtime.h]
 fn jce_runtime_get_time_scale :: (const JceRuntime *) -> float    [application/jce_runtime.h]
@@ -4981,6 +4985,8 @@ struct JcePerceptionResult { bool can_see; uint64_t seen_entity; jce_vec3 seen_p
 struct JcePerceptionTarget { uint64_t entity; jce_vec3 position; float loudness }    [middleware/ai/jce_perception.h]
 struct JcePhysics2DDesc { jce_vec2 gravity; uint32_t max_bodies }    [middleware/physics/jce_physics2d.h]
 struct JcePhysics2DJointDesc { int kind; JceBodyHandle body_a; JceBodyHandle body_b; jce_vec2 anchor_a; jce_vec2 anchor_b; float distance; float frequency_hz; float damping_ratio; bool use_motor; float motor_speed_rad_s; float motor_max_torque; bool use_limits; float lower_angle_rad; float upper_angle_rad; bool collide_connected }    [middleware/physics/jce_physics2d.h]
+struct JcePhysicsDebugQuery { uint32_t struct_size; uint32_t flags; jce_vec3 bounds_min; jce_vec3 bounds_max; uint32_t max_objects; uint32_t max_shapes; uint32_t max_mesh_parts; uint32_t max_triangles; uint32_t max_lines; jce_vec3 range_center; float range_radius; JceCharacterHandle keep_character; uint32_t range_flags }    [middleware/physics/jce_physics_debug.h]
+struct JcePhysicsDebugQueryStats { uint32_t struct_size; uint32_t status; uint32_t objects_visited; uint32_t shapes_visited; uint32_t shapes_admitted; uint32_t mesh_parts_visited; uint32_t triangles_read; uint32_t lines_emitted; uint32_t unsupported_shapes; uint64_t admitted_mesh_triangles }    [middleware/physics/jce_physics_debug.h]
 struct JcePhysicsJointInfo { JcePhysicsJointKind kind; JceBodyHandle body_a; JceBodyHandle body_b; jce_vec3 anchor_a; jce_vec3 anchor_b; jce_vec3 axis; float limit_low; float limit_high; jce_vec3 linear_lower; jce_vec3 linear_upper; jce_vec3 angular_lower; jce_vec3 angular_upper }    [middleware/physics/jce_physics_joint_query.h]
 struct JcePhysicsMaterial { float dynamic_friction; float static_friction; float restitution; JcePhysicsCombine friction_combine; JcePhysicsCombine restitution_combine }    [middleware/physics/jce_physics_material.h]
 struct JcePhysicsWorldDesc { jce_vec3 gravity; uint32_t max_bodies; float fixed_timestep; int32_t max_sub_steps; int32_t solver_iterations; int32_t split_impulse; float deactivation_time; float linear_sleep_threshold; float angular_sleep_threshold; bool multithreaded }    [middleware/physics/jce_physics.h]

@@ -1802,11 +1802,19 @@ static int sr_water_find_slot(JceSceneRenderer *sr, JceEntity e)
         if (free_slot < 0 && !sr->water_cache[i].used) free_slot = i;
     }
     if (free_slot >= 0) return free_slot;
+    /* A pending shared allocation cannot replace an evicted mesh yet. Keep
+     * the resident slots available to their existing owners during cooldown. */
+    if (sr->water_mesh_retry_pending &&
+        sr->water_mesh_retry_context == sr->resource_prepared_context &&
+        (uint32_t)(jce_renderer_get_frame_index(sr->renderer) -
+                   sr->water_mesh_retry_frame) < 60u) return -1;
     /* All slots taken: evict a deterministic one (rebuilds next time). */
     int victim = (int)((uint32_t)e % (uint32_t)SR_WATER_SLOT_MAX);
     sr_water_slot_free(sr, victim);
     return victim;
 }
+
+#include "jce_sr_water_mesh_cache.h"
 
 static bool sr_water_acquire_fft(JceScene *scene, JceEntity e,
                                  const JceWaterComponent *wc,
@@ -1980,38 +1988,7 @@ void sr_draw_water(JceSceneRenderer *sr, JceScene *scene,
         jce_scene_comp_enabled(scene, e, jce_component_find("WaterMotion")) &&
         model.col[0].x == 1.0f && model.col[0].y == 0.0f && model.col[0].z == 0.0f &&
         model.col[2].x == 0.0f && model.col[2].y == 0.0f && model.col[2].z == 1.0f;
-    const bool rebuild = !sr->water_cache[slot].used ||
-                         !sr->water_cache[slot].mesh ||
-                         sr->water_cache[slot].size_x != wc->size_x ||
-                         sr->water_cache[slot].size_z != wc->size_z ||
-                         /* Topology, not just extent: flipping `ocean` changes
-                          * the mesh for the SAME size, and without this the
-                          * toggle appears to do nothing until a designer also
-                          * nudges the dimensions. */
-                         sr->water_cache[slot].ocean_mesh != wc->ocean ||
-                         sr->water_cache[slot].ocean_detail != ocean_detail;
-    if (rebuild || (legacy_fft && !sr->water_cache[slot].fft_source_vertices)) {
-        JceMeshVertex *flat = NULL;
-        JceMeshVertex **retained = legacy_fft ? &flat : NULL;
-        /* Keep the current mesh if changing only the wave mode and the
-         * extra source geometry cannot be retained. It can draw the fallback. */
-        JceMesh *next = wc->ocean ? sr_water_build_rings(wc->size_x, wc->size_z, ocean_detail, retained)
-                                 : sr_water_build_grid(wc->size_x, wc->size_z, retained);
-        if (next || rebuild) {
-            if (sr->water_cache[slot].mesh)
-                jce_mesh_destroy(sr->water_cache[slot].mesh);
-            JCE_FREE(sr->water_cache[slot].fft_source_vertices);
-            sr->water_cache[slot].mesh = next;
-            sr->water_cache[slot].fft_source_vertices = flat;
-            sr->water_cache[slot].ocean_mesh = wc->ocean;
-            sr->water_cache[slot].ocean_detail = ocean_detail;
-            sr->water_cache[slot].size_x = wc->size_x;
-            sr->water_cache[slot].size_z = wc->size_z;
-            sr->water_cache[slot].entity = e;
-            sr->water_cache[slot].used = true;
-        }
-    }
-    JceMesh *mesh = sr->water_cache[slot].mesh;
+    JceMesh *mesh = sr_water_mesh_acquire(sr, slot, e, wc, ocean_detail, legacy_fft);
     if (!mesh) return;
 
     /* REGISTER THE REFLECTION REQUEST FROM THE DRAW, not from a second walk
@@ -3915,11 +3892,9 @@ static JceAsyncRunResult sr_ibl_worker(JceAsyncContext *ctx, void *arg)
     if (jce_async_context_cancel_requested(ctx))
         return JCE_ASYNC_RUN_CANCELLED;
 
-    /* Timed because the sky bake re-runs whenever the sun moves two degrees,
-     * which under a day/night cycle is continuous. It is on a LOW-priority
-     * worker with one job in flight at a time, so the question is not whether
-     * it stalls the frame -- it cannot -- but whether it keeps a core busy
-     * forever. The number belongs in the log where anyone can see it. */
+    /* CPU convolution runs on a LOW-priority worker, one job at a time.
+     * Main-thread sky generation/upload and shared CPU contention still need
+     * independent frame measurements; this timer covers only convolution. */
     const uint64_t t0 = jce_time_perf_counter();
     j->result = jce_ibl_bake_cpu(j->pixels, j->w, j->h, j->irr, j->pf);
     j->bake_ms = (float)jce_time_perf_to_ms(t0, jce_time_perf_counter());
@@ -3979,15 +3954,21 @@ static void sr_ibl_poll(JceSceneRenderer *sr)
     sr->ibl_job = NULL;
 
     if (stale) {
+        if (sr_ibl_job_is_sky_done_tmp) sr->sky_ibl_snapshot.valid = false;
         if (res) jce_ibl_cpu_free(res);
         if (sr->skybox && sr->skybox_hdr_path[0] && sr->skybox_use_as_ibl)
             sr_ibl_start_async(sr, sr->skybox_hdr_path);
         return;
     }
-    if (!res) return;
+    if (!res) {
+        if (sr_ibl_job_is_sky_done_tmp) sr->sky_ibl_snapshot.valid = false;
+        return;
+    }
 
     if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
     sr->ibl_data = jce_ibl_upload_cpu(res);   /* MAIN-thread GPU upload */
+    if (sr_ibl_job_is_sky_done_tmp && !sr->ibl_data)
+        sr->sky_ibl_snapshot.valid = false;
     if (sr->ibl_data)
         LOG_INFO(LOG_TAG, "IBL ready (async, %.1f ms): %s",
                  (double)bake_ms,
@@ -4074,6 +4055,11 @@ void sr_refresh_sky_ibl(JceSceneRenderer *sr,
                         const JceSceneRenderingSettings *rs)
 {
     if (!sr || !rs) return;
+    /* A disabled scene does not consume procedural IBL. Keep any accepted
+     * task with sr_ibl_poll: it may finish into the retained cache, but do not
+     * allocate/generate another sky or queue another convolution while off.
+     * Re-enable compares the current sky against the last admitted snapshot. */
+    if (!rs->ibl_enabled) return;
     if (sr->skybox_active) return;
     if (rs->sky_mode != JCE_SCENE_SKY_PREETHAM &&
         rs->sky_mode != JCE_SCENE_SKY_PHYSICAL) return;
@@ -4088,27 +4074,14 @@ void sr_refresh_sky_ibl(JceSceneRenderer *sr,
     const float amb = amb_lum * (rs->ambient_intensity > 0.0f
                                  ? rs->ambient_intensity : 1.0f);
 
-    /* Two degrees, not the half degree the SH9 projection uses. That
-     * projection is nine multiply-adds; this is a cubemap convolution on a
-     * worker, and at a four-hours-per-second cycle the sun crosses half a
-     * degree every eight milliseconds. A specular horizon is also a much
-     * lower-frequency thing than the sun it came from. */
+    const float sd[3] = { sun.x, sun.y, sun.z };
+    if (!sr_sky_ibl_refresh_needed(&sr->sky_ibl_snapshot, sd, turb, amb)) return;
+    /* The two-degree gate uses exact numeric state. Formatting rounds the
+     * ambient and direction and cannot be used as a floating-point cache. */
     char key[96];
     snprintf(key, sizeof key, "sky:%.3f,%.3f,%.3f/%.2f/%.4f",
              (double)sun.x, (double)sun.y, (double)sun.z,
              (double)turb, (double)amb);
-    if (strcmp(key, sr->sky_ibl_key) == 0) return;
-    {
-        /* Deadband on the direction itself; the key alone would rebake on
-         * every float wobble of the last printed digit. */
-        float kx = 0.0f, ky = 0.0f, kz = 0.0f, kt = 0.0f, ka = 0.0f;
-        if (sr->sky_ibl_key[0] &&
-            sscanf(sr->sky_ibl_key, "sky:%f,%f,%f/%f/%f",
-                   &kx, &ky, &kz, &kt, &ka) == 5) {
-            const float dot = sun.x * kx + sun.y * ky + sun.z * kz;
-            if (dot > 0.99939f && kt == turb && ka == amb) return;
-        }
-    }
 
     const uint32_t W = 128u, H = 64u;
     float *px = (float *)JCE_MALLOC((size_t)W * H * 4u * sizeof(float));
@@ -4116,7 +4089,6 @@ void sr_refresh_sky_ibl(JceSceneRenderer *sr,
 
     JceSkyConfig scfg = jce_sky_config_default();
     scfg.turbidity = turb;
-    const float sd[3] = { sun.x, sun.y, sun.z };
     JceSkyState sst = jce_sky_evaluate(&scfg, sd);
 
     for (uint32_t y = 0; y < H; ++y) {
@@ -4177,6 +4149,7 @@ void sr_refresh_sky_ibl(JceSceneRenderer *sr,
     job->w = W; job->h = H; job->irr = 16; job->pf = 32;
 
     snprintf(sr->sky_ibl_key, sizeof sr->sky_ibl_key, "%s", key);
+    sr_sky_ibl_snapshot_set(&sr->sky_ibl_snapshot, sd, turb, amb);
     snprintf(sr->ibl_job_hdr, sizeof sr->ibl_job_hdr, "%s", key);
     sr->ibl_job_is_sky = true;
     sr->sky_ibl_t0     = jce_time_perf_counter();
@@ -4195,6 +4168,7 @@ void sr_refresh_sky_ibl(JceSceneRenderer *sr,
         sr->ibl_job = NULL;
         sr->ibl_job_is_sky = false;
         sr->sky_ibl_key[0] = '\0';
+        sr->sky_ibl_snapshot.valid = false;
     }
 }
 
@@ -4246,11 +4220,13 @@ void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *list)
     if (sctx.hdr_path && !sctx.use_as_ibl && sr->ibl_data) {
         jce_ibl_destroy(sr->ibl_data);
         sr->ibl_data = NULL;
+        sr->sky_ibl_snapshot.valid = false;
     }
     sr->skybox_use_as_ibl = sctx.hdr_path ? sctx.use_as_ibl : true;
     (void)list;
 
     if (hdr_path && strcmp(hdr_path, sr->skybox_hdr_path) != 0) {
+        sr->sky_ibl_snapshot.valid = false;
         if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
         if (sr->skybox)   { jce_skybox_destroy(sr->skybox); sr->skybox = NULL; }
         /* Try PAK chain first (engine + bundle overlays) so a bundled
@@ -4310,6 +4286,7 @@ void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *list)
                      hdr_path);
         }
     } else if (!hdr_path && sr->skybox_active) {
+        sr->sky_ibl_snapshot.valid = false;
         if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
         if (sr->skybox)   { jce_skybox_destroy(sr->skybox); sr->skybox = NULL; }
         sr->skybox_hdr_path[0] = '\0';
@@ -4638,11 +4615,8 @@ void sr_drive_decals(JceSceneRenderer *sr, JceScene *scene,
         /* Component-filtered walk (O(#decals)); O(1) all-clear gate. */
         if (has_authored)
             jce_scene_each_decal(scene, sr_decal_each_entity, &ctx);
-        /* The spawned count is this feature's only observable: an authored
-         * projector culled by draw_distance or layer_mask simply is not in
-         * the pool, and a decal outside the view frustum looks the same as a
-         * culled one on screen.  Logged once per change so the distinction is
-         * checkable without a debugger. */
+        /* Log changed candidate/accepted counts: pixels alone cannot distinguish
+         * pool rejection, distance/layer culling and offscreen projectors. */
         {
             static uint32_t s_last = UINT32_MAX;
             uint32_t key = (ctx.candidates << 16) | (ctx.spawned & 0xFFFFu);
@@ -4664,16 +4638,9 @@ void sr_drive_decals(JceSceneRenderer *sr, JceScene *scene,
     }
 }
 
-/* ── Foliage Cluster (stylized billboard canopy / bush) ───────────────────
- *
- * The hand-painted-diorama foliage model (reference: Elemental-Serenity's
- * BushManager): N camera-facing billboard cards sampled on a squashed
- * sphere shell around the entity, each carrying its OUTWARD shell normal.
- * vs_foliage billboards + wind-sways the cards; fs_foliage alpha-masks the
- * leaf shape and shades a 3-tone toon ramp (shadow/mid/highlight x
- * multiplier) keyed on that normal vs the primary light — which reads as a
- * shaded leafy BALL instead of flat cards.  One instanced submit per
- * cluster; instance data cached per entity (rebuilt on param change). */
+/* Foliage clusters: wind-swayed billboard cards on a squashed sphere shell.
+ * Outward normals drive a three-tone light ramp; alpha masks form the leaves.
+ * Per-entity instances rebuild on parameter changes (Elemental-Serenity reference). */
 
 uint32_t sr_foliage_hash(const JceFoliageClusterComponent *c,
                                 const jce_vec3 *origin)
@@ -4702,6 +4669,12 @@ static const uint32_t sr_fcluster_card_indices[6] = {0, 1, 2, 0, 2, 3};
 
 static void sr_foliage_lazy_init(JceSceneRenderer *sr)
 {
+    const uint32_t frame = jce_renderer_get_frame_index(sr->renderer);
+    /* Shared failures retry after 60 device frames/new prepared context,
+     * independently of cluster, cascade and Scene/Game viewport counts. */
+    if (sr->fcluster_retry_pending &&
+        sr->fcluster_retry_context == sr->resource_prepared_context &&
+        (uint32_t)(frame - sr->fcluster_retry_frame) < 60u) return;
     if (!sr->fcluster_prog_tried) {
         sr->fcluster_prog_tried = true;
         const JceRendererApiInfo api = jce_renderer_get_api_info();
@@ -4710,26 +4683,19 @@ static void sr_foliage_lazy_init(JceSceneRenderer *sr)
         sr->fcluster_expanded_cards = !instancing &&
             bgfx_get_renderer_type() == BGFX_RENDERER_TYPE_OPENGL &&
             jce_graphics_api_is_compatibility_gl_es(api.build_tier, JCE_BACKEND_OPENGL);
+    }
+    if (!BGFX_HANDLE_IS_VALID(sr->prog_fcluster)) {
         const char *vs_colour = sr->fcluster_expanded_cards ? "foliage_cards" : "foliage";
         JceShaderHandle fh = jce_renderer_shader_load_named_internal(sr->pak, vs_colour, "foliage");
         sr->prog_fcluster.idx = fh.idx;
-        if (fh.idx == UINT16_MAX)
-            LOG_WARN(LOG_TAG, "foliage shader not found in PAK "
-                              "(foliage clusters will not render)");
-        /* Depth-only foliage pairing: REAL
-         * leaf shadows - alpha-tested cards, wind-animated like the color
-         * pass (the reference's discard-below-0.8 depth material).  The
-         * DEDICATED vs orients cards tangent to the shell instead of
-         * billboarding: in a cascade view vs_foliage's u_invView is the
-         * LIGHT's inverse view, so every card faced the light coherently
-         * and the union cast one solid straight band across the grass at
-         * grazing angles.  Missing program -> sphere-proxy fallback. */
+    }
+    if (!BGFX_HANDLE_IS_VALID(sr->prog_fcluster_shadow)) {
+        /* Shadow cards remain tangent to the shell: light-facing billboards
+         * merge into straight bands at grazing angles. Match color wind and
+         * retain the 0.8 alpha cutoff; missing program uses the sphere proxy. */
         const char *vs_shadow = sr->fcluster_expanded_cards ? "foliage_cards_shadow" : "foliage_shadow";
         JceShaderHandle sh = jce_renderer_shader_load_named_internal(sr->pak, vs_shadow, "foliage_shadow");
         sr->prog_fcluster_shadow.idx = sh.idx;
-        if (sh.idx == UINT16_MAX)
-            LOG_WARN(LOG_TAG, "foliage_shadow shader not found in PAK "
-                              "(leaf shadows fall back to sphere proxies)");
     }
     if (!BGFX_HANDLE_IS_VALID(sr->u_foliage_time))
         sr->u_foliage_time = bgfx_create_uniform("u_foliage_time",
@@ -4756,12 +4722,46 @@ static void sr_foliage_lazy_init(JceSceneRenderer *sr)
     }
     if (!sr->fcluster_shadow_sphere)
         sr->fcluster_shadow_sphere = jce_mesh_create_sphere(0.5f);
+    if (!BGFX_HANDLE_IS_VALID(sr->u_foliage_hashed_alpha))
+        sr->u_foliage_hashed_alpha = bgfx_create_uniform(
+            "u_foliage_hashed_alpha", BGFX_UNIFORM_TYPE_VEC4, 1);
+    const bool failed = (!sr->fcluster_expanded_cards && !sr->fcluster_quad) ||
+        !BGFX_HANDLE_IS_VALID(sr->prog_fcluster) ||
+        !BGFX_HANDLE_IS_VALID(sr->prog_fcluster_shadow) ||
+        !sr->fcluster_shadow_sphere || !BGFX_HANDLE_IS_VALID(sr->u_foliage_time) ||
+        !BGFX_HANDLE_IS_VALID(sr->u_foliage_colors) ||
+        !BGFX_HANDLE_IS_VALID(sr->u_foliage_light) ||
+        !BGFX_HANDLE_IS_VALID(sr->s_foliage_alpha) ||
+        !BGFX_HANDLE_IS_VALID(sr->u_foliage_hashed_alpha);
+    if (failed) {
+        sr->fcluster_retry_frame = frame;
+        sr->fcluster_retry_context = sr->resource_prepared_context;
+        sr->fcluster_retry_pending = true;
+        if (!sr->fcluster_allocation_failure_logged) {
+            const bgfx_stats_t *st = bgfx_get_stats();
+            const bgfx_caps_t *caps = bgfx_get_caps();
+            LOG_WARN(LOG_TAG, "foliage shared resources unavailable; retry after 60 device frames "
+                "ready_quad=%d ready_sphere=%d ready_color=%d ready_shadow=%d "
+                "backend_ib=%d/%d backend_vb=%d/%d (unavailable=-1; pending requests unmeasured)",
+                sr->fcluster_expanded_cards || sr->fcluster_quad != NULL,
+                sr->fcluster_shadow_sphere != NULL,
+                BGFX_HANDLE_IS_VALID(sr->prog_fcluster),
+                BGFX_HANDLE_IS_VALID(sr->prog_fcluster_shadow),
+                st ? (int)st->numIndexBuffers : -1,
+                caps ? (int)caps->limits.maxIndexBuffers : -1,
+                st ? (int)st->numVertexBuffers : -1,
+                caps ? (int)caps->limits.maxVertexBuffers : -1);
+            sr->fcluster_allocation_failure_logged = true;
+        }
+    } else {
+        if (sr->fcluster_allocation_failure_logged)
+            LOG_INFO(LOG_TAG, "foliage shared resources recovered");
+        sr->fcluster_retry_pending = false;
+        sr->fcluster_allocation_failure_logged = false;
+    }
 }
 
-/* Submit a solid sphere-proxy depth for a FoliageCluster into a shadow view
- * (soft round tree/bush shadow on the ground).  Returns true if the entity is
- * a foliage cluster (handled).  Pushes into the shared render queue so it
- * batches with the mesh shadows. */
+/* Shadow cards use a shared-queue sphere proxy on refusal; true means handled. */
 static int sr_fcluster_ensure_cache(JceSceneRenderer *sr, JceScene *scene,
                                     JceEntity e,
                                     const JceFoliageClusterComponent *fc);
@@ -4775,13 +4775,8 @@ static void sr_fcluster_report_gl21_submit(bool *reported, const char *program,
         program, (unsigned)count);
 }
 
-/* Hashed-alpha strength for the foliage shadow pass.
- *
- * Gated on a temporal resolve, from the same authority the cascade dither uses
- * (jce_shadow_blend.h explains why it must be that one and not the tier).  A
- * stochastic alpha test with nothing to average it is a STIPPLED shadow -- and
- * stippling reads as a broken filter, which is worse than the popping it
- * replaces.  Zero keeps the fixed 0.8 cutoff, byte-identical to before. */
+/* Use the temporal-resolve authority from jce_shadow_blend.h, never the tier.
+ * Without averaging, hashed alpha stipples; zero preserves the fixed 0.8 cutoff. */
 static float sr_foliage_hashed_alpha_scale(void)
 {
     return jce_render_pipeline_is_feature_enabled("taa") ? 1.0f : 0.0f;
@@ -4799,6 +4794,9 @@ bool sr_try_submit_foliage_shadow(JceSceneRenderer *sr, JceScene *scene,
     /* Draw the alpha-tested, wind-animated leaf cards into this cascade. */
     const bool expanded = sr->fcluster_expanded_cards;
     if (BGFX_HANDLE_IS_VALID(sr->prog_fcluster_shadow) &&
+        BGFX_HANDLE_IS_VALID(sr->u_foliage_time) &&
+        BGFX_HANDLE_IS_VALID(sr->s_foliage_alpha) &&
+        BGFX_HANDLE_IS_VALID(sr->u_foliage_hashed_alpha) &&
         (expanded || sr->fcluster_quad) &&
         fc->leaf_count > 0 && jce_scene_has_transform(scene, e)) {
         int slot = sr_fcluster_ensure_cache(sr, scene, e, fc);
@@ -4837,9 +4835,6 @@ bool sr_try_submit_foliage_shadow(JceSceneRenderer *sr, JceScene *scene,
                 bgfx_set_index_buffer(ibh, 0, 6u * cards);
                 if (!expanded) bgfx_set_instance_data_buffer(&idb, 0, n);
                 /* No face cull: wind sway can flip a billboard edge-on. */
-                if (!BGFX_HANDLE_IS_VALID(sr->u_foliage_hashed_alpha))
-                    sr->u_foliage_hashed_alpha = bgfx_create_uniform(
-                        "u_foliage_hashed_alpha", BGFX_UNIFORM_TYPE_VEC4, 1);
                 const float ha[4] = {sr_foliage_hashed_alpha_scale(), 0.0f, 0.0f, 0.0f};
                 bgfx_set_uniform(sr->u_foliage_hashed_alpha, ha, 1);
                 bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
@@ -4891,9 +4886,7 @@ bool sr_try_submit_foliage_shadow(JceSceneRenderer *sr, JceScene *scene,
     return true;
 }
 
-/* (renamed from sr_foliage_find_slot — that name already belongs to the
- * VegetationScatter cache at the top of this file; this variant probes the
- * separate fcluster_cache.) */
+/* This is the cluster cache, separate from VegetationScatter's foliage cache. */
 static int sr_fcluster_find_slot(JceSceneRenderer *sr, JceEntity e)
 {
     int n = (int)(sizeof sr->fcluster_cache / sizeof sr->fcluster_cache[0]);
@@ -4904,16 +4897,13 @@ static int sr_fcluster_find_slot(JceSceneRenderer *sr, JceEntity e)
         if (!sr->fcluster_cache[i].used && free_slot < 0) free_slot = i;
     }
     if (free_slot >= 0) return free_slot;
-    /* All slots taken: evict a deterministic one (rebuilds next time).
-     * Without this, a table full of stale entries — e.g. entity ids
-     * renumbered by an editor undo (scene world recreate) — made every
-     * new cluster return -1 and silently skip drawing forever. */
+    /* Bounded deterministic eviction also retires stale scene-generation ids. */
     static bool warned = false;
     if (!warned) {
         warned = true;
         LOG_WARN(LOG_TAG,
-                 "fcluster cache full (%d slots) — evicting; stale entries "
-                 "suggest a scene swap without jce_scene_renderer_reset_entity_caches()",
+                 "fcluster cache full (%d slots) -- evicting; active working set "
+                 "exceeds the budget, or stale scene entries need cache reset",
                  n);
     }
     int victim = (int)((uint32_t)e % (uint32_t)n);
@@ -4923,20 +4913,20 @@ static int sr_fcluster_find_slot(JceSceneRenderer *sr, JceEntity e)
     return victim;
 }
 
-/* Drop every entity-keyed environment cache (VegetationScatter foliage,
- * grass fields, water surfaces, foliage-cluster canopies).  Call after any
- * operation that renumbers entity ids while keeping this renderer alive —
- * editor undo/redo and scene switches destroy + recreate the ECS world, so
- * recycled ids come back with bumped generation bits and every cached slot
- * goes permanently stale.  Stale slots squat their fixed-size tables (a
- * full fcluster table used to silently skip drawing new clusters) and pin
- * dead CPU/GPU buffers.  Content is rebuilt lazily on the next draw. */
+/* Undo/redo and scene swaps recycle entity ids. Retire all entity-keyed
+ * foliage/grass/water/cluster resources; the next draw rebuilds them lazily. */
 void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr)
 {
     if (!sr) return;
     sr_prev_xform_reset(sr);
     sr_ssgi_reset(sr);
     sr->resource_prepared_valid = false;
+    /* Explicit reset frees pressure and permits immediate shared-resource retries. */
+    sr->water_mesh_retry_pending = false;
+    sr->water_mesh_failure_logged = false;
+    sr->underwater_retry_pending = false;
+    sr->fcluster_retry_pending = false;
+    sr->fcluster_allocation_failure_logged = false;
     sr_release_prepass_targets(sr, SR_PREPASS_TARGET_RESET);
     sr_fullscreen_effect_reset_all(sr);
     sr_grass_reset_failed_programs(sr);
@@ -4958,9 +4948,7 @@ void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr)
             memset(&sr->fcluster_cache[i], 0, sizeof sr->fcluster_cache[i]);
             ++dropped;
         }
-    /* Nanite-lite meshlet indirects are ENTITY-keyed too: a recreated world
-     * replays entity ids, so a stale slot would alias a fresh entity and
-     * draw last world's cluster args.  Same seam, same rule: drop them all. */
+    /* Meshlet indirects are entity-keyed too; stale slots would replay old cluster args. */
     for (int i = 0; i < (int)(sizeof sr->meshlet_cache /
                               sizeof sr->meshlet_cache[0]); ++i)
         if (sr->meshlet_cache[i].used) {
@@ -4971,15 +4959,8 @@ void jce_scene_renderer_reset_entity_caches(JceSceneRenderer *sr)
             sr->meshlet_cache[i].used = false;
             ++dropped;
     }
-    /* Frame-invariance caches.  A recreated scene replays its counter
-     * sequences from scratch (structural_epoch / xform_counter / per-entity
-     * xform gens restart with the new world), so equality-keyed snapshots
-     * taken before the swap can FALSE-HIT after it once the deterministic
-     * reload drives the counters back to a previously seen value: the frozen
-     * ecull then replays draw commands built with pre-swap world matrices
-     * (a mesh stays at its old position after redo) and the CSM cascade
-     * cache skips re-rendering (a shadow stays at the old position after
-     * undo).  Every snapshot below rebuilds in one frame — drop them all. */
+    /* New worlds replay structural/xform counter values. Drop equality-keyed
+     * snapshots so frozen draws and CSM cannot reuse pre-swap world matrices. */
     sr->ecull_frz_valid = false;          /* frozen-frame ecull replay */
     sr->eidx_list_gen   = 0;              /* entity→ecull-slot index */
     if (sr->model_bounds_enabled)
@@ -5028,10 +5009,7 @@ static JceMesh *sr_fcluster_build_expanded_mesh(const float *instances, uint32_t
     return mesh;
 }
 
-/* Fill (or reuse) the per-entity leaf-card cache; returns the
- * slot or -1.  Shared by the color pass AND the CSM shadow pass - the
- * shadow views are submitted earlier in the frame, so the shadow path
- * must be able to build the cache before the color pass ever ran. */
+/* Return a cached leaf-card slot or -1; shadow views may build it before color. */
 static int sr_fcluster_ensure_cache(JceSceneRenderer *sr, JceScene *scene,
                                     JceEntity e,
                                     const JceFoliageClusterComponent *fc)
@@ -5044,11 +5022,8 @@ static int sr_fcluster_ensure_cache(JceSceneRenderer *sr, JceScene *scene,
 
     int count = fc->leaf_count;
     if (count > 256) count = 256;
-    /* LOW-tier floor: canopy cards are the scene's biggest ALPHA-TEST
-     * overdraw source (hundreds of screen-covering discard billboards, worst
-     * case several fullscreen relayers on an iGPU).  Tier LOW keeps ~2/3 of
-     * the cards — the shell stays visually closed because the scatter is
-     * shell-uniform — HIGH/ULTRA draw the authored count. */
+    /* LOW reduces alpha-test overdraw to ~2/3 of shell-uniform cards;
+     * HIGH/ULTRA preserve the authored count. */
     {
         static int s_low = -1;
         if (s_low < 0)
@@ -5157,6 +5132,10 @@ void sr_draw_foliage_cluster(JceSceneRenderer *sr, JceScene *scene,
 
     sr_foliage_lazy_init(sr);
     if (!BGFX_HANDLE_IS_VALID(sr->prog_fcluster) ||
+        !BGFX_HANDLE_IS_VALID(sr->u_foliage_time) ||
+        !BGFX_HANDLE_IS_VALID(sr->u_foliage_colors) ||
+        !BGFX_HANDLE_IS_VALID(sr->u_foliage_light) ||
+        !BGFX_HANDLE_IS_VALID(sr->s_foliage_alpha) ||
         (!sr->fcluster_expanded_cards && !sr->fcluster_quad)) return;
 
     int slot = sr_fcluster_ensure_cache(sr, scene, e, fc);

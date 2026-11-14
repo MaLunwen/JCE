@@ -2,7 +2,7 @@
   "version": 6,
   "cmakeMinimumRequired": {
     "major": 3,
-    "minor": 20,
+    "minor": 25,
     "patch": 0
   },
   "configurePresets": [
@@ -12,7 +12,9 @@
       "generator": "Ninja",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "JCE_BUILD_VARIANT": "release"
+        "JCE_BUILD_VARIANT": "release",
+        "JCE_BUILD_EDITOR": "ON",
+        "JCE_DELIVERY_PROFILE": "authoring"
       }
     },
     {
@@ -21,6 +23,26 @@
       "inherits": "_desktop-base",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x64/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows"
+          ]
+        }
+      },
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "toolset": {
+        "value": "v143,version=14.4",
+        "strategy": "external"
       }
     },
     {
@@ -29,6 +51,26 @@
       "inherits": "_desktop-base",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-arm64/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows"
+          ]
+        }
+      },
+      "architecture": {
+        "value": "arm64",
+        "strategy": "external"
+      },
+      "toolset": {
+        "value": "v143,version=14.4",
+        "strategy": "external"
       }
     },
     {
@@ -37,6 +79,26 @@
       "inherits": "_desktop-base",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x86/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows"
+          ]
+        }
+      },
+      "architecture": {
+        "value": "x86",
+        "strategy": "external"
+      },
+      "toolset": {
+        "value": "v143,version=14.4",
+        "strategy": "external"
       }
     },
     {
@@ -45,6 +107,18 @@
       "inherits": "_desktop-base",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-x64/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Linux"
+          ]
+        }
       }
     },
     {
@@ -53,6 +127,18 @@
       "inherits": "_desktop-base",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-arm64/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Linux"
+          ]
+        }
       }
     },
     {
@@ -63,6 +149,18 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-x64/conan/preset/build/Release/generators/conan_toolchain.cmake",
         "CMAKE_OSX_ARCHITECTURES": "x86_64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "10.15"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "macOS"
+          ]
+        }
       }
     },
     {
@@ -73,11 +171,23 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-arm64/conan/preset/build/Release/generators/conan_toolchain.cmake",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "host-release",
-      "displayName": "Host Release (Ninja)",
+      "displayName": "Host / Release",
       "description": "Host build using Conan toolchain",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/host",
@@ -85,31 +195,42 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/host-conan/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows",
+            "Linux",
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "windows-x64-release",
-      "displayName": "Desktop Windows x64 Release",
+      "displayName": "Windows x64 / Authoring Release",
       "inherits": "_windows-x64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "windows-x64-debug",
-      "displayName": "Desktop Windows x64 Debug (full PDB, no inlining)",
-      "description": "Debug build with full PDB, /MDd CRT, optimised for VS 2026 diagnostics",
-      "inherits": "_desktop-base",
+      "displayName": "Windows x64 / Authoring Debug",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer. Full PDB, /MDd CRT and disabled inlining.",
+      "inherits": "_windows-x64",
       "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/debug",
-      "toolset": {
-        "value": "v143",
-        "strategy": "external"
-      },
-      "architecture": {
-        "value": "x64",
-        "strategy": "external"
-      },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "JCE_BUILD_VARIANT": "debug",
@@ -123,29 +244,32 @@
     },
     {
       "name": "windows-x64-release-sdk",
-      "displayName": "SDK Windows x64 (release)",
+      "displayName": "Windows x64 / Embedded SDK Release",
       "inherits": "windows-x64-release",
       "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-x86_64",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "windows-x64-dist-sdk",
-      "displayName": "SDK Windows x64 (dist)",
+      "displayName": "Windows x64 / Embedded SDK Dist",
       "inherits": "windows-x64-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-x86_64-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "windows-x64-asan",
-      "displayName": "Desktop Windows x64 AddressSanitizer",
-      "description": "Release + symbols + AddressSanitizer (catches use-after-free, OOB, leaks)",
-      "generator": "Ninja",
+      "displayName": "Windows x64 / Authoring ASan",
+      "description": "Authoring Release with symbols and AddressSanitizer for address errors.",
       "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/asan",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
@@ -157,11 +281,12 @@
         "CMAKE_CXX_FLAGS_RELEASE": "/MD /O1 /Ob1 /Zi /DNDEBUG /fsanitize=address /Oy- /FS /D_DISABLE_STRING_ANNOTATION=1 /D_DISABLE_VECTOR_ANNOTATION=1",
         "CMAKE_EXE_LINKER_FLAGS_RELEASE": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_SHARED_LINKER_FLAGS_RELEASE": "/DEBUG:FULL /INCREMENTAL:NO"
-      }
+      },
+      "inherits": "_windows-x64"
     },
     {
       "name": "jni-release",
-      "displayName": "JNI Desktop Release",
+      "displayName": "JNI / Host Release",
       "description": "JNI shared library build for host platform",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/jni/desktop/obj/preset/release",
@@ -170,21 +295,40 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "JCE_BUILD_JNI": "ON",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/jni/desktop/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows",
+            "Linux",
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "windows-arm64-release",
-      "displayName": "Desktop Windows ARM64 Release",
+      "displayName": "Windows ARM64 / Authoring Release",
       "inherits": "_windows-arm64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/windows-arm64/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/windows-arm64/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "windows-arm64-debug",
-      "displayName": "Desktop Windows ARM64 Debug",
-      "inherits": "_desktop-base",
+      "displayName": "Windows ARM64 / Authoring Debug",
+      "inherits": "_windows-arm64",
       "binaryDir": "${sourceDir}/build/desktop/windows-arm64/obj/preset/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -195,41 +339,47 @@
         "CMAKE_EXE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_MODULE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer. Full PDB, /MDd CRT and disabled inlining."
     },
     {
       "name": "windows-arm64-release-sdk",
-      "displayName": "SDK Windows ARM64 (release)",
+      "displayName": "Windows ARM64 / Embedded SDK Release",
       "inherits": "windows-arm64-release",
       "binaryDir": "${sourceDir}/build/desktop/windows-arm64/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-aarch64",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "windows-arm64-dist-sdk",
-      "displayName": "SDK Windows ARM64 (dist)",
+      "displayName": "Windows ARM64 / Embedded SDK Dist",
       "inherits": "windows-arm64-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/windows-arm64/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-aarch64-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "windows-x86-release",
-      "displayName": "Desktop Windows x86 (32-bit) Release",
+      "displayName": "Windows x86 / Authoring Release",
       "inherits": "_windows-x86",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/windows-x86/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/windows-x86/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "windows-x86-debug",
-      "displayName": "Desktop Windows x86 (32-bit) Debug",
-      "inherits": "_desktop-base",
+      "displayName": "Windows x86 / Authoring Debug",
+      "inherits": "_windows-x86",
       "binaryDir": "${sourceDir}/build/desktop/windows-x86/obj/preset/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -240,53 +390,94 @@
         "CMAKE_EXE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_MODULE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer. Full PDB, /MDd CRT and disabled inlining."
     },
     {
       "name": "windows-x86-release-sdk",
-      "displayName": "SDK Windows x86 (release)",
+      "displayName": "Windows x86 / Embedded SDK Release",
       "inherits": "windows-x86-release",
       "binaryDir": "${sourceDir}/build/desktop/windows-x86/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-i686",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "windows-x86-dist-sdk",
-      "displayName": "SDK Windows x86 (dist)",
+      "displayName": "Windows x86 / Embedded SDK Dist",
       "inherits": "windows-x86-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/windows-x86/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/win32-i686-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "android-arm64-release",
-      "displayName": "Mobile Android arm64 Release",
+      "displayName": "Android ARM64 / Release",
       "description": "Android arm64 build with Conan toolchain",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/mobile/android-arm64/obj/preset/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/mobile/android-arm64/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows",
+            "Linux",
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "wasm-release",
-      "displayName": "Web WASM Release",
+      "displayName": "Web WASM / Release",
       "description": "WebAssembly build with Conan toolchain",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/web/wasm/obj/preset/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/web/wasm/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows",
+            "Linux",
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "wasm-dist",
-      "displayName": "Web WASM Dist (isolated CMake cache)",
+      "displayName": "Web WASM / Dist",
       "description": "WebAssembly distribution variant; separate from release",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/web/wasm/obj/preset/dist",
@@ -294,101 +485,132 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/web/wasm/conan/preset/build/Release/generators/conan_toolchain.cmake",
         "JCE_BUILD_VARIANT": "dist"
+      },
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "Windows",
+            "Linux",
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "linux-x64-release",
-      "displayName": "Desktop Linux x64 Release",
+      "displayName": "Linux x64 / Authoring Release",
       "inherits": "_linux-x64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/linux-x64/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/linux-x64/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "linux-x64-debug",
-      "displayName": "Desktop Linux x64 Debug",
-      "inherits": "_desktop-base",
+      "displayName": "Linux x64 / Authoring Debug",
+      "inherits": "_linux-x64",
       "binaryDir": "${sourceDir}/build/desktop/linux-x64/obj/preset/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "JCE_BUILD_VARIANT": "debug",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-x64/conan/preset/build/Debug/generators/conan_toolchain.cmake"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "linux-x64-release-sdk",
-      "displayName": "SDK Linux x64 (release)",
+      "displayName": "Linux x64 / Embedded SDK Release",
       "inherits": "linux-x64-release",
       "binaryDir": "${sourceDir}/build/desktop/linux-x64/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/linux-x86_64",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "linux-x64-dist-sdk",
-      "displayName": "SDK Linux x64 (dist)",
+      "displayName": "Linux x64 / Embedded SDK Dist",
       "inherits": "linux-x64-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/linux-x64/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/linux-x86_64-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "linux-arm64-release",
-      "displayName": "Desktop Linux ARM64 Release",
+      "displayName": "Linux ARM64 / Authoring Release",
       "inherits": "_linux-arm64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/linux-arm64/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/linux-arm64/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "linux-arm64-debug",
-      "displayName": "Desktop Linux ARM64 Debug",
-      "inherits": "_desktop-base",
+      "displayName": "Linux ARM64 / Authoring Debug",
+      "inherits": "_linux-arm64",
       "binaryDir": "${sourceDir}/build/desktop/linux-arm64/obj/preset/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "JCE_BUILD_VARIANT": "debug",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-arm64/conan/preset/build/Debug/generators/conan_toolchain.cmake"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "linux-arm64-release-sdk",
-      "displayName": "SDK Linux ARM64 (release)",
+      "displayName": "Linux ARM64 / Embedded SDK Release",
       "inherits": "linux-arm64-release",
       "binaryDir": "${sourceDir}/build/desktop/linux-arm64/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/linux-aarch64",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "linux-arm64-dist-sdk",
-      "displayName": "SDK Linux ARM64 (dist)",
+      "displayName": "Linux ARM64 / Embedded SDK Dist",
       "inherits": "linux-arm64-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/linux-arm64/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/linux-aarch64-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "macos-x64-release",
-      "displayName": "Desktop macOS x64 Release",
+      "displayName": "macOS x64 / Authoring Release",
       "inherits": "_macos-x64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/macos-x64/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/macos-x64/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "macos-x64-debug",
-      "displayName": "Desktop macOS x64 Debug",
-      "inherits": "_desktop-base",
+      "displayName": "macOS x64 / Authoring Debug",
+      "inherits": "_macos-x64",
       "binaryDir": "${sourceDir}/build/desktop/macos-x64/obj/preset/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -396,41 +618,47 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-x64/conan/preset/build/Debug/generators/conan_toolchain.cmake",
         "CMAKE_OSX_ARCHITECTURES": "x86_64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "10.15"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "macos-x64-release-sdk",
-      "displayName": "SDK macOS x64 (release)",
+      "displayName": "macOS x64 / Embedded SDK Release",
       "inherits": "macos-x64-release",
       "binaryDir": "${sourceDir}/build/desktop/macos-x64/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/darwin-x86_64",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "macos-x64-dist-sdk",
-      "displayName": "SDK macOS x64 (dist)",
+      "displayName": "macOS x64 / Embedded SDK Dist",
       "inherits": "macos-x64-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/macos-x64/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/darwin-x86_64-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "macos-arm64-release",
-      "displayName": "Desktop macOS ARM64 Release",
+      "displayName": "macOS ARM64 / Authoring Release",
       "inherits": "_macos-arm64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       },
-      "binaryDir": "${sourceDir}/build/desktop/macos-arm64/obj/preset/release"
+      "binaryDir": "${sourceDir}/build/desktop/macos-arm64/obj/preset/release",
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "macos-arm64-debug",
-      "displayName": "Desktop macOS ARM64 Debug",
-      "inherits": "_desktop-base",
+      "displayName": "macOS ARM64 / Authoring Debug",
+      "inherits": "_macos-arm64",
       "binaryDir": "${sourceDir}/build/desktop/macos-arm64/obj/preset/debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -438,327 +666,609 @@
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-arm64/conan/preset/build/Debug/generators/conan_toolchain.cmake",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "macos-arm64-release-sdk",
-      "displayName": "SDK macOS ARM64 (release)",
+      "displayName": "macOS ARM64 / Embedded SDK Release",
       "inherits": "macos-arm64-release",
       "binaryDir": "${sourceDir}/build/desktop/macos-arm64/obj/preset/release-sdk",
       "installDir": "${sourceDir}/dist/sdk/darwin-aarch64",
       "cacheVariables": {
-        "JCE_ENABLE_SDK_INSTALL": "ON"
-      }
+        "JCE_ENABLE_SDK_INSTALL": "ON",
+        "JCE_BUILD_EDITOR": "OFF",
+        "JCE_DELIVERY_PROFILE": "embedded"
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "macos-arm64-dist-sdk",
-      "displayName": "SDK macOS ARM64 (dist)",
+      "displayName": "macOS ARM64 / Embedded SDK Dist",
       "inherits": "macos-arm64-release-sdk",
       "binaryDir": "${sourceDir}/build/desktop/macos-arm64/obj/preset/dist-sdk",
       "installDir": "${sourceDir}/dist/sdk/darwin-aarch64-dist",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Embedded SDK installation rules; build then install the selected configuration."
     },
     {
       "name": "ios-arm64-release",
-      "displayName": "Mobile iOS ARM64 Release",
+      "displayName": "iOS ARM64 / Release",
       "description": "iOS arm64 cross-compile build",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/mobile/ios-arm64/obj/preset/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/mobile/ios-arm64/conan/preset/build/Release/generators/conan_toolchain.cmake"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "hostOS": [
+            "macOS"
+          ]
+        }
       }
     },
     {
       "name": "windows-x64-dist",
       "binaryDir": "${sourceDir}/build/desktop/windows-x64/obj/preset/dist",
-      "displayName": "Desktop windows-x64 Dist (royalty-free, non-SDK)",
+      "displayName": "Windows x64 / Authoring Dist",
       "inherits": "windows-x64-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "windows-arm64-dist",
       "binaryDir": "${sourceDir}/build/desktop/windows-arm64/obj/preset/dist",
-      "displayName": "Desktop windows-arm64 Dist (royalty-free, non-SDK)",
+      "displayName": "Windows ARM64 / Authoring Dist",
       "inherits": "windows-arm64-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "windows-x86-dist",
       "binaryDir": "${sourceDir}/build/desktop/windows-x86/obj/preset/dist",
-      "displayName": "Desktop windows-x86 Dist (royalty-free, non-SDK)",
+      "displayName": "Windows x86 / Authoring Dist",
       "inherits": "windows-x86-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "linux-x64-dist",
       "binaryDir": "${sourceDir}/build/desktop/linux-x64/obj/preset/dist",
-      "displayName": "Desktop linux-x64 Dist (royalty-free, non-SDK)",
+      "displayName": "Linux x64 / Authoring Dist",
       "inherits": "linux-x64-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "linux-arm64-dist",
       "binaryDir": "${sourceDir}/build/desktop/linux-arm64/obj/preset/dist",
-      "displayName": "Desktop linux-arm64 Dist (royalty-free, non-SDK)",
+      "displayName": "Linux ARM64 / Authoring Dist",
       "inherits": "linux-arm64-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "macos-x64-dist",
       "binaryDir": "${sourceDir}/build/desktop/macos-x64/obj/preset/dist",
-      "displayName": "Desktop macos-x64 Dist (royalty-free, non-SDK)",
+      "displayName": "macOS x64 / Authoring Dist",
       "inherits": "macos-x64-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     },
     {
       "name": "macos-arm64-dist",
       "binaryDir": "${sourceDir}/build/desktop/macos-arm64/obj/preset/dist",
-      "displayName": "Desktop macos-arm64 Dist (royalty-free, non-SDK)",
+      "displayName": "macOS ARM64 / Authoring Dist",
       "inherits": "macos-arm64-release",
       "cacheVariables": {
         "JCE_BUILD_VARIANT": "dist"
-      }
+      },
+      "description": "Desktop authoring build; single-executable delivery uses the separate editor/package producer."
     }
   ],
   "buildPresets": [
     {
       "name": "build-host-release",
-      "displayName": "Build Host Release",
+      "displayName": "Build Host / Release",
       "configurePreset": "host-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      }
     },
     {
       "name": "build-windows-x64-release",
-      "displayName": "Build Desktop Windows x64",
+      "displayName": "Build Windows x64 / Authoring Release",
       "configurePreset": "windows-x64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x64-debug",
-      "displayName": "Build Desktop Windows x64 Debug",
+      "displayName": "Build Windows x64 / Authoring Debug",
       "configurePreset": "windows-x64-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x64-release-sdk",
       "configurePreset": "windows-x64-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x64 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x64-dist-sdk",
       "configurePreset": "windows-x64-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x64 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x64-asan",
-      "displayName": "Build Desktop Windows x64 ASan",
+      "displayName": "Build Windows x64 / Authoring ASan",
       "configurePreset": "windows-x64-asan",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-jni-release",
-      "displayName": "Build JNI Desktop",
+      "displayName": "Build JNI / Host Release",
       "configurePreset": "jni-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      }
     },
     {
       "name": "build-windows-arm64-release",
-      "displayName": "Build Desktop Windows ARM64",
+      "displayName": "Build Windows ARM64 / Authoring Release",
       "configurePreset": "windows-arm64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-arm64-debug",
       "configurePreset": "windows-arm64-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "displayName": "Build Windows ARM64 / Authoring Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-arm64-release-sdk",
       "configurePreset": "windows-arm64-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows ARM64 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-arm64-dist-sdk",
       "configurePreset": "windows-arm64-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows ARM64 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x86-release",
       "configurePreset": "windows-x86-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x86 / Authoring Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x86-debug",
       "configurePreset": "windows-x86-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "displayName": "Build Windows x86 / Authoring Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x86-release-sdk",
       "configurePreset": "windows-x86-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x86 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x86-dist-sdk",
       "configurePreset": "windows-x86-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x86 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-android-arm64-release",
-      "displayName": "Build Mobile Android arm64",
+      "displayName": "Build Android ARM64 / Release",
       "configurePreset": "android-arm64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      }
     },
     {
       "name": "build-wasm-release",
-      "displayName": "Build Web WASM",
+      "displayName": "Build Web WASM / Release",
       "configurePreset": "wasm-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      }
     },
     {
       "name": "build-wasm-dist",
-      "displayName": "Build Web WASM Dist",
+      "displayName": "Build Web WASM / Dist",
       "configurePreset": "wasm-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "inList",
+        "string": "${hostSystemName}",
+        "list": [
+          "Windows",
+          "Linux",
+          "Darwin"
+        ]
+      }
     },
     {
       "name": "build-linux-x64-release",
-      "displayName": "Build Desktop Linux x64",
+      "displayName": "Build Linux x64 / Authoring Release",
       "configurePreset": "linux-x64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-x64-debug",
       "configurePreset": "linux-x64-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "displayName": "Build Linux x64 / Authoring Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-x64-release-sdk",
       "configurePreset": "linux-x64-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Linux x64 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-x64-dist-sdk",
       "configurePreset": "linux-x64-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Linux x64 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-arm64-release",
-      "displayName": "Build Desktop Linux ARM64",
+      "displayName": "Build Linux ARM64 / Authoring Release",
       "configurePreset": "linux-arm64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-arm64-debug",
       "configurePreset": "linux-arm64-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "displayName": "Build Linux ARM64 / Authoring Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-arm64-release-sdk",
       "configurePreset": "linux-arm64-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Linux ARM64 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-arm64-dist-sdk",
       "configurePreset": "linux-arm64-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Linux ARM64 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-macos-x64-release",
-      "displayName": "Build Desktop macOS x64",
+      "displayName": "Build macOS x64 / Authoring Release",
       "configurePreset": "macos-x64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-x64-debug",
       "configurePreset": "macos-x64-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "displayName": "Build macOS x64 / Authoring Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-x64-release-sdk",
       "configurePreset": "macos-x64-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build macOS x64 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-x64-dist-sdk",
       "configurePreset": "macos-x64-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build macOS x64 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-arm64-release",
-      "displayName": "Build Desktop macOS ARM64",
+      "displayName": "Build macOS ARM64 / Authoring Release",
       "configurePreset": "macos-arm64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-arm64-debug",
       "configurePreset": "macos-arm64-debug",
-      "configuration": "Debug"
+      "configuration": "Debug",
+      "displayName": "Build macOS ARM64 / Authoring Debug",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-arm64-release-sdk",
       "configurePreset": "macos-arm64-release-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build macOS ARM64 / Embedded SDK Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-arm64-dist-sdk",
       "configurePreset": "macos-arm64-dist-sdk",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build macOS ARM64 / Embedded SDK Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-ios-arm64-release",
-      "displayName": "Build Mobile iOS ARM64",
+      "displayName": "Build iOS ARM64 / Release",
       "configurePreset": "ios-arm64-release",
-      "configuration": "Release"
+      "configuration": "Release",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-windows-x64-dist",
       "configurePreset": "windows-x64-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x64 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-arm64-dist",
       "configurePreset": "windows-arm64-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows ARM64 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-windows-x86-dist",
       "configurePreset": "windows-x86-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Windows x86 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     },
     {
       "name": "build-linux-x64-dist",
       "configurePreset": "linux-x64-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Linux x64 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-linux-arm64-dist",
       "configurePreset": "linux-arm64-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build Linux ARM64 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
     },
     {
       "name": "build-macos-x64-dist",
       "configurePreset": "macos-x64-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build macOS x64 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     },
     {
       "name": "build-macos-arm64-dist",
       "configurePreset": "macos-arm64-dist",
-      "configuration": "Release"
+      "configuration": "Release",
+      "displayName": "Build macOS ARM64 / Authoring Dist",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
     }
   ]
 }

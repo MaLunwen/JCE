@@ -8,7 +8,7 @@
  *
  * The cook is expensive, so the model-space wireframe is cached by
  * model path + cook settings and only rebuilt when those change; each
- * frame the cached segments are transformed by the entity's TRS and
+ * frame the cached segments use the runtime's world position/rotation and
  * emitted through jce_debug_draw_line — no new render path.
  */
 
@@ -25,8 +25,8 @@ extern "C" {
  * force every segment to this ABGR colour (so the debug overlay can draw all
  * compound colliders one colour, and the selection pass can draw the selected
  * one in the selection colour instead of fighting it with palette green). */
-/* detailed: 1 = fitted triangle wireframe (use for ONE selected prop);
- *           0 = outer bounds box per child (use for the all-props overlay). */
+/* Edit-time preview density: 1 = selected, 0 = all entities. Both draw
+ * distributed triangle edges; Play uses the actual physics world instead. */
 void jce_gizmo_compound_collider_draw_from_component(
     JceScene *scene, JceEntity owner, const JceCompoundColliderComponent *cc,
     unsigned int override_abgr, int detailed);

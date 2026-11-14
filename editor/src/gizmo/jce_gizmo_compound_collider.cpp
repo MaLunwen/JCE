@@ -7,15 +7,15 @@
  *     child colliders (never one fat box spanning the gaps).
  *   - Box   → 12 oriented edges.
  *   - Sphere→ 3 great circles.
- *   - Capsule→ two rings + 4 side lines along the local axis.
+ *   - Capsule-> two rings, side lines and hemisphere meridians.
  *   - Convex hull → bounding box of the hull points (hull face data is
  *     not retained by the cook, so the tight AABB stands in for it).
- *   - Triangle mesh → triangle edges (capped to keep the line count sane).
+ *   - Triangle mesh -> distributed triangle edges within a preview budget.
  *
  * The cook (especially V-HACD) is far too expensive to run per frame, so
  * the model-space wireframe is cached keyed by model path + cook settings
  * and only rebuilt when those change.  Each frame the cached segments are
- * transformed by the owner entity's TRS and emitted through
+ * transformed by the owner's runtime-compatible world rigid pose and emitted through
  * jce_debug_draw_line — reusing the existing debug-line path.
  */
 
@@ -60,11 +60,11 @@ const uint32_t kPalette[] = {
 };
 constexpr int kPaletteN = (int)(sizeof(kPalette) / sizeof(kPalette[0]));
 
-/* Cap trimesh edge spam HARD: the overlay draws this for EVERY prop every
- * frame, so 37 props at 6000 each blew past the debug-line buffer (~150k lines)
- * and dropped late geometry. 800 still conveys the shape; full fitted detail is
- * unnecessary for the overlay (select a prop for its exact shape). */
-constexpr uint32_t kMaxTriSegs = 2000u;
+/* Edit-time preview only. Play uses the live Bullet shape overlay instead.
+ * Dense meshes are sampled across their ENTIRE triangle range, never a prefix;
+ * the selected preview spends a larger budget without inventing an AABB. */
+constexpr uint32_t kPreviewTriSegs = 600u;
+constexpr uint32_t kSelectedTriSegs = 32766u;
 
 std::unordered_map<std::string, std::vector<Seg>> s_cache;
 
@@ -142,6 +142,21 @@ void push_capsule(std::vector<Seg> &out, const JceCookedChild *c, uint32_t col)
         jce_vec3 hi = child_pt(c, v3(r * d[0],  hh, r * d[1]));
         out.push_back({ lo, hi, col });
     }
+    for (int plane = 0; plane < 2; ++plane) {
+        for (int sign = -1; sign <= 1; sign += 2) {
+            jce_vec3 previous{};
+            for (int i = 0; i <= 16; ++i) {
+                const float angle = float(i) * (3.14159265f / 16.0f);
+                const float radial = r * cosf(angle);
+                const jce_vec3 point = child_pt(c, v3(
+                    plane == 0 ? radial : 0.0f,
+                    sign * (hh + r * sinf(angle)),
+                    plane == 1 ? radial : 0.0f));
+                if (i != 0) out.push_back({previous, point, col});
+                previous = point;
+            }
+        }
+    }
 }
 
 /* hull / trimesh geometry is baked in model space with identity
@@ -172,15 +187,16 @@ void push_hull_bounds(std::vector<Seg> &out, const JceCookedChild *c, uint32_t c
         out.push_back({ p[pair[0]], p[pair[1]], col });
 }
 
-void push_trimesh(std::vector<Seg> &out, const JceCookedChild *c, uint32_t col)
+void push_trimesh(std::vector<Seg> &out, const JceCookedChild *c, uint32_t col,
+                  uint32_t budget)
 {
-    if (!c->vertices || !c->indices) {
-        push_hull_bounds(out, c, col);
-        return;
-    }
+    if (!c->vertices || !c->indices || budget < 3) return;
     const uint32_t vc = c->vertex_count;
-    uint32_t added = 0;
-    for (uint32_t i = 0; i + 2 < c->index_count && added < kMaxTriSegs; i += 3) {
+    const uint32_t triangles = c->index_count / 3;
+    const uint32_t slots = budget / 3;
+    const uint32_t stride = triangles ? 1 + (triangles - 1) / slots : 1;
+    for (uint64_t triangle = 0; triangle < triangles; triangle += stride) {
+        const uint32_t i = (uint32_t)(triangle * 3);
         const uint32_t i0 = c->indices[i + 0];
         const uint32_t i1 = c->indices[i + 1];
         const uint32_t i2 = c->indices[i + 2];
@@ -196,7 +212,6 @@ void push_trimesh(std::vector<Seg> &out, const JceCookedChild *c, uint32_t col)
         out.push_back({ va, vb, col });
         out.push_back({ vb, vd, col });
         out.push_back({ vd, va, col });
-        added += 3;
     }
 }
 
@@ -211,9 +226,8 @@ std::string make_key(const JceCompoundColliderComponent *cc, int detailed)
     return std::string(buf);
 }
 
-/* detailed=1 -> fitted triangle wireframe (Unity-style, for ONE selected prop);
- * detailed=0 -> outer bounds box per child (cheap, for the all-props overlay so
- * tens of thousands of trimesh lines don't get pushed every frame). */
+/* Both modes draw real triangle edges across the complete asset. Detailed
+ * selection uses a larger budget. Live Play draws the actual physics world. */
 const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc,
                                      int detailed)
 {
@@ -267,12 +281,10 @@ const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc,
                 case JCE_SHAPE_SPHERE:        push_sphere(segs, ch, col);       break;
                 case JCE_SHAPE_CAPSULE:       push_capsule(segs, ch, col);      break;
                 case JCE_SHAPE_CONVEX_HULL:   push_hull_bounds(segs, ch, col);  break;
-                /* Detailed (selected): fitted triangle wireframe (Unity-style),
-                 * capped + index-bounds-checked. Non-detailed (overlay): outer
-                 * bounds box — keeps the all-props line load tiny + crash-safe. */
+                /* Never substitute the triangle mesh's outer bounds. */
                 case JCE_SHAPE_TRIANGLE_MESH:
-                    if (detailed) push_trimesh(segs, ch, col);
-                    else          push_hull_bounds(segs, ch, col);
+                    push_trimesh(segs, ch, col,
+                                 detailed ? kSelectedTriSegs : kPreviewTriSegs);
                     break;
                 default:                      push_hull_bounds(segs, ch, col);  break;
                 }
@@ -280,45 +292,8 @@ const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc,
             jce_collider_cooked_free(&cooked);
         }
 
-        /* Fallback: the cook produced no drawable wireframe (e.g. a TRIANGLE
-         * MESH child whose vertices/indices are serialized to the .jcol blob
-         * but NOT retained in the in-memory cooked child — push_trimesh then
-         * sees null and draws nothing). Draw the model's bounding box from the
-         * loaded parts so a compound collider is never invisible in the overlay. */
-        if (segs.empty()) {
-            bool have = false;
-            float mn[3] = { 0, 0, 0 }, mx[3] = { 0, 0, 0 };
-            for (uint32_t pi = 0; pi < parts.count; ++pi) {
-                const float *vp = in[pi].vertices;
-                if (!vp) continue;
-                for (uint32_t vi = 0; vi < in[pi].vertex_count; ++vi) {
-                    const float *p = &vp[vi * 3u];
-                    if (!have) {
-                        mn[0]=mx[0]=p[0]; mn[1]=mx[1]=p[1]; mn[2]=mx[2]=p[2];
-                        have = true;
-                    } else {
-                        for (int k = 0; k < 3; ++k) {
-                            if (p[k] < mn[k]) mn[k] = p[k];
-                            if (p[k] > mx[k]) mx[k] = p[k];
-                        }
-                    }
-                }
-            }
-            if (have) {
-                jce_vec3 cr[8]; int n = 0;
-                for (int a = 0; a < 2; ++a)
-                for (int b = 0; b < 2; ++b)
-                for (int c2 = 0; c2 < 2; ++c2)
-                    cr[n++] = v3(a ? mx[0] : mn[0], b ? mx[1] : mn[1],
-                                 c2 ? mx[2] : mn[2]);
-                static const int e[12][2] = {
-                    {0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
-                    {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}
-                };
-                for (auto &pr : e)
-                    segs.push_back({ cr[pr[0]], cr[pr[1]], kPalette[0] });
-            }
-        }
+        /* A failed/missing cook has no known fitted shape. Do not replace it
+         * with the render mesh bounds and imply that box exists in physics. */
     }
     /* One-shot diagnostic: pinpoint where a model fails (resolve/load/cook). */
     {
@@ -360,14 +335,14 @@ extern "C" void jce_gizmo_compound_collider_draw_from_component(
     const std::vector<Seg> *segs = get_or_build(cc, detailed);
     if (!segs || segs->empty()) return;
 
-    JceTransform *t = jce_scene_get_transform(scene, owner);
-    jce_vec3 pos   = t ? t->position : v3(0, 0, 0);
-    jce_quat rot   = t ? t->rotation : jce_q_identity();
-    jce_vec3 scale = t ? t->scale    : v3(1, 1, 1);
-
+    jce_vec3 pos = v3(0, 0, 0);
+    jce_quat rot = jce_q_identity();
+    if (!jce_scene_get_world_pose(scene, owner, &pos, &rot, nullptr)) return;
+    /* Cooked mesh/compound runtime bodies consume world position+rotation;
+     * imported part transforms are baked by the cook. Entity scale is not
+     * applied by that runtime owner, so this preview must not invent it. */
     auto xform = [&](jce_vec3 m) -> jce_vec3 {
-        jce_vec3 s = v3(m.x * scale.x, m.y * scale.y, m.z * scale.z);
-        return jce_v3_add(pos, jce_q_rotate(rot, s));
+        return jce_v3_add(pos, jce_q_rotate(rot, m));
     };
 
     for (const Seg &sg : *segs)

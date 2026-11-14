@@ -31,8 +31,9 @@ typedef struct SrCloudTemporal SrCloudTemporal;
 #include "jce_sr_grass_gate_internal.h"
 #include "jce_sr_model_diagnostics.h"
 #include "jce_sr_model_deps.h"
+#include "jce_sr_ibl_refresh.h"
 
-
+#define SR_FCLUSTER_CACHE_CAPACITY 64
 /* Ratio of cloud-base wind to the surface wind the environment carries.
  * Surface wind is slowed by friction with the ground; the free-atmosphere wind
  * above the boundary layer is typically two to four times it. */
@@ -542,6 +543,9 @@ struct JceSceneRenderer {
      * body that stops being submerged stops tinting -- a sticky flag would
      * leave the whole screen underwater after the camera surfaced. */
     struct JceUnderwater      *underwater;
+    uint32_t                   underwater_retry_frame;
+    uint64_t                   underwater_retry_context;
+    bool                       underwater_retry_pending;
     bool                       underwater_frame;
     /* Sticky: this scene contains water with absorption authored, so the
      * base+17 view slot must be reserved even on frames the camera is
@@ -989,10 +993,11 @@ struct JceSceneRenderer {
      * evaluable (jce_sky_radiance is pure math), so it can feed exactly the
      * same bake the HDR path uses.
      *
-     * `sky_ibl_key` identifies what the CURRENT ibl_data was baked for, and
-     * doubles as the staleness key for an in-flight sky bake -- ibl_job_hdr
-     * cannot serve, because a sky bake has no HDR path to compare. */
+     * The numeric snapshot identifies the last admitted sky bake. It is
+     * invalidated on failure or HDR transitions; the formatted key is only
+     * for diagnostics and never compared back to unrounded scene values. */
     char                     sky_ibl_key[96];
+    SrSkyIblSnapshot          sky_ibl_snapshot;
     uint64_t                 sky_ibl_t0;       /* submit stamp, main thread   */
     float                    sky_ibl_bake_ms;  /* submit -> collected, ms     */
     float                    sky_ibl_work_ms;  /* the convolution itself, ms  */
@@ -1350,6 +1355,10 @@ struct JceSceneRenderer {
         uint16_t               caustic_fft_resolution;
         int                    fft_res;        /* resolution fft_tex was sized for */
     } water_cache[16];
+    uint32_t              water_mesh_retry_frame;
+    uint64_t              water_mesh_retry_context;
+    bool                  water_mesh_retry_pending;
+    bool                  water_mesh_failure_logged;
     bgfx_program_handle_t prog_water;
     bgfx_program_handle_t prog_water_physical; /* desktop compatibility */
     bool                  water_prog_tried;
@@ -1518,7 +1527,7 @@ struct JceSceneRenderer {
         float     *inst;        /* count * 8 floats: pos.xyz,scale, nrm.xyz,phase */
         uint32_t   inst_cap;    /* floats */
         JceMesh   *expanded_mesh; /* compatibility desktop GL card geometry */
-    } fcluster_cache[48];
+    } fcluster_cache[SR_FCLUSTER_CACHE_CAPACITY];
     JceMesh              *fcluster_quad;        /* shared 1x1 billboard card */
     uint32_t              fcluster_submit_reported_reasons; /* first rejection per owner, not current state */
     JceMesh              *fcluster_shadow_sphere; /* unit sphere: soft blob shadow proxy */
@@ -1527,6 +1536,10 @@ struct JceSceneRenderer {
                                                   * REAL alpha-tested wind-animated
                                                   * leaf shadows (sphere = fallback) */
     bool                  fcluster_prog_tried;
+    uint32_t              fcluster_retry_frame;
+    uint64_t              fcluster_retry_context;
+    bool                  fcluster_retry_pending;
+    bool                  fcluster_allocation_failure_logged;
     bool                  fcluster_expanded_cards;
     bool                  fcluster_gl21_colour_reported;
     bool                  fcluster_gl21_shadow_reported;

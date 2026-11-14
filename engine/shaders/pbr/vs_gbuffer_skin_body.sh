@@ -45,6 +45,9 @@ int decode_bone_index_clamped(float raw_index)
 
 void main()
 {
+#if defined(JCE_DEPTH_ALPHA)
+    v_texcoord0 = a_texcoord0.xy;
+#endif
 	int i0 = decode_bone_index_clamped(a_indices.x);
 	int i1 = decode_bone_index_clamped(a_indices.y);
 	int i2 = decode_bone_index_clamped(a_indices.z);

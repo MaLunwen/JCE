@@ -427,7 +427,7 @@ def msvc_env(t: dict) -> dict:
     base["PATH"] = os.pathsep.join(
         tool_dirs + [fr"{_sr}\System32", _sr, fr"{_sr}\System32\Wbem"])
     out = subprocess.check_output(
-        f'"{vc}" {arch} >nul 2>&1 && set', shell=True, text=True, env=base)
+        f'"{vc}" {arch} -vcvars_ver={_VC_TOOLSET_PREFIX} >nul 2>&1 && set', shell=True, text=True, env=base)
     env = {}
     for line in out.splitlines():
         if "=" in line:
@@ -776,9 +776,24 @@ def web_toolchain_conan_args(em: dict, env: dict) -> list[str]:
     return host_args
 
 
+def conan_rebuild_names(names) -> tuple[str, ...]:
+    """Admit explicit package names without accepting Conan reference patterns."""
+    if isinstance(names, (str, bytes)):
+        raise ValueError("dependency rebuild names must be a sequence of package names")
+    result = []
+    for name in names:
+        if not isinstance(name, str) or re.fullmatch(r"[a-z0-9][a-z0-9_.+-]{0,99}", name) is None:
+            raise ValueError("dependency rebuild requires a simple lowercase Conan package name "
+                             "(1..100 characters), not a reference or pattern")
+        if name not in result:
+            result.append(name)
+    return tuple(result)
+
+
 @_cache_owned(lambda values: [conan_dir(values["t"])])
-def conan_install(t: dict, config: str, env: dict) -> Path:
+def conan_install(t: dict, config: str, env: dict, *, rebuild_dependencies=()) -> Path:
     """Reuse generated Conan metadata only while all owned graph inputs match."""
+    rebuild_dependencies = conan_rebuild_names(rebuild_dependencies)
     env = dict(env)
     env.setdefault("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
     tc = toolchain_path(t, config)
@@ -804,11 +819,9 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
         extra = ["-s", "build_type=Debug"] if config == "Debug" else []
         if config == "Debug" and t["host"] == "windows":
             extra += ["-s", "compiler.runtime_type=Debug"]
-        vs_conf = []
-        if HOST == "windows":
-            vs = find_vs_install(t["arch"])
-            if vs:
-                vs_conf = ["-c", f"tools.microsoft.msbuild:installation_path={vs}"]
+        from tools.build.conan_msvc import configuration as msvc_configuration
+        vs_conf = msvc_configuration(t, env, host=HOST, arch_dirs=_ARCH_CLDIR,
+                                     toolset_prefix=_VC_TOOLSET_PREFIX, dry_run=DRY_RUN)
         command = ["conan", "install", ".",
                    "-pr:h", f"conan/profiles/{t['profile']}",
                    "-pr:b", f"conan/profiles/{host_build_profile()}",
@@ -823,16 +836,21 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
         current = stamp.read_text(encoding="ascii").strip()
     except OSError:
         current = None
-    if graphics_tier_matches(tc, graphics_tier) and current == fingerprint:
+    if not rebuild_dependencies and graphics_tier_matches(tc, graphics_tier) and current == fingerprint:
         log(f"Conan metadata inputs unchanged ({config}): {tc} (reuse)")
         return tc
-    log(f"Conan metadata changed, missing or unstamped ({config}); regenerating")
+    if rebuild_dependencies:
+        log("Conan explicit dependency rebuild requested: " + ", ".join(rebuild_dependencies))
+    else:
+        log(f"Conan metadata changed, missing or unstamped ({config}); regenerating")
     # Failed installs must never bless partially rewritten metadata. Preserve
     # build trees and packages; invalidate only our own success marker.
     if not DRY_RUN:
         stamp.unlink(missing_ok=True)
     export_conan_recipes(env)
-    run(command, env=env, cwd=ROOT)
+    # Rebuilding is a one-invocation action, not a different dependency graph.
+    # Keep the normal fingerprint so the next ordinary preparation can reuse it.
+    run([*command, *("--build=" + name + "/*" for name in rebuild_dependencies)], env=env, cwd=ROOT)
     if not tc.exists() and not DRY_RUN:
         die(f"conan toolchain not generated: {tc}")
     stamp_graphics_tier(tc, graphics_tier)
@@ -1579,10 +1597,7 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
             die("cross build requires a runnable host shaderc; build the native "
                 "SDK/host tools first or set JCE_SHADERC_EXECUTABLE")
         overrides += [f"-DJCE_SHADERC_EXECUTABLE={sc}"]
-    # Conan regenerates a root CMakeUserPresets.json that breaks `cmake --preset`
-    # (duplicate conan-release across targets). We use our own presets, so drop it.
-    if not DRY_RUN:
-        (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
+    # Conan generation is disabled at the recipe; preserve local IDE user presets.
     if is_wasm:
         # No wasm preset: configure explicitly through the Emscripten toolchain.
         tc = toolchain_path(t, config)
@@ -2269,8 +2284,7 @@ def _editor_asan(t: dict, env: dict) -> None:
     conan_install(t, "Release", env)
     flags = ("/MD /O1 /Ob1 /Zi /DNDEBUG /fsanitize=address /Oy- /FS "
              "/D_DISABLE_STRING_ANNOTATION=1 /D_DISABLE_VECTOR_ANNOTATION=1")
-    if not DRY_RUN:
-        (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
+    # CMakeUserPresets.json belongs to local IDE configuration.
     run(["cmake", "-S", str(ROOT), "-B", str(bdir), "-G", "Ninja",
          f"-DCMAKE_TOOLCHAIN_FILE={toolchain_path(t, 'Release')}",
          "-DCMAKE_BUILD_TYPE=Release", "-DJCE_BUILD_VARIANT=asan",
@@ -2526,8 +2540,7 @@ def cmd_editor(args) -> None:
         sc = find_host_shaderc()
         if sc:
             overrides.append(f"-DJCE_SHADERC_EXECUTABLE={sc}")
-    if not DRY_RUN:
-        (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
+    # CMakeUserPresets.json belongs to local IDE configuration.
     run(["cmake", "--preset", preset, "-B", str(bdir), *overrides], env=env, cwd=ROOT)
     run(["cmake", "--build", str(bdir), "--target", "JCE_Editor"], env=env, cwd=ROOT)
     attach_binsize_reports(t, args.variant, bdir)
@@ -3571,8 +3584,7 @@ def cmd_test(args) -> None:
     build_dir = preset_binary_dir(tgt, variant)
     if getattr(args, "configure", False):
         conan_install(tgt, "Debug" if variant == "debug" else "Release", env)
-        if not DRY_RUN:
-            (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
+        # CMakeUserPresets.json belongs to local IDE configuration.
         sdk_flags = []
         if sdk_selected:
             sdk_flags = [f"-DJCE_TEST_SDK_DIR={Path(sdk).resolve().as_posix()}",
@@ -3916,6 +3928,15 @@ def cmd_xp_probe(args) -> None:
         die(f"XP probe failed with code {result.returncode}")
 
 
+def cmd_ide(args) -> None:
+    """Prepare IDE presets through the shared compiler and dependency owners."""
+    from tools.build.ide import prepare
+    try:
+        prepare(argparse.Namespace(**globals()), args)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        die("ide: " + str(error))
+
+
 # ── argparse ──────────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="jce.py", description="JCE unified build driver")
@@ -4087,6 +4108,18 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--phase", choices=("prepare", "resolve", "dependencies", "configure", "build", "audit"),
                     default="build", help="XP editor only: stage to execute")
     sp.set_defaults(func=dispatch_editor)
+
+    sp = sub.add_parser("ide", help="prepare the canonical native Windows IDE preset (no JCE target build)")
+    add_arch(sp)
+    add_variant(sp, ["release", "debug", "dist"], "release")
+    add_graphics_api_tier(sp)
+    sp.add_argument("--prepare-only", action="store_true", help="prepare dependencies/local IDE settings without CMake configure")
+    sp.add_argument("--rebuild-dependency", action="append", default=[], metavar="NAME",
+                    help="rebuild one named Conan dependency from source with the selected toolchain (repeatable)")
+    sp.add_argument("--vscode", action="store_true", help="back up and update selected local VS Code JSONC settings")
+    sp.add_argument("--shader-build-dir", type=Path, help="explicit existing shader build for optional Modkit configuration")
+    sp.add_argument("--rollback-local", type=Path, help="restore one IDE local backup after exact current/backup hash checks")
+    sp.set_defaults(func=cmd_ide)
 
     sp = sub.add_parser("host-tools", help="build host jce_pak/jce_cook/jce_bin2obj")
     add_arch(sp)

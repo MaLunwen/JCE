@@ -109,13 +109,21 @@ static uint32_t cloud_hash_u32(uint32_t v)
     return v;
 }
 
-static uint32_t cloud_hash3(uint32_t x, uint32_t y, uint32_t z, uint32_t seed)
+static uint32_t cloud_hash_xy(uint32_t x, uint32_t y, uint32_t seed)
 {
     uint32_t h = cloud_hash_u32(seed ^ 0x9e3779b9u);
     h = cloud_hash_u32(h ^ (x * 0x85ebca6bu));
-    h = cloud_hash_u32(h ^ (y * 0xc2b2ae35u));
-    h = cloud_hash_u32(h ^ (z * 0x27d4eb2fu));
-    return h;
+    return cloud_hash_u32(h ^ (y * 0xc2b2ae35u));
+}
+
+static uint32_t cloud_hash_z(uint32_t xy, uint32_t z)
+{
+    return cloud_hash_u32(xy ^ (z * 0x27d4eb2fu));
+}
+
+static uint32_t cloud_hash3(uint32_t x, uint32_t y, uint32_t z, uint32_t seed)
+{
+    return cloud_hash_z(cloud_hash_xy(x, y, seed), z);
 }
 
 /* Wrap a lattice index into [0,F). F is guaranteed >= 1 by cloud_freq_cells. */
@@ -231,7 +239,19 @@ static float cloud_worley3(float gx, float gy, float gz, uint32_t F, uint32_t se
     const int32_t yi = (int32_t)floorf(gy);
     const int32_t zi = (int32_t)floorf(gz);
     float best2 = 4.0f; /* > any distance reachable in the 3x3x3 neighbourhood */
+    uint32_t xy[3][3];
+    uint32_t wz[3];
     int32_t dz;
+
+    /* All three Z planes share the same nine wrapped XY hash prefixes.
+     * Reuse integer work only; every cell visit and distance operation below
+     * retains its original order and unwrapped position. */
+    for (int32_t dy = -1; dy <= 1; ++dy) {
+        const uint32_t wy = cloud_wrapi(yi + dy, F);
+        wz[dy + 1] = cloud_wrapi(zi + dy, F);
+        for (int32_t dx = -1; dx <= 1; ++dx)
+            xy[dy + 1][dx + 1] = cloud_hash_xy(cloud_wrapi(xi + dx, F), wy, seed);
+    }
 
     for (dz = -1; dz <= 1; ++dz) {
         int32_t dy;
@@ -243,9 +263,7 @@ static float cloud_worley3(float gx, float gy, float gz, uint32_t F, uint32_t se
                 const int32_t cz = zi + dz;
                 /* Position uses the UNWRAPPED cell, the hash uses the wrapped
                  * one: that is the whole tiling trick for cellular noise. */
-                const uint32_t h = cloud_hash3(cloud_wrapi(cx, F),
-                                               cloud_wrapi(cy, F),
-                                               cloud_wrapi(cz, F), seed);
+                const uint32_t h = cloud_hash_z(xy[dy + 1][dx + 1], wz[dz + 1]);
                 const float ox = (float)(h & 1023u) * (1.0f / 1024.0f);
                 const float oy = (float)((h >> 10) & 1023u) * (1.0f / 1024.0f);
                 const float oz = (float)((h >> 20) & 1023u) * (1.0f / 1024.0f);

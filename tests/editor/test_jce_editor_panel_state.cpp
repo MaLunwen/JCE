@@ -20,6 +20,7 @@ JceEditorConfig stored;
 bool source_found, allow_save;
 int saved_count = 64, save_calls, shutdown_hierarchy, shutdown_viewer, shutdown_tests;
 int shutdown_bundle_browser, init_console, shutdown_console;
+int init_assets_directory, shutdown_assets_directory;
 std::vector<std::string> shutdown_order;
 int warning_toasts, error_toasts;
 struct Record { JceLogLevel level; std::string tag, message; };
@@ -81,6 +82,10 @@ extern "C" void jce_file_viewer_shutdown(void)
 void jce_editor_lan_discovery_shutdown(void) {}
 extern "C" void jce_editor_panel_test_runner_shutdown(void)
 { ++shutdown_tests; shutdown_order.emplace_back("test_runner"); }
+extern "C" void jce_editor_assets_directory_init(void)
+{ ++init_assets_directory; }
+extern "C" void jce_editor_assets_directory_shutdown(void)
+{ ++shutdown_assets_directory; shutdown_order.emplace_back("assets_directory"); }
 extern "C" void jce_editor_panel_console_init(void)
 { ++init_console; }
 extern "C" void jce_editor_panel_console_shutdown(void)
@@ -125,8 +130,11 @@ TEST_CASE("reinitializing panel lifecycle cannot keep unsaved specialized visibi
 {
     seed(false, JCE_EDITOR_PANELS_MASK_UNSET, 0, 64);
     const int old_console_init = init_console;
+    const int old_assets_init = init_assets_directory;
+    const int old_assets_shutdown = shutdown_assets_directory;
     jce_editor_panels_init();
     CHECK(init_console == old_console_init + 1);
+    CHECK(init_assets_directory == old_assets_init + 1);
     const JceEditorPanel panels[] = {
         JCE_PANEL_BUILD_PROFILES, JCE_PANEL_TEST_RUNNER, JCE_PANEL_VFX_GRAPH,
         JCE_PANEL_USER_GUIDE, JCE_PANEL_RENDER_PIPELINE, JCE_PANEL_PROFILE_ANALYZER
@@ -138,8 +146,9 @@ TEST_CASE("reinitializing panel lifecycle cannot keep unsaved specialized visibi
     shutdown_order.clear();
     jce_editor_panels_shutdown();
     CHECK(shutdown_bundle_browser == old_bundle_browser + 1);
+    CHECK(shutdown_assets_directory == old_assets_shutdown + 1);
     const std::vector<std::string> expected_shutdown_order = {
-        "bundle_browser", "test_runner", "hierarchy", "file_viewer", "console"
+        "bundle_browser", "test_runner", "assets_directory", "hierarchy", "file_viewer", "console"
     };
     CHECK(shutdown_order == expected_shutdown_order);
     CHECK(shutdown_hierarchy == old_hierarchy + 1);
@@ -147,8 +156,10 @@ TEST_CASE("reinitializing panel lifecycle cannot keep unsaved specialized visibi
     CHECK(shutdown_viewer == old_viewer + 1);
     CHECK(shutdown_console == old_console + 1);
     CHECK(init_console == old_console_init + 1);
+    CHECK(init_assets_directory == old_assets_init + 1);
     jce_editor_panels_init();
     CHECK(init_console == old_console_init + 2);
+    CHECK(init_assets_directory == old_assets_init + 2);
     for (auto panel : panels) CHECK_FALSE(visible(panel));
     CHECK(visible(JCE_PANEL_SCENE_VIEW));
 }

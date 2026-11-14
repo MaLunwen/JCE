@@ -10,6 +10,7 @@
 #define JCE_PHYSICS_INTERNAL_H
 
 #include <jce/middleware/physics/jce_physics_material.h>
+#include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/physics/jce_physics_types.h>
 #include <jce/os/core/jce_math.h>
 
@@ -297,6 +298,9 @@ typedef void (*jce_bullet_line_fn)(float fx, float fy, float fz,
  * values exposed by JcePhysicsDebugFlag).  Installs / removes the
  * btIDebugDraw subclass on first non-zero / zero transition. */
 void jce_bullet_debug_set_mode(JceBulletWorld *bw, uint32_t flags);
+bool jce_bullet_debug_query_shapes(JceBulletWorld *bw,
+    const JcePhysicsDebugQuery *query, jce_debug_line_fn sink, void *userdata,
+    JcePhysicsDebugQueryStats *stats);
 
 /* Drive Bullet's debug-draw pass and forward every line to `fn`.
  * No-op when the installed mode is 0 or `fn` is NULL. */

@@ -25,7 +25,9 @@ static unsigned char data[4 * 32];
 static float instances[4 * 8];
 static JceSceneRenderer renderer;
 static JceFoliageClusterComponent field;
-static jce_vec3 position;
+static jce_vec3 position, sun_color;
+static float sun_intensity;
+static bool sun_present;
 static const JceCamera *camera;
 static int mode, cvar_token;
 static uint32_t instance_count;
@@ -218,8 +220,12 @@ static JceRendererApiInfo api_info_port(void)
 bool sr_resolve_primary_dir_light(JceSceneRenderer *sr, JceScene *scene, EntityList *list,
     bool shadow_only, jce_vec3 *to_light, jce_vec3 *color, float *intensity)
 {
-    (void)scene; (void)list; (void)color; (void)intensity; TEST_ASSERT_EQUAL_PTR(&renderer, sr);
-    TEST_ASSERT_FALSE(shadow_only); *to_light = jce_v3(.2f, .9f, .3f); ++resources; return true;
+    (void)scene; (void)list; TEST_ASSERT_EQUAL_PTR(&renderer, sr);
+    TEST_ASSERT_FALSE(shadow_only); ++resources;
+    if (!sun_present) return false;
+    *to_light = jce_v3(.2f, .9f, .3f);
+    TEST_ASSERT_NOT_NULL(color); TEST_ASSERT_NOT_NULL(intensity);
+    *color = sun_color; *intensity = sun_intensity; return true;
 }
 JceTexture sr_resolve_texture(JceSceneRenderer *sr, const char *path)
 { TEST_ASSERT_EQUAL_PTR(&renderer, sr); TEST_ASSERT_EQUAL_STRING("leaf.png", path); ++resources; return (JceTexture){77u}; }
@@ -244,6 +250,7 @@ void setUp(void)
     memset(uniforms, 0, sizeof uniforms); memset(draws, 0, sizeof draws); memset(&s_lu, 0, sizeof s_lu);
     names = submits = acquires = textures_created = allocations = resources = 0u;
     instance_queries = 0u; expanded = false;
+    sun_color = jce_v3(1, 1, 1); sun_intensity = 1.0f; sun_present = true;
     available_count = allocated_count = 4u; null_allocation = false; shadows_enabled = true;
     vertex_handle = 21u; index_handle = 22u; mode = 9; state = 0u; instance_count = 0u;
     position = jce_v3(4, 8, -12); camera = (const JceCamera *)&position;
@@ -382,6 +389,31 @@ static void absent_camera_fog_and_alpha_keep_neutral_final_values(void)
     camera = NULL; field.alpha_tex[0] = '\0'; renderer.fog_frame.params[0] = 0;
     mode = 10; TEST_ASSERT_EQUAL_UINT32(3u, emit().accepted); expect_draw(0u, true);
 }
+static void night_rgb_and_ambient_are_rebound_without_an_emission_floor(void)
+{
+    JceLightEnv environment;
+    memset(&environment, 0, sizeof environment);
+    renderer.light_env = &environment;
+    sun_color = jce_v3(.006f, .012f, .03f); sun_intensity = 1.0f;
+    jce_light_env_set_ambient(&environment, jce_v3(.06f, .08f, .15f), .2f);
+    TEST_ASSERT_EQUAL_UINT32(3u, emit().accepted);
+    const float night[3] = {.0072f, .0224f, .072f};
+    Uniform *colors = named(draws[0], "u_foliage_colors");
+    TEST_ASSERT_EQUAL_UINT(1u, colors->writes);
+    for (unsigned i = 0; i < 3u; ++i)
+        TEST_ASSERT_FLOAT_WITHIN(.000001f, night[i], colors->value[12u + i]);
+
+    /* Removing the sun and ambient must clear the next accepted draw;
+     * stale light or a scalar-one ToD sun cannot keep the palette bright. */
+    sun_present = false; renderer.light_env = NULL;
+    TEST_ASSERT_EQUAL_UINT32(3u, emit().accepted);
+    colors = named(draws[1], "u_foliage_colors");
+    TEST_ASSERT_EQUAL_UINT(1u, colors->writes);
+    const float dark[3] = {0, 0, 0};
+    TEST_ASSERT_EQUAL_FLOAT_ARRAY(dark, colors->value + 12u, 3u);
+    no_pending_writes();
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -391,5 +423,6 @@ int main(void)
     RUN_TEST(expanded_cards_submit_full_geometry_without_instance_capacity);
     RUN_TEST(disabled_shadow_modes_publish_zero_splits_without_shadow_samplers);
     RUN_TEST(absent_camera_fog_and_alpha_keep_neutral_final_values);
+    RUN_TEST(night_rgb_and_ambient_are_rebound_without_an_emission_floor);
     return UNITY_END();
 }

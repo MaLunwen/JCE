@@ -60,6 +60,9 @@ ALLOWED = {
     "engine/src/middleware/scene/jce_sr_environment.c",
     "engine/src/middleware/scene/jce_sr_draw.c",
     "engine/src/middleware/scene/jce_scene_renderer.c",
+    # Private body selector delegates to jce_environment_key_direction. It
+    # consumes the existing snapshot without a second clock or light curve.
+    "engine/src/middleware/scene/jce_sr_tod_key.h",
     # Type-only includes: the renderer struct HOLDS a JceTimeOfDayState member
     # and the public renderer header exposes a time-of-day setter, so both need
     # the declaration.  Neither computes lighting; they only carry the type.

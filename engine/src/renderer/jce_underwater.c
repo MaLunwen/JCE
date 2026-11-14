@@ -27,6 +27,14 @@ struct JceUnderwater {
     bool destination_refusal_logged;
 };
 
+static bool underwater_ready(const JceUnderwater *u)
+{
+    return u && u->vbh.idx != UINT16_MAX && u->ibh.idx != UINT16_MAX &&
+        u->prog.idx != UINT16_MAX && u->u_sigma.idx != UINT16_MAX &&
+        u->u_tint.idx != UINT16_MAX && u->u_params.idx != UINT16_MAX &&
+        u->s_depth.idx != UINT16_MAX;
+}
+
 JceUnderwater *jce_underwater_create(const JcePakArchive *pak)
 {
     const char *sfx = jce_shader_backend_suffix();
@@ -34,6 +42,12 @@ JceUnderwater *jce_underwater_create(const JcePakArchive *pak)
 
     JceUnderwater *u = (JceUnderwater *)JCE_CALLOC(1, sizeof(*u));
     if (!u) return NULL;
+    /* Zero is a live bgfx handle. Every unacquired owner starts INVALID so
+     * the ordinary destructor is safe at every partial initialization edge. */
+    u->vbh.idx = u->ibh.idx = u->prog.idx = UINT16_MAX;
+    u->u_sigma.idx = u->u_tint.idx = u->u_params.idx = u->s_depth.idx = UINT16_MAX;
+    bgfx_shader_handle_t vsh = { UINT16_MAX }, fsh = { UINT16_MAX };
+    const char *failure = "vertex_staging_allocation";
 
     bgfx_vertex_layout_begin(&u->layout, BGFX_RENDERER_TYPE_NOOP);
     bgfx_vertex_layout_add(&u->layout, BGFX_ATTRIB_POSITION,  2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
@@ -47,30 +61,62 @@ JceUnderwater *jce_underwater_create(const JcePakArchive *pak)
         { { -1.0f,  1.0f }, { 0.0f, 0.0f } },
     };
     static const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
-    u->vbh = bgfx_create_vertex_buffer(bgfx_copy(verts, sizeof(verts)),
-                                       &u->layout, BGFX_BUFFER_NONE);
-    u->ibh = bgfx_create_index_buffer(bgfx_copy(idx, sizeof(idx)), BGFX_BUFFER_NONE);
+    const bgfx_memory_t *vmem = bgfx_copy(verts, sizeof(verts));
+    if (!vmem) goto failed;
+    u->vbh = bgfx_create_vertex_buffer(vmem, &u->layout, BGFX_BUFFER_NONE);
+    failure = "vertex_buffer_allocation";
+    if (u->vbh.idx == UINT16_MAX) goto failed;
+    const bgfx_memory_t *imem = bgfx_copy(idx, sizeof(idx));
+    failure = "index_staging_allocation";
+    if (!imem) goto failed;
+    u->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_NONE);
+    failure = "index_buffer_allocation";
+    if (u->ibh.idx == UINT16_MAX) goto failed;
 
-    /* Reuses the postfx fullscreen vertex shader: the quad and the varying are
-     * identical, and a second copy would be a second thing to keep in step. */
-    bgfx_shader_handle_t vsh = jce_shader_load_from_pak(pak, "vs_postfx",     sfx, LOG_TAG);
-    bgfx_shader_handle_t fsh = jce_shader_load_from_pak(pak, "fs_underwater", sfx, LOG_TAG);
-    if (vsh.idx == UINT16_MAX || fsh.idx == UINT16_MAX) {
-        LOG_ERROR(LOG_TAG, "shader load failed");
-        if (vsh.idx != UINT16_MAX) bgfx_destroy_shader(vsh);
-        if (fsh.idx != UINT16_MAX) bgfx_destroy_shader(fsh);
-        bgfx_destroy_vertex_buffer(u->vbh);
-        bgfx_destroy_index_buffer(u->ibh);
-        JCE_FREE(u);
-        return NULL;
-    }
-    u->prog = bgfx_create_program(vsh, fsh, true);
+    vsh = jce_shader_load_from_pak(pak, "vs_postfx", sfx, LOG_TAG);
+    failure = "vertex_shader_acquisition";
+    if (vsh.idx == UINT16_MAX) goto failed;
+    fsh = jce_shader_load_from_pak(pak, "fs_underwater", sfx, LOG_TAG);
+    failure = "fragment_shader_acquisition";
+    if (fsh.idx == UINT16_MAX) goto failed;
+    /* Creator references are released explicitly on both link outcomes. */
+    u->prog = bgfx_create_program(vsh, fsh, false);
+    bgfx_destroy_shader(vsh); vsh.idx = UINT16_MAX;
+    bgfx_destroy_shader(fsh); fsh.idx = UINT16_MAX;
+    failure = "program_link";
+    if (u->prog.idx == UINT16_MAX) goto failed;
 
-    u->u_sigma  = bgfx_create_uniform("u_uw_sigma",  BGFX_UNIFORM_TYPE_VEC4, 1);
-    u->u_tint   = bgfx_create_uniform("u_uw_tint",   BGFX_UNIFORM_TYPE_VEC4, 1);
+    u->u_sigma = bgfx_create_uniform("u_uw_sigma", BGFX_UNIFORM_TYPE_VEC4, 1);
+    failure = "sigma_uniform_allocation";
+    if (u->u_sigma.idx == UINT16_MAX) goto failed;
+    u->u_tint = bgfx_create_uniform("u_uw_tint", BGFX_UNIFORM_TYPE_VEC4, 1);
+    failure = "tint_uniform_allocation";
+    if (u->u_tint.idx == UINT16_MAX) goto failed;
     u->u_params = bgfx_create_uniform("u_uw_params", BGFX_UNIFORM_TYPE_VEC4, 1);
-    u->s_depth  = bgfx_create_uniform("s_uw_depth",  BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    failure = "params_uniform_allocation";
+    if (u->u_params.idx == UINT16_MAX) goto failed;
+    u->s_depth = bgfx_create_uniform("s_uw_depth", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    failure = "depth_sampler_allocation";
+    if (u->s_depth.idx == UINT16_MAX) goto failed;
     return u;
+
+failed:
+    if (vsh.idx != UINT16_MAX) bgfx_destroy_shader(vsh);
+    if (fsh.idx != UINT16_MAX) bgfx_destroy_shader(fsh);
+    {
+        /* Backend statistics can lag queued creates/destroys. These are
+         * observed handle counts, not VRAM exhaustion or leak diagnoses. */
+        const bgfx_stats_t *st = bgfx_get_stats();
+        const bgfx_caps_t *caps = bgfx_get_caps();
+        LOG_WARN(LOG_TAG, "resource initialization refused reason=%s "
+            "backend_ib=%d/%d backend_vb=%d/%d (unavailable=-1; pending requests unmeasured)",
+            failure, st ? (int)st->numIndexBuffers : -1,
+            caps ? (int)caps->limits.maxIndexBuffers : -1,
+            st ? (int)st->numVertexBuffers : -1,
+            caps ? (int)caps->limits.maxVertexBuffers : -1);
+    }
+    jce_underwater_destroy(u);
+    return NULL;
 }
 
 void jce_underwater_destroy(JceUnderwater *u)
@@ -93,7 +139,7 @@ void jce_underwater_render(JceUnderwater *u, const JceRenderer *renderer,
                            const JceUnderwaterParams *p,
                            uint16_t view_id)
 {
-    if (!u || !p || u->prog.idx == UINT16_MAX) return;
+    if (!p || !underwater_ready(u)) return;
     if (depth_tex_handle == UINT16_MAX) return;
     if (width == 0u || height == 0u) return;
     /* No extinction is not "clear water", it is a caller that has nothing to

@@ -11,6 +11,8 @@
  */
 
 #include "jce_sr_internal.h"
+#include "renderer/jce_pbr_cull_override.h"
+#include "renderer/jce_model_depth_internal.h"
 #include <jce/renderer/jce_lighting_system.h>
 #include "jce_sr_probe.h"
 #include <jce/os/core/jce_timer.h>   /* JCE_CULL_KPI broad-phase timing */
@@ -279,6 +281,7 @@ static bool sr_try_push_bindpose_velocity(JceSceneRenderer *sr, JceScene *scene,
 
     SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
     if (!mc || !mc->model) return false;
+    if (jce_model_depth_masked(mc->model)) return false;
     if (!jce_scene_has_transform(scene, e)) return false;
     uint32_t nprims = jce_model_skinned_primitive_count(mc->model);
     if (nprims == 0) return false;
@@ -492,7 +495,8 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
     jce_mat4 node_lt;
     bool moved = (prev_model != NULL) &&
                  memcmp(prev_model->raw[0], model.raw[0], sizeof(float) * 16) != 0;
-    if (vel_inst_ready && !moved && vel_rq &&
+    if (vel_inst_ready && !moved && vel_rq && !(mr && mr->double_sided) &&
+        !jce_model_depth_masked(mc->model) &&
         jce_model_gpu_instanceable(mc->model, &node_lt)) {
         jce_mat4 world = jce_m4_multiply(&model, &node_lt);   /* fold node transform */
         uint32_t nd = jce_model_gpu_drawable_count(mc->model);
@@ -518,8 +522,10 @@ static bool sr_try_submit_model_velocity(JceSceneRenderer *sr, JceScene *scene,
     float gmat[4] = { rough, 0.0f, 0.0f, 0.0f };
     jce_enc_set_uniform(sr->u_gbuffer_mat, gmat, 1);
     jce_enc_set_uniform(sr->u_gbuffer_albedo, alb2, 1);
+    const bool previous_cull = jce_pbr_set_two_sided_override(mr && mr->double_sided);
     jce_model_draw_velocity(mc->model, sr->renderer, view_id, ctx,
                             &model, NULL, 0, prev_model, NULL, 0);
+    jce_pbr_set_two_sided_override(previous_cull);
     sr_prev_xform_store(sr, e, &model);
     return true;
 }

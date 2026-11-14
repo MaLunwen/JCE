@@ -9,6 +9,7 @@
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_renderer.h>
+#include "jce_debug_line_sample.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <math.h>
@@ -29,7 +30,7 @@ typedef struct {
  * wireframes for every prop (a graveyard scene is ~72k lines). 131072 lines =
  * 262144 verts = 4 MB static + up to 4 MB transient/frame, comfortably under
  * bgfx's 6 MB (393k-vert) default transient buffer. The flush clamps to what
- * actually fits, so this never blacks out the whole overlay. */
+ * actually fits; reduction samples across the entire queued line range. */
 #define MAX_DEBUG_LINES 131072
 
 static DebugVertex s_verts[MAX_DEBUG_LINES * 2];
@@ -260,17 +261,28 @@ void jce_debug_draw_flush(uint16_t view_id, const JceRenderer *renderer)
         s_layout_ready = true;
     }
 
-    /* Allocate transient vertex buffer. Draw as many whole lines as actually
-     * fit in the available transient memory rather than bailing on the whole
-     * batch — a partial overlay beats a blank one. */
+    /* The frame may have less transient memory left than the overlay's own
+     * budget. Keep whole lines distributed across the queue, not a prefix. */
     bgfx_transient_vertex_buffer_t tvb;
     uint32_t draw_count = s_vert_count;
     uint32_t avail = bgfx_get_avail_transient_vertex_buffer(draw_count, &s_layout);
     if (avail < draw_count) draw_count = avail & ~1u; /* whole lines only */
+    if (draw_count < s_vert_count) {
+        static bool s_transient_warned = false;
+        if (!s_transient_warned) {
+            s_transient_warned = true;
+            jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                "Transient capacity limits debug overlay to %u/%u lines; "
+                "sampling the complete queue (none if capacity is zero). "
+                "This display limit does not change collision geometry.",
+                draw_count / 2, s_vert_count / 2);
+        }
+    }
     if (draw_count < 2) goto done;
     bgfx_alloc_transient_vertex_buffer(&tvb, draw_count, &s_layout);
 
-    memcpy(tvb.data, s_verts, draw_count * sizeof(DebugVertex));
+    jce_debug_line_sample(tvb.data, s_verts, s_vert_count / 2,
+                         draw_count / 2, sizeof(DebugVertex) * 2);
 
     bgfx_set_transient_vertex_buffer(0, &tvb, 0, draw_count);
 
@@ -285,11 +297,11 @@ void jce_debug_draw_flush(uint16_t view_id, const JceRenderer *renderer)
         bgfx_set_transform(identity.raw[0], 1);
     }
 
-    /* Render state: lines, depth test, no blending. */
+    /* A collider edge may be coplanar with the visible floor. Admit equality
+     * and preserve scene depth; debug lines must not occlude later geometry. */
     uint64_t state = BGFX_STATE_WRITE_RGB
                    | BGFX_STATE_WRITE_A
-                   | BGFX_STATE_WRITE_Z
-                   | BGFX_STATE_DEPTH_TEST_LESS
+                   | BGFX_STATE_DEPTH_TEST_LEQUAL
                    | BGFX_STATE_PT_LINES
                    | BGFX_STATE_MSAA;
     bgfx_set_state(state, 0);

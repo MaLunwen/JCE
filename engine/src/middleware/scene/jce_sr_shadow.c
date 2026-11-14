@@ -1295,37 +1295,11 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     if (!sr_admit_directional_shadow(sr, scene, list, use_csm, &shadow_dir))
         return;
 
-    /* Capability-matrix U3: at night the moon is the key light.
-     *
-     * Below the horizon the resolver still returns the sun, so the cascades
-     * were fitted around a light underneath the world. This points them at the
-     * moon instead.
-     *
-     * ITS VISIBLE EFFECT IS CURRENTLY NIL, AND THAT IS NOT A REASON TO REMOVE
-     * IT -- it is the finding. Measured on a scene frozen at midnight, pixels
-     * moved by switching shadows off: 0.004% before this change, 0.000% after,
-     * against 4.7% by day. The cause is not the cascades: there is 506x less
-     * directional energy at night to occlude (mean |delta| 0.0033 vs 1.6698),
-     * because jce_time_of_day.c gives night a "moonlight TINT" -- a colour
-     * floor on the sun term -- and never a moon with radiance of its own.
-     *
-     * So the matrix's estimate for U3, "one call-site change in the CSM
-     * setup", is wrong: a shadow needs a light, and the moon is not one yet.
-     * This half is correct and guarded and costs nothing; the other half is
-     * plan section 8, and until it lands the right expectation for this line
-     * is that it changes no pixel.
-     *
-     * jce_environment_key_direction is the one predicate everything that picks
-     * a key light must share -- that is its stated reason for existing -- and
-     * shadow_dir is already in its convention, a unit vector TOWARD the light.
-     *
-     * GATED ON tod_active, and that guard is the whole safety of this change.
-     * Without a day/night cycle, sun_direction_ws is whatever the scene's
-     * directional light happens to be, and a light authored pointing upward
-     * (to_light.y < 0, which is perfectly legal and appears in stylised
-     * scenes) would read as night and flip every shadow to the antipode. A
-     * scene that opted into a cycle has asked for a sky where the sun sets;
-     * one that did not has not. */
+    /* ToD primary-light resolution and environment state share the same
+     * sun/moon predicate. The environment retains the actual sun direction;
+     * its selected key is the moon at night. Keep this guarded override
+     * consistent with that state, without flipping authored non-ToD lights.
+     * Correct directions alone do not establish visible night-shadow energy. */
     if (sr->tod_active && !jce_environment_is_daytime(sr->env))
         shadow_dir = jce_environment_key_direction(sr->env);
 
@@ -1890,12 +1864,13 @@ void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         sr->gpu_shadow_planes_valid = (nc > 0);
     }
 
-    /* World-anchored light-space basis (mirrors jce_csm.c) used by the
-     * per-cascade shadow-caster culling in the loops below. */
+    /* Read the actual atlas axes: rebuilding a separate light basis can cull
+     * against a rotated square after the cascade fitter changes its frame. */
     jce_vec3 scull_ld = jce_v3_normalize(light_dir);
-    jce_vec3 scull_upref = (fabsf(scull_ld.y) > 0.99f) ? jce_v3(0,0,1) : jce_v3(0,1,0);
-    jce_vec3 scull_right = jce_v3_normalize(jce_v3_cross(scull_ld, scull_upref));
-    jce_vec3 scull_up    = jce_v3_normalize(jce_v3_cross(scull_right, scull_ld));
+    jce_vec3 scull_right = jce_v3_normalize(jce_v3(csm.vp[0].raw[0][0],
+        csm.vp[0].raw[1][0], csm.vp[0].raw[2][0]));
+    jce_vec3 scull_up = jce_v3_normalize(jce_v3(csm.vp[0].raw[0][1],
+        csm.vp[0].raw[1][1], csm.vp[0].raw[2][1]));
 
     /* Dual shadow maps active this frame: needs the flag, percascade tracking
      * (dynamics in shadow_dyn), and a valid atlas.  When on, movers are NOT

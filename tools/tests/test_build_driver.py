@@ -48,18 +48,13 @@ class BuildDriverTests(unittest.TestCase):
             config.parent.mkdir(parents=True)
             config.write_text("fixture")
             project = root / "project"
-            output = project / "build/windows-wasm32-dist/App.html"
+            target = {"host": driver.HOST, "arch": "wasm32", "emscripten": True}
+            output = driver._app_build_dir(project, target, "dist") / "App.html"
             output.parent.mkdir(parents=True)
             output.write_text("unchanged artifact")
             args = SimpleNamespace(project=str(project), arch="wasm", sdk=sdk,
                 variant="dist", target=None, exe=None, registry_proof="actual-receipt.json",
                 delivery_profile="embedded", clean=False, configure_only=False)
-            target = {"host": driver.HOST, "arch": "wasm32", "emscripten": True}
-            # Host-dependent directory uses the actual target descriptor.
-            if driver.HOST != "windows":
-                moved = project / f"build/{driver.HOST}-wasm32-dist/App.html"
-                moved.parent.mkdir(parents=True)
-                output.rename(moved); output = moved
             delivery = Mock()
             delivery.profile.return_value = "embedded"
             digest = hashlib.sha256(output.read_bytes()).hexdigest()
@@ -449,6 +444,14 @@ class BuildDriverTests(unittest.TestCase):
                 target = {"host": host, "profile": "fixture", "arch": "x86_64",
                           "emscripten": web}
                 env = {"CMAKE_BUILD_PARALLEL_LEVEL": "2"}
+                if host == "windows":
+                    tools = root / "observed VS/VC/Tools/MSVC/14.44.00000/bin/Hostx64/x64"
+                    tools.mkdir(parents=True)
+                    for name in ("cl", "link", "cl.exe", "link.exe"):
+                        candidate = tools / name
+                        candidate.write_text("counted command port, never executed")
+                        candidate.chmod(0o755)
+                    env.update(PATH=str(tools), INCLUDE="counted include", LIB="counted lib")
                 em = {"toolchain": "fixture.cmake", "cc": "emcc", "cxx": "em++"}
                 commands = []
                 def capture(command, **kwargs):
@@ -469,6 +472,18 @@ class BuildDriverTests(unittest.TestCase):
                     self.assertEqual(len(commands), 1)  # old tree: no fingerprint
                     driver.conan_install(target, "Release", env)
                     self.assertEqual(len(commands), 1)  # identical inputs reused
+                    normal_command = list(commands[0])
+                    stamp = tc.parent / ".jce-conan-generation"
+                    normal_stamp = stamp.read_bytes()
+                    for attempt in range(2):
+                        driver.conan_install(target, "Release", env,
+                            rebuild_dependencies=("rmlui", "freetype", "rmlui"))
+                        self.assertEqual(len(commands), attempt + 2)
+                        self.assertEqual(commands[-1], normal_command +
+                                         ["--build=rmlui/*", "--build=freetype/*"])
+                        self.assertEqual(stamp.read_bytes(), normal_stamp)
+                    driver.conan_install(target, "Release", env)
+                    self.assertEqual(len(commands), 3)  # force was not persisted
                     for path in (recipe, profile, base, lock):
                         path.write_text(path.read_text() + "\n# changed")
                         count = len(commands)
@@ -508,8 +523,63 @@ class BuildDriverTests(unittest.TestCase):
                         self.assertEqual(len(commands), count + 1)
                         driver.conan_install(target, "Release", env)
                         self.assertEqual(len(commands), count + 1)
+                    if host == "windows" and not web:
+                        count = len(commands)
+                        selected = json.loads(next(value.split("=", 1)[1] for value in commands[-1]
+                            if value.startswith("tools.build:compiler_executables=")))
+                        self.assertEqual(Path(selected["c"]).parent, tools)
+                        self.assertEqual(selected["c"], selected["cpp"])
+                        changed = root / "other VS/VC/Tools/MSVC/14.43.34808/bin/Hostx64/x64"
+                        changed.mkdir(parents=True)
+                        for old in tools.iterdir():
+                            candidate = changed / old.name
+                            candidate.write_bytes(old.read_bytes()); candidate.chmod(0o755)
+                        env["PATH"] = str(changed)
+                        driver.conan_install(target, "Release", env)
+                        self.assertEqual(len(commands), count + 1)
+                        driver.conan_install(target, "Release", env)
+                        self.assertEqual(len(commands), count + 1)
                     self.assertEqual(sentinel.read_bytes(), b"cached native object")
                     self.assertTrue(tc.is_file())
+
+    def test_conan_rebuild_names_reject_references_patterns_and_unbounded_names(self):
+        driver = self.driver("jce_conan_rebuild_names_test")
+        self.assertEqual(driver.conan_rebuild_names(("rmlui", "quickjs-ng", "rmlui")),
+                         ("rmlui", "quickjs-ng"))
+        self.assertEqual(driver.conan_rebuild_names(()), ())
+        for name in ("", "*", "rmlui/*", "rmlui/6.2", "rmlui@owner/channel",
+                     " rmlui", "rmlui ", "rmlui\n", "--build=*", "RmlUi", "a" * 101, None):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                driver.conan_rebuild_names((name,))
+        with self.assertRaises(ValueError):
+            driver.conan_rebuild_names("rmlui")
+
+    def test_conan_rebuild_dry_run_prints_forced_request_without_writing(self):
+        driver = self.driver("jce_conan_rebuild_dry_run_test")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "conan").mkdir()
+            (root / "conanfile.py").write_text("# graph input\n")
+            tc = root / "conan_toolchain.cmake"
+            tc.write_text("# existing generator\n")
+            target = {"host": "linux", "profile": "fixture", "arch": "x86_64", "key": "fixture"}
+            with patch.object(driver, "ROOT", root), patch.object(driver, "HOST", "linux"), \
+                    patch.object(driver, "sync_conan_hooks"), patch.object(driver, "export_conan_recipes"), \
+                    patch.object(driver, "toolchain_path", return_value=tc), \
+                    patch.object(driver, "conan_dir", return_value=root), \
+                    patch.object(driver, "host_build_profile", return_value="fixture"):
+                with patch.object(driver, "run"):
+                    driver.conan_install(target, "Release", {})
+                before = {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file()}
+                output = io.StringIO()
+                with patch.object(driver, "DRY_RUN", True), contextlib.redirect_stdout(output), \
+                        patch.object(driver, "_cache_scope", side_effect=AssertionError("dry-run lease")), \
+                        patch.object(driver.subprocess, "Popen", side_effect=AssertionError("dry-run child")):
+                    driver.conan_install(target, "Release", {}, rebuild_dependencies=("rmlui",))
+                self.assertIn("--build=missing", output.getvalue())
+                self.assertIn("--build=rmlui/*", output.getvalue())
+                self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                                         for p in root.rglob("*") if p.is_file()})
 
     def test_bgfx_cpu_profiler_shared_args_are_explicit_and_refuse_invalid_values(self):
         driver = self.driver("jce_bgfx_profiler_args_test")
@@ -628,6 +698,8 @@ class BuildDriverTests(unittest.TestCase):
                     requested["CMAKE_BUILD_PARALLEL_LEVEL"] = raw
 
                 def activate(command, **kwargs):
+                    self.assertIn(" x64 -vcvars_ver=14.4 >nul", command,
+                                  "shared activation must select the profile family, not the VS default")
                     self.assertEqual(kwargs["env"].get("CMAKE_BUILD_PARALLEL_LEVEL"),
                                      raw, "clean MSVC must retain the requested job budget")
                     return "\n".join(f"{key}={value}" for key, value in {
@@ -673,6 +745,15 @@ class BuildDriverTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "install failed"):
                     driver.conan_install(target, "Release", {})
                 self.assertFalse(stamp.exists())
+                run.side_effect = None
+                driver.conan_install(target, "Release", {})
+                self.assertTrue(stamp.is_file())
+                run.side_effect = RuntimeError("explicit rebuild failed")
+                with self.assertRaisesRegex(RuntimeError, "explicit rebuild failed"):
+                    driver.conan_install(target, "Release", {}, rebuild_dependencies=("rmlui",))
+                self.assertIn("--build=rmlui/*", run.call_args.args[0])
+                self.assertFalse(stamp.exists())
+                self.assertTrue(tc.exists())
                 run.side_effect = None
                 driver.conan_install(target, "Release", {})
                 self.assertTrue(stamp.is_file())
@@ -765,11 +846,11 @@ class BuildDriverTests(unittest.TestCase):
             env = {"JCE_TEST_TOOLCHAIN": "sentinel"}
             args = SimpleNamespace(arch="x64", variant="debug", configure=True, jobs=2,
                                    filter="^test_fixture$", repeat_until_fail=20)
-            with patch.object(driver, "ROOT", root), patch.object(driver, "HOST", "linux"), patch.object(driver, "resolve_target", return_value={"key": "fixture"}), patch.object(driver, "preset_binary_dir", return_value=build) as binary, patch.object(driver, "preset_name", return_value="linux-x64-debug"), patch.object(driver, "msvc_env", return_value=env), patch.object(driver, "conan_install") as conan, patch.object(driver, "run") as run, patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+            with patch.object(driver, "ROOT", root), patch.object(driver, "HOST", "linux"), patch.object(driver, "resolve_target", return_value={"key": "linux-x64"}), patch.object(driver, "preset_binary_dir", return_value=build) as binary, patch.object(driver, "preset_name", return_value="linux-x64-debug"), patch.object(driver, "msvc_env", return_value=env), patch.object(driver, "conan_install") as conan, patch.object(driver, "run") as run, patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
                 driver.cmd_test(args)
             self.assertEqual(2, binary.call_count)
-            binary.assert_called_with({"key": "fixture"}, "debug")
-            conan.assert_called_once_with({"key": "fixture"}, "Debug", env)
+            binary.assert_called_with({"key": "linux-x64"}, "debug")
+            conan.assert_called_once_with({"key": "linux-x64"}, "Debug", env)
             self.assertIn("-DJCE_BUILD_TESTS=ON", run.call_args_list[0].args[0])
             self.assertIn("--preset", run.call_args_list[0].args[0])
             self.assertEqual(run.call_count, 3)  # configure, selected build, selected CTest
@@ -907,6 +988,7 @@ class BuildDriverTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("jce_build_env_test", ROOT / "tools/build/jce.py")
         driver = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(driver)
+        target = driver.resolve_target("x64")
         with tempfile.TemporaryDirectory(prefix="jce-build-env-") as tmp:
             build = Path(tmp)
             (build / "CMakeCache.txt").touch()
@@ -914,7 +996,7 @@ class BuildDriverTests(unittest.TestCase):
             calls = []
             def record(argv, **kwargs):
                 calls.append((argv, kwargs))
-            with patch.dict(os.environ, {"JCE_TEST_REAL_FONT": "1"}), patch.object(driver, "resolve_target", return_value={"key": "fixture"}), patch.object(driver, "preset_binary_dir", return_value=build), patch.object(driver, "msvc_env", return_value=env), patch.object(driver, "run", side_effect=record), patch.object(driver, "ctest_jobs", return_value="1"), patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as probe:
+            with patch.dict(os.environ, {"JCE_TEST_REAL_FONT": "1"}), patch.object(driver, "resolve_target", return_value=target), patch.object(driver, "preset_binary_dir", return_value=build), patch.object(driver, "msvc_env", return_value=env), patch.object(driver, "run", side_effect=record), patch.object(driver, "ctest_jobs", return_value="1"), patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as probe:
                 driver.cmd_test(SimpleNamespace(arch="x64", jobs=1, rerun_failed=False))
             self.assertEqual(probe.call_args.args[0][-1], "import PIL, numpy")
             self.assertIs(probe.call_args.kwargs["env"], calls[1][1]["env"])
@@ -932,12 +1014,13 @@ class BuildDriverTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("jce_python_fallback_test", ROOT / "tools/build/jce.py")
         driver = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(driver)
+        target = driver.resolve_target("x64")
         with tempfile.TemporaryDirectory() as tmp:
             build = Path(tmp)
             python = build / "configured-python"
             python.touch()
             (build / "CMakeCache.txt").write_text("_Python3_EXECUTABLE:INTERNAL=%s\n" % python)
-            with patch.object(driver, "resolve_target", return_value={"key": "fixture"}), patch.object(driver, "preset_binary_dir", return_value=build), patch.object(driver, "msvc_env", return_value={"key": "fixture"}), patch.object(driver, "run") as run, patch.object(driver, "ctest_jobs", return_value="1"), patch.object(driver.subprocess, "run", side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as probe:
+            with patch.object(driver, "resolve_target", return_value=target), patch.object(driver, "preset_binary_dir", return_value=build), patch.object(driver, "msvc_env", return_value={"key": "fixture"}), patch.object(driver, "run") as run, patch.object(driver, "ctest_jobs", return_value="1"), patch.object(driver.subprocess, "run", side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as probe:
                 driver.cmd_test(SimpleNamespace(arch="x64", jobs=1, rerun_failed=False))
             self.assertEqual(probe.call_count, 2)
             self.assertEqual(probe.call_args.args[0][0], str(python))
@@ -947,10 +1030,11 @@ class BuildDriverTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("jce_python_missing_test", ROOT / "tools/build/jce.py")
         driver = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(driver)
+        target = driver.resolve_target("x64")
         with tempfile.TemporaryDirectory() as tmp:
             build = Path(tmp)
             (build / "CMakeCache.txt").touch()
-            with patch.object(driver, "resolve_target", return_value={"key": "fixture"}), patch.object(driver, "preset_binary_dir", return_value=build), patch.object(driver, "msvc_env", return_value={"key": "fixture"}), patch.object(driver, "run") as run, patch.object(driver, "ctest_jobs", return_value="1"), patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+            with patch.object(driver, "resolve_target", return_value=target), patch.object(driver, "preset_binary_dir", return_value=build), patch.object(driver, "msvc_env", return_value={"key": "fixture"}), patch.object(driver, "run") as run, patch.object(driver, "ctest_jobs", return_value="1"), patch.object(driver.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
                 with self.assertRaisesRegex(SystemExit, "requires Pillow and numpy"):
                     driver.cmd_test(SimpleNamespace(arch="x64", jobs=1, rerun_failed=False))
             self.assertEqual(run.call_count, 3)
@@ -1556,6 +1640,94 @@ class AgentBridgeDriverControls(unittest.TestCase):
             self.assert_dispatch(dry_run=True, force_old=True)
         self.environment.assert_called_once()
         self.runner.assert_not_called()
+
+
+class ConanMsvcControls(unittest.TestCase):
+    """Actual path/command owners with counted Windows tools; no MSVC execution."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.vs = self.root / "selected VS"
+        self.tools = self.vs / "VC/Tools/MSVC/14.43.34808/bin/Hostx64/x64"
+        self.tools.mkdir(parents=True)
+        self.paths = {name: self.tools / (name + ".exe") for name in ("cl", "link")}
+        for path in self.paths.values():
+            path.write_bytes(b"counted tool file, never executed")
+        self.env = {"Path": str(self.tools), "INCLUDE": "counted headers", "LIB": "counted libraries",
+                    "VSINSTALLDIR": str(self.vs), "VCToolsInstallDir": str(self.tools.parents[2]),
+                    "VSCMD_ARG_TGT_ARCH": "x64"}
+        self.target = {"host": "windows", "arch": "x86_64"}
+        spec = importlib.util.spec_from_file_location("jce_msvc_conf_driver", ROOT / "tools/build/jce.py")
+        self.driver = importlib.util.module_from_spec(spec); spec.loader.exec_module(self.driver)
+        from tools.build import conan_msvc
+        self.owner = conan_msvc
+
+    def invoke(self, *, host="windows", dry_run=False):
+        with patch.object(self.owner.shutil, "which", side_effect=lambda name, **kwargs:
+                          str(self.paths[name]) if self.paths.get(name) else None):
+            return self.owner.configuration(self.target, self.env, host=host,
+                arch_dirs=self.driver._ARCH_CLDIR, toolset_prefix=self.driver._VC_TOOLSET_PREFIX,
+                dry_run=dry_run)
+
+    def test_observed_compiler_and_installation_are_bound_only_to_host_context(self):
+        expected = self.paths["cl"].as_posix()
+        self.assertEqual(self.invoke(), ["-c:h", "tools.microsoft.msbuild:installation_path=" +
+            self.vs.as_posix(), "-c:h", "tools.build:compiler_executables=" +
+            json.dumps({"c": expected, "cpp": expected}, sort_keys=True, separators=(",", ":"))])
+
+    def test_cross_target_keeps_build_context_unpinned(self):
+        for arch, directory in (("i686", "x86"), ("aarch64", "arm64")):
+            with self.subTest(arch=arch):
+                self.target["arch"] = arch
+                self.env["VSCMD_ARG_TGT_ARCH"] = directory
+                self.paths = {name: self.tools.parent / directory / (name + ".exe")
+                              for name in ("cl", "link")}
+                result = self.invoke()
+                self.assertEqual(result[::2], ["-c:h", "-c:h"])
+                self.assertIn(self.paths["cl"].as_posix(), result[-1])
+
+    def test_non_windows_graph_has_no_msvc_binding_or_probe(self):
+        with patch.object(self.owner.shutil, "which", side_effect=AssertionError("must not probe")):
+            for host, target_host in (("linux", "linux"), ("windows", "linux"), ("darwin", "darwin")):
+                self.target["host"] = target_host
+                self.assertEqual(self.owner.configuration(self.target, self.env, host=host,
+                    arch_dirs=self.driver._ARCH_CLDIR, toolset_prefix=self.driver._VC_TOOLSET_PREFIX), [])
+
+    def test_incomplete_environment_refuses_before_generation(self):
+        for key in ("INCLUDE", "LIB"):
+            with self.subTest(key=key), patch.dict(self.env, {key: ""}):
+                with self.assertRaisesRegex(ValueError, "needs cl, link"):
+                    self.invoke()
+        self.paths["cl"] = None
+        with self.assertRaisesRegex(ValueError, "needs cl, link"):
+            self.invoke()
+        self.assertEqual(self.invoke(dry_run=True), [])
+
+    def test_architecture_toolset_and_environment_mismatch_refuse(self):
+        cases = [("VSCMD_ARG_TGT_ARCH", "x86", "developer-shell"),
+                 ("VSINSTALLDIR", str(self.root / "other VS"), "active VS installation"),
+                 ("VCToolsInstallDir", str(self.root / "other toolset"), "active VC toolset")]
+        for key, value, message in cases:
+            with self.subTest(key=key), patch.dict(self.env, {key: value}):
+                with self.assertRaisesRegex(ValueError, message): self.invoke()
+        original = self.paths.copy()
+        for replacement, message in (("14.51.00000", "profile family"),):
+            self.paths = {key: Path(str(value).replace("14.43.34808", replacement))
+                          for key, value in original.items()}
+            with self.assertRaisesRegex(ValueError, message): self.invoke()
+        self.paths = original.copy()
+        self.paths["link"] = self.tools.parent / "x86/link.exe"
+        with self.assertRaisesRegex(ValueError, "different target toolsets"): self.invoke()
+        self.paths = original.copy(); self.target["arch"] = "i686"
+        with self.assertRaisesRegex(ValueError, "requested target"): self.invoke()
+
+    def test_unsafe_cmake_expansion_path_refuses(self):
+        self.env.pop("VSINSTALLDIR"); self.env.pop("VCToolsInstallDir")
+        self.paths = {key: Path(str(value).replace("selected VS", "selected $VS"))
+                      for key, value in self.paths.items()}
+        with self.assertRaisesRegex(ValueError, "cannot be represented"): self.invoke()
 
 
 if __name__ == "__main__":

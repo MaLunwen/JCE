@@ -489,3 +489,27 @@ It checks bounded motion and the known flat-water force equilibrium. Preserve
 the original impulse-sign, sampled-disturbance and no-body-step checks. The old
 continuous one-shot call must fail the long-running ordinary assertion. These
 CPU Bullet/runtime controls do not replace full authored-scene native validation.
+
+
+The complete Rml scene-overlay header controls in rml_scene_batch_controls.cmake
+compile as C99 and C++20. The actual tag registry and first-match lookup helpers
+are extracted unchanged; scene iteration, component storage, UI, input and clocks
+are counted typed ports. Keep dynamic retag/delete/recreate, duplicate first
+entity without a UI component, late arrival, cross-scene identity, Untagged and
+intern refusal, same-call command deduplication, simultaneous key edges and
+original pointer/quarantine controls. These prove local operation counts and
+semantics, not native ECS/RmlUi timing, installed-SDK compatibility or FPS. The
+complete-header per_binding variant must compile and exit normally with failed
+unchanged scan-budget assertions. Preserve that direct receipt in addition to
+CTest WILL_FAIL. Regenerate private include ports only under the build cache.
+
+The existing test_jce_runtime_script_cost target also selects an exact authored
+script path through the same native C runtime environment consumed by the
+private owner. It compares current on_update rows against the same-frame
+script_focus/script_other phases, includes two matching instances, and requires
+a later runtime with no matching callback to publish zero. It retains the
+original ranking, disabled-measurement, fresh-row and non-consuming-reset tests.
+Application CMake registration is unchanged. Separate complete-owner/actual-loop
+CPU ports exercise selector refusal, skipped updates, multiple runtime calls,
+zero durations and ordinary missing-wire/misclassification/gating failures; they
+are not execution of the native Lua/Engine test or a graphical acceptance run.

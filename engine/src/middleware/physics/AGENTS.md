@@ -252,3 +252,65 @@ AVERAGE 是一个**真实的作者选择**，而默认构造的 body 不能被�
 
 **改这里之前：`jce_physics_material_combine()` 是规则的唯一实现，不要在回调里重写它。**
 这个单元存在的全部原因就是它**从来没有调用者**。
+
+
+## Bounded native debug geometry
+
+`jce_physics_debug_query.cpp` owns the additive read-only shape query. It reads
+live Bullet objects and compound poses, admits finite object/shape/part counts,
+and allocates a finite triangle budget before indexed vertex reads. The private
+`jce_physics_debug_mesh.hpp` reads native float/double vertices and 8/16/32-bit
+indices, applies mesh scaling and the compound/world transform exactly once,
+and selects faces over the full admitted index range. Quotas of two or more
+consume a deterministic progressive face sequence: head/tail anchors followed
+by a bounded bit-reversed index domain. Changing only the quota preserves the
+smaller sample as a prefix, so view admission cannot reshuffle all retained
+mesh detail. Face emission is not index-sorted; the existing singleton middle
+sample is a separate boundary. This is sampling stability, not full coverage
+or a rendering/simulation timing fix. It never loads render
+assets, calls whole-mesh `processAllTriangles`, or constructs convex hulls.
+Native convex faces are used only when already available; missing hull features
+and heightfields are reported as unsupported. They are not displayed as exact
+boxes unless the caller explicitly requested AABB diagnostics.
+
+`jce_physics_debug_query.hpp` is private C++ plumbing; the public C99 query and
+stats live in `jce_physics_debug.h`. The query borrows shapes only for the call,
+retains no world pointers, uses bounded stack metadata, and does not edit debug
+flags, the installed sink, or simulation. Old `flush` remains compatible. Editor
+shape rendering uses the bounded API; contacts/constraints use the legacy path
+with the wireframe/AABB/normal bits removed, preventing a second full mesh walk.
+A PARTIAL warning means edges may be omitted; it is not proof of a missing body.
+
+The native indexed-reader test executes with Bullet 3.25. The query TU has a
+separate real-header compile check. These checks do not certify a linked JCE
+host, Windows viewport frames, contact simulation, or product frame rate.
+`test_jce_physics_debug_mesh_old_quota` restores only the old quota-dependent
+face-selection wire and must compile before failing ordinary unchanged native
+reader stability assertions. Preserve the scalar-layout, scaling, invalid-index
+and bounded-read controls alongside the progressive-sampling cases.
+
+## Spatial debug range before geometry budgets
+
+Positive-radius queries use the existing instantiated quantized Bullet BVH.
+`jce_physics_debug_range.hpp` reads its native node bounds and escape indices
+without reading triangle arrays, rebuilding a BVH, calling processAllTriangles
+or adding a second world. Reject far subtrees before retaining candidate IDs
+and allocating per-part triangle quotas. Mesh BVH bounds already include mesh
+scaling; only a scaled-shape wrapper and current compound/world pose are added.
+Recheck selected local faces' actual AABBs after conservative quantization.
+Cross-boundary shapes/faces remain whole; this is not spherical mesh clipping.
+
+The per-query metadata caps are 16384 candidates and 131072 node visits; limits
+remain explicit PARTIAL/LIMIT outcomes. Nonquantized/missing BVHs report
+UNSUPPORTED in ranged mode; radius zero retains the old bounded indexed path.
+No cross-frame shape/candidate pointers are retained. Candidate sets may change
+when the center moves: progressive quotas promise stability only for the same
+admitted set, not unchanged pixels during motion.
+
+The bridge resolves the opted-in live char_bodies slot and the query verifies
+its actual world-array membership before giving that one object first share.
+Fresh, dead, invalid or detached characters retain nobody. A player exemption
+must not exempt nearby terrain or every capsule. Public descriptors accept
+the old prefix by bounded memcpy; no suffix may be read from a V1 allocation.
+Native Bullet world/BVH/old-C-caller ASan controls are separate from Windows
+viewport latency, simulation stepping, full SDK and rendered FPS evidence.

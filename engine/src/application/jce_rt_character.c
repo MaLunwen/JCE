@@ -20,6 +20,13 @@
 
 #define LOG_TAG "runtime"
 
+JCE_API JceCharacterHandle JCE_CALL jce_runtime_get_player_character(const JceRuntime *rt)
+{
+	return rt && rt->physics && rt->character_entity != 0 && jce_character_valid(rt->character)
+	    ? rt->character : JCE_CHARACTER_INVALID;
+}
+
+
 /* First clip whose name contains `want` (case-insensitive), or -1. */
 static int rt_clip_by_name(const JceSkeletalAnimatorComponent *sa, const char *want)
 {

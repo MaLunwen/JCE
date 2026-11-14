@@ -576,59 +576,7 @@ float csm_bias_scale_for_cascade(int cascade)
     return u_csmBiasScales.w;
 }
 
-// Stable per-fragment hash for PCF kernel rotation (breaks grid patterns).
-float shadow_hash(vec3 p)
-{
-    p = fract(p * vec3(443.897, 441.423, 437.195));
-    p += dot(p, p.yzx + 19.19);
-    return fract((p.x + p.y) * p.z);
-}
-
-// Selected sampler; preserve the original PCF tier and tap arithmetic.
-float csm_pcf_filter(sampler2D shadow_map, vec2 csm_uv, float csm_z,
-                     float depth_bias, vec2 texel, float filter_radius,
-                     vec3 world_pos)
-{
-    float s;
-    if (u_shadowQuality.x < 1.5)
-    {
-        // Tier 1: unrotated 3x3 PCF (9 taps).
-        float sum9 = 0.0;
-        for (int y = -1; y <= 1; y++)
-        {
-            for (int x = -1; x <= 1; x++)
-            {
-                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
-                float depth = texture2D(shadow_map, csm_uv + offset).r;
-                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        s = sum9 / 9.0;
-    }
-    else
-    {
-        // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
-        // to eliminate visible grid patterns while keeping temporally stable shadows.
-        float angle = shadow_hash(world_pos) * 6.283185;
-        float rot_c = cos(angle);
-        float rot_s = sin(angle);
-
-        float sum = 0.0;
-        for (int y = -2; y <= 2; y++)
-        {
-            for (int x = -2; x <= 2; x++)
-            {
-                vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
-                vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
-                                   raw.x * rot_s + raw.y * rot_c);
-                float depth = texture2D(shadow_map, csm_uv + offset).r;
-                sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
-            }
-        }
-        s = sum / 25.0;
-    }
-    return s;
-}
+#include "csm_filter.sh"
 
 
 float sample_csm_shadow(int cascade,
@@ -670,7 +618,7 @@ float sample_csm_shadow(int cascade,
         return -1.0;
     }
 
-    float inv_map_size = max(u_csmParams.x, 1.0 / 2048.0);
+    float inv_map_size = csm_inverse_map_size(u_csmParams.x);
     vec2 texel = vec2_splat(inv_map_size);
     float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
 
@@ -692,12 +640,8 @@ float sample_csm_shadow(int cascade,
                                            depth_bias, texel, filter_radius);
     }
 
-    // Shadow filter tier (see u_shadowQuality). GLSL-120 safety rule: a
-    // uniform branch selecting between CONSTANT-bound loops — never a
-    // variable loop bound, never `continue`.
-    // Tier 0: single hard tap; the bias math above stays (it is ALU-only
-    // and remains the acne defence), and the hash-rotation sin/cos is
-    // skipped along with the 25-tap kernel.
+    // Tier 0 keeps a single hard tap.  Tiers 1/2 use the shared fixed
+    // disk kernel (9/25 taps), with no per-fragment hash or dynamic indexing.
     // STATIC shadow factor `s` (this cascade's csm_tex).  Computed per filter
     // tier, then — for dual shadow maps — min()'d with the dynamic atlas below
     // through a SINGLE return so cascade fallthrough/blend/edge logic inherits it.
@@ -710,25 +654,25 @@ float sample_csm_shadow(int cascade,
     }
     else
     {
-        // Select once, outside the unchanged PCF loops.
+        // Select the sampler once, outside the shared 9/25-tap kernel.
         BRANCH if (cascade == 0)
             s = csm_pcf_filter(s_csmShadow0, csm_uv, csm_z,
-                depth_bias, texel, filter_radius, world_pos);
+                depth_bias, texel, filter_radius);
         else BRANCH if (cascade == 1)
             s = csm_pcf_filter(s_csmShadow1, csm_uv, csm_z,
-                depth_bias, texel, filter_radius, world_pos);
+                depth_bias, texel, filter_radius);
         else BRANCH if (cascade == 2)
             s = csm_pcf_filter(s_csmShadow2, csm_uv, csm_z,
-                depth_bias, texel, filter_radius, world_pos);
+                depth_bias, texel, filter_radius);
         else
             s = csm_pcf_filter(s_csmShadow3, csm_uv, csm_z,
-                depth_bias, texel, filter_radius, world_pos);
+                depth_bias, texel, filter_radius);
     }
 
     // Dual shadow maps: min() with the DYNAMIC-caster atlas tile for this cascade
     // (movers, rendered separately with the SAME cascade VP into s_shadowMap as a
     // 2x2 tile grid).  Occluded if EITHER the static map OR the dynamic map
-    // occludes — a 3x3 PCF clamped inside the tile so it can't bleed into a
+    // occludes — shared phase-weighted PCF clamped inside the tile, avoiding a
     // neighbour cascade.  Enabled lane is 0 unless dual mode is active this frame,
     // so the whole block is a no-op (byte-identical) otherwise.
     if (u_csmDynParams.z > 0.5)
@@ -745,10 +689,8 @@ float sample_csm_shadow(int cascade,
         vec2 lo  = org + dt * 0.5;
         vec2 hi  = org + invT - dt * 0.5;
         vec2 ctr = clamp(org + csm_uv * invT, lo, hi);
-        // Match the dynamic tap count to the STATIC filter tier so the min-combine
-        // — which runs for EVERY shadowed pixel, movers or not — costs the same as
-        // the static sample it augments.  Tier 0 (iGPU) = 1 hard tap keeps the
-        // dynamic add ~free; higher tiers use 3x3 PCF for a soft mover edge.
+        // Hard tier retains one point comparison. Both filtered tiers use the
+        // same nine dynamic reads, independent of the static 9/25 tap policy.
         if (u_shadowQuality.x < 0.5)
         {
             float dd = texture2D(s_shadowMap, ctr).r;
@@ -756,18 +698,8 @@ float sample_csm_shadow(int cascade,
         }
         else
         {
-            float dsum = 0.0;
-            for (int dy = -1; dy <= 1; dy++)
-            {
-                for (int dx = -1; dx <= 1; dx++)
-                {
-                    vec2 t = clamp(org + csm_uv * invT + vec2(float(dx), float(dy)) * dt,
-                                   lo, hi);
-                    float dd = texture2D(s_shadowMap, t).r;
-                    dsum += (csm_z - depth_bias > dd) ? 0.0 : 1.0;
-                }
-            }
-            s = min(s, dsum * (1.0 / 9.0));
+            s = min(s, csm_dynamic_pcf(s_shadowMap, org + csm_uv * invT,
+                                      csm_z, depth_bias, dt, lo, hi));
         }
     }
     return s;

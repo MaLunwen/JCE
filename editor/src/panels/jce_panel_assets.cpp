@@ -19,6 +19,7 @@
 #include "core/jce_assetdb.h"
 #include "ui/jce_editor_modals.h"
 #include "jce_panel_assets_internal.h"
+#include "jce_panel_assets_directory.h"
 #include "jce_panel_common.h"
 #include "scene/jce_asset_path_index.h"
 
@@ -100,6 +101,7 @@ static std::string format_modified_time(const char *path)
 
 static void reset_asset_browser_view_to_root(const std::string &root)
 {
+    jce_asset_directory::owner().invalidate(true);
     s_assets.current_path = root;
     s_assets.entries.clear();
     s_assets.selected_set.clear();
@@ -297,6 +299,7 @@ void ensure_assets_init(void)
 
 void request_asset_resource_refresh(void)
 {
+    jce_asset_directory::owner().invalidate();
     s_assets.needs_refresh = true;
     if (!s_assets.project_root.empty() &&
         !is_filesystem_root(s_assets.project_root.c_str()))
@@ -305,6 +308,7 @@ void request_asset_resource_refresh(void)
 
 void refresh_entries(void)
 {
+    jce_asset_directory::owner().invalidate_current();
     s_assets.entries.clear();
 
     /* No project root mounted (no-project launch): nothing to list.
@@ -373,39 +377,8 @@ void refresh_entries(void)
 
 static bool directory_entries_changed(void)
 {
-    std::vector<std::pair<std::string, bool>> disk_entries;
-    
-    struct ListCtx {
-        std::vector<std::pair<std::string, bool>> *entries;
-    } ctx;
-    ctx.entries = &disk_entries;
-    
-    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
-        ListCtx *c = static_cast<ListCtx*>(ud);
-        c->entries->emplace_back(name, is_dir);
-        return true;
-    };
-    
-    if (!jce_fs_host_list_dir(s_assets.current_path.c_str(), cb, &ctx))
-        return false;
-
-    std::sort(disk_entries.begin(), disk_entries.end(),
-              [](const std::pair<std::string, bool> &a,
-                 const std::pair<std::string, bool> &b) {
-                  if (a.second != b.second) return a.second > b.second;
-                  return a.first < b.first;
-              });
-
-    if (disk_entries.size() != s_assets.entries.size())
-        return true;
-
-    for (size_t i = 0; i < disk_entries.size(); i++) {
-        if (disk_entries[i].first != s_assets.entries[i].name
-            || disk_entries[i].second != s_assets.entries[i].is_dir)
-            return true;
-    }
-
-    return false;
+    return jce_asset_directory::owner().current_changed(
+        s_assets.current_path, s_assets.entries);
 }
 
 void navigate_asset_directory(const std::string &path, bool clear_search)
@@ -960,6 +933,7 @@ void jce_editor_panel_assets_content(void)
     }
 
     if (!s_assets.pending_navigation_path.empty()) {
+        jce_asset_directory::owner().invalidate_current();
         s_assets.current_path = s_assets.pending_navigation_path;
         s_assets.pending_navigation_path.clear();
 
@@ -979,11 +953,16 @@ void jce_editor_panel_assets_content(void)
         s_assets.needs_refresh = true;
     }
 
+    /* Poll only terminal snapshots here. Enumeration and sorting run through
+     * the shared background executor, never as a fallback on task refusal. */
+    const bool membership_changed = directory_entries_changed();
+    if (!s_assets.needs_refresh && membership_changed)
+        request_asset_resource_refresh();
     double now = ImGui::GetTime();
     if (now >= s_assets.next_auto_refresh_time) {
         s_assets.next_auto_refresh_time = now + 0.35;
-        if (!s_assets.needs_refresh && directory_entries_changed())
-            request_asset_resource_refresh();
+        if (!s_assets.needs_refresh)
+            jce_asset_directory::owner().poll_current(s_assets.current_path);
     }
 
     if (s_assets.needs_refresh)
@@ -1014,8 +993,18 @@ void jce_editor_panel_assets_content(void)
             const std::vector<FileEntry> *display_ptr = &raw_entries;
             if (s_assets.kind_filter != 0) {
                 filtered.reserve(raw_entries.size());
+                auto append_filtered = [&](const FileEntry &fe) {
+                    const int index = (int)filtered.size();
+                    /* Populate the owning entry before this frame's view copy.
+                     * Otherwise a kind filter would discard its warmed cache. */
+                    if (s_assets.view_mode == ASSET_BROWSER_VIEW_GRID &&
+                        s_assets.renaming_idx != index &&
+                        s_assets.selected_set.count(index) == 0)
+                        prepare_asset_grid_caption(fe);
+                    filtered.push_back(fe);
+                };
                 for (const auto &fe : raw_entries) {
-                    if (fe.is_dir) { filtered.push_back(fe); continue; }
+                    if (fe.is_dir) { append_filtered(fe); continue; }
                     std::string e = fe.ext;
                     for (auto &c : e) c = (char)tolower((unsigned char)c);
                     bool keep = false;
@@ -1036,7 +1025,7 @@ void jce_editor_panel_assets_content(void)
                         keep = (e==".zip"||e==".pak"||e==".7z"||e==".tar"||e==".gz"||e==".rar");
                         break;
                     }
-                    if (keep) filtered.push_back(fe);
+                    if (keep) append_filtered(fe);
                 }
                 display_ptr = &filtered;
             }

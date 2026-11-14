@@ -564,8 +564,7 @@ def _configure(driver, args, target: dict, env: dict, sdk: Path | None = None, p
                        "host shaderc; set JCE_SHADERC_EXECUTABLE")
         if shaderc:
             driver.log(f"embedded shaderc (build host): {shaderc}")
-        if not driver.DRY_RUN:
-            (driver.ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
+        # Conan no longer writes root presets; keep local IDE configuration.
         driver.run(["cmake", "-S", str(driver.ROOT), "-B", str(build), "-G", "Ninja",
                 f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", "-DCMAKE_BUILD_TYPE=Release",
                 f"-DJCE_BUILD_VARIANT={args.variant}", "-DJCE_EDITOR_STANDALONE=ON",

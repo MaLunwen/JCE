@@ -1301,3 +1301,43 @@ the public one-shot velocity impulse every tick: additive feedback can lower the
 water under the body until the depth-dependent drag becomes unstable. Collider
 radius, submersion/coverage and the existing deadband keep their current owners.
 The force model and public event-impulse API remain unchanged.
+
+## Optional exact-path script cost partition
+
+`jce_rt_script_cost.c` owns the unchanged public script-cost iterate/reset
+bodies and an optional private launch selector. The gameplay loop still reads
+`jce_perf_phase_enabled()` once, preserves its existing two counter reads around
+each admitted on_update, and forwards that same measured ms to the partition.
+Inactive and SimLod-skipped callbacks do not contribute. Fixed updates and VM
+coroutines retain their separate existing owners and are not included.
+
+`JCE_PERF_SCRIPT_DETAIL=1` explicitly enables an exact, case-sensitive
+`JCE_PERF_SCRIPT_PATH` byte match against ScriptEntry's authored path. The
+main-thread selector is latched on the first profiled script pass for this
+process; it copies at most255 path bytes, rejects empty/overlength/control bytes,
+and does not retain getenv storage. Profiling off performs no selector read.
+Defaults register no new phase names. Explicit selector/refusal diagnostics use
+the existing direct logger so Dist can observe them subject to sink filtering.
+
+Only the fixed literal slots `script_focus` and `script_other` are registered.
+They accumulate the current measured callbacks across runtimes into the same
+Engine-owned frame snapshot as `script`; no per-entity names, frame IDs, clocks,
+resets or public ABI are added. Each enabled pass publishes both subtotals,
+including zero. Zero does not certify that a callback ran. The sum agrees with
+`script` up to floating-point accumulation and CSV rounding. The public cost
+iterator keeps its intentional most-recent-row semantics and is never polled
+to manufacture a current-frame partition. Additional diagnostics perturb timing
+and require a separate capture mode. Native runtime tests remain in the
+existing test_jce_runtime_script_cost target; CPU source ports do not certify
+Lua execution, a rebuilt Editor, graphical behavior or performance.
+
+## Player identity for read-only debug range
+
+`jce_rt_character.c` owns `jce_runtime_get_player_character`: return the current
+character only when runtime, physics, nonzero character entity and valid handle
+exist. Fresh zeroed state must not expose slot zero. This adds no body/entity
+guessing, scene mutation, simulation step or retained cache. The receiving
+physics query checks the live pool/world; character handles remain borrowed
+current-call identities. Keep this accessor with the existing character owner
+rather than growing the frozen large jce_runtime.c. Player-centered debug range
+uses the existing smoothed player-position accessor, with camera fallback.

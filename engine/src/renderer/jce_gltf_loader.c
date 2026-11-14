@@ -1704,6 +1704,12 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
 
     JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
     if (!model) { jce_gltf_model_cpu_free(cpu); return NULL; }
+    const char *failure = NULL;
+    uint32_t failed_node = UINT32_MAX, failed_primitive = UINT32_MAX;
+    if (cpu->num_nodes > 0 && !cpu->nodes) {
+        failure = "missing_node_source";
+        goto failed;
+    }
 
     /* Local-space AABB seed (model space); accumulated over every primitive's
      * vertices × its node's baked world transform in the node loop below, so the
@@ -1750,6 +1756,7 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
     /* Nodes: create GPU meshes from the CPU vertex/index arrays. */
     if (cpu->num_nodes > 0 && cpu->nodes) {
         model->nodes = (JceModelNode *)JCE_CALLOC(cpu->num_nodes, sizeof(JceModelNode));
+        if (!model->nodes) { failure = "node_allocation"; goto failed; }
         if (model->nodes) {
             model->num_nodes = cpu->num_nodes;
             for (uint32_t n = 0; n < cpu->num_nodes; ++n) {
@@ -1760,10 +1767,15 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                 dn->parent             = src->parent;
                 dn->joint_parent_index = src->joint_parent_index;
                 dn->joint_local_matrix = src->joint_local_matrix;
-                dn->num_primitives     = src->num_prims;
+                failed_node = n;
+                failed_primitive = UINT32_MAX;
                 if (src->num_prims > 0) {
+                    if (!src->prims) { failure = "missing_primitive_source"; goto failed; }
                     dn->primitives = (JceModelPrimitive *)JCE_CALLOC(
                         src->num_prims, sizeof(JceModelPrimitive));
+                    if (!dn->primitives) { failure = "primitive_allocation"; goto failed; }
+                    /* Publish the count only when destroy can traverse the array. */
+                    dn->num_primitives = src->num_prims;
                     if (dn->primitives) {
                         for (uint32_t p = 0; p < src->num_prims; ++p) {
                             JceModelPrimCpu  *sp = &src->prims[p];
@@ -1773,7 +1785,13 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                             /* Morph deltas: transfer ownership (CPU-only, no
                              * GPU resource).  FEATURE 3.1 CPU pre-skin path. */
                             dp->morph          = sp->morph; sp->morph = NULL;
-                            if (!sp->verts || sp->num_verts == 0) continue;
+                            if (sp->num_verts == 0) continue;
+                            failed_primitive = p;
+                            if (!sp->verts) { failure = "missing_vertex_source"; goto failed; }
+                            if (sp->num_indices > 0 && !sp->indices) {
+                                failure = "missing_index_source";
+                                goto failed;
+                            }
                             /* Accumulate this primitive's vertex positions
                              * (node-local) transformed by the node's baked world
                              * matrix into the model-space AABB.  pos[3] is the
@@ -1810,6 +1828,10 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                                 dp->skinned_mesh = jce_pbr_mesh_create(
                                     (const JcePbrVertex *)sp->verts, sp->num_verts,
                                     sp->indices, sp->num_indices, retain_morph);
+                            if (!dp->skinned_mesh) {
+                                failure = "required_mesh_upload";
+                                goto failed;
+                            }
                             /* In-asset auto-LOD (P1 #6): upload each parsed
                              * reduced index set as an alternate IBO sharing this
                              * mesh's vertex buffer.  Only the static (non-
@@ -1864,6 +1886,15 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
      * jce_gltf_model_cpu_free is null-safe per remaining field). */
     jce_gltf_model_cpu_free(cpu);
     return model;
+
+failed:
+    /* A partial model would be cached as a successful load and hide missing
+     * geometry. Release admitted GPU meshes and all CPU ownership exactly once. */
+    LOG_WARN(LOG_TAG, "model geometry upload rejected node=%u primitive=%u reason=%s",
+        (unsigned)failed_node, (unsigned)failed_primitive, failure);
+    jce_model_destroy(model);
+    jce_gltf_model_cpu_free(cpu);
+    return NULL;
 }
 
 void jce_gltf_model_cpu_free(JceModelCpu *cpu)

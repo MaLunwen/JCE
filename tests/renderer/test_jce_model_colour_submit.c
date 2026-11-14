@@ -14,6 +14,7 @@
 #include "renderer/jce_model_instancing.h"
 #include "renderer/jce_renderer_internal.h"
 #include "renderer/jce_gltf_loader.h"
+#include "renderer/jce_pbr_depth_internal.h"
 #include "renderer/jce_instance_upload.h"
 #include "renderer/jce_shader_deferred.h"
 #include "os/core/jce_memory.h"
@@ -33,6 +34,19 @@ static ModelSubmit submits[8];
 static unsigned submit_count, callback_count, material_count, geometry_count;
 static unsigned late_bind_count, explicit_bind_count, explicit_submit_count;
 static unsigned resolve_count, transient_count, instance_bind_count;
+static unsigned index_bind_count, reduced_lod_count;
+static uint16_t index_handles[8];
+static uint32_t index_firsts[8], index_counts[8];
+static void counted_index_buffer(bgfx_index_buffer_handle_t handle,
+                                  uint32_t first, uint32_t count)
+{
+    if (index_bind_count < 8u) {
+        index_handles[index_bind_count] = handle.idx;
+        index_firsts[index_bind_count] = first;
+        index_counts[index_bind_count] = count;
+    }
+    ++index_bind_count;
+}
 static uint16_t static_program, instance_program, tint_program, source_buffer;
 static uint32_t source_start, source_count;
 static uint32_t bound_flags[4];
@@ -228,6 +242,13 @@ static JcePbrMaterial material_default(void)
     return out;
 }
 
+/* MASK depth is compiled by the full owner, but this fixture exercises the
+ * colour producers only. Its private dependencies remain typed, inert ports. */
+static JceShaderHandle unused_depth_program(JcePbrDepthKind kind)
+{ (void)kind; return (JceShaderHandle){UINT16_MAX}; }
+static bool unused_depth_material(const JcePbrMaterial *mat)
+{ (void)mat; return false; }
+
 /* The complete TU also contains unrelated loading, shadow, morph and velocity
  * entries. Their fixed-arity dependency ports are inert; none replaces model
  * admission, primitive iteration, upload packing or terminal submission. */
@@ -252,15 +273,15 @@ static JcePbrMaterial material_default(void)
 #define jce_mesh_vertex_count(mesh) (3u)
 #define jce_mesh_index_count(mesh) (3u)
 #define jce_skinned_mesh_vertex_count(mesh) (3u)
-#define jce_skinned_mesh_index_count(mesh) (3u)
+#define jce_skinned_mesh_index_count(mesh) (reduced_lod_count ? 12u : 3u)
 #define jce_mesh_get_vbh(mesh) (7u)
 #define jce_mesh_get_ibh(mesh) (8u)
 #define jce_skinned_mesh_get_vbh(mesh) (7u)
 #define jce_skinned_mesh_get_ibh(mesh) (8u)
 #define jce_skinned_mesh_is_skinned(mesh) (false)
-#define jce_skinned_mesh_lod_count(mesh) (0u)
-#define jce_skinned_mesh_lod_ibh(mesh, level) (8u)
-#define jce_skinned_mesh_lod_index_count(mesh, level) (3u)
+#define jce_skinned_mesh_lod_count(mesh) (reduced_lod_count)
+#define jce_skinned_mesh_lod_ibh(mesh, level) (9u + (level))
+#define jce_skinned_mesh_lod_index_count(mesh, level) (9u - 3u * (level))
 #define jce_skinned_mesh_meshlet_ibh(mesh) (UINT16_MAX)
 #define jce_skinned_mesh_set_submit_state(state) ((void)0)
 #define jce_skinned_mesh_set_submit_stencil(stencil) ((void)0)
@@ -291,6 +312,8 @@ static JcePbrMaterial material_default(void)
 #define jce_skeleton_joint_count(skeleton) (0u)
 #define jce_skeleton_evaluate(skeleton, locals, out, count) ((void)0)
 #define jce_skin_build_world_palette(root, joints, count, out, max) (0u)
+#define jce_pbr_depth_program unused_depth_program
+#define jce_pbr_material_bind_depth unused_depth_material
 #define jce_pbr_material_bind counted_material
 #define jce_pbr_material_bind_toon_atlas(atlas, basis) ((void)0)
 #define jce_pbr_material_bind_toon_hair_depth(texture) (false)
@@ -322,7 +345,7 @@ static JcePbrMaterial material_default(void)
 #define bgfx_encoder_set_stencil(encoder, front, back) ((void)0)
 #define bgfx_set_uniform(handle, value, num) ((void)0)
 #define bgfx_set_vertex_buffer(stream, handle, start, count) ((void)0)
-#define bgfx_set_index_buffer(handle, start, count) ((void)0)
+#define bgfx_set_index_buffer counted_index_buffer
 #define bgfx_discard counted_discard
 #define bgfx_encoder_discard counted_encoder_discard
 #define jce_shader_deferred_resolve counted_resolve
@@ -343,6 +366,7 @@ void setUp(void)
     submit_count = callback_count = material_count = geometry_count = 0;
     explicit_bind_count = explicit_submit_count = resolve_count = 0;
     transient_count = instance_bind_count = pending_sampler_uniform_count = 0;
+    index_bind_count = reduced_lod_count = 0;
     memset(pending_sampler_uniforms, 0, sizeof pending_sampler_uniforms);
     source_buffer = UINT16_MAX; source_start = source_count = 0;
     payload_count = payload_stride = 0;
@@ -514,6 +538,21 @@ static void foliage_lod_material_override_precedes_default_in_each_band(void)
     assert_foliage_bands(2u);
     TEST_ASSERT_EQUAL_MEMORY(&override, &last_material, sizeof override);
 }
+static void foliage_lod_binds_only_triangle_prefix_and_selected_lod(void)
+{
+    node.num_primitives = 1u;
+    reduced_lod_count = 2u;
+    jce_model_draw_foliage_lod_indirect(&model, renderer, 23u, 41u, 4u, 118u, 119u);
+    assert_foliage_bands(4u);
+    const uint16_t expected_handles[4] = {8u, 9u, 10u, 10u};
+    const uint32_t expected_counts[4] = {12u, 9u, 6u, 6u};
+    TEST_ASSERT_EQUAL_UINT32(4u, index_bind_count);
+    for (unsigned band = 0; band < 4u; ++band) {
+        TEST_ASSERT_EQUAL_UINT16(expected_handles[band], index_handles[band]);
+        TEST_ASSERT_EQUAL_UINT32(0u, index_firsts[band]);
+        TEST_ASSERT_EQUAL_UINT32(expected_counts[band], index_counts[band]);
+    }
+}
 int main(void)
 {
     UNITY_BEGIN();
@@ -527,5 +566,6 @@ int main(void)
     RUN_TEST(single_tint_folds_material_into_stock_static_program);
     RUN_TEST(foliage_lod_missing_material_uses_default_in_each_band);
     RUN_TEST(foliage_lod_material_override_precedes_default_in_each_band);
+    RUN_TEST(foliage_lod_binds_only_triangle_prefix_and_selected_lod);
     return UNITY_END();
 }

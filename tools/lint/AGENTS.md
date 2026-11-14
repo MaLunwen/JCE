@@ -104,3 +104,10 @@ The source-level and populated-root gate for generated build/ output is
 New CMake/Conan, host, desktop and XP caches stay in their existing owners.
 Update both contract and negative tests before adding a new output root.
 No automated migration/deletion of build caches or audit evidence is allowed.
+
+The public source aggregate registers test_ide_build.py, test_ide_cache.py and
+test_ide_modkit.py. The metadata controls exercise selective version-description
+retirement, exact backups and guarded restoration without deleting object trees.
+Their compiler/Conan ports and temporary JSONC/CMake metadata establish local
+configuration behavior only; native Windows builds and IDE execution remain
+separate qualifications.

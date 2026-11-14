@@ -103,6 +103,9 @@ vec3 agxTonemap(vec3 val)
     vec3 x2 = val * val; vec3 x4 = x2 * x2;
     val = 15.5 * x4 * x2 - 40.14 * x4 * val + 31.96 * x4 - 6.868 * x2 * val + 0.4298 * x2 + 0.1191 * val - 0.00232;
     val = mul(agx_out, val);
+    /* The sigmoid/outset are encoded for a 2.2 display. Return display-linear
+     * like the other operators; combineTonemap owns the output gamma. */
+    val = pow(max(val, vec3_splat(0.0)), vec3_splat(2.2));
     return clamp(val, vec3_splat(0.0), vec3_splat(1.0));
 }
 

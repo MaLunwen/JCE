@@ -1,5 +1,59 @@
 # tests/editor — Editor regression ownership
 
+The existing `test_jce_editor_kpi_game_capture` owner also covers natural
+capture policy, one-run Stop/re-Play behavior, preserved accepted identity,
+terminal/failure receipts and legacy deterministic sizing/restart. Its public
+log sink must be flushed before release. Controlled clock/log ports and actual
+controller/schedule compilation are separate from a native file writer or GPU
+capture. The Game panel's current-frame admission is checked separately with
+its actual caller block; a supplied completed-frame boolean is not pixel proof.
+
+
+`asset_directory_controls.cmake` compiles the actual private scan/cache owner,
+actual FileEntry/state declarations, complete reset/refresh/navigation functions,
+periodic frame block, recursive/tree draw bodies and shared panels init/shutdown.
+The fixture uses real headless ImGui and public SDK types with counted async,
+filesystem, metadata and unrelated UI/host endpoints. Production scan callbacks
+run on controlled std::thread workers, with a separate cooperative owner-thread
+case. Result/request lifetime, delayed and cancelled work, A-B-A generations,
+partial/failed/empty directory scans, unknown child expanders, FIFO/refusal
+backoff, root/manual/navigation invalidation, shutdown and late completion are
+runtime assertions; a second TU checks the single inline owner. Actual caller
+wires must preserve unchanged periodic main-thread scan counts and the existing
+synchronous changed-folder materialization. Seven ordinary source mutations
+must compile and fail those assertions. These are controlled CPU executions,
+not the engine executor/SDL filesystem, full Editor, OS file-watcher latency,
+native UI pixels or FPS acceptance. Existing test_jce_editor_panel_state.cpp
+also counts the two directory lifecycle hooks and their teardown order.
+
+`asset_caption_controls.cmake` compiles the actual private grid-caption owner,
+FileEntry/state declarations, prepare helper and filtered-copy lambda with real
+ImGui. Its independent original-label reference checks exact byte truncation
+and actual cursor/item/vertex layout, including full selected labels and
+fractional spacing. Counted wrapped-height calls cover warm reuse, every
+font/context/spacing/DPI/wrap key and same-length filename replacement; native
+font reload and a second real context exercise the key producer. Entry refresh
+retires its derived strings, while filtered view copies retain the warmed
+original. old_remeasure, stale_metrics, stale_name and missing_filtered_warmup
+must compile and fail ordinary assertions. This is CPU text/layout ownership,
+not native rename/selection gestures, filesystem observation, GPU pixels or
+complete-editor frame performance. The production grid's call wire is checked
+at configure time; complete grid/detail TUs are not executed by this fixture.
+
+`test_jce_physics_overlay.cpp` includes the actual private Scene/Game overlay and
+renderer line-sampling owners, with real public SDK types and matrix math. Typed
+counted physics/renderer ports cover missing live-world refusal, independent
+flags, user wireframe-off intent, stack-sink retirement, conservative frustum
+rejection, crossing lines, distributed overbudget detail and reduced transient
+copies preserving complete endpoint pairs. The external source-variant controls
+restore prefix truncation or remove frustum/flag/lifetime/off guards and must
+compile then fail ordinary assertions. These CPU executions are not native
+Bullet, GPU pixels, full Editor build or full CTest evidence.
+Viewport composite controls include Contacts/AABB-only requests in the same
+Game bridge-retention decision as wireframe; stale saved wireframe alone must
+not override the viewport toggle. Preserve the existing extraction boundaries
+and unrelated target lifetime/Canvas retirement controls.
+
 viewport_composite_controls.cmake consumes the actual shared composite and
 screenshot helpers plus complete Scene/Game composite-through-Canvas blocks.
 Typed public SDK ports cover D3D11/top-left/empty-Canvas admission, conservative
@@ -544,10 +598,15 @@ state, camera helpers, begin/end, getter/reset, initialization admission prefix,
 complete shutdown and camera-resolution/render prefix, plus actual Play create
 transaction and detach/retry wires. Public camera creation, clone, view and
 projection math are real; renderer, Runtime, primary/VCam, history and PostFX
-ports are typed/countable CPU controls. Thirteen groups cover complete rolled
+ports are typed/countable CPU controls. The groups cover complete rolled
 perspective/fixed-orthographic/dynamic-height preservation, repeated Play/Stop,
 camera-less initial navigation, hidden Game, allocation/runtime failure and
 retry, missing-camera refusal, release and deferred zero-feedback camera cuts.
+The actual resolution prefix also checks warning suppression for applied VCam
+and player-follow sources, the retained CPU camera pose when sources disappear,
+primary-failure reasons, bounded repeated warnings and recovery/Stop re-arming.
+The log port retains actual formatted diagnostics; these are source-consumption
+controls, not a claim that a native captured session used the patched binary.
 
 The old-selection, old-default-seed, missing-release/admission/cut contracts
 mutate only actual production wires and must compile then fail unchanged
@@ -950,3 +1009,18 @@ paths, after explicit overrides. Ordinary old-seed, missing-layout and ignored
 manifest-name variants must compile then fail unchanged assertions. These CPU
 ports do not perform actual project-state disk IO, launch a child, draw a UI
 or certify relocation and target execution.
+
+
+`test_jce_physics_overlay` also verifies the bounded public query signature,
+finite source budgets, one shape request per view, and contacts/constraints-only
+legacy flush. It tests native partial/failure diagnostics and flag restoration
+using typed ports; it does not execute the Bullet world or GPU. The physics
+indexed-reader target is the separate native Bullet geometry check.
+
+The existing physics-overlay fixture also executes the shared runtime range
+settings owner with typed UI-state and runtime-position endpoints. It covers
+30 m/camera/no-frustum defaults without writes, saved zero, finite bounds,
+player center, missing/nonfinite-player camera fallback, actual view inversion
+and unchanged true character handle forwarding. These are CPU policy/endpoint
+controls, not editor-session file persistence, native widget input or pixels.
+The existing target owns these cases; do not create a second settings owner.

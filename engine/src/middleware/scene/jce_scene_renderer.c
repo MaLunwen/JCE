@@ -17,6 +17,7 @@
 #include "jce_sr_model_diagnostics.h"
 #include "jce_terrain_cache.h"
 #include "jce_sr_internal.h"
+#include "jce_sr_tod_key.h"
 #include "jce_sr_model_table.h"
 #include "jce_sr_colour_output.h"
 #include "jce_scene_video_internal.h"
@@ -139,6 +140,9 @@ typedef struct {
     float       fx, fz;   /* focus point (XZ); y is intentionally ignored */
     float       r2;       /* (radius + margin) squared; horizontal cull */
     bool        enabled;
+    int         prior_count;
+    bool        same_layout;
+    bool        complete;
 } SrCollectCtx;
 
 static void collect_entity_cb(JceScene *s, JceEntity e, void *ud)
@@ -153,6 +157,8 @@ static void collect_entity_cb(JceScene *s, JceEntity e, void *ud)
      * warning (preserve the old behaviour of not crashing). */
     if (list->count + 1 > list->cap) {
         if (!sr_entity_list_reserve(list, list->count + 1)) {
+            ctx->same_layout = false;
+            ctx->complete = false;
             static bool warned = false;
             if (!warned) {
                 warned = true;
@@ -226,6 +232,12 @@ static void collect_entity_cb(JceScene *s, JceEntity e, void *ud)
         }
     }
 
+    /* Compare before overwriting this slot. Every camera move still applies
+     * the exact focus test above; only an identical ordered result can retain
+     * the layout generation consumed by ecull and the shadow grids. */
+    if (ctx->same_layout &&
+        (list->count >= ctx->prior_count || list->entities[list->count] != e))
+        ctx->same_layout = false;
     list->entities[list->count++] = e;
 }
 
@@ -1010,7 +1022,7 @@ bool sr_resolve_primary_dir_light(JceSceneRenderer *sr,
         /* Time-of-day is an authored scene driver, not a fallback preview:
          * when enabled, its sun is the primary directional light for both
          * PBR and CSM shadows. */
-        if (out_to_light) *out_to_light = sr->tod_state.sun_direction;
+        if (out_to_light) *out_to_light = sr_tod_key_direction(&sr->tod_state);
         if (out_color) *out_color = sr->tod_state.sun_color;
         if (out_intensity) *out_intensity = 1.0f;
         return true;
@@ -1750,21 +1762,11 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_water_caustic_fine_detail.idx = UINT16_MAX;
     sr->s_water_caustic_disp.idx  = UINT16_MAX;
     sr->u_water_shore.idx         = UINT16_MAX;
-    /* AND THE PLANAR TRIO.  bgfx handle 0 is a VALID handle, so a calloc'd
-     * handle passes BGFX_HANDLE_IS_VALID and the lazy `if (!valid) create`
-     * guard never fires -- the uniform is never made and every set writes to
-     * whatever owns handle 0.  Measured: the water's planar branch stayed
-     * false with the C side setting it to 1.0, through three probes.  Every
-     * water uniform above is here for the same reason. */
+    /* Planar uniforms need INVALID too: calloc's valid handle 0 aliases another owner. */
     sr->s_water_planar.idx        = UINT16_MAX;
     sr->u_water_planar.idx        = UINT16_MAX;
     sr->u_water_planar_vp.idx     = UINT16_MAX;
-    /* Both cascade textures, not just the primary.  fft2_tex was missing from
-     * this loop, which only stayed harmless while it was allocated
-     * unconditionally next to fft_tex; now that it is created ONLY when the
-     * field really has a second cascade (see sr_draw_water), idx 0 reading as
-     * "already allocated" would mean the cascade texture is never created and
-     * bgfx texture 0 gets bound as displacement instead. */
+    /* Invalidate both cascade textures; fft2_tex is acquired only when authored. */
     for (int i = 0; i < SR_WATER_SLOT_MAX; i++) {
         sr->water_cache[i].fft_tex.idx  = UINT16_MAX;
         sr->water_cache[i].fft2_tex.idx = UINT16_MAX;
@@ -1796,6 +1798,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_foliage_colors.idx  = UINT16_MAX;
     sr->u_foliage_light.idx   = UINT16_MAX;
     sr->s_foliage_alpha.idx   = UINT16_MAX;
+    sr->u_foliage_hashed_alpha.idx = UINT16_MAX;
     /* Streaming LOD cross-fade (Direction B): the per-draw u_lodFade uniform is
      * created lazily at the start of the first color pass; invalidate the handle
      * here because JCE_CALLOC zeros to idx 0 (a VALID bgfx handle).  fade_state
@@ -2595,6 +2598,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_foliage_colors)) bgfx_destroy_uniform(sr->u_foliage_colors);
     if (BGFX_HANDLE_IS_VALID(sr->u_foliage_light))  bgfx_destroy_uniform(sr->u_foliage_light);
     if (BGFX_HANDLE_IS_VALID(sr->s_foliage_alpha))  bgfx_destroy_uniform(sr->s_foliage_alpha);
+    if (BGFX_HANDLE_IS_VALID(sr->u_foliage_hashed_alpha)) bgfx_destroy_uniform(sr->u_foliage_hashed_alpha);
     for (int i = 0; i < (int)(sizeof sr->fcluster_cache /
                               sizeof sr->fcluster_cache[0]); i++) {
         jce_mesh_destroy(sr->fcluster_cache[i].expanded_mesh);
@@ -3166,6 +3170,14 @@ static void sr_model_bounds_drain(JceSceneRenderer *sr, JceScene *scene,
                                   const EntityList *list, uint64_t list_gen)
 {
     if (!sr->model_bounds_geometry_dirty) return;
+    if (!sr->model_bounds_enabled) {
+        /* A successful load or eviction can change bounds without changing
+         * entity transforms. Coalesce publications until this boundary; never
+         * clear tables while a synchronous model callback is using them. */
+        sr_model_bounds_drop_tables(sr);
+        sr_model_bounds_retire_geometry(sr);
+        return;
+    }
     const uint64_t structure = jce_scene_get_structural_epoch(scene);
     const EntityList *frozen = NULL;
     if (sr->model_bounds_deps.queue_head && sr->ecull_frz_valid &&
@@ -3954,7 +3966,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     static bool        s_col_all    = false;
     static bool        s_col_valid  = false;
     static float       s_col_fx = 0.0f, s_col_fz = 0.0f, s_col_r2 = 0.0f;
-    /* Monotonic list rebuild counter — the frozen-frame ecull key (slice 4)
+    /* Monotonic list layout counter — the frozen-frame ecull key (slice 4)
      * uses it to prove "the list this ecull[] was built against is the very
      * array still in place" without hashing 150k ids. */
     static uint64_t    s_col_list_gen = 0;
@@ -3970,12 +3982,18 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         .fz      = cfg->cull_focus_z,
         .r2      = 0.0f,
         .enabled = false,
+        .prior_count = 0,
+        .same_layout = false,
+        .complete = true,
     };
     const bool prior_list = s_col_valid && s_col_scene == scene &&
         s_col_scene_id == sr->model_bounds_scene && s_col_owner == sr;
     sr_model_bounds_drain(sr, scene, prior_list ? &list : NULL, s_col_list_gen);
+    /* After a cold entry or bounds retirement, collect all once so ecull can
+     * rebuild the AABBs. An origin-only fallback could otherwise omit a large
+     * surface whose origin is distant but whose bounds reach the focus. */
     if (cfg->cull_focus_enabled && cfg->cull_radius > 0.0f &&
-        !sr->model_bounds_deps.fallback) {
+        sr->model_bounds_focus_collect_valid && !sr->model_bounds_deps.fallback) {
         float eff = cfg->cull_radius + 70.0f; /* footprint margin */
         collect_ctx.r2      = eff * eff;
         collect_ctx.enabled = true;
@@ -3998,14 +4016,15 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         bool cache_hit = s_col_cache_on && s_col_valid &&
                          s_col_scene  == (const void *)scene &&
                          s_col_scene_id == sr->model_bounds_scene &&
+                         s_col_owner == sr && sr->model_bounds_focus_collect_valid &&
+                         s_col_focus_revision == sr->model_bounds_focus_revision &&
                          s_col_roster == roster_now &&
                          s_col_struct == struct_now &&
                          roster_now != 0 &&
                          s_col_all == !collect_ctx.enabled;
         if (cache_hit && collect_ctx.enabled) {
-            cache_hit = (!sr->model_bounds_enabled ||
-                         (s_col_owner == sr && sr->model_bounds_focus_collect_valid &&
-                          s_col_focus_revision == sr->model_bounds_focus_revision)) &&
+            cache_hit = s_col_owner == sr && sr->model_bounds_focus_collect_valid &&
+                        s_col_focus_revision == sr->model_bounds_focus_revision &&
                         s_col_fx == collect_ctx.fx &&
                         s_col_fz == collect_ctx.fz &&
                         s_col_r2 == collect_ctx.r2;
@@ -4041,6 +4060,23 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             }
         }
         if (!cache_hit) {
+            /* A focus change requires a real recollect, but not necessarily a
+             * new positional layout. Keep the generation only when every old
+             * ID is matched in order, with the same count and cache owner.
+             * Transform, enable and component generations remain independent
+             * ecull invalidations below; they are not accepted here. */
+            collect_ctx.prior_count = list.count;
+            collect_ctx.same_layout = s_col_cache_on && prior_list &&
+                s_col_list_gen != 0 && roster_now != 0 &&
+                s_col_roster == roster_now && s_col_struct == struct_now &&
+                s_col_all == !collect_ctx.enabled &&
+                sr->model_bounds_focus_collect_valid &&
+                s_col_focus_revision == sr->model_bounds_focus_revision &&
+                (!collect_ctx.enabled || s_col_r2 == collect_ctx.r2);
+            list.count = 0;
+            jce_scene_each_entity(scene, collect_entity_cb, &collect_ctx);
+            const bool same_layout = collect_ctx.same_layout &&
+                collect_ctx.complete && list.count == collect_ctx.prior_count;
             /* JCE_COLLECT_DBG=1: log WHY the cache missed (diagnosis aid). */
             static int s_col_dbg = -1;
             if (s_col_dbg < 0) {
@@ -4053,7 +4089,8 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
                     LOG_INFO(LOG_TAG,
                              "collect-cache MISS: on=%d focus=%d all=%d scene=%d "
                              "roster %llu->%llu struct %llu->%llu xform %llu->%llu "
-                             "focus(%.1f,%.1f,r2 %.0f)->(%.1f,%.1f,r2 %.0f)",
+                             "focus(%.1f,%.1f,r2 %.0f)->(%.1f,%.1f,r2 %.0f) "
+                             "layout_same=%d complete=%d count=%d->%d",
                              s_col_cache_on, (int)collect_ctx.enabled,
                              (int)s_col_all,
                              (int)(s_col_scene == (const void *)scene),
@@ -4065,23 +4102,25 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
                              (unsigned long long)xform_now,
                              (double)s_col_fx, (double)s_col_fz, (double)s_col_r2,
                              (double)collect_ctx.fx, (double)collect_ctx.fz,
-                             (double)collect_ctx.r2);
+                             (double)collect_ctx.r2,
+                             (int)same_layout, (int)collect_ctx.complete,
+                             collect_ctx.prior_count, list.count);
             }
-            list.count = 0;
-            jce_scene_each_entity(scene, collect_entity_cb, &collect_ctx);
             s_col_all    = !collect_ctx.enabled;
             s_col_scene  = (const void *)scene;
             s_col_owner = sr;
             s_col_scene_id = sr->model_bounds_scene;
             s_col_focus_revision = sr->model_bounds_focus_revision;
-            sr->model_bounds_focus_collect_valid = true;
+            sr->model_bounds_focus_collect_valid = collect_ctx.complete;
             s_col_roster = roster_now;
             s_col_struct = struct_now;
             s_col_xform  = xform_now;
             s_col_fx = collect_ctx.fx; s_col_fz = collect_ctx.fz;
             s_col_r2 = collect_ctx.r2;
-            s_col_valid  = true;
-            s_col_list_gen++;
+            /* A refused grow must retry even with a stationary camera. A
+             * partial list cannot become a permanently cached collection. */
+            s_col_valid  = collect_ctx.complete;
+            if (!same_layout) s_col_list_gen++;
         }
         jce_perf_phase_add("collect", jce_time_perf_to_ms(_t0_collect, jce_time_perf_counter()));
     }
@@ -4134,11 +4173,9 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
      * uses one predicate", and a frozen predicate makes them agree on the
      * wrong answer instead of disagreeing on the right one.
      *
-     * The direction comes from sr_resolve_primary_dir_light, the renderer's
-     * single resolver, rather than from tod_state directly. That matters:
-     * the resolver already decides between the time-of-day sun and the
-     * scene's authored directional light, and a second copy of that decision
-     * here would drift from CSM and the fog the first time either changed.
+     * The resolver selects the body that lights geometry. Under time-of-day
+     * that body may be the moon, so solar state must retain the actual sun
+     * from the snapshot. Authored lights still use the resolver direction.
      *
      * The moon is the antipode of the sun. That is the standard cheap model
      * and it is what jce_environment_default() already encodes -- its sun is
@@ -4167,9 +4204,11 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
                                          want_screen_shafts ? &color : NULL, &inten)) {
             cloud_sun = to_light;
             if (want_screen_shafts) shaft_sun_radiance = jce_v3_scale(color, inten);
-            sr->env->sun_direction_ws  = to_light;
-            sr->env->moon_direction_ws = jce_v3(-to_light.x, -to_light.y,
-                                               -to_light.z);
+            /* The key can be the moon. Preserve solar identity for sky and
+             * daytime predicates; cloud shadowing consumes the selected key. */
+            const jce_vec3 solar = sr->tod_active ? sr->tod_state.sun_direction : to_light;
+            sr->env->sun_direction_ws  = solar;
+            sr->env->moon_direction_ws = jce_v3(-solar.x, -solar.y, -solar.z);
             /* ILLUMINANCE IS DELIBERATELY NOT WRITTEN.
              *
              * The first version here set it to 100000 * inten, and on this
@@ -4929,8 +4968,16 @@ ecull_build_done:;
         jce_perf_phase_add("shadow_gather", jce_time_perf_to_ms(_t0_shadow, jce_time_perf_counter()));
     }
 
-    sr_update_cloud_shadow_frame(sr, scene, camera, scene_rendering, cloud_sun,
-                                 cfg->reduced_pass, sky_drawn);
+    {
+        const int profile_cloud_shadow = jce_perf_phase_enabled();
+        const uint64_t cloud_shadow_start = profile_cloud_shadow
+            ? jce_time_perf_counter() : 0u;
+        sr_update_cloud_shadow_frame(sr, scene, camera, scene_rendering, cloud_sun,
+                                    cfg->reduced_pass, sky_drawn);
+        if (profile_cloud_shadow)
+            jce_perf_phase_add("sr_cloud_shadow",
+                jce_time_perf_to_ms(cloud_shadow_start, jce_time_perf_counter()));
+    }
 
     /* SSAO: camera depth pre-pass + screen-space AO (gated on the scene's
      * authored ssao_enabled + the pipeline feature flag; OFF => byte-identical).
@@ -5384,10 +5431,7 @@ ecull_build_done:;
         }
     }
 
-    /* Cleared BEFORE the entity pass, which is where the water draw sets it.
-     * A sticky flag would leave the whole screen tinted after the camera
-     * surfaced -- and "everything is slightly blue" reads as a colour-grade
-     * decision, not as stale state. */
+    /* Water sets this during entity draws; clear first so surfacing removes absorption. */
     sr->underwater_frame = false;
 
     uint16_t transparent_view = sr_water_optics_begin(sr, camera, view_id_base, cfg);
@@ -5405,20 +5449,23 @@ ecull_build_done:;
     /* Cloth/soft-body grids (after entities so lighting uniforms are live). */
     sr_draw_cloth(sr, scene, view_id_base);
 
-    /* ── Underwater absorption ───────────────────────────────────────────
-     * After every scene surface has been drawn, and after the fog composite.
-     *
-     * base+17, and the slot matters: base+10..14 are the shadow band (base+10
-     * simple, base+11+c per cascade), base+15/16 are the fog render and its
-     * composite, base+18 is SSR.  base+14 was the obvious-looking choice and it
-     * is CASCADE 3 -- writing there would have overwritten a shadow map with a
-     * fullscreen quad, which in this renderer has previously produced a black
-     * screen rather than anything that looked like a slot conflict. */
+    /* Underwater follows surfaces/fog in base+17. Shadow uses base+10..14,
+     * fog base+15/16, SSR base+18; using base+14 would overwrite cascade 3. */
     if (sr->underwater_frame && sr->pak
         && cfg->scene_depth_tex_handle != UINT16_MAX
         && cfg->viewport_width > 0 && cfg->viewport_height > 0)
     {
-        if (!sr->underwater) sr->underwater = jce_underwater_create(sr->pak);
+        if (!sr->underwater) {
+            const uint32_t frame = jce_renderer_get_frame_index(sr->renderer);
+            if (!sr->underwater_retry_pending ||
+                sr->underwater_retry_context != sr->resource_prepared_context ||
+                (uint32_t)(frame - sr->underwater_retry_frame) >= 60u) {
+                sr->underwater = jce_underwater_create(sr->pak);
+                sr->underwater_retry_frame = frame;
+                sr->underwater_retry_context = sr->resource_prepared_context;
+                sr->underwater_retry_pending = sr->underwater == NULL;
+            }
+        }
         if (sr->underwater) {
             JceUnderwaterParams up;
             memset(&up, 0, sizeof up);
@@ -6539,8 +6586,8 @@ void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr)
     if (!sr) return;
     if (sr->model_bounds_enabled) {
         sr_anim_instances_destroy(sr);
-        sr_model_bounds_reset(sr);
     }
+    sr_model_bounds_reset(sr);
     /* One owner for task cancellation, GPU objects, heap slots and the hash
      * table. Invalidations discard failed paths too, so a repaired GLB can
      * load on the next request. No saved authoring data is modified. */

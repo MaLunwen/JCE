@@ -104,6 +104,63 @@ static void test_load_still_compiles_text_with_custom_env(void)
         "environment — the hardening broke a legitimate first-party use");
 }
 
+/* Arity is observable before luaL_loadbufferx pushes its result. With exactly
+   three arguments that result occupies slot 4; it is not a caller-supplied
+   environment. Delayed factories catch the bug that constant chunks hide. */
+static void test_load_default_environment_for_each_arity(void)
+{
+    TEST_ASSERT_TRUE_MESSAGE(
+        probe_says_true(
+            "local src = 'return {start=function() return type(_G), math.abs(-7) end}'\n"
+            "local chunks = {load(src), load(src, '@two'), "
+                "load(src, '@three', 't'), load(src, '@nil', 't', nil)}\n"
+            "assert(#chunks == 4, 'default-environment load failed')\n"
+            "for _, chunk in ipairs(chunks) do\n"
+            "  local factory = chunk()\n"
+            "  local kind, answer = factory.start()\n"
+            "  assert(kind == 'table' and answer == 7, 'default _ENV changed')\n"
+            "end"),
+        "load() bound a compiled function as _ENV instead of preserving the "
+        "sandbox globals for a default-environment factory");
+}
+
+static void test_load_custom_environments_do_not_leak_between_factories(void)
+{
+    TEST_ASSERT_TRUE_MESSAGE(
+        probe_says_true(
+            "local src = 'return function() answer=answer+1; return answer, io, jce end'\n"
+            "local a, b = {answer=40}, {answer=90}\n"
+            "local fa = assert(load(src, '@a', 't', a))()\n"
+            "local fb = assert(load(src, '@b', 't', b))()\n"
+            "local x, io_value, host = fa()\n"
+            "assert(x == 41 and io_value == nil and host == nil)\n"
+            "assert(fb() == 91 and a.answer == 41 and b.answer == 91)\n"
+            "assert(answer == nil, 'custom environment leaked into globals')\n"
+            "local ordinary = assert(load('return type(_G)', '@ordinary', 't'))\n"
+            "assert(ordinary() == 'table', 'prior custom env remained active')"),
+        "load() leaked a custom environment into another factory or the sandbox");
+}
+
+static void test_load_reader_functions_are_not_invoked(void)
+{
+    TEST_ASSERT_TRUE_MESSAGE(
+        probe_says_true(
+            "local calls = 0\n"
+            "local chunk, err = load(function() calls=calls+1; return 'return 1' end)\n"
+            "assert(chunk == nil and type(err) == 'string')\n"
+            "assert(calls == 0, 'a refused reader was executed')"),
+        "load() executed a reader function or stopped returning nil/message");
+}
+
+static void test_load_forces_text_even_when_binary_mode_requested(void)
+{
+    TEST_ASSERT_TRUE_MESSAGE(
+        probe_says_true(
+            "local chunk = assert(load('return math.abs(-9)', '@text', 'b'))\n"
+            "assert(chunk() == 9, 'text compilation or default environment broke')"),
+        "load() stopped treating a requested mode as text-only");
+}
+
 /* A binary chunk must be refused whatever mode the caller asks for.  The
    caller's mode argument is ignored on purpose: relying on every call site
    to remember "t" is exactly how this kind of hole survives. */
@@ -147,6 +204,10 @@ int main(void)
     RUN_TEST(test_loadfile_is_removed);
     RUN_TEST(test_dangerous_libs_absent);
     RUN_TEST(test_load_still_compiles_text_with_custom_env);
+    RUN_TEST(test_load_default_environment_for_each_arity);
+    RUN_TEST(test_load_custom_environments_do_not_leak_between_factories);
+    RUN_TEST(test_load_reader_functions_are_not_invoked);
+    RUN_TEST(test_load_forces_text_even_when_binary_mode_requested);
     RUN_TEST(test_load_refuses_binary_chunks);
     RUN_TEST(test_load_reports_syntax_errors_as_nil_plus_message);
     return UNITY_END();

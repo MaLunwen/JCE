@@ -195,7 +195,7 @@ static void submit_tile(const SrWaterCausticAtlas *a, uint16_t ix, uint16_t iz,
         colour[channel] = 1.0f;
         bgfx_set_scissor(ix, scissor_y, TILE_STRIDE, TILE_STRIDE);
         bgfx_set_vertex_buffer(0, vertices, 0, UINT32_MAX);
-        bgfx_set_index_buffer(indices, 0, UINT32_MAX);
+        bgfx_set_index_buffer(indices, 0, jce_mesh_index_count(a->grid));
         bgfx_set_uniform(a->projection, projection, 1);
         bgfx_set_uniform(a->tile, tile, 1);
         bgfx_set_uniform(a->channel, colour, 1);

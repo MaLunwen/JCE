@@ -1,3 +1,27 @@
+Focus movement still executes the original exact entity/focus-AABB collection.
+Its positional list generation may remain only after a complete recollect has
+the identical ordered full entity IDs and count, with the same renderer,
+scene-instance, roster, structure, focus-bounds proof and collection mode.
+Transform/enable/component metadata gates remain independent. Entity-list
+reserve refusal invalidates collection reuse and retries on a stationary frame;
+this is not a general guarantee for the separate ecull-array allocation owner.
+The existing JCE_COLLECT_DBG record exposes sampled layout/progress outcomes;
+no phase slot or per-entity timer is added.
+
+Cold or invalid bounds proofs use one conservative collect-all refresh before
+exact focus filtering resumes. This keeps large surfaces whose origins are
+distant but whose actual bounds overlap the focus. The collect-all cache also
+requires the same valid proof/revision/owner; a late publication after cold
+collection cannot strand the renderer permanently in unbounded collection.
+
+Model publication uses the existing model-bounds dirty/drain owner in both
+modes. Default mode batches conservative bounds/retained-geometry retirement
+before collection and after animation; dependency tracking and selective repair
+remain opt-in. A synchronous callback during later work retains dirty state
+until the following boundary. Scene-instance entry and explicit public model
+cache invalidation also retire default-mode bounds. A stationary focus hit
+cannot bypass a dirty publication's invalidated proof.
+
 The private `jce_sr_ssgi_lifetime` owner retains SSGI through reduced
 reflection/probe views. Reduced calls neither advance idle accounting nor
 clear any ordinary view's request. Ordinary views OR requests within the same
@@ -50,6 +74,21 @@ lower-resolution dual-atlas route is introduced. Local atlas is uncached and
 currently lacks a FoliageCluster producer; this change covers CSM only.
 
 # engine/src/middleware/scene — Scene / ECS (L4)
+
+Procedural sky IBL admission uses the private `jce_sr_ibl_refresh.h` numeric
+snapshot in each SceneRenderer. Compare normalized directions against the
+existing two-degree threshold and exact authored ambient/turbidity values;
+never parse the rounded diagnostic string back into cache authority. Queue,
+bake/upload failure and HDR transitions invalidate the admitted snapshot.
+The existing one-job-in-flight guard and main-thread upload owner remain.
+Scene `ibl_enabled=false` refuses new procedural sky generation and bake
+admission. Already accepted tasks still retire through `sr_ibl_poll` and may
+populate the retained cache; disabling never drops their handles. Re-enabling
+compares against the last admitted snapshot, so changed sky/scalars refresh
+and unchanged cached sky is reused. The HDR skybox path retains its separate
+`use_as_ibl` semantics; this guard does not change skybox rendering.
+CPU admission tests do not certify native frame time, worker contention or
+rendered IBL quality; the convolution timer excludes generation and upload.
 
 `jce_scene_point_light_write_internal.h` classifies PointLight cull invalidation
 before the existing typed set. An existing independent value may change only
@@ -1364,6 +1403,14 @@ environment owner retains resource/cache lookup and scoped receipt publication.
 The foliage shader's existing output formula is unchanged. Instance admission
 and CPU submit-return are not GPU completion or pixel acceptance.
 
+The separate FoliageCluster shell cache has a generic fixed 64-slot budget.
+Per-slot CPU leaf records remain lazy and capped at 256 cards of eight floats:
+512 KiB for full CPU records, excluding metadata and compatibility meshes.
+Both reset and destruction traverse the complete array. Working sets above
+the budget retain deterministic eviction; a capacity warning alone does not
+establish a missed scene reset. Stable capacity reuse is CPU work avoidance,
+not a whole-frame or GPU performance claim.
+
 jce_sr_shadow_frame.c/h owns the existing frame-active/r.shadows/CSM selection
 and CSM split packing. The full shadow-state binder and split-only foliage
 consumer reuse this owner; split-only binding does not bind shadow textures or
@@ -1595,3 +1642,52 @@ and reuses opaque colour/depth, with no new sampler, target or public field.
 The shader accepts only a four-neighbour exact-clear screen-sky footprint and
 keeps finite-march/offscreen limitations; runtime GPU evidence is separate from
 CPU reset/lifecycle controls.
+
+The private jce_sr_tod_key.h consumes the evaluated sun direction and its
+antipodal moon through jce_environment_key_direction. PBR color, procedural
+foliage and the primary CSM resolver share this selected key; the live scene
+environment retains actual solar identity for sky and daytime predicates.
+It introduces no clock, solar curve, exposure change or authored night floor.
+
+jce_sr_foliage_lighting.h owns the bounded incident RGB-times-intensity
+response applied to the existing authored ramp multiplier. The color binder
+reads the resolved ambient and primary directional energy; material/shader ABI
+and ramp shape remain unchanged. Zero illumination supplies zero surface
+emission. Host-authored tint remains independent from light energy.
+
+Shared foliage resource acquisition and underwater creation retry at most
+once per 60 renderer device frames after a refusal, or immediately after an
+explicit cache reset/context change. Keep successful resources, aggregate one
+failure diagnostic per episode and rearm after recovery. Initialize every
+owned foliage uniform, including hashed alpha, to INVALID and release once.
+Resource submission controls do not certify device recovery or frame times.
+
+Rigid imported MeshRenderer two-sided requests are scoped around color,
+depth/velocity and shadow submissions through renderer/jce_pbr_cull_override.h.
+Restore the previous scope after each draw. Embedded materials and textures
+remain immutable; affected requests avoid batching whose key cannot carry
+the cull flag. This can increase draw calls and needs native timing evidence.
+
+`jce_sr_water_mesh_cache.h` owns only grid/ring cache replacement and refusal
+admission. A failed geometry build pauses all new water meshes for 60 renderer
+device frames, including other entities, viewports and slot evictions. Existing
+matching meshes remain usable; changed extent/topology metadata commits only
+with a successful replacement. A missing legacy FFT source may retain analytic
+fallback. Explicit entity-cache reset or a new prepared context permits an
+immediate retry. Keep one aggregate failure log per episode plus recovery;
+backend handle counts are observations, not VRAM exhaustion or GPU completion.
+Initialization, retained-vertex retirement and texture sentinels keep their
+existing renderer/water-resource owners. CPU failure ports are not native proof.
+While this cooldown is active, a full cache does not evict a resident to serve
+a request that cannot allocate. Ordinary pre-failure eviction remains unchanged.
+The caustic atlas binds only the grid's triangle count, excluding the packed
+wireframe suffix while keeping its three RGB submissions and vertex range.
+
+Camera depth/normal/velocity dispatch uses the model owner's MASK-aware
+program selection. `jce_model_depth_masked` excludes cutout models from static
+and bind-pose velocity queues whose keys carry no alpha material; the ordinary
+per-primitive route then binds the alpha source. Animated crowd velocity may
+stay batched because its model submitter binds every primitive/chunk. Keep
+opaque batching unchanged. Procedural FoliageCluster remains outside this
+imported-model camera-depth route; do not attribute its visible edge to this
+fix without an actual source/output witness.

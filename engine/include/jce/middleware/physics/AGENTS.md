@@ -41,3 +41,24 @@ C 调用方是用 `JceBodyType` 常量经公共 setter 写这个字段的，
 而 0 恰恰是那个本来就永远无法被 honour 的值。**任何既有调用方的含义都不变。**
 
 **下次给一个「已经有公共 setter」的字段换编码时，先问代码通路。**
+
+
+## Additive bounded shape debug query
+
+`jce_physics_debug_query_shapes` takes a version-sized POD query, explicit
+world-space bounds, finite source-work budgets and a per-call line sink. It
+returns counters and partial/sampled/unsupported status without changing the
+existing global debug settings. Its boolean return denotes valid query
+execution, not complete visual coverage. All exposed types remain C99 and
+contain no Bullet or renderer types. Existing `debug_flush` ABI is unchanged.
+
+## Ranged live-shape queries
+
+`JcePhysicsDebugQuery` appends optional center/radius/character/flags fields.
+The original 52-byte prefix remains accepted: copy only the caller's declared
+size into a zeroed current descriptor before any suffix read. Keep stats layout
+unchanged. Zero radius disables distance filtering; it does not remove budgets.
+A character exemption is opt-in and resolves through the queried world's live
+character pool, never a guessed scene entity or ordinary body handle.
+The runtime accessor returns the current borrowed player handle or INVALID.
+Do not retain it across runtime/scene retirement. New headers remain pure C99.

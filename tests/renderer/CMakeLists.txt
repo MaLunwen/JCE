@@ -1725,3 +1725,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/optional_stock_admission_controls.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/bgfx_trace_sink_controls.cmake")
 
 include("${CMAKE_CURRENT_LIST_DIR}/gpu_profile_admission_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/postfx_agx_controls.cmake")
+
+include("${CMAKE_CURRENT_LIST_DIR}/csm_dynamic_filter_controls.cmake")

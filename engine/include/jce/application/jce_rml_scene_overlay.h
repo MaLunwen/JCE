@@ -9,25 +9,31 @@
 #include <jce/middleware/ui/jce_ui.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_perf_phase.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_views.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_keys.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-#define JCE_RML_SCENE_BIND_MAX 64 /* CK_0225_RML_BINDINGS: supports 36 validated CK slots */
+#define JCE_RML_SCENE_BIND_MAX 96 /* Bounded scene values, controls and visibility. */
 #define JCE_RML_SCENE_LINE_MAX 192
 
 typedef struct JceRmlSceneBinding {
     char tag[64];
     JceUIElementHandle element;
-    int kind; /* 0=text, 1=optional text, 2=progress fraction, 3=journal */
+    int kind; /* 0=text, 1=optional, 2=progress, 3=journal, 4=visible, 5=modal, 6=command, 7=key, 8=modal-key */
     uint64_t previous_hash;
     bool initialized;
+    char command[64]; /* A bounded command for the target UIText mailbox. */
+    int key_code;
+    bool key_held;
 } JceRmlSceneBinding;
 
 typedef struct JceRmlSceneOverlay {
@@ -42,6 +48,9 @@ typedef struct JceRmlSceneOverlay {
     JceUIElementHandle help_button, help_close, help_panel;
     bool help_visible;
     uint32_t width, height;
+    JceScene *scene; /* Borrowed only while the host owns this overlay and scene. */
+    bool wait_release; /* Quarantine held controls across modal dismissal. */
+    bool capture_owned, capture_saved; /* Runtime-host pointer handoff only. */
 } JceRmlSceneOverlay;
 
 static uint64_t jce_rml_scene_text_hash(const char *s)
@@ -92,11 +101,190 @@ static void jce_rml_scene_overlay_page(JceRmlSceneOverlay *o, int page)
     }
 }
 
+static bool jce_rml_scene_overlay_has_modal_controls(const JceRmlSceneOverlay *o)
+{
+    if (!o || !o->ui) return false;
+    for (int i = 0; i < o->bind_count; ++i)
+        if (o->binds[i].kind == 5) return true;
+    return false;
+}
+
+/* A snapshot belongs to one sync/input operation, never to a frame or scene.
+ * Resolve all requested tags in the same entity order as find_with_tag; a
+ * first match without the requested UI component must not select a later one.
+ * Tags and full entity handles can change between any two operations. */
+typedef struct JceRmlSceneTargets {
+    uint16_t tags[JCE_RML_SCENE_BIND_MAX];
+    JceEntity entities[JCE_RML_SCENE_BIND_MAX];
+    int bind_target[JCE_RML_SCENE_BIND_MAX];
+    int count, remaining;
+} JceRmlSceneTargets;
+
+static void jce_rml_scene_overlay_resolve_entity(JceScene *scene, JceEntity e,
+    void *userdata)
+{
+    JceRmlSceneTargets *targets = (JceRmlSceneTargets *)userdata;
+    if (!targets->remaining) return;
+    JceTagComponent *tag = jce_scene_get_tag_component(scene,e);
+    const uint16_t tag_id = tag ? tag->tag_id : 0u;
+    for (int i = 0; i < targets->count; ++i) {
+        if (targets->tags[i] == tag_id && !targets->entities[i]) {
+            targets->entities[i] = e;
+            --targets->remaining;
+            return;
+        }
+    }
+}
+
+static void jce_rml_scene_overlay_resolve(JceRmlSceneTargets *targets,
+    const JceRmlSceneOverlay *o, JceScene *scene, uint32_t kind_mask)
+{
+    memset(targets,0,sizeof *targets);
+    for (int i = 0; i < o->bind_count; ++i) {
+        const JceRmlSceneBinding *b = &o->binds[i];
+        targets->bind_target[i] = -1;
+        if ((unsigned)b->kind > 8u || !(kind_mask & (1u << b->kind))) continue;
+        const uint16_t tag_id = jce_tag_intern(b->tag);
+        /* Match find_with_tag: an invalid/failed intern is not Untagged. */
+        if (!b->tag[0] || (!tag_id && strcmp(b->tag,"Untagged") != 0)) continue;
+        int target = 0;
+        while (target < targets->count && targets->tags[target] != tag_id) ++target;
+        if (target == targets->count) targets->tags[targets->count++] = tag_id;
+        targets->bind_target[i] = target;
+    }
+    targets->remaining = targets->count;
+    if (targets->count) jce_scene_each_entity(scene,jce_rml_scene_overlay_resolve_entity,targets);
+}
+
+static JceEntity jce_rml_scene_overlay_target(const JceRmlSceneTargets *targets,
+    int binding)
+{
+    const int target = targets->bind_target[binding];
+    return target >= 0 ? targets->entities[target] : JCE_ENTITY_INVALID;
+}
+
+static bool jce_rml_scene_overlay_modal_targets(const JceRmlSceneOverlay *o,
+    JceScene *scene, const JceRmlSceneTargets *targets)
+{
+    for (int i = 0; i < o->bind_count; ++i) {
+        if (o->binds[i].kind != 5) continue;
+        JceEntity e = jce_rml_scene_overlay_target(targets,i);
+        JceUIToggleComponent *toggle = e ? jce_scene_get_ui_toggle(scene,e) : NULL;
+        if (toggle && toggle->is_on) return true;
+    }
+    return false;
+}
+
+static bool jce_rml_scene_overlay_modal_active(JceRmlSceneOverlay *o, JceScene *scene)
+{
+    if (!o || !o->ui || !scene) return false;
+    JceRmlSceneTargets targets;
+    jce_rml_scene_overlay_resolve(&targets,o,scene,1u << 5);
+    return jce_rml_scene_overlay_modal_targets(o,scene,&targets);
+}
+
+/* Query before sampling gameplay. A host keeps raw UI input available while
+ * it suppresses its game/controller sample and releases pointer capture. */
+static bool jce_rml_scene_overlay_wants_input(JceRmlSceneOverlay *o, JceScene *scene)
+{
+    if (!o || !o->ui || !scene) return false;
+    if (o->open_page || o->help_visible) return true;
+    JceRmlSceneTargets targets;
+    bool checked[JCE_RML_SCENE_BIND_MAX] = {false};
+    jce_rml_scene_overlay_resolve(&targets,o,scene,
+        (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8));
+    for (int i = 0; i < o->bind_count; ++i) {
+        JceRmlSceneBinding *b = &o->binds[i];
+        if (b->kind != 6 && b->kind != 7 && b->kind != 8) continue;
+        const int target = targets.bind_target[i];
+        if (target < 0 || checked[target]) continue;
+        checked[target] = true;
+        JceEntity e = targets.entities[target];
+        JceUITextComponent *text = e ? jce_scene_get_ui_text(scene,e) : NULL;
+        if (text && text->text[0]) return true;
+    }
+    return jce_rml_scene_overlay_modal_targets(o,scene,&targets);
+}
+
+/* Preserve ownership until every pre-existing control has been released.
+ * The neutral release frame is consumed too, preventing an old action edge
+ * from becoming the first frame of resumed gameplay. */
+static bool jce_rml_scene_overlay_blocks_gameplay(JceRmlSceneOverlay *o,
+    JceScene *scene, const JceInput *input, const JceInputActions *actions)
+{
+    if (!o || !o->ui || !scene) return false;
+    if (jce_rml_scene_overlay_wants_input(o,scene)) {
+        o->wait_release = true;
+        return true;
+    }
+    if (!o->wait_release) return false;
+    if (input) {
+        for (int key = 4; key < JCE_KEY_COUNT; ++key)
+            if (jce_input_key_down(input,(JceKey)key)) return true;
+        for (int button = 1; button <= 5; ++button)
+            if (jce_input_mouse_button(input,button)) return true;
+        if (jce_input_touch_count(input) > 0) return true;
+    }
+    if (actions) {
+        int count = jce_actions_count(actions);
+        for (int i = 0; i < count; ++i) {
+            float value = jce_action_value(actions,i);
+            if (value != value || value > 0.001f || value < -0.001f) return true;
+        }
+    }
+    o->wait_release = false;
+    return true;
+}
+
+/* Feed raw UI keys before the host masks the gameplay keyboard. Keys are
+ * edge-triggered and share the same bounded first-event mailbox as buttons. */
+static void jce_rml_scene_overlay_prepare_input(JceRmlSceneOverlay *o,
+    JceScene *scene, const JceInput *input)
+{
+    if (!o || !o->ui || !scene) return;
+    o->scene = scene;
+    bool modal_checked = false, modal = false;
+    bool targets_ready = false;
+    JceRmlSceneTargets targets;
+    for (int i = 0; i < o->bind_count; ++i) {
+        JceRmlSceneBinding *b = &o->binds[i];
+        if (b->kind != 7 && b->kind != 8) continue;
+        bool down = input && jce_input_key_down(input,(JceKey)b->key_code);
+        bool edge = down && !b->key_held;
+        if (edge && b->kind == 8 && !modal_checked) {
+            modal = jce_rml_scene_overlay_modal_active(o,scene);
+            modal_checked = true;
+        }
+        if (edge && (b->kind == 7 || modal)) {
+            if (!targets_ready) {
+                jce_rml_scene_overlay_resolve(&targets,o,scene,(1u << 7) | (1u << 8));
+                targets_ready = true;
+            }
+            JceEntity e = jce_rml_scene_overlay_target(&targets,i);
+            JceUITextComponent *text = e ? jce_scene_get_ui_text(scene,e) : NULL;
+            if (text && !text->text[0])
+                memcpy(text->text,b->command,strlen(b->command) + 1u);
+        }
+        b->key_held = down;
+    }
+}
+
 static void jce_rml_scene_overlay_click(JceUIElementHandle e,
                                          const char *type, void *userdata)
 {
     JceRmlSceneOverlay *o = (JceRmlSceneOverlay *)userdata;
     if (!o || !type || strcmp(type, "click") != 0) return;
+    for (int i = 0; i < o->bind_count; ++i) {
+        JceRmlSceneBinding *b = &o->binds[i];
+        if (b->kind != 6 || b->element.idx != e.idx || !o->scene) continue;
+        JceEntity target = jce_scene_find_with_tag(o->scene,b->tag);
+        JceUITextComponent *text = target ? jce_scene_get_ui_text(o->scene,target) : NULL;
+        if (text && !text->text[0]) {
+            /* A one-event mailbox: do not overwrite an unconsumed click. */
+            memcpy(text->text,b->command,strlen(b->command) + 1u);
+        }
+        return;
+    }
     if (jce_ui_elem_valid(o->help_button) && o->help_button.idx == e.idx) {
         jce_rml_scene_overlay_help(o, !o->help_visible);
         return;
@@ -122,7 +310,12 @@ static void jce_rml_scene_overlay_close(JceRmlSceneOverlay *o)
 
 /* Parses a small, UTF-8 ASCII-key manifest of `text|element_id|scene_tag`,
  * `optional|element_id|scene_tag`, `journal|element_id|scene_tag`,
- * or `progress|element_id|scene_tag` rows.
+ * `progress|element_id|scene_tag`, `visible|element_id|scene_tag`,
+ * `modal|element_id|scene_tag`, `command|button_id|scene_tag`, or
+ * `key|decimal_scancode|scene_tag` or `modal-key|decimal_scancode|scene_tag`
+ * rows (0 <= key < JCE_KEY_COUNT). Modal keys only enqueue while a modal is on.
+ * Visible/modal read UIToggle.is_on without replacing element children.
+ * Commands write their button id to a UIText mailbox; the consumer clears it.
  * Validates all rows before publishing the overlay. No CK identifiers here. */
 static bool jce_rml_scene_overlay_open(JceRmlSceneOverlay *o,
     JceRenderer *renderer, JcePakArchive *pak, const char *markup,
@@ -160,15 +353,37 @@ static bool jce_rml_scene_overlay_open(JceRmlSceneOverlay *o,
         int kind = strcmp(row, "text") == 0 ? 0 :
                    strcmp(row, "optional") == 0 ? 1 :
                    strcmp(row, "progress") == 0 ? 2 :
-                   strcmp(row, "journal") == 0 ? 3 : -1;
+                   strcmp(row, "journal") == 0 ? 3 :
+                   strcmp(row, "visible") == 0 ? 4 :
+                   strcmp(row, "modal") == 0 ? 5 :
+                   strcmp(row, "command") == 0 ? 6 :
+                   strcmp(row, "key") == 0 ? 7 :
+                   strcmp(row, "modal-key") == 0 ? 8 : -1;
         if (kind < 0) return false;
         JceRmlSceneBinding *b = &parsed[parsed_count++];
         b->kind = kind;
+        if (kind == 6) memcpy(b->command,sep1,strlen(sep1) + 1u);
+        if (kind == 7 || kind == 8) {
+            size_t key_len = strlen(sep1);
+            if (!key_len || key_len > 3u) return false;
+            int key = 0;
+            for (size_t k = 0; k < key_len; ++k) {
+                if (sep1[k] < '0' || sep1[k] > '9') return false;
+                key = key*10 + (sep1[k] - '0');
+            }
+            if (key >= JCE_KEY_COUNT) return false;
+            b->key_code = key;
+            snprintf(b->command,sizeof b->command,"key:%d",key);
+            for (int j = 0; j < parsed_count - 1; ++j)
+                if ((parsed[j].kind == 7 || parsed[j].kind == 8) && parsed[j].key_code == key) return false;
+        }
         memcpy(b->tag, sep2, strlen(sep2) + 1);
         /* Temporary sentinel: resolved below, after UI context creation. */
         b->element.idx = UINT32_MAX;
         for (int j = 0; j < parsed_count - 1; ++j)
-            if (strcmp(parsed[j].tag, b->tag) == 0) return false;
+            if (strcmp(parsed[j].tag, b->tag) == 0 &&
+                !((parsed[j].kind >= 6 && parsed[j].kind <= 8) &&
+                  (b->kind >= 6 && b->kind <= 8))) return false;
         /* RML id is kept in a separate stack table until handles resolve. */
     }
     if (parsed_count <= 0) return false;
@@ -198,6 +413,7 @@ static bool jce_rml_scene_overlay_open(JceRmlSceneOverlay *o,
         char *id = sep+1; char *end = strchr(id,'|');
         if (!end) { jce_rml_scene_overlay_close(o); return false; }
         *end=0;
+        if (parsed[idx].kind == 7 || parsed[idx].kind == 8) { ++idx; continue; }
         parsed[idx].element = jce_ui_find_element(o->ui,o->document,id);
         if (!jce_ui_elem_valid(parsed[idx].element)) {
             jce_rml_scene_overlay_close(o); return false;
@@ -206,6 +422,12 @@ static bool jce_rml_scene_overlay_open(JceRmlSceneOverlay *o,
     }
     for (int i = 0; i < parsed_count; ++i) o->binds[i] = parsed[i];
     o->bind_count = parsed_count;
+    for (int i = 0; i < parsed_count; ++i) {
+        if (o->binds[i].kind == 6 &&
+            !jce_ui_elem_on(o->ui,o->binds[i].element,"click",jce_rml_scene_overlay_click,o)) {
+            jce_rml_scene_overlay_close(o); return false;
+        }
+    }
     o->menu = jce_ui_find_element(o->ui,o->document,"rml_overlay_panel");
     o->help_panel = jce_ui_find_element(o->ui,o->document,"rml_help_panel");
     o->help_button = jce_ui_find_element(o->ui,o->document,"rml_help_button");
@@ -239,10 +461,21 @@ static bool jce_rml_scene_overlay_open(JceRmlSceneOverlay *o,
 static void jce_rml_scene_overlay_sync(JceRmlSceneOverlay *o, JceScene *scene)
 {
     if (!o || !o->ui || !scene) return;
+    o->scene = scene;
+    JceRmlSceneTargets targets;
+    jce_rml_scene_overlay_resolve(&targets,o,scene,(1u << 6) - 1u);
     for (int i = 0; i < o->bind_count; ++i) {
         JceRmlSceneBinding *b = &o->binds[i];
-        JceEntity e = jce_scene_find_with_tag(scene,b->tag);
-        if (b->kind == 2) {
+        if (b->kind >= 6 && b->kind <= 8) continue;
+        JceEntity e = jce_rml_scene_overlay_target(&targets,i);
+        if (b->kind == 4 || b->kind == 5) {
+            JceUIToggleComponent *p = e ? jce_scene_get_ui_toggle(scene,e) : NULL;
+            bool visible = p && p->is_on;
+            if (b->initialized && b->previous_hash == (uint64_t)visible) continue;
+            jce_ui_elem_set_property(o->ui,b->element,"display",visible ? "block" : "none");
+            b->previous_hash = (uint64_t)visible;
+            b->initialized = true;
+        } else if (b->kind == 2) {
             JceUIProgressBarComponent *p = e ? jce_scene_get_ui_progress_bar(scene,e) : NULL;
             if (!p) continue;
             float span = p->max_value-p->min_value;
@@ -287,7 +520,14 @@ static void jce_rml_scene_overlay_frame(JceRmlSceneOverlay *o, JceScene *scene,
         jce_ui_set_dpi_scale(o->ui,jce_rml_scene_overlay_dp_ratio(width,height));
         o->width = width; o->height = height;
     }
+    const bool profile = jce_perf_phase_enabled() != 0;
+    uint64_t phase_start = profile ? jce_time_perf_counter() : 0u;
     jce_rml_scene_overlay_sync(o,scene);
+    if (profile) {
+        const uint64_t now = jce_time_perf_counter();
+        jce_perf_phase_add("rml_sync",jce_time_perf_to_ms(phase_start,now));
+        phase_start = now;
+    }
     /* These keys are routed only when the native host provides an input
      * owner. The editor's Game View still uses its existing script-driven
      * J journal and mouse buttons; do not invent access to host ImGui input. */
@@ -303,16 +543,54 @@ static void jce_rml_scene_overlay_frame(JceRmlSceneOverlay *o, JceScene *scene,
         if (jce_input_key_pressed(input,JCE_KEY_ESCAPE) && o->open_page)
             jce_rml_scene_overlay_page(o,0);
     }
-    if (input) jce_ui_process_input(o->ui,input);
+    /* Full-window hosts can retain ordinary focus/wheel handling. Embedded
+     * views provide transformed pointer coordinates, which stay authoritative:
+     * never feed both routes or a click can fire twice at different positions. */
+    float raw_x = 0.0f, raw_y = 0.0f;
+    if (input) jce_input_mouse_pos(input,&raw_x,&raw_y);
+    bool matching_pointer = input && pointer_valid && raw_x == pointer_x && raw_y == pointer_y &&
+        jce_input_mouse_button(input,1) == pointer_down;
+    if (matching_pointer) jce_ui_process_input(o->ui,input);
     else jce_ui_process_pointer_state(o->ui,pointer_x,pointer_y,pointer_down,pointer_valid);
     jce_ui_update(o->ui,dt > 0 ? dt : 0.0f);
     jce_ui_render_view(o->ui,view_id);
+    if (profile)
+        jce_perf_phase_add("rml_render",jce_time_perf_to_ms(phase_start,jce_time_perf_counter()));
 }
 
 /* Optional runtime-only convenience. Implemented here because default_main
  * is itself a one-translation-unit host template, not a reusable module.
  * Defined for the default host only; Editor uses the shared overlay API. */
 #ifdef JCE_RML_SCENE_HOST_RUNTIME
+#include <jce/os/platform/jce_window.h>
+static bool jce_rml_scene_overlay_runtime_input(JceRmlSceneOverlay *o,
+    JceScene *scene, const JceInput *input, const JceInputActions *actions,
+    JceWindow *window, bool *captured, bool allow_capture)
+{
+    jce_rml_scene_overlay_prepare_input(o,scene,input);
+    bool blocked = jce_rml_scene_overlay_blocks_gameplay(o,scene,input,actions);
+    if (!o || !captured) return blocked;
+    if (blocked) {
+        if (!o->capture_owned) {
+            o->capture_saved = *captured;
+            o->capture_owned = true;
+        }
+        if (*captured && window) {
+            jce_window_set_relative_mouse_mode(window,false);
+            jce_window_set_mouse_grab(window,false);
+        }
+        *captured = false;
+    } else if (o->capture_owned && (!o->capture_saved || allow_capture)) {
+        *captured = o->capture_saved && allow_capture;
+        if (window) {
+            jce_window_set_relative_mouse_mode(window,*captured);
+            jce_window_set_mouse_grab(window,*captured);
+        }
+        o->capture_owned = false;
+    }
+    return blocked;
+}
+
 static void jce_rml_scene_overlay_runtime_tick(
     JceRmlSceneOverlay *o, bool *checked, JceFileSystem *fs,
     JceRenderer *renderer, JcePakArchive *pak, JceScene *scene,

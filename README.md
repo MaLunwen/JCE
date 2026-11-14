@@ -210,14 +210,14 @@ artifacts still require their own relocation and system-dependency validation.
 
 | | |
 | --- | --- |
-| Version | `0.14.9` (authoritative: `CMakeLists.txt`) |
+| Version | `0.14.10` (authoritative: `CMakeLists.txt`) |
 | Engine (C99) | 495 tracked `.c` under `engine/src/` |
 | Editor (C++20) | 236 tracked `.cpp` under `editor/src/`, 110 panels |
 | Public API | 316 headers under `engine/include/jce/`, 24 umbrellas, 4007 `JCE_API` symbols |
 | Shaders | 164 `.sc` under `engine/shaders/` |
 | Scripting | 6 binding trees under `scripting/` (c, cpp, csharp, java, js, python) over one flat C ABI, plus Lua built in |
 | Editor languages | 15 locales under `editor/resources/assets/i18n/` |
-| Build matrix | 49 CMake presets, 15 Conan profiles |
+| Build matrix | 50 CMake presets, 16 Conan profiles |
 | Gates | `tools/lint/run_all.py` + `tools/audit/run_architecture_audit.py` -- both must exit 0 with no `FAIL` line |
 | Parity ledger | 255 measured rows vs Unity / Unreal / Godot -- 28 ahead, 165 parity, 56 behind, 3 n/a (76.6% at or above) |
 
@@ -441,7 +441,12 @@ SHA-256 executable on the target XP guest and report the exit code.
 
 
 
-All commands are PowerShell from the repo root. Prerequisites: **VS 2022** (Desktop C++), **CMake 3.20+**, **Conan 2.x**, **Java 8+ JDK**. Ninja is recommended.
+Run commands from the repository root; the native Windows examples also work in
+CMD. Native Windows prerequisites are Visual Studio with Desktop C++ tools in
+the shared **MSVC 14.4** family, **Conan 2.x** and Ninja. The repository's schema 6
+presets require **CMake 3.25+**; non-preset configuration retains its own CMake
+minimum. **Java 8+ JDK** is required when the optional authoring Java backend is
+selected. Use the shared setup command for observed local tool paths.
 
 ## A. SDK consumer game
 
